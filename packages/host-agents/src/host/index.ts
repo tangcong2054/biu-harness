@@ -102,7 +102,17 @@ export class AgentsService extends Service {
         const claimed = claim(live.inbox)
         this.emitInbox(id)
         if (!claimed) break
-        last = await this.ctx.agentLoop.create(this.resolveLlm(id), id, live.abort.signal).run(claimed)
+        try {
+          last = await this.ctx.agentLoop.create(this.resolveLlm(id), id, live.abort.signal).run(claimed)
+        } catch (error) {
+          // 停止/空回车只终结「当前回合」，不代表放弃整个队列：排队的 wake 多半是别的
+          // session 派工（task_deliver / 进度回传 走 wait:false，入队后不再自行 kick），
+          // 若在这里整体退出循环，它们会永久滞留在 inbox 直到用户下次手动发消息。
+          // 已 abort 的 signal 无法复用，换一个再跑下一轮。
+          if (!isCancelled(error) || !live.inbox.some((item) => item.kind === 'wake')) throw error
+          live.abort = new AbortController()
+          last = { text: '', steps: [] }
+        }
       }
       return last
     }
@@ -124,7 +134,7 @@ export class AgentsService extends Service {
         return Promise.resolve({ text: '', steps: [] })
       }
       return running.then(() => result).catch((error) => {
-        if (/cancelled|AbortError|aborted/i.test(String(error))) {
+        if (isCancelled(error)) {
           return { text: '', steps: [] }
         }
         throw error
@@ -214,6 +224,10 @@ export class AgentsService extends Service {
     const agent = await this.create()
     return agent.send(last)
   }
+}
+
+function isCancelled(error: unknown): boolean {
+  return /cancelled|AbortError|aborted/i.test(String(error))
 }
 
 function sanitizeImages(raw: AgentSendOptions['images']): ClaimedInput['images'] {
