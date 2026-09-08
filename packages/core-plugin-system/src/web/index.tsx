@@ -1,9 +1,25 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
+import {
+  Component,
+  useEffect,
+  useRef,
+  useState,
+  type ErrorInfo,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from 'react'
 import type { Context } from 'cordis'
 import { useSlotEntries, type SlotsService } from '@biu/web-slots'
 import type { SlotProps } from '@biu/type-slots'
 
-import { XMarkIcon, MinusIcon, ArrowsPointingOutIcon, ArrowsPointingInIcon, PuzzlePieceIcon, Bars2Icon } from '@heroicons/react/16/solid'
+import {
+  XMarkIcon,
+  MinusIcon,
+  ArrowsPointingOutIcon,
+  ArrowsPointingInIcon,
+  PuzzlePieceIcon,
+  Bars2Icon,
+  ExclamationTriangleIcon,
+} from '@heroicons/react/16/solid'
 import type { DatabaseUi } from '@biu/type-file-system/ui'
 import type { DockService } from '@biu/core-dock'
 import { pluginsChrome } from './chrome.tsx'
@@ -46,6 +62,84 @@ let pluginWindowZ = 21
 
 type ResizeEdge = { north?: boolean; south?: boolean; east?: boolean; west?: boolean }
 type ResizeSession = WinGeom & ResizeEdge & { px: number; py: number }
+
+type PluginCrashBoundaryProps = {
+  pluginId: string
+  title: string
+  onClose: () => void
+  children: ReactNode
+}
+
+type PluginCrashBoundaryState = {
+  error: Error | null
+  closed: boolean
+}
+
+/** 每个商店插件独立隔离：一个窗口崩溃不能卸载整个 extras 层。 */
+export class PluginCrashBoundary extends Component<PluginCrashBoundaryProps, PluginCrashBoundaryState> {
+  state: PluginCrashBoundaryState = { error: null, closed: false }
+
+  static getDerivedStateFromError(error: Error): Partial<PluginCrashBoundaryState> {
+    return { error }
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error(`[store-plugin:${this.props.pluginId}] render crashed`, error, info)
+  }
+
+  private close = () => {
+    this.setState({ closed: true })
+    this.props.onClose()
+  }
+
+  render() {
+    if (this.state.closed) return null
+    if (!this.state.error) return this.props.children
+    return (
+      <div
+        role="alertdialog"
+        aria-label={`${this.props.title} 渲染失败`}
+        className="pointer-events-auto absolute inset-0 z-30 flex items-center justify-center bg-black/70 p-6 backdrop-blur-sm"
+      >
+        <div className="w-full max-w-sm overflow-hidden rounded-xl border border-white/10 bg-(--dsw-sidebar) shadow-2xl">
+          <div className="flex items-center gap-3 border-b border-white/8 px-5 py-4">
+            <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-[#cf2d56]/15 text-[#e05272]">
+              <ExclamationTriangleIcon className="size-4" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm font-semibold text-[#f0efed]">{this.props.title} 无法运行</div>
+              <div className="mt-0.5 text-xs text-[#f2f1ed]/45">插件渲染异常，主界面未受影响</div>
+            </div>
+            <button
+              type="button"
+              aria-label="关闭故障插件"
+              title="关闭故障插件"
+              onClick={this.close}
+              className="flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent p-0 text-[#f2f1ed]/45 transition-colors hover:bg-white/8 hover:text-[#f0efed]"
+            >
+              <XMarkIcon className="size-4" />
+            </button>
+          </div>
+          <div className="px-5 py-4">
+            <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-black/20 px-3 py-2.5 text-xs leading-5 text-[#f2f1ed]/65">
+              {String(this.state.error.message || this.state.error)}
+            </pre>
+            <div className="mt-4 flex items-center justify-between gap-3">
+              <span className="truncate text-[11px] text-[#f2f1ed]/35">{this.props.pluginId}</span>
+              <button
+                type="button"
+                onClick={this.close}
+                className="shrink-0 cursor-pointer rounded-md border-0 bg-[#cf2d56] px-3.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
+              >
+                关闭插件
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+}
 
 function PluginAppWindow({
   extraId,
@@ -433,7 +527,13 @@ function PluginExtrasLayer(props: SlotProps) {
               setFullscreenId((cur) => (cur === entry.id ? null : entry.id))
             }}
           >
-            <Component renderSlot={() => null} />
+            <PluginCrashBoundary
+              pluginId={pluginId}
+              title={title}
+              onClose={() => dismissAndStop(entry.id, pluginId)}
+            >
+              <Component renderSlot={() => null} />
+            </PluginCrashBoundary>
           </PluginAppWindow>
         )
       })}

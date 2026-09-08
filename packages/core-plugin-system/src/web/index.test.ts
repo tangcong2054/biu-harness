@@ -1,10 +1,13 @@
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
+import { createElement } from 'react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { Context, Service } from 'cordis'
 import * as slots from '@biu/web-slots'
 import * as dock from '@biu/core-dock'
 import type { CollectionChrome, CollectionViewType, DatabaseUi } from '@biu/type-file-system/ui'
 import * as plugins2Ui from './index.tsx'
+import { PluginCrashBoundary } from './index.tsx'
 
 class FakeDatabaseUi extends Service implements DatabaseUi {
   last: { path: string; chrome: CollectionChrome } | null = null
@@ -60,6 +63,42 @@ test('plugin system web passes name/tags/action chrome into databaseUi', async (
   assert.equal(typeof ui.last?.chrome.cells?.author, 'function')
   assert.equal(typeof ui.last?.chrome.cells?.tags, 'function')
   assert.equal(typeof ui.last?.chrome.Action, 'function')
+})
+
+test('broken store plugin is isolated and close stops only that plugin', () => {
+  let hostClicks = 0
+  let closes = 0
+  const BrokenPlugin = () => {
+    throw new ReferenceError('useState is not defined')
+  }
+  const originalError = console.error
+  console.error = () => undefined
+  try {
+    render(
+      createElement(
+        'div',
+        null,
+        createElement('button', { onClick: () => hostClicks += 1 }, 'Host action'),
+        createElement(
+          PluginCrashBoundary,
+          {
+            pluginId: 'poker-clean',
+            title: '极简现代德州扑克',
+            onClose: () => closes += 1,
+          },
+          createElement(BrokenPlugin),
+        ),
+      ),
+    )
+    assert.match(screen.getByRole('alertdialog').textContent ?? '', /useState is not defined/)
+    fireEvent.click(screen.getByRole('button', { name: 'Host action' }))
+    assert.equal(hostClicks, 1)
+    fireEvent.click(screen.getByRole('button', { name: '关闭插件' }))
+    assert.equal(closes, 1)
+    assert.equal(screen.queryByRole('alertdialog'), null)
+  } finally {
+    console.error = originalError
+  }
 })
 
 test('plugin window sizes from manifest.shell instead of measuring DOM', async () => {
