@@ -66,7 +66,7 @@ function configPath() {
 }
 
 function emptyKeys(): Record<string, string> {
-  return { deepseek: '', openai: '', anthropic: '' }
+  return { deepseek: '', openai: '', anthropic: '', 'token-plan': '' }
 }
 
 function defaults(): ChatConfig {
@@ -74,12 +74,17 @@ function defaults(): ChatConfig {
   if (process.env.DEEPSEEK_API_KEY) envKeys.deepseek = process.env.DEEPSEEK_API_KEY
   if (process.env.OPENAI_API_KEY) envKeys.openai = process.env.OPENAI_API_KEY
   if (process.env.ANTHROPIC_API_KEY) envKeys.anthropic = process.env.ANTHROPIC_API_KEY
+  if (process.env.TOKENHUB_API_KEY) envKeys['token-plan'] = process.env.TOKENHUB_API_KEY
   const deepseek = Boolean(envKeys.deepseek)
   const openai = Boolean(envKeys.openai)
   const anthropic = Boolean(envKeys.anthropic)
-  const provider: ChatProvider = deepseek ? 'deepseek' : openai ? 'openai' : anthropic ? 'anthropic' : 'deepseek'
+  const requestedEndpoint = process.env.CHAT_ENDPOINT_ID?.trim()
+  const endpointId = requestedEndpoint || (process.env.TOKENHUB_API_KEY ? 'token-plan' : '')
+  const endpoint = endpointId ? findEndpointPreset(endpointId) : undefined
+  const envProvider = parseProvider(process.env.CHAT_PROVIDER)
+  const provider: ChatProvider = endpoint?.provider ?? envProvider ?? (deepseek ? 'deepseek' : openai ? 'openai' : anthropic ? 'anthropic' : 'deepseek')
   return {
-    endpointId: provider,
+    endpointId: endpoint?.id ?? provider,
     provider,
     apiKeys: envKeys,
     baseUrls: {},
@@ -88,7 +93,13 @@ function defaults(): ChatConfig {
     blockedEndpoints: [],
     model:
       process.env.CHAT_MODEL ||
-      (provider === 'openai' ? 'gpt-4o-mini' : provider === 'anthropic' ? 'claude-3-5-sonnet-20241022' : 'deepseek-v4-flash'),
+      (endpoint?.id === 'token-plan'
+        ? 'deepseek/deepseek-v4-flash'
+        : provider === 'openai'
+          ? 'gpt-4o-mini'
+          : provider === 'anthropic'
+            ? 'claude-3-5-sonnet-20241022'
+            : 'deepseek-v4-flash'),
     systemPrompt: '你是控制台里的助手。需要时调用当前已注册的 tools；插件卸载后对应 tool 会消失。回答简洁。',
     agentMode: 'standard',
     extraTools: [],
@@ -112,6 +123,11 @@ function readPersisted(): Partial<ChatConfig> | null {
 function writePersisted(config: ChatConfig) {
   const dir = join(process.cwd(), '.cordis')
   mkdirSync(dir, { recursive: true })
+  const apiKeys = { ...config.apiKeys }
+  if (process.env.DEEPSEEK_API_KEY) apiKeys.deepseek = ''
+  if (process.env.OPENAI_API_KEY) apiKeys.openai = ''
+  if (process.env.TOKENHUB_API_KEY) apiKeys['token-plan'] = ''
+  if (process.env.ANTHROPIC_API_KEY) apiKeys.anthropic = ''
   writeFileSync(
     configPath(),
     `${JSON.stringify(
@@ -122,7 +138,7 @@ function writePersisted(config: ChatConfig) {
         systemPrompt: config.systemPrompt,
         agentMode: config.agentMode,
         extraTools: config.extraTools,
-        apiKeys: config.apiKeys,
+        apiKeys,
         baseUrls: config.baseUrls,
         customEndpoints: config.customEndpoints,
         customModels: config.customModels,
@@ -131,7 +147,7 @@ function writePersisted(config: ChatConfig) {
       null,
       2,
     )}\n`,
-    'utf8',
+    { encoding: 'utf8', mode: 0o600 },
   )
 }
 
@@ -153,6 +169,7 @@ function keyFor(endpointId: string, saved: Partial<ChatConfig> | null): string {
     deepseek: process.env.DEEPSEEK_API_KEY,
     openai: process.env.OPENAI_API_KEY,
     anthropic: process.env.ANTHROPIC_API_KEY,
+    'token-plan': process.env.TOKENHUB_API_KEY,
   }
   if (envMap[endpointId]) return envMap[endpointId]!
   const savedKeys = saved?.apiKeys
@@ -251,19 +268,32 @@ function mergePersisted(base: ChatConfig, saved: Partial<ChatConfig> | null): Ch
     }
   }
 
+  const envProvider = parseProvider(process.env.CHAT_PROVIDER)
+  const envEndpointId =
+    process.env.CHAT_ENDPOINT_ID?.trim() ||
+    (process.env.TOKENHUB_API_KEY ? 'token-plan' : envProvider ?? '')
   const endpointId =
-    typeof saved.endpointId === 'string' && saved.endpointId.trim()
+    envEndpointId ||
+    (typeof saved.endpointId === 'string' && saved.endpointId.trim()
       ? saved.endpointId.trim()
-      : parseProvider(saved.provider) ?? base.endpointId
+      : parseProvider(saved.provider) ?? base.endpointId)
 
   const endpoint =
     findEndpointPreset(endpointId) ??
     customEndpoints.find((e) => e.id === endpointId) ??
     findEndpointPreset(base.endpointId)
+  const requestedModel =
+    process.env.CHAT_MODEL ||
+    (typeof saved.model === 'string' && saved.model.trim() ? saved.model.trim() : base.model)
+  const knownModels = [...LLM_MODEL_CATALOG, ...customModels]
+  const model =
+    envEndpointId && !process.env.CHAT_MODEL && !knownModels.some((item) => item.endpointId === endpointId && item.model === requestedModel)
+      ? knownModels.find((item) => item.endpointId === endpointId)?.model ?? requestedModel
+      : requestedModel
 
   return {
     endpointId,
-    provider: endpoint?.provider ?? parseProvider(saved.provider) ?? base.provider,
+    provider: endpoint?.provider ?? envProvider ?? parseProvider(saved.provider) ?? base.provider,
     apiKeys,
     baseUrls,
     customEndpoints,
@@ -271,7 +301,7 @@ function mergePersisted(base: ChatConfig, saved: Partial<ChatConfig> | null): Ch
     blockedEndpoints: Array.isArray(saved.blockedEndpoints)
       ? [...new Set(saved.blockedEndpoints.map((id) => String(id).trim()).filter(Boolean))]
       : [],
-    model: !process.env.CHAT_MODEL && typeof saved.model === 'string' && saved.model.trim() ? saved.model.trim() : base.model,
+    model,
     systemPrompt: typeof saved.systemPrompt === 'string' ? saved.systemPrompt : base.systemPrompt,
     agentMode: parseAgentMode(saved.agentMode, base.agentMode),
     extraTools: Array.isArray(saved.extraTools)
@@ -461,6 +491,7 @@ export class ChatService extends Service {
       apiKey: key,
       model: effective.model,
       ...(endpoint ? { baseUrl: effectiveBaseUrl(this.config, endpoint) } : {}),
+      ...(process.env.LLM_API_ENDPOINT ? { endpoint: process.env.LLM_API_ENDPOINT } : {}),
     }
   }
 
@@ -579,25 +610,31 @@ export class ChatService extends Service {
     }>,
     opts?: { persist?: boolean },
   ) {
-    if (typeof next.endpointId === 'string' && next.endpointId.trim()) {
+    const endpointLocked = Boolean(
+      process.env.CHAT_ENDPOINT_ID || process.env.TOKENHUB_API_KEY || process.env.CHAT_PROVIDER,
+    )
+    const modelLocked = Boolean(process.env.CHAT_MODEL)
+    if (!endpointLocked && typeof next.endpointId === 'string' && next.endpointId.trim()) {
       const id = next.endpointId.trim()
       const ep = resolveEndpoint(this.config, id)
       this.config.endpointId = id
       if (ep) this.config.provider = ep.provider
       // 未指定 model 时，切到该入口第一个模型
-      if (typeof next.model !== 'string' || !next.model.trim()) {
+      if (!modelLocked && (typeof next.model !== 'string' || !next.model.trim())) {
         const first = allModels(this.config).find((m) => m.endpointId === id)
         if (first) this.config.model = first.model
         else if (ep) this.config.model = defaultModelFor(ep.provider)
       }
-    } else if (next.provider) {
+    } else if (next.provider && !endpointLocked) {
       this.config.provider = next.provider
       this.config.endpointId = next.provider
-      if (typeof next.model !== 'string' || !next.model.trim()) {
+      if (!modelLocked && (typeof next.model !== 'string' || !next.model.trim())) {
         this.config.model = defaultModelFor(next.provider)
       }
     }
-    if (typeof next.model === 'string' && next.model.trim()) this.config.model = next.model.trim()
+    if (!modelLocked && typeof next.model === 'string' && next.model.trim()) {
+      this.config.model = next.model.trim()
+    }
     if (typeof next.systemPrompt === 'string') this.config.systemPrompt = next.systemPrompt
     if (typeof next.baseUrl === 'string' && next.baseUrl.trim()) {
       this.config.baseUrls[this.config.endpointId] = normalizeBaseUrl(next.baseUrl)

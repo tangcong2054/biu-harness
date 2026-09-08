@@ -12,6 +12,8 @@ export interface LlmConfig {
    * 也可直接传入已含后缀的完整 URL。
    */
   baseUrl?: string
+  /** OpenAI-compatible chat completions 完整地址；仅允许通过 Host 环境配置注入。 */
+  endpoint?: string
 }
 
 /** 把用户配置的 baseUrl 解析成 chat.completions 完整地址。 */
@@ -359,6 +361,19 @@ function sseDataLine(line: string): string | undefined {
   return line.slice(5).replace(/^ /, '')
 }
 
+export function resolveOpenAiCompatUrl(config: LlmConfig): string {
+  if (!config.endpoint) {
+    return config.provider === 'deepseek'
+      ? 'https://api.deepseek.com/chat/completions'
+      : 'https://api.openai.com/v1/chat/completions'
+  }
+  const url = new URL(config.endpoint)
+  if (url.protocol !== 'https:') throw new Error('custom LLM endpoint must use HTTPS')
+  if (url.username || url.password) throw new Error('custom LLM endpoint must not contain credentials')
+  if (url.hash) throw new Error('custom LLM endpoint must not contain a fragment')
+  return url.toString()
+}
+
 export class OpenAiCompatLlm implements LlmClient {
   constructor(private config: LlmConfig) {}
 
@@ -368,7 +383,9 @@ export class OpenAiCompatLlm implements LlmClient {
     signal?: AbortSignal,
     options?: ChatOptions,
   ): Promise<AssistantReply> {
-    const url = resolveChatCompletionsUrl(this.config.baseUrl, this.config.provider)
+    const url = this.config.endpoint
+      ? resolveOpenAiCompatUrl(this.config)
+      : resolveChatCompletionsUrl(this.config.baseUrl, this.config.provider)
     // 仅 deepseek provider 支持自动路由到视觉模型；openai/anthropic 保持配置原状。
     const hasImage = messages.some((m) => hasImageContent(m.content))
     const model =
@@ -394,6 +411,7 @@ export class OpenAiCompatLlm implements LlmClient {
       },
       body: JSON.stringify(body),
       signal,
+      redirect: 'error',
     })
     if (!res.ok) {
       let detail = `llm http ${res.status}`

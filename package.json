@@ -12,11 +12,11 @@
     "predev": "node scripts/link-cordis-plugins.mjs",
     "prestart": "node scripts/link-cordis-plugins.mjs",
     "dev": "concurrently -k \"npm:dev:host\" \"npm:dev:web\"",
-    "dev:host": "tsx host/index.ts",
-    "dev:host:nowatch": "tsx host/index.ts",
+    "dev:host": "tsx --env-file=.env host/index.ts",
+    "dev:host:nowatch": "tsx --env-file=.env host/index.ts",
     "dev:web": "vite",
     "build": "vite build",
-    "start": "tsx host/index.ts",
+    "start": "tsx --env-file=.env host/index.ts",
     "test": "vitest run"
   },
   "dependencies": {

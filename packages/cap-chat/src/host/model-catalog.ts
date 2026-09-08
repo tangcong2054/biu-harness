@@ -78,6 +78,17 @@ export const LLM_ENDPOINT_PRESETS: LlmEndpointDef[] = [
     builtin: true,
   },
   {
+    id: 'token-plan',
+    label: '腾讯云 Token Plan',
+    group: 'official',
+    protocol: 'openai-compat',
+    baseUrl: 'https://api.lkeap.cloud.tencent.com/plan/v3',
+    provider: 'openai',
+    placeholder: 'sk-tp-…',
+    note: '一把 Token Plan Key 共用多个套餐模型',
+    builtin: true,
+  },
+  {
     id: 'anthropic',
     label: 'Anthropic',
     group: 'official',
@@ -522,6 +533,11 @@ export const LLM_MODEL_CATALOG: LlmModelDef[] = [
   { id: 'deepseek-flash', label: 'DeepSeek Flash', endpointId: 'deepseek', provider: 'deepseek', model: 'deepseek-v4-flash', category: 'flash', note: '通用 / 快速', builtin: true },
   { id: 'deepseek-pro', label: 'DeepSeek Pro', endpointId: 'deepseek', provider: 'deepseek', model: 'deepseek-v4-pro', category: 'pro', note: '深度推理', builtin: true },
   { id: 'deepseek-flash-vision', label: 'DeepSeek Flash Vision', endpointId: 'deepseek', provider: 'deepseek', model: 'deepseek-v4-flash-vision-exp', category: 'flash', note: '视觉', builtin: true },
+
+  // ── 腾讯云 Token Plan（同一 Key 可切换套餐内模型）──
+  { id: 'token-plan-deepseek-v4-flash', label: 'DeepSeek V4 Flash', endpointId: 'token-plan', provider: 'openai', model: 'deepseek/deepseek-v4-flash', category: 'flash', note: 'Token Plan', builtin: true },
+  { id: 'token-plan-deepseek-v4-pro', label: 'DeepSeek V4 Pro', endpointId: 'token-plan', provider: 'openai', model: 'deepseek/deepseek-v4-pro', category: 'pro', note: 'Token Plan · 深度推理', builtin: true },
+  { id: 'token-plan-glm-5-2', label: 'GLM-5.2', endpointId: 'token-plan', provider: 'openai', model: 'glm-5.2', category: 'other', note: 'Token Plan', builtin: true },
 
   // ── OpenAI 官方 ──
   { id: 'gpt-4o', label: 'GPT-4o', endpointId: 'openai', provider: 'openai', model: 'gpt-4o', category: 'gpt', note: '通用旗舰', builtin: true },

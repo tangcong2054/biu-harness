@@ -51,6 +51,17 @@ test('builtin models reference known endpoints', () => {
   }
 })
 
+test('Tencent Token Plan exposes DeepSeek and GLM-5.2 through one endpoint', () => {
+  const endpoint = findEndpointPreset('token-plan')
+  assert.equal(endpoint?.baseUrl, 'https://api.lkeap.cloud.tencent.com/plan/v3')
+  assert.equal(endpoint?.provider, 'openai')
+  const models = LLM_MODEL_CATALOG.filter((m) => m.endpointId === 'token-plan')
+  assert.deepEqual(
+    models.map((m) => m.model),
+    ['deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-pro', 'glm-5.2'],
+  )
+})
+
 test('official providers ship a rich model catalog', () => {
   const deepseek = LLM_MODEL_CATALOG.filter((m) => m.endpointId === 'deepseek')
   const openai = LLM_MODEL_CATALOG.filter((m) => m.endpointId === 'openai')
