@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { Editor } from '@tiptap/core'
+import hljsCore from 'highlight.js/lib/core'
+import http from 'highlight.js/lib/languages/http'
 import { pageEditorExtensions } from './kit.ts'
 import { filterSlashItems, SLASH_ITEMS } from './slash.ts'
 
@@ -54,6 +56,18 @@ const a = 1
   assert.match(out, /先/)
   assert.match(out, /引用/)
   assert.match(out, /const a = 1/)
+  editor.destroy()
+})
+
+test('code language registered globally but missing from lowlight falls back without crashing', () => {
+  hljsCore.registerLanguage('http', http)
+  const editor = new Editor({
+    extensions: pageEditorExtensions(),
+    content: '```http\nGET /api/example\n```',
+    contentType: 'markdown',
+  })
+  assert.match(editor.getHTML(), /data-language="http"/)
+  assert.match(editor.getMarkdown(), /```http/)
   editor.destroy()
 })
 
