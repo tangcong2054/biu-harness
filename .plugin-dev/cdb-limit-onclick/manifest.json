@@ -1,0 +1,16 @@
+{
+  "id": "cdb-limit-onclick",
+  "name": "SQL 限流下发块",
+  "blurb": "页面里插一个块，把一条 SQL 直接变成 DBbrain 限流规则：从 SQL 自动解析关键词（表名 + 字面量）与语句类型，填并发和时长，点一下就走 VerifyUserAccount 换 SessionToken → CreateSqlFilter 下发，并回显当前 RUNNING 的限流任务，可一键终止。凭证读环境变量或 .biu/cdb-limit-secret.json（宿主侧，不回传浏览器），数据库密码只用于当次换 token、不落盘。无头插件，只登记页面块。",
+  "tags": [
+    "page",
+    "editor",
+    "cdb",
+    "dbbrain",
+    "limit"
+  ],
+  "author": "",
+  "authorUrl": "",
+  "createdAt": 1789889654200,
+  "headless": true
+}
