@@ -8,7 +8,7 @@ import Placeholder from '@tiptap/extension-placeholder'
 import { TableKit } from '@tiptap/extension-table'
 import StarterKit from '@tiptap/starter-kit'
 import { Paragraph } from '@tiptap/extension-paragraph'
-import { common, createLowlight } from 'lowlight'
+import { pageLowlight } from './page-lowlight.ts'
 import { pageTextStyle, pageHighlight, Color } from './color-marks.ts'
 import { headingSkin } from './heading-skin.ts'
 import { pageBlock } from './page-block.ts'
@@ -130,15 +130,6 @@ const pageBlockMath = BlockMath.extend({
     attrs: { latex: latexFromMarkdown(token.latex) },
   }),
 })
-
-const pageLowlight = createLowlight(common)
-// TipTap 也检查 highlight.js 的全局注册表；若其它模块注册了本实例没有的语言，
-// 它仍会调用 lowlight.highlight 并抛错。这里兜底为自动识别，不能让一个代码块拖垮整页。
-const highlightRegisteredLanguage = pageLowlight.highlight
-pageLowlight.highlight = (language, value, options) =>
-  pageLowlight.registered(language)
-    ? highlightRegisteredLanguage(language, value, options)
-    : pageLowlight.highlightAuto(value, options)
 
 const pageCodeBlock = CodeBlockLowlight.extend({
   renderHTML({ node, HTMLAttributes }) {
