@@ -79,7 +79,7 @@ import { AppDialog, CellSelect, CheckRow, LocalText } from './controls.tsx'
 import { DataSidebar } from './data-sidebar.tsx'
 import { buildCrumbs, type CrumbTarget } from './sidebar-nav.ts'
 import { CrumbTrail } from './crumb-trail.tsx'
-import { pickDomAttrs, recordPickKind } from './pick-dom.ts'
+import { fieldPickAttrs, pickDomAttrs, recordPickKind, recordSourcePath } from './pick-dom.ts'
 import { normalizeRecordEmoji, recordPreviewEmoji, crumbRecordLabel } from './sidebar-preview.ts'
 import { recordPreviewMascot, RecordMark } from './record-mark.tsx'
 import { COL_WIDTH_MAX, COL_WIDTH_MIN, colWidthStyle, normalizeColumnWidths, normalizeSavedView, normalizePageSize, tableWidthStyle, viewStateKey, type SavedView } from './saved-view.ts'
@@ -99,7 +99,7 @@ import {
   visibleActions,
   placedActions,
 } from './fsdb-cells.tsx'
-import { ShareButton } from './share-popover.tsx'
+import { ShareButton, SharePanel } from './share-popover.tsx'
 import { ensureFsdbStyle } from './fsdb-style.ts'
 import { RecordDetail } from './record-detail.tsx'
 import { PageBanner } from './page-banner.tsx'
@@ -1950,7 +1950,20 @@ export function CollectionBrowser({
   )
   const currentTable = tables.find((item) => item.path === collectionPath)
   const recordKind = recordPickKind(currentTable?.view?.moduleId || currentTable?.id)
-  const recordPick = (row: DbRecord) => pickDomAttrs(recordKind, row.id, labelOf(row))
+  const recordPathOf = (row: DbRecord) => recordSourcePath(collectionPath, row.id)
+  const recordPick = (row: DbRecord) =>
+    pickDomAttrs(recordKind, row.id, labelOf(row), { path: recordPathOf(row), title: labelOf(row) })
+  const cellValueText = (row: DbRecord, key: string, field: FieldSpec) => {
+    const raw = parseFacetFlatColumnKey(key) ? readFacetFlatValue(row, key, facetSourceKey(schema)) : row[key]
+    return formatField(field, raw)
+  }
+  const cellPickOf = (row: DbRecord, key: string, field: FieldSpec) =>
+    fieldPickAttrs(recordKind, row.id, key, {
+      label: field.label ?? key,
+      title: labelOf(row),
+      path: recordPathOf(row),
+      text: cellValueText(row, key, field),
+    })
 
   function renderCell(row: DbRecord, key: string, field: FieldSpec, surface: 'table' | 'detail' = 'detail') {
     const kind = resolveFieldType(field)
@@ -2274,6 +2287,7 @@ export function CollectionBrowser({
             type="button"
             className="tasks-icon-btn tasks-title-open"
             data-testid="record-title-open"
+            {...recordPick(row)}
             data-biu-action="open"
             aria-label="查看详情"
             title="查看详情"
@@ -2464,6 +2478,7 @@ export function CollectionBrowser({
             {columns.map((col) => (
               <td
                 key={col.key}
+                {...cellPickOf(row, col.key, col.field)}
                 style={colWidthStyle(columnWidths[col.key])}
                 className={
                   cellPick?.id === row.id && cellPick.key === col.key
@@ -3446,8 +3461,8 @@ export function CollectionBrowser({
           toolbar={<RecordActions row={selected} place="detail" />}
           share={
             nested && detailId ? (
-              <ShareButton
-                buttonClassName="fsdb-detail-float-btn"
+              <SharePanel
+                embedded
                 target={{
                   kind: 'record',
                   collection: collectionPath,
@@ -3465,6 +3480,7 @@ export function CollectionBrowser({
           canPrev={viewIndex == null ? total > 1 : viewIndex > 0}
           canNext={viewIndex == null ? total > 1 : viewIndex < total - 1}
           collectionPath={collectionPath}
+          recordKind={recordKind}
         />
       ) : null}
         </div>

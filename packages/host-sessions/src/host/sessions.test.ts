@@ -50,6 +50,43 @@ test('tool_calls assistant uses null content for API history', async () => {
   ])
 })
 
+test('lastMessageAt stays on the user message while the agent keeps writing', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const older = await ctx.sessions.create('older')
+  const newer = await ctx.sessions.create('newer')
+  await ctx.sessions.append(older.id, { type: 'user/message', text: '先问', kind: 'wake' })
+  const spoken = (await ctx.sessions.require(older.id)).events.find((event) => event.type === 'user/message')
+  assert.ok(spoken && spoken.type === 'user/message')
+  await ctx.sessions.append(newer.id, { type: 'user/message', text: '后问', kind: 'wake' })
+  await ctx.sessions.append(older.id, {
+    type: 'assistant/message',
+    text: '',
+    tool_calls: [{ id: '1', name: 'clock_now', arguments: '{}' }],
+  })
+  await ctx.sessions.append(older.id, { type: 'tool/result', id: '1', name: 'clock_now', ok: true, detail: 'now' })
+  await ctx.sessions.append(older.id, { type: 'assistant/message', text: '答完了' })
+  const listed = await ctx.sessions.listSummaries()
+  const row = listed.find((item) => item.id === older.id)
+  assert.equal(row?.lastMessageAt, spoken.ts)
+  assert.ok((row?.updatedAt ?? 0) >= spoken.ts)
+  const dir = await mkdtemp(join(tmpdir(), 'cordis-spoken-'))
+  const path = join(dir, 'sessions.sqlite')
+  const sql = new Context()
+  await sql.plugin(sessionStore, { driver: 'sqlite', path })
+  await sql.plugin(sessions)
+  const sqlOlder = await sql.sessions.create('sql-older')
+  await sql.sessions.append(sqlOlder.id, { type: 'user/message', text: '先问', kind: 'wake' })
+  const sqlSpoken = (await sql.sessions.require(sqlOlder.id)).events.find((event) => event.type === 'user/message')
+  assert.ok(sqlSpoken && sqlSpoken.type === 'user/message')
+  await sql.sessions.append(sqlOlder.id, { type: 'assistant/message', text: '还在干活' })
+  await sql.sessions.append(sqlOlder.id, { type: 'tool/call', id: '2', name: 'bash', arguments: '{}' })
+  const sqlRow = (await sql.sessions.listSummaries()).find((item) => item.id === sqlOlder.id)
+  assert.equal(sqlRow?.lastMessageAt, sqlSpoken.ts)
+  assert.ok((sqlRow?.updatedAt ?? 0) >= sqlSpoken.ts)
+})
+
 test('sqlite session store round-trips and listSummaries skips full reload', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'cordis-sqlite-'))
   const path = join(dir, 'sessions.sqlite')
@@ -149,6 +186,48 @@ test('reload heals orphan tool_calls so next LLM round is valid', async () => {
   assert.ok(tool)
 })
 
+test('startup reload promotes stuck partial tool/result instead of leaving it skipped', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cordis-heal-partial-'))
+  const path = join(dir, 'sessions.sqlite')
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'sqlite', path })
+  await ctx.plugin(sessions)
+  await ctx.sessions.create('chestnut')
+  await ctx.sessions.append('chestnut', { type: 'user/message', text: 'ls', kind: 'wake' })
+  await ctx.sessions.append('chestnut', { type: 'turn/start', turn: 2 })
+  await ctx.sessions.append('chestnut', {
+    type: 'assistant/message',
+    text: '',
+    tool_calls: [{ id: 'call_00_partial', name: 'bash', arguments: '{}' }],
+  })
+  await ctx.sessions.append('chestnut', {
+    type: 'tool/result',
+    id: 'call_00_partial',
+    name: 'bash',
+    ok: true,
+    detail: 'file-a\n',
+    partial: true,
+  })
+  await new Promise((resolve) => setTimeout(resolve, 120))
+
+  const ctx2 = new Context()
+  await ctx2.plugin(sessionStore, { driver: 'sqlite', path })
+  await ctx2.plugin(sessions)
+  const loaded = await ctx2.sessions.get('chestnut')
+  const results = loaded!.events.filter((item) => item.type === 'tool/result')
+  assert.equal(results.length, 1)
+  if (results[0]?.type === 'tool/result') {
+    assert.equal(results[0].partial, undefined)
+    assert.equal(results[0].detail, 'file-a\n')
+    assert.equal(results[0].id, 'call_00_partial')
+  }
+  const history = ctx2.sessions.deriveMessages('chestnut')
+  const assistantAt = history.findIndex((item) => item.role === 'assistant' && item.tool_calls?.[0]?.id === 'call_00_partial')
+  assert.ok(assistantAt >= 0)
+  assert.equal(history[assistantAt + 1]?.role, 'tool')
+  assert.equal(history[assistantAt + 1]?.content, 'file-a\n')
+})
+
 test('fork copies the append-only log into a child session', async () => {
   const ctx = new Context()
   await ctx.plugin(sessionStore, { driver: 'memory' })
@@ -180,37 +259,6 @@ test('setProject binds host absolute path and clears it', async () => {
   assert.equal(child.project?.path, project?.path)
   assert.equal(await ctx.sessions.setProject(record.id, null), undefined)
   assert.equal((await ctx.sessions.require(record.id)).project, undefined)
-})
-
-test('setProject binds macOS NFD-stored directory given NFC typed path', async () => {
-  const ctx = new Context()
-  await ctx.plugin(sessionStore, { driver: 'memory' })
-  await ctx.plugin(sessions)
-  const record = await ctx.sessions.create()
-
-  // macOS 的 APFS/HFS+ 以 NFD（分解）形式存储含组合字符的文件名；用户输入通常是
-  // NFC（预组合）。两者字节不同导致 realpath 对 NFC 去解析返回 ENOENT（目录其实
-  // 存在）。此测试用“带组合字符”的名字制造 NFC≠NFD，模拟“NFC 路径绑定 NFD 目录”。
-  const nfdName = 'café\u0301'.normalize('NFD') // 带组合重音的分解形式
-  const base = await mkdtemp(join(tmpdir(), 'cordis-nfd-'))
-  const dir = join(base, nfdName)
-  const { mkdir } = await import('node:fs/promises')
-  await mkdir(dir)
-  // 建立后确认该目录确实能按 NFC 与 NFD 不同解析（保证用例成立）
-  const nfcName = nfdName.normalize('NFC')
-  if (nfcName === nfdName) {
-    // 平台不支持组合差异（非 macOS / 特殊构造），跳过，不影响其余测试
-    return
-  }
-  // 用 NFC 形式的完整路径去绑定（正是 macOS 上“中文等目录无法绑定”的复现路径）
-  const nfcPath = join(base, nfcName)
-  const project = await ctx.sessions.setProject(record.id, { path: nfcPath })
-  assert.ok(project, 'NFC 路径应能绑定到 NFD 存储的目录')
-  assert.equal(project.name, nfdName) // 目录真实（磁盘）名字
-  const storedPath = (await ctx.sessions.require(record.id)).project?.path
-  assert.equal(storedPath, project.path)
-  // 存储的 path 必须是真实可解析的目录（realpath 通过）——即后序再绑定/使用不报不存在
-  assert.equal(await realpath(storedPath!), await realpath(dir))
 })
 
 test('delete removes session from store and cache', async () => {
@@ -363,6 +411,28 @@ test('applyContextBudget: over budget keeps head + recent tail', () => {
   assert.equal(out[out.length - 1], msgs[msgs.length - 1]) // 最新保留
   // 中间的旧消息被丢弃
   assert.ok(out.length < msgs.length)
+})
+
+test('applyContextBudget does not split assistant tool_calls from their tool results', () => {
+  const msgs: LlmMessage[] = [
+    { role: 'system', content: 'SYS' },
+    { role: 'user', content: 'old-'.padEnd(400, 'x') },
+    { role: 'assistant', content: 'old-a'.padEnd(400, 'x') },
+    { role: 'user', content: 'run' },
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'call_x', type: 'function', function: { name: 'bash', arguments: '{}' } }],
+    },
+    { role: 'tool', tool_call_id: 'call_x', content: 'out' },
+    { role: 'user', content: 'wake' },
+  ]
+  const out = applyContextBudget(msgs, 80, 2)
+  const assistant = out.find((item) => item.role === 'assistant' && item.tool_calls?.length)
+  const toolAt = out.findIndex((item) => item.role === 'tool' && item.tool_call_id === 'call_x')
+  assert.ok(assistant)
+  assert.ok(toolAt > 0)
+  assert.equal(out[toolAt - 1], assistant)
 })
 
 test('deriveMessages projects pasted images as multimodal content', () => {

@@ -9,13 +9,21 @@ const style = readFileSync(resolve(import.meta.dirname, './fsdb-style.ts'), 'utf
 
 test('embedded record details can share their explicit record target', () => {
   assert.match(browser, /share=\{\s*nested && detailId \?/)
-  assert.match(browser, /buttonClassName="fsdb-detail-float-btn"/)
+  assert.match(browser, /<SharePanel/)
+  assert.match(browser, /embedded/)
   assert.match(browser, /recordId: detailId/)
   assert.match(detail, /share\?: ReactNode/)
+  assert.match(detail, /share=\{share\}/)
+  assert.match(detail, /shareLabel=\{collectionPath === '\/pages' \? '分享页面' : '分享记录'\}/)
+  assert.match(detail, /data-testid="fsdb-detail-share"/)
+  assert.match(detail, /placement="left"/)
   assert.match(detail, /fsdb-detail-float-nav\$\{share \? ' has-share' : ''\}/)
-  assert.match(detail, /\{share\}/)
+  assert.doesNotMatch(detail, /\{share\}\s*\{onPrev/)
   assert.match(style, /\.inspector-database-page \.fsdb-detail-float-nav\.has-share\{opacity:1\}/)
+  assert.match(style, /\.fsdb-detail-more-menu\.has-share/)
+  assert.match(style, /\.fsdb-detail-more-caret/)
   assert.doesNotMatch(browser, /\{nested \? null : \(\s*<ShareButton/)
+  assert.doesNotMatch(browser, /buttonClassName="fsdb-detail-float-btn"/)
 })
 
 test('hydrating page-blocks prefers the route view over local 全部', () => {
@@ -48,7 +56,7 @@ test('user and system collection sections fold independently', () => {
   const sidebar = readFileSync(resolve(import.meta.dirname, './data-sidebar.tsx'), 'utf8')
   const fold = readFileSync(resolve(import.meta.dirname, '../../../public-ui/src/sidebar-fold.tsx'), 'utf8')
   assert.match(sidebar, /const \[userOpen, setUserOpen\] = useState\(true\)/)
-  assert.match(sidebar, /const \[systemOpen, setSystemOpen\] = useState\(true\)/)
+  assert.match(sidebar, /const \[systemOpen, setSystemOpen\] = useState\(false\)/)
   assert.match(sidebar, /onClick=\{\(\) => setUserOpen\(\(prev\) => !prev\)\}/)
   assert.match(sidebar, /onClick=\{\(\) => setSystemOpen\(\(prev\) => !prev\)\}/)
   assert.match(sidebar, /<SidebarFold/)
@@ -206,6 +214,8 @@ test('table title opens record from the title-side button', () => {
   assert.doesNotMatch(browser, /<AddProperty/)
   assert.match(browser, /const lockedKind = String\(catalogLocks.blockKind/)
   assert.doesNotMatch(browser, /recordPick\(row\)\} onClick=\{\(\) => setDetailId\(row\.id\)\}/)
+  assert.match(browser, /cellPickOf\(row, col.key, col.field\)/)
+  assert.match(detail, /propPick\(key, field/)
 })
 
 test('title cell row tools skip the overflow action menu', () => {
@@ -681,6 +691,8 @@ test('database extras sit after the record detail, not in the inspector', () => 
   assert.match(browser, /<RecordEmojiBoard/)
   assert.match(browser, /writePatch\(row, \{ emoji: normalizeRecordEmoji\(next\) \}\)/)
   assert.match(detail, /data-testid=\{`fsdb-pane-\$\{pane\.id\}`\}/)
+  assert.match(detail, /fsdb-detail-prop-panes/)
+  assert.match(detail, /pane.place === 'properties'/)
   assert.match(style, /\.fsdb-fileview\{[^}]*min-height:0/)
   assert.match(style, /\.fsdb-fileview\{[^}]*max-height:none/)
   assert.match(style, /\.fsdb-fileview\{[^}]*overflow:visible/)
