@@ -73,6 +73,13 @@ const CSS = `
 `
 
 const QUERY_PAGE_SIZE = 100
+const PICK_CONTENT_CHARS = 24_000
+
+function pickContent(value: string) {
+  return value.length > PICK_CONTENT_CHARS
+    ? `${value.slice(0, PICK_CONTENT_CHARS)}\n…（WebSQL 选取内容已截断）`
+    : value
+}
 
 function useStyle() {
   useEffect(() => {
@@ -135,6 +142,7 @@ function Results({ result, componentId }: { result: Result; componentId: string 
                     data-biu-id={`${componentId}:result:${rowIndex}:${columnIndex}`}
                     data-biu-label={`${column} · ${value === 'NULL' ? 'NULL' : value.slice(0, 80)}`}
                     data-biu-field={column}
+                    data-biu-selection={pickContent(value)}
                   >
                     {value === 'NULL' ? <i>NULL</i> : value}
                   </td>
@@ -214,6 +222,20 @@ function WebSqlBlock({ data, update, writable }: BlockProps) {
     result,
     error,
   }), [componentId, host, port, user, connected, serverVersion, database, databases, tables, selectedTable, columns, sql, result, error])
+
+  const resultPickContent = useMemo(() => {
+    if (!result) return ''
+    return pickContent(JSON.stringify({
+      database,
+      sql,
+      page: result.page ?? 1,
+      pageSize: result.pageSize ?? QUERY_PAGE_SIZE,
+      hasMore: Boolean(result.hasMore),
+      ms: result.ms ?? 0,
+      columns: result.columns ?? [],
+      rows: result.rows ?? [],
+    }, null, 2))
+  }, [database, sql, result])
 
   function persist(patch: Record<string, unknown>) {
     if (writable) update(patch)
@@ -436,7 +458,13 @@ function WebSqlBlock({ data, update, writable }: BlockProps) {
             </section>
           ) : null}
           {result ? (
-            <section className="wsp-panel" data-biu-kind="websql-result" data-biu-id={`${componentId}:result`} data-biu-label={`查询结果 · ${result.rows?.length ?? 0} 行`}>
+            <section
+              className="wsp-panel"
+              data-biu-kind="websql-result"
+              data-biu-id={`${componentId}:result`}
+              data-biu-label={`查询结果 · ${result.rows?.length ?? 0} 行`}
+              data-biu-selection={resultPickContent}
+            >
               <div className="wsp-panel-head">
                 查询结果
                 <span className="wsp-meta">第 {result.page ?? 1} 页 · {result.rows?.length ?? 0} 行 · {result.ms ?? 0} ms</span>
