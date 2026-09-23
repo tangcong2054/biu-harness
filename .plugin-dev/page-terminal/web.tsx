@@ -580,6 +580,14 @@ function TerminalSurface({
     const send = (message: Record<string, unknown>) => {
       if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message))
     }
+    const activate = () => {
+      if (!term) return
+      send({ type: 'focus', cols: term.cols, rows: term.rows })
+    }
+    const onWindowFocus = () => activate()
+    const onPanePointerDown = () => activate()
+    window.addEventListener('focus', onWindowFocus)
+    paneEl.addEventListener('pointerdown', onPanePointerDown)
 
     const openVisibleTerminal = () => {
       if (!isVisible()) return
@@ -663,7 +671,7 @@ function TerminalSurface({
         socket.addEventListener('open', () => {
           if (disposed || !term) return
           scheduleFit()
-          send({ type: 'resize', cols: term.cols, rows: term.rows })
+          send({ type: document.hasFocus() ? 'focus' : 'resize', cols: term.cols, rows: term.rows })
         })
         socket.addEventListener('message', (event) => {
           decodePtyChunk(event.data, (chunk) => {
@@ -718,6 +726,8 @@ function TerminalSurface({
       cancelAnimationFrame(secondFrame)
       intersection?.disconnect()
       document.removeEventListener('visibilitychange', scheduleFit)
+      window.removeEventListener('focus', onWindowFocus)
+      paneEl.removeEventListener('pointerdown', onPanePointerDown)
       resizeObs.disconnect()
       buryObs?.disconnect()
       detachScroll()
@@ -1233,14 +1243,26 @@ function PageTerminal({
   data,
   update,
   writable,
+  presentation,
 }: {
   data: Record<string, unknown>
   update: (patch: Record<string, unknown>) => void
   writable: boolean
+  presentation?: {
+    mode: 'inline' | 'sidebar' | 'maximized' | 'minimized'
+    detached?: boolean
+    inline: () => void
+    maximize: () => void
+  }
 }) {
   const [settingsOpen, setSettingsOpen] = React.useState(false)
   const settingsWrap = React.useRef<HTMLDivElement | null>(null)
-  const zoom = useZoom()
+  const legacyZoom = useZoom()
+  const popout = new URLSearchParams(window.location.search).get('popout') === 'page-block'
+  const zoomed = presentation ? presentation.mode === 'maximized' : legacyZoom.zoomed
+  const expanded = presentation
+    ? presentation.detached || presentation.mode === 'sidebar'
+    : legacyZoom.zoomed || popout
   const sessionKey = typeof data.sid === 'string' && data.sid ? data.sid : ''
   useEffect(() => {
     if (sessionKey || !writable) return
@@ -1268,12 +1290,12 @@ function PageTerminal({
   const body = (
     <section
       ref={(el: HTMLElement | null) => {
-        zoom.slotRef.current = el
+        legacyZoom.slotRef.current = el
       }}
       data-testid="page-terminal"
       className="pt-card"
       style={{
-        ...(zoom.zoomed
+        ...(!presentation && legacyZoom.zoomed
           ? {
               position: 'fixed',
               inset: 0,
@@ -1296,10 +1318,18 @@ function PageTerminal({
           {settingsOpen ? <SettingsPanel onClose={() => setSettingsOpen(false)} /> : null}
         </div>
         <IconButton
-          label={zoom.zoomed ? '退出全屏' : '全屏放大'}
-          active={zoom.zoomed}
+          label={presentation ? (presentation.detached ? '聚焦独立窗口' : '独立窗口') : zoomed ? '放回页面' : '全屏放大'}
+          active={expanded}
           dataZoomExit
-          onClick={() => (zoom.zoomed ? zoom.stop() : zoom.start())}
+          onClick={() => {
+            if (presentation) {
+              presentation.maximize()
+            } else if (legacyZoom.zoomed) {
+              legacyZoom.stop()
+            } else {
+              legacyZoom.start()
+            }
+          }}
         >
           <ExpandIcon shrink={zoom.zoomed} />
         </IconButton>
@@ -1315,7 +1345,7 @@ function PageTerminal({
           history={history}
           onHistory={(next) => update({ history: next })}
           sessionKey={sessionKey}
-          fill={zoom.zoomed}
+          fill={presentation ? presentation.mode === 'sidebar' : legacyZoom.zoomed || popout}
         />
       ) : null}
     </section>

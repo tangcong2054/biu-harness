@@ -63,12 +63,14 @@ function BrowserSurface({
   zoomed,
   onZoom,
   onClose,
+  detached,
 }: {
   data: Record<string, unknown>
   update: (patch: Record<string, unknown>) => void
   zoomed: boolean
   onZoom: () => void
   onClose?: () => void
+  detached?: boolean
 }) {
   const [addr, setAddr] = useState(String(data.url ?? ''))
   const [src, setSrc] = useState(normalizeUrl(String(data.url ?? '')))
@@ -242,8 +244,8 @@ function BrowserSurface({
             type="button"
             tabIndex={-1}
             data-testid="page-browser-zoom"
-            title="放大浏览器"
-            aria-label="放大浏览器"
+            title={detached ? '在独立窗口打开' : '放大浏览器'}
+            aria-label={detached ? '独立窗口' : '放大浏览器'}
             onMouseDown={(event) => event.preventDefault()}
             onClick={onZoom}
             style={iconBtn}
@@ -358,17 +360,26 @@ function BrowserSurface({
 function BrowserCard({
   data,
   update,
+  presentation,
 }: {
   data: Record<string, unknown>
   update: (patch: Record<string, unknown>) => void
   writable: boolean
+  presentation?: {
+    mode: 'inline' | 'sidebar' | 'maximized' | 'minimized'
+    detached?: boolean
+    inline: () => void
+    maximize: () => void
+  }
 }) {
   const [zoom, setZoom] = useState(false)
   const height = blockHeight(data)
   const hostRef = useRef<HTMLDivElement | null>(null)
   const [overlayEl, setOverlayEl] = useState<HTMLElement | null>(null)
+  const presented = Boolean(presentation && (presentation.mode === 'sidebar' || presentation.mode === 'maximized'))
 
   useEffect(() => {
+    if (presentation) return
     if (!zoom) {
       setOverlayEl(null)
       return
@@ -384,20 +395,27 @@ function BrowserCard({
       relockAncestors()
       setOverlayEl(null)
     }
-  }, [zoom])
+  }, [zoom, presentation])
 
   const surface = (zoomed: boolean) => (
-    <BrowserSurface data={data} update={update} zoomed={zoomed} onZoom={() => setZoom(true)} onClose={() => setZoom(false)} />
+    <BrowserSurface
+      data={data}
+      update={update}
+      zoomed={zoomed}
+      onZoom={() => (presentation ? presentation.maximize() : setZoom(true))}
+      onClose={() => (presentation ? presentation.inline() : setZoom(false))}
+      detached={Boolean(presentation)}
+    />
   )
 
   return (
     <div
       ref={hostRef}
       data-testid="page-browser"
-      style={{ position: 'relative', width: '100%', height, display: 'flex' }}
+      style={{ position: 'relative', width: '100%', height: presented ? '100%' : height, minHeight: presented ? 0 : undefined, display: 'flex' }}
     >
-      {surface(false)}
-      {overlayEl ? createPortal(surface(true), overlayEl) : null}
+      {surface(presented)}
+      {!presentation && overlayEl ? createPortal(surface(true), overlayEl) : null}
     </div>
   )
 }

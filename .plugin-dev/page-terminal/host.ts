@@ -6,7 +6,7 @@ import type { IPty } from 'node-pty'
 export const name = 'page-terminal'
 export const inject = ['http', 'sandbox']
 
-type Socket = {
+export type Socket = {
   readyState: number
   OPEN: number
   send(data: string): void
@@ -17,6 +17,22 @@ type Socket = {
 /** PTY 可能在 socket 挂上之前就吐数据；`ws?.readyState === ws?.OPEN` 在 ws 为 null 时是 `undefined === undefined`。 */
 function isOpen(ws: Socket | null | undefined): ws is Socket {
   return !!ws && ws.readyState === ws.OPEN
+}
+
+export function broadcastSockets(sockets: Iterable<Socket>, data: string) {
+  for (const socket of sockets) {
+    if (!isOpen(socket)) continue
+    try {
+      socket.send(data)
+    } catch {
+      // 连接可能正在关闭，重连时会从 PTY buffer 回放。
+    }
+  }
+}
+
+export function activeSocketAfterDetach(sockets: Set<Socket>, active: Socket | null, detached: Socket) {
+  if (active !== detached) return active
+  return sockets.values().next().value ?? null
 }
 
 type Ctx = {
@@ -60,8 +76,10 @@ type PooledSession = {
   pty: IPty
   /** 最近的原始输出字节，用于重连回放。 */
   buffer: string
-  /** 当前挂着的连接（同一时刻最多一个）。 */
-  socket: Socket | null
+  /** 同一终端可以同时显示在主窗口和独立窗口。 */
+  sockets: Set<Socket>
+  /** 只有当前活动窗口可以改变 PTY 尺寸，避免两个窗口反复争抢。 */
+  activeSocket: Socket | null
   /** 最后一次有连接的时间，用于 LRU。 */
   lastSeen: number
 }
@@ -331,6 +349,14 @@ export function apply(ctx: Ctx) {
 
   const kill = (session: PooledSession) => {
     pool.delete(session.key)
+    for (const socket of session.sockets) {
+      try {
+        socket.close(1000, 'shell killed')
+      } catch {
+        // 已断开。
+      }
+    }
+    session.sockets.clear()
     try {
       session.pty.kill()
     } catch {
@@ -383,7 +409,7 @@ export function apply(ctx: Ctx) {
           cwd: process.cwd(),
           env: ptyEnv({ ...process.env, ...sandbox.env }),
         })
-        session = { key, pty: child, buffer: '', socket: null, lastSeen: Date.now() }
+        session = { key, pty: child, buffer: '', sockets: new Set(), activeSocket: null, lastSeen: Date.now() }
         pool.set(key, session)
         child.onData((chunk) => {
           const current = pool.get(key)
@@ -394,22 +420,18 @@ export function apply(ctx: Ctx) {
             // 超上限只留尾部，避免无限增长。
             current.buffer = tailLines(current.buffer.slice(-maxBytes), settings.replayLines)
           }
-          const ws = current.socket
-          if (!isOpen(ws)) return
-          try {
-            ws.send(typeof chunk === 'string' ? chunk : String(chunk))
-          } catch {
-            // 连接可能已断；数据已写入 buffer，下次重连会回放。
-          }
+          broadcastSockets(current.sockets, typeof chunk === 'string' ? chunk : String(chunk))
         })
         child.onExit(() => {
           const current = pool.get(key)
-          const ws = current?.socket
-          if (isOpen(ws)) {
-            try {
-              ws.close(1000, 'shell exited')
-            } catch {
-              // 忽略。
+          if (current) {
+            for (const ws of current.sockets) {
+              if (!isOpen(ws)) continue
+              try {
+                ws.close(1000, 'shell exited')
+              } catch {
+                // 忽略。
+              }
             }
           }
           pool.delete(key)
@@ -420,15 +442,8 @@ export function apply(ctx: Ctx) {
       }
     }
 
-    // 旧连接让位（同一会话同时只服务一个前端）。
-    if (session.socket && session.socket !== socket) {
-      try {
-        session.socket.close(1000, 'superseded')
-      } catch {
-        // 忽略。
-      }
-    }
-    session.socket = socket
+    session.sockets.add(socket)
+    session.activeSocket ??= socket
     session.lastSeen = Date.now()
 
     // 回放历史：先清屏，再把这之前的输出重放一遍，接上就是完整画面。
@@ -451,8 +466,15 @@ export function apply(ctx: Ctx) {
       } catch {
         return
       }
-      if (msg.type === 'input') current.pty.write(String(msg.data ?? ''))
-      if (msg.type === 'resize') {
+      if (msg.type === 'input') {
+        current.activeSocket = socket
+        current.pty.write(String(msg.data ?? ''))
+      }
+      if (msg.type === 'focus') {
+        current.activeSocket = socket
+        current.pty.resize(dim(msg.cols, cols, 20, 500), dim(msg.rows, rows, 5, 400))
+      }
+      if (msg.type === 'resize' && current.activeSocket === socket) {
         current.pty.resize(dim(msg.cols, 80, 20, 500), dim(msg.rows, 20, 5, 400))
       }
       // 前端明确要求结束该会话（例如插件停用）。
@@ -463,7 +485,8 @@ export function apply(ctx: Ctx) {
       const current = pool.get(key)
       if (!current) return
       // 只断开连接，**不杀进程** —— 前端关了不代表后端要死。
-      if (current.socket === socket) current.socket = null
+      current.sockets.delete(socket)
+      current.activeSocket = activeSocketAfterDetach(current.sockets, current.activeSocket, socket)
       current.lastSeen = Date.now()
       evictIfNeeded()
     }

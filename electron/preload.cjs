@@ -36,3 +36,15 @@ contextBridge.exposeInMainWorld('biuBrowser', {
     return () => ipcRenderer.removeListener('biu:browser:inspected', h)
   },
 })
+
+contextBridge.exposeInMainWorld('biuPresentation', {
+  available: true,
+  open: (request) => ipcRenderer.invoke('biu:presentation:open', request),
+  focus: (request) => ipcRenderer.invoke('biu:presentation:focus', request),
+  close: (request) => ipcRenderer.invoke('biu:presentation:close', request),
+  onClosed: (fn) => {
+    const h = (_event, payload) => fn(payload)
+    ipcRenderer.on('biu:presentation:closed', h)
+    return () => ipcRenderer.removeListener('biu:presentation:closed', h)
+  },
+})

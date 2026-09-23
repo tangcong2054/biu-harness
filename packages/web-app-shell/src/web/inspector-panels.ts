@@ -6,6 +6,7 @@ export type InspectorPanelExtra = {
   common?: unknown
   action?: unknown
   repeatable?: unknown
+  offer?: unknown
 }
 
 /** 右侧检查器跟当前 Session：页面附加块不进这一栏，但 Session 可以加数据库。 */
@@ -35,6 +36,7 @@ const INSPECTOR_VIEW_OMIT = new Set([
   'useSnapshot',
   'slots',
   'repeatable',
+  'offer',
 ])
 
 export function inspectorViewProps(raw: Record<string, unknown>) {

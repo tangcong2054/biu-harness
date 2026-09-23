@@ -104,6 +104,37 @@ test('root lists registered collections; record read/update follows schema', asy
   await assert.rejects(() => db.update('/notes/n1', { nope: 1 }), /unknown field/)
 })
 
+test('page-block record paths preserve the leading collection slash', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const id = '/pages::p1::b1'
+  let title = '终端'
+  db.register({
+    id: 'page-blocks',
+    path: '/page-blocks',
+    schema: {
+      labelField: 'title',
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+      },
+    },
+    records: { update: true },
+    list: () => [{ id, title }],
+    get: (recordId) => recordId === id ? { id, title } : null,
+    update: (recordId, patch) => {
+      assert.equal(recordId, id)
+      title = String(patch.title ?? title)
+      return { id, title }
+    },
+  })
+
+  const read = await db.read('/page-blocks//pages::p1::b1')
+  assert.equal(read.value.id, id)
+  const updated = await db.update('/page-blocks//pages::p1::b1', { title: '独立窗口' })
+  assert.equal(updated.value.title, '独立窗口')
+})
+
 test('html banner is stored by file system and never written as a table field', async () => {
   const ctx = new Context()
   const db = new DatabaseService(ctx)

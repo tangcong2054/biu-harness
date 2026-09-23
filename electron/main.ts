@@ -33,6 +33,85 @@ let spawnedHost = false
 let view: BrowserView | null = null
 let win: BrowserWindow | null = null
 let browserPanelReady = false
+const presentationWindows = new Map<string, BrowserWindow>()
+
+type PresentationWindowRequest = {
+  recordId: string
+  title?: string
+}
+
+function presentationWindowUrl(recordId: string) {
+  const target = new URL(isDev ? DEV_URL : hostUrl)
+  target.searchParams.set('popout', 'page-block')
+  target.searchParams.set('record', recordId)
+  return target.toString()
+}
+
+function presentationSender(event: Electron.IpcMainInvokeEvent) {
+  return BrowserWindow.fromWebContents(event.sender)
+}
+
+async function openPresentationWindow(event: Electron.IpcMainInvokeEvent, raw: PresentationWindowRequest) {
+  const recordId = typeof raw?.recordId === 'string' ? raw.recordId.trim().slice(0, 500) : ''
+  if (!recordId) throw new Error('page block record id is required')
+  const existing = presentationWindows.get(recordId)
+  if (existing && !existing.isDestroyed()) {
+    if (existing.isMinimized()) existing.restore()
+    existing.show()
+    existing.focus()
+    return { recordId, opened: false }
+  }
+
+  const parent = presentationSender(event)
+  const child = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    minWidth: 640,
+    minHeight: 420,
+    show: false,
+    title: typeof raw.title === 'string' && raw.title.trim() ? raw.title.trim().slice(0, 200) : 'Biu 插件',
+    backgroundColor: '#191919',
+    webPreferences: {
+      preload: join(electronRoot, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+  })
+  presentationWindows.set(recordId, child)
+  child.once('ready-to-show', () => child.show())
+  child.on('closed', () => {
+    if (presentationWindows.get(recordId) === child) presentationWindows.delete(recordId)
+    if (parent && !parent.isDestroyed()) parent.webContents.send('biu:presentation:closed', { recordId })
+  })
+  await child.loadURL(presentationWindowUrl(recordId))
+  return { recordId, opened: true }
+}
+
+ipcMain.handle('biu:presentation:open', openPresentationWindow)
+ipcMain.handle('biu:presentation:focus', (_event, raw: PresentationWindowRequest) => {
+  const recordId = typeof raw?.recordId === 'string' ? raw.recordId.trim() : ''
+  const child = presentationWindows.get(recordId)
+  if (!child || child.isDestroyed()) return false
+  if (child.isMinimized()) child.restore()
+  child.show()
+  child.focus()
+  return true
+})
+ipcMain.handle('biu:presentation:close', (event, raw: PresentationWindowRequest) => {
+  const recordId = typeof raw?.recordId === 'string' ? raw.recordId.trim() : ''
+  const sender = presentationSender(event)
+  const child = presentationWindows.get(recordId)
+  if (child && child === sender && !child.isDestroyed()) {
+    child.close()
+    return true
+  }
+  if (child && !child.isDestroyed()) {
+    child.close()
+    return true
+  }
+  return false
+})
 
 /** 前端报上来的矩形（CSS 像素，相对窗口内容区）。 */
 let rect: { x: number; y: number; width: number; height: number } | null = null
@@ -687,5 +766,5 @@ app.on('window-all-closed', () => {
 })
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) void createWindow()
+  if (!win || win.isDestroyed()) void createWindow()
 })

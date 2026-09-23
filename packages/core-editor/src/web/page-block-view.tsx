@@ -1,4 +1,5 @@
-import { memo, useEffect, useLayoutEffect, useRef, type MouseEvent } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
+import { createPortal } from 'react-dom'
 import type { NodeViewProps } from '@tiptap/react'
 import { NodeViewWrapper } from '@tiptap/react'
 import { PlayIcon } from '@heroicons/react/16/solid'
@@ -6,6 +7,14 @@ import { RenderBoundary } from '@biu/public-ui'
 import { getPageEditor, usePageEditorVersion } from './service.ts'
 import { formatPageBlockFence, requestEnablePageBlockPlugin } from './page-block-meta.ts'
 import { bindPageBlockPlugin } from './page-block-plugin-host.ts'
+import { pageBlockRecordId } from '../page-block-fence.ts'
+import { usePageBlockSync } from './page-block-sync.ts'
+import {
+  getPagePresentation,
+  PagePresentationInlineActions,
+  PagePresentationPlaceholder,
+  usePagePresentation,
+} from './presentation.tsx'
 
 function assetName(file: string) {
   return file.replace(/^assets\//, '')
@@ -82,17 +91,64 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
   const file = typeof data.file === 'string' ? data.file : ''
   const blockId = String(node.attrs.id ?? '').trim()
   const pickId = blockId || `${plugin || 'page-block'}:${kind}`
+  const presentationId = `page-block:${pickId}`
   const pickLabel = spec?.label || kind
+  const presentationTitle = String(data.title ?? '').trim() || pickLabel
+  const [recordKey, setRecordKey] = useState('')
+  const applyRemoteData = useCallback((next: Record<string, unknown>) => {
+    updateAttributes({ data: next })
+  }, [updateAttributes])
+  const publishData = usePageBlockSync(recordKey, data, applyRemoteData)
   const update = (patch: Record<string, unknown>, opts?: { replace?: boolean }) => {
     const next = opts?.replace ? { ...patch } : { ...data, ...patch }
     if (!Object.prototype.hasOwnProperty.call(patch, 'title') && typeof data.title === 'string') {
       next.title = data.title
     }
     updateAttributes({ data: next })
+    publishData(next)
   }
   const View = spec?.View
   const hostRef = useRef<HTMLElement | null>(null)
-  useLayoutEffect(() => bindPageBlockPlugin(hostRef.current, plugin), [plugin, kind, View, data])
+  const inlineRef = useRef<HTMLDivElement | null>(null)
+  const contentHost = useMemo(() => {
+    const element = document.createElement('div')
+    element.setAttribute('data-page-presentation-id', presentationId)
+    return element
+  }, [presentationId])
+  const presentation = usePagePresentation(presentationId)
+  useLayoutEffect(() => {
+    const editorHost = hostRef.current?.closest<HTMLElement>('.page-editor')
+    const pageId = editorHost?.dataset.pageRecordId?.trim() ?? ''
+    const collection = editorHost?.dataset.pageCollection?.trim() || '/pages'
+    setRecordKey(pageId && blockId ? pageBlockRecordId(collection, pageId, blockId) : '')
+  }, [blockId])
+  useLayoutEffect(() => {
+    const disposeHost = bindPageBlockPlugin(hostRef.current, plugin)
+    const disposeContent = bindPageBlockPlugin(contentHost, plugin)
+    return () => {
+      disposeHost()
+      disposeContent()
+    }
+  }, [plugin, kind, View, data, contentHost])
+  useLayoutEffect(() => {
+    if (!View || !inlineRef.current) return
+    const service = getPagePresentation()
+    if (!service) {
+      inlineRef.current.appendChild(contentHost)
+      return () => contentHost.remove()
+    }
+    return service.register({
+      id: presentationId,
+      plugin,
+      title: presentationTitle,
+      host: contentHost,
+      inlineTarget: inlineRef.current,
+      recordId: recordKey,
+    })
+  }, [View, presentationId, plugin, contentHost])
+  useEffect(() => {
+    getPagePresentation()?.updateMeta(presentationId, { plugin, title: presentationTitle, recordId: recordKey })
+  }, [presentationId, plugin, presentationTitle, recordKey])
 
   useEffect(() => {
     if (!cloneFrom || !file) return
@@ -124,6 +180,7 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
       data-page-block={kind}
       data-page-block-plugin={plugin}
       data-page-block-id={blockId || undefined}
+      data-page-block-record={recordKey || undefined}
       data-page-block-capture=""
       data-biu-plugin={plugin || undefined}
       data-biu-kind="plugin"
@@ -133,13 +190,28 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
       data-testid={`page-block-${kind}`}
       onMouseDown={onMouseDown}
     >
+      {View && presentation ? <PagePresentationInlineActions controls={presentation} /> : null}
       {cloneFrom ? (
         <div className="page-block-missing">正在复制附件…</div>
       ) : View ? (
-        // 文档里的插件块崩了只烂这一块，不该让整个应用白屏。
-        <RenderBoundary label={plugin || kind}>
-          <View data={data} update={update} writable={editor.isEditable} />
-        </RenderBoundary>
+        <>
+          <div ref={inlineRef} className="page-presentation-inline-slot" />
+          {presentation && presentation.mode !== 'inline' ? (
+            <PagePresentationPlaceholder mode={presentation.mode} onRestore={presentation.inline} />
+          ) : null}
+          {createPortal(
+            // 文档里的插件块崩了只烂这一块，不该让整个应用白屏。
+            <RenderBoundary label={plugin || kind}>
+              <View
+                data={data}
+                update={update}
+                writable={editor.isEditable}
+                presentation={presentation ?? undefined}
+              />
+            </RenderBoundary>,
+            contentHost,
+          )}
+        </>
       ) : (
         <PageBlockMissing kind={kind} plugin={plugin} data={data} />
       )}

@@ -130,6 +130,7 @@ export const SessionInspector = memo(function SessionInspector({
           focusOnCall: Boolean(extra.focusOnCall),
           common: Boolean(extra.common),
           repeatable: Boolean(extra.repeatable),
+          offer: extra.offer !== false,
           action: typeof extra.action === 'string' ? extra.action : '',
         }]
       })
@@ -538,7 +539,7 @@ export const SessionInspector = memo(function SessionInspector({
               })}
               <div className="inspector-add-foot">
                 {displayTabs
-                  .filter((item) => item.repeatable || !opened.some((id) => slotTabId(id) === item.id))
+                  .filter((item) => item.offer && (item.repeatable || !opened.some((id) => slotTabId(id) === item.id)))
                   .map((item) => (
                     <button
                       key={item.id}
@@ -603,7 +604,7 @@ export const SessionInspector = memo(function SessionInspector({
           {displayTabs.length || toolTabs.length ? (
             <div className="inspector-empty-list">
               {displayTabs
-                .filter((item) => item.repeatable || !opened.some((id) => slotTabId(id) === item.id))
+                .filter((item) => item.offer && (item.repeatable || !opened.some((id) => slotTabId(id) === item.id)))
                 .map((item) => (
                   <button
                     key={item.id}

@@ -244,6 +244,13 @@ function publicCollection(item: CollectionSpec): CollectionInfo {
 }
 
 function splitPath(path: string): string[] {
+  // page-block 记录 id 自身以集合路径开头（如 /pages::p1::b1），
+  // 因此完整记录路径天然包含双斜杠：/page-blocks//pages::p1::b1。
+  // 必须在通用 normalize 折叠斜杠前保留这个 record id。
+  if (path.startsWith('/page-blocks//')) {
+    const recordId = `/${path.slice('/page-blocks//'.length)}`.trim()
+    if (recordId !== '/') return ['page-blocks', recordId]
+  }
   const normalized = normalizeCollectionPath(path)
   if (normalized === '/') return []
   const parts = normalized.slice(1).split('/').filter(Boolean)

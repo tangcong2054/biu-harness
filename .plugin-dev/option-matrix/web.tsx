@@ -340,13 +340,37 @@ function ScoreInput({ value, max, onChange, readOnly }: { value: number; max: nu
   )
 }
 
-function OptionMatrix({ data, update, writable }: { data: Data; update: (patch: Record<string, unknown>) => void; writable: boolean }) {
+function OptionMatrix({
+  data,
+  update,
+  writable,
+  presentation,
+}: {
+  data: Data
+  update: (patch: Record<string, unknown>) => void
+  writable: boolean
+  presentation?: {
+    mode: 'inline' | 'sidebar' | 'maximized' | 'minimized'
+    detached?: boolean
+    inline: () => void
+    maximize: () => void
+  }
+}) {
   useOmStyle()
   const [showMd, setShowMd] = useState(false)
   const [copied, setCopied] = useState(false)
   const [draftTitle, setDraftTitle] = useState(data.title ?? '')
   const titleTouched = useRef(false)
-  const zoom = useMaximize()
+  const legacyZoom = useMaximize()
+  const zoom = presentation
+    ? {
+        max: presentation.mode === 'maximized',
+        detached: Boolean(presentation.detached),
+        open: presentation.maximize,
+        close: presentation.inline,
+        layer: null,
+      }
+    : legacyZoom
 
   useEffect(() => {
     if (!titleTouched.current) setDraftTitle(data.title ?? '')
@@ -799,12 +823,12 @@ function OptionMatrix({ data, update, writable }: { data: Data; update: (patch: 
       key="zoom"
       type="button"
       data-page-block-expand=""
-      title={zoom.max ? '退出放大（Esc）' : '放大到全屏看'}
-      aria-label={zoom.max ? '退出放大' : '放大'}
-      onClick={() => (zoom.max ? zoom.close() : zoom.open())}
+      title={presentation ? '在独立窗口打开' : zoom.max ? '退出放大（Esc）' : '放大到全屏看'}
+      aria-label={presentation ? '独立窗口' : zoom.max ? '退出放大' : '放大'}
+      onClick={() => (presentation ? zoom.open() : zoom.max ? zoom.close() : zoom.open())}
       style={btn({ fontSize: '0.82em', padding: '2px 8px', fontWeight: 700, whiteSpace: 'nowrap' })}
     >
-      {zoom.max ? '⤡ 缩小' : '⤢ 放大'}
+      {presentation ? (presentation.detached ? '聚焦窗口' : '独立窗口') : zoom.max ? '⤡ 缩小' : '⤢ 放大'}
     </button>,
   ]
 
@@ -843,7 +867,7 @@ function OptionMatrix({ data, update, writable }: { data: Data; update: (patch: 
         className="om-root"
         style={{ border: `1px solid ${LINE}`, borderRadius: 12, padding: compact ? 10 : 14, margin: '10px 0', font: 'inherit' }}
       >
-        {zoom.max ? (
+        {zoom.max && !presentation ? (
           <>
             {toolbarRow}
             <div style={{ fontSize: '0.82em', opacity: 0.6 }}>已放大到全屏窗口显示 —— 点「⤡ 缩小」或按 Esc 退出。</div>
@@ -852,7 +876,7 @@ function OptionMatrix({ data, update, writable }: { data: Data; update: (patch: 
           body
         )}
       </div>
-      {zoom.max && zoom.layer
+      {!presentation && zoom.max && zoom.layer
         ? createPortal(
             <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0, font: 'inherit', color: 'inherit' }}>
               <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: compact ? 14 : 22 }}>{body}</div>

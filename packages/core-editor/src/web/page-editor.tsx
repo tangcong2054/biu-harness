@@ -621,7 +621,14 @@ export function PageEditor({ record, value, writable, onChange, path }: FsConten
 
   if (source) {
     return (
-      <div className="page-editor is-source" tabIndex={-1} onMouseDown={onEditorBlankMouseDown} onKeyDownCapture={onEditorHotkey}>
+      <div
+        className="page-editor is-source"
+        data-page-record-id={String(record.id)}
+        data-page-collection={path?.slice(0, path.lastIndexOf('/')) || '/pages'}
+        tabIndex={-1}
+        onMouseDown={onEditorBlankMouseDown}
+        onKeyDownCapture={onEditorHotkey}
+      >
         {findBar}
         <SourceEditor
           ref={sourceFind}
@@ -638,7 +645,14 @@ export function PageEditor({ record, value, writable, onChange, path }: FsConten
   }
 
   return (
-    <div className="page-editor" tabIndex={-1} onMouseDown={onEditorBlankMouseDown} onKeyDownCapture={onEditorHotkey}>
+    <div
+      className="page-editor"
+      data-page-record-id={String(record.id)}
+      data-page-collection={path?.slice(0, path.lastIndexOf('/')) || '/pages'}
+      tabIndex={-1}
+      onMouseDown={onEditorBlankMouseDown}
+      onKeyDownCapture={onEditorHotkey}
+    >
       {findBar}
       <EditorContent editor={editor} />
       {writable !== false ? <PageBlockHandle editor={editor} /> : null}

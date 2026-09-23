@@ -1,6 +1,7 @@
 import { useSyncExternalStore, type ComponentType } from 'react'
-import { Service, type Context } from 'cordis'
+import { Service, type Context, type Plugin } from 'cordis'
 import { registerBlockAssets } from '@biu/type-file-system'
+import type { PagePresentationControls } from './presentation.tsx'
 
 export type HeadingLevel = 1 | 2 | 3
 
@@ -14,6 +15,8 @@ export type PageBlockViewProps = {
   data: Record<string, unknown>
   update: (patch: Record<string, unknown>, opts?: { replace?: boolean }) => void
   writable: boolean
+  /** 宿主统一提供的页面内 / 右侧栏 / 全屏 / 最小化切换。 */
+  presentation?: PagePresentationControls
 }
 
 /** 斜杠菜单分类。'basic' 进「基础模块」；其它字符串各自成组。 */
@@ -76,6 +79,7 @@ export class PageEditorService extends Service {
   private headings = new Map<HeadingLevel, HeadingReplacement>()
   private extras: SlashCommandSpec[] = []
   private customBlocks = new Map<string, PageBlockSpec>()
+  private runtimeBlocks = new Map<string, Promise<void>>()
   private seq = 0
   private listeners = new Set<() => void>()
 
@@ -104,6 +108,42 @@ export class PageEditorService extends Service {
 
   blocks() {
     return [...this.customBlocks.values()]
+  }
+
+  async ensureBlockPlugin(pluginId: string) {
+    const id = pluginId.trim()
+    if (!id || this.blocks().some((block) => block.plugin === id)) return
+    const pending = this.runtimeBlocks.get(id)
+    if (pending) return pending
+    const loading = (async () => {
+      const href = new URL(`/api/plugin-store/files/${encodeURIComponent(id)}/web.js`, window.location.origin)
+      href.searchParams.set('v', String(Date.now()))
+      const loaded = await import(/* @vite-ignore */ href.href) as {
+        default?: unknown
+        apply?: unknown
+        inject?: unknown
+        name?: unknown
+      }
+      let runtime: Plugin
+      if (typeof loaded.default === 'function' && (typeof loaded.apply === 'function' || Array.isArray(loaded.inject))) {
+        runtime = {
+          ...(typeof loaded.name === 'string' ? { name: loaded.name } : {}),
+          ...(Array.isArray(loaded.inject) ? { inject: loaded.inject as string[] } : {}),
+          apply: (typeof loaded.apply === 'function' ? loaded.apply : loaded.default) as Plugin['apply'],
+        }
+      } else {
+        runtime = (loaded.default && typeof loaded.default === 'object' ? loaded.default : loaded) as Plugin
+      }
+      await this.ctx.plugin(runtime)
+      if (!this.blocks().some((block) => block.plugin === id)) {
+        throw new Error(`插件 ${id} 没有注册页面块`)
+      }
+    })().catch((error) => {
+      this.runtimeBlocks.delete(id)
+      throw error
+    })
+    this.runtimeBlocks.set(id, loading)
+    return loading
   }
 
   slashCommands() {

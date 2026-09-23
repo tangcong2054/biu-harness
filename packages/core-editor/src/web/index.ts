@@ -1,9 +1,15 @@
 import 'katex/dist/katex.min.css'
 import 'highlight.js/styles/github-dark.css'
 import type { Context } from 'cordis'
+import type { ComponentType } from 'react'
 import { DEFAULT_CHROME_PATH, type DatabaseUi } from '@biu/type-file-system/ui'
 import { PageEditor } from './page-editor.tsx'
 import { PageEditorService } from './service.ts'
+import {
+  PagePresentationInspector,
+  PagePresentationLayer,
+  PagePresentationService,
+} from './presentation.tsx'
 import { PAGE_EDITOR_STYLE } from './style.ts'
 import { SourceToggle } from './source-toggle.tsx'
 import { pageBlocksCollectionView, PageBlockContent } from './page-blocks-view.tsx'
@@ -12,21 +18,59 @@ export { PageEditor, PageEditor as RecordEditor } from './page-editor.tsx'
 export { SourceToggle } from './source-toggle.tsx'
 export { PageEditorService, BASIC_BLOCK_TYPE, getPageEditor, usePageEditorVersion } from './service.ts'
 export type { HeadingReplacement, PageBlockSpec, PageBlockViewProps, SlashCommandSpec, SlashInsert } from './service.ts'
+export {
+  PagePresentationService,
+  getPagePresentation,
+  usePagePresentation,
+} from './presentation.tsx'
+export type { PagePresentationControls, PagePresentationMode } from './presentation.tsx'
 export { pageEditorExtensions } from './kit.ts'
 export { markdownLocusFromRange, markdownLocusFromSelection, markdownLocusFromElement } from './markdown-locus.ts'
-export { PageBlocksView, PageBlockContent, PageBlockStage, pageBlocksCollectionView, PAGE_BLOCKS_VIEW_ID } from './page-blocks-view.tsx'
+export { PageBlocksView, PageBlockContent, PageBlockStage, PageBlockPopout, pageBlocksCollectionView, PAGE_BLOCKS_VIEW_ID } from './page-blocks-view.tsx'
 
 export const name = 'core-editor-ui'
 export const inject = ['databaseUi']
 
 export function apply(ctx: Context) {
   new PageEditorService(ctx)
+  const presentation = new PagePresentationService(ctx)
   const ui = ctx.get('databaseUi') as DatabaseUi
   // 凡是有 file 正文的表都走 Markdown；没有 contentField 的表不会用到这份 chrome。
   ctx.effect(() => ui.decorate(DEFAULT_CHROME_PATH, { Content: PageEditor, DetailTools: SourceToggle }).dispose)
   // page-blocks 用自己的正文组件盖掉上面的通配（精确路径在 mergeChrome 里后写覆盖）。
   ctx.effect(() => ui.decorate('/page-blocks', { Content: PageBlockContent }).dispose)
   ctx.effect(() => ui.registerView('/page-blocks', pageBlocksCollectionView).dispose)
+  ctx.inject(['slots'], (inner) => {
+    const slots = inner.get('slots') as unknown as {
+      place: (
+        name: string,
+        Component: ComponentType<any>,
+        options?: Record<string, unknown>,
+      ) => { dispose(): void }
+    }
+    const layer = slots.place('root-overlays', PagePresentationLayer, {
+      key: 'page-presentation-layer',
+      order: 70,
+      props: () => ({ presentation }),
+    })
+    const inspector = slots.place('inspector-panels', PagePresentationInspector, {
+      key: 'page-plugin',
+      order: 65,
+      props: () => ({
+        tabId: 'page-plugin',
+        tabLabel: '页面插件',
+        requiresSession: true,
+        centerKinds: ['session'],
+        repeatable: true,
+        offer: false,
+        presentation,
+      }),
+    })
+    return () => {
+      layer.dispose()
+      inspector.dispose()
+    }
+  })
 }
 
 if (typeof document !== 'undefined') {

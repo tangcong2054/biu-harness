@@ -5,6 +5,7 @@ import type { CollectionViewType, FsContentProps, FsViewProps } from '@biu/type-
 import { PageBlockMissing } from './page-block-view.tsx'
 import { bindPageBlockPlugin } from './page-block-plugin-host.ts'
 import { getPageEditor, usePageEditorVersion } from './service.ts'
+import { usePageBlockSync } from './page-block-sync.ts'
 
 export const PAGE_BLOCKS_VIEW_ID = 'blocks'
 export const PAGE_REVEAL_EVENT = 'biu:inspector-reveal'
@@ -106,6 +107,16 @@ async function readPageName(pageId: string) {
   return pageNameFromRecord(body.value, pageId)
 }
 
+async function waitForPageEditor(timeoutMs = 15_000) {
+  const started = Date.now()
+  while (Date.now() - started < timeoutMs) {
+    const editor = getPageEditor()
+    if (editor) return editor
+    await new Promise((resolve) => window.setTimeout(resolve, 50))
+  }
+  throw new Error('页面插件运行时没有就绪')
+}
+
 function usePageNames(ids: string[]) {
   const key = [...new Set(ids.filter(Boolean))].sort().join('\0')
   const [names, setNames] = useState<Record<string, string>>({})
@@ -161,6 +172,8 @@ export function PageBlockStage({
     if (recordTitle) parsed.title = recordTitle
     return parsed
   })
+  const recordId = String(row.id ?? '').trim()
+  const publishData = usePageBlockSync(recordId, data, (next) => setData(next))
   useEffect(() => {
     const parsed = parsePageBlockRowData(source)
     if (recordTitle) parsed.title = recordTitle
@@ -170,8 +183,9 @@ export function PageBlockStage({
     const next = mergeLiveBlockData(data, patch, { replace: opts?.replace, title: recordTitle })
     setData(next)
     const toWrite = persistBlockDataPatch(next, patch)
+    publishData(next)
     if (onChange) onChange(toWrite)
-    else void writeBlockData(String(row.id), toWrite)
+    else void writeBlockData(recordId, toWrite)
   }
   const hostRef = useRef<HTMLDivElement | null>(null)
   useLayoutEffect(() => bindPageBlockPlugin(hostRef.current, plugin), [plugin, kind, View, packed])
@@ -182,6 +196,7 @@ export function PageBlockStage({
       data-page-block={kind || undefined}
       data-page-block-plugin={plugin || undefined}
       data-page-block-id={String(row.blockId ?? '') || undefined}
+      data-page-block-record={recordId || undefined}
       data-biu-plugin={plugin || undefined}
       data-biu-kind={plugin ? 'plugin' : undefined}
       data-biu-id={plugin || undefined}
@@ -194,6 +209,55 @@ export function PageBlockStage({
         <PageBlockMissing kind={kind || 'unknown'} plugin={plugin} data={data} />
       )}
     </div>
+  )
+}
+
+type PresentationBridge = {
+  close?: (request: { recordId: string }) => Promise<unknown>
+}
+
+export function PageBlockPopout() {
+  const params = new URLSearchParams(window.location.search)
+  const recordId = params.get('popout') === 'page-block' ? params.get('record')?.trim() ?? '' : ''
+  const [row, setRow] = useState<DbRecord | null>(null)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    if (!recordId) return
+    let cancelled = false
+    void fetch(`/api/db/read?path=${encodeURIComponent(`/page-blocks/${recordId}`)}`)
+      .then(async (response) => {
+        const body = (await response.json()) as { value?: DbRecord; error?: string }
+        if (!response.ok || !body.value) throw new Error(body.error || response.statusText)
+        const plugin = String(body.value.plugin ?? '').trim()
+        const editor = await waitForPageEditor()
+        if (plugin) await editor.ensureBlockPlugin(plugin)
+        if (!cancelled) setRow(body.value)
+      })
+      .catch((reason) => {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [recordId])
+
+  const close = () => {
+    const bridge = (window as unknown as { biuPresentation?: PresentationBridge }).biuPresentation
+    if (bridge?.close) void bridge.close({ recordId })
+    else window.close()
+  }
+
+  return (
+    <main className="page-block-popout">
+      <header className="page-block-popout-head" data-biu-ignore>
+        <strong>{String(row?.title ?? '插件')}</strong>
+        <button type="button" onClick={close}>关闭窗口</button>
+      </header>
+      <div className="page-block-popout-stage">
+        {row ? <PageBlockStage row={row} /> : <div className="page-block-missing">{error || '正在加载插件…'}</div>}
+      </div>
+    </main>
   )
 }
 

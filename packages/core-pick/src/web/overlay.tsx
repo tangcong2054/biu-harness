@@ -29,7 +29,7 @@ export function PickOverlay(_props: SlotProps) {
       return
     }
     document.documentElement.classList.add('pick-mode')
-    const route = () => window.location.pathname
+    const route = () => pick.route()
     const EDITOR_SEL = '.page-editor, .tiptap, [data-testid="page-editor"], .cm-editor'
     const inEditor = (target: EventTarget | null) =>
       target instanceof Element && Boolean(target.closest(EDITOR_SEL))

@@ -10,6 +10,12 @@ type BlockProps = {
   data: Record<string, unknown>
   update: (patch: Record<string, unknown>) => void
   writable: boolean
+  presentation?: {
+    mode: 'inline' | 'sidebar' | 'maximized' | 'minimized'
+    detached?: boolean
+    inline: () => void
+    maximize: () => void
+  }
 }
 
 type Result = {
@@ -37,6 +43,25 @@ type ColumnRow = {
   IS_NULLABLE: string
   COLUMN_KEY: string
   EXTRA: string
+}
+
+type WebSqlSnapshot = {
+  host: string
+  port: string
+  user: string
+  password: string
+  database: string
+  sql: string
+  connected: boolean
+  databases: string[]
+  expandedDatabase: string
+  tables: TableRow[]
+  selectedTable: string
+  columns: ColumnRow[]
+  result: Result | null
+  serverVersion: string
+  busy: string
+  error: string
 }
 
 const CSS = `
@@ -156,7 +181,7 @@ function Results({ result, componentId }: { result: Result; componentId: string 
   )
 }
 
-function WebSqlBlock({ data, update, writable }: BlockProps) {
+function WebSqlBlock({ data, update, writable, presentation }: BlockProps) {
   useStyle()
   const rootRef = useRef<HTMLDivElement | null>(null)
   const serviceUrl = 'http://127.0.0.1:43120'
@@ -177,29 +202,103 @@ function WebSqlBlock({ data, update, writable }: BlockProps) {
   const [serverVersion, setServerVersion] = useState('')
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
-  const [max, setMax] = useState(false)
+  const [legacyMax, setLegacyMax] = useState(false)
   const [componentId, setComponentId] = useState('websql')
+  const max = presentation ? presentation.mode === 'maximized' : legacyMax
 
   useEffect(() => {
     const root = rootRef.current
     const host = root?.parentElement?.closest('[data-page-block]')
-    const id = host?.getAttribute('data-page-block-id') || host?.getAttribute('data-biu-id') || ''
+    const id = host?.getAttribute('data-page-block-record') || host?.getAttribute('data-page-block-id') || host?.getAttribute('data-biu-id') || ''
     if (id) setComponentId(id)
   }, [])
 
+  const sharedState = useMemo<WebSqlSnapshot>(() => ({
+    host,
+    port,
+    user,
+    password,
+    database,
+    sql,
+    connected,
+    databases,
+    expandedDatabase,
+    tables,
+    selectedTable,
+    columns,
+    result,
+    serverVersion,
+    busy,
+    error,
+  }), [
+    host, port, user, password, database, sql, connected, databases, expandedDatabase,
+    tables, selectedTable, columns, result, serverVersion, busy, error,
+  ])
+  const sharedRef = useRef(sharedState)
+  const channelRef = useRef<BroadcastChannel | null>(null)
+  const syncSource = useRef(crypto.randomUUID())
+  const applyingShared = useRef(false)
+  sharedRef.current = sharedState
+
   useEffect(() => {
-    if (!max) return
+    if (!componentId || componentId === 'websql' || typeof BroadcastChannel === 'undefined') return
+    const channel = new BroadcastChannel(`biu:websql:${componentId}`)
+    channelRef.current = channel
+    channel.onmessage = (event: MessageEvent<{ type?: string; source?: string; state?: WebSqlSnapshot }>) => {
+      const message = event.data
+      if (!message || message.source === syncSource.current) return
+      if (message.type === 'request') {
+        channel.postMessage({ type: 'state', source: syncSource.current, state: sharedRef.current })
+        return
+      }
+      if (message.type !== 'state' || !message.state) return
+      const next = message.state
+      applyingShared.current = true
+      setHost(next.host)
+      setPort(next.port)
+      setUser(next.user)
+      setPassword(next.password)
+      setDatabase(next.database)
+      setSql(next.sql)
+      setConnected(next.connected)
+      setDatabases(next.databases)
+      setExpandedDatabase(next.expandedDatabase)
+      setTables(next.tables)
+      setSelectedTable(next.selectedTable)
+      setColumns(next.columns)
+      setResult(next.result)
+      setServerVersion(next.serverVersion)
+      setBusy(next.busy)
+      setError(next.error)
+    }
+    channel.postMessage({ type: 'request', source: syncSource.current })
+    return () => {
+      if (channelRef.current === channel) channelRef.current = null
+      channel.close()
+    }
+  }, [componentId])
+
+  useEffect(() => {
+    if (applyingShared.current) {
+      applyingShared.current = false
+      return
+    }
+    channelRef.current?.postMessage({ type: 'state', source: syncSource.current, state: sharedState })
+  }, [sharedState])
+
+  useEffect(() => {
+    if (presentation || !legacyMax) return
     const previous = document.body.style.overflow
     document.body.style.overflow = 'hidden'
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setMax(false)
+      if (event.key === 'Escape') setLegacyMax(false)
     }
     window.addEventListener('keydown', onKeyDown)
     return () => {
       document.body.style.overflow = previous
       window.removeEventListener('keydown', onKeyDown)
     }
-  }, [max])
+  }, [presentation, legacyMax])
 
   const conn = useMemo(() => ({
     host,
@@ -346,12 +445,18 @@ function WebSqlBlock({ data, update, writable }: BlockProps) {
           className="wsp-btn"
           data-biu-kind="websql-action"
           data-biu-id={`${componentId}:fullscreen`}
-          data-biu-label={max ? '退出全屏' : '全屏'}
-          data-biu-action="fullscreen"
-          onClick={() => setMax((value: boolean) => !value)}
-          title={max ? '退出全屏（Esc）' : '全屏'}
+          data-biu-label={presentation ? (presentation.detached ? '聚焦独立窗口' : '独立窗口') : max ? '退出全屏' : '全屏'}
+          data-biu-action={presentation ? 'popout' : 'fullscreen'}
+          onClick={() => {
+            if (presentation) {
+              presentation.maximize()
+            } else {
+              setLegacyMax((value: boolean) => !value)
+            }
+          }}
+          title={presentation ? '在独立窗口打开' : max ? '退出全屏（Esc）' : '全屏'}
         >
-          {max ? '退出全屏' : '全屏'}
+          {presentation ? (presentation.detached ? '聚焦窗口' : '独立窗口') : max ? '退出全屏' : '全屏'}
         </button>
       </div>
       <div className="wsp-body">
@@ -499,7 +604,7 @@ function WebSqlBlock({ data, update, writable }: BlockProps) {
       </div>
     </div>
   )
-  return max ? createPortal(block, document.body) : block
+  return !presentation && max ? createPortal(block, document.body) : block
 }
 
 export function apply(ctx: {

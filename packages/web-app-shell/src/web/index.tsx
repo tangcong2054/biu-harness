@@ -53,6 +53,7 @@ import { useSlotEntries } from '@biu/web-slots'
 import type { SlotsService } from '@biu/web-slots'
 import { chromeIcon } from './chrome-icon.ts'
 import { ChatDockStack, ChatStage } from '@biu/public-ui'
+import { PageBlockPopout } from '@biu/core-editor/web'
 import {
   ChevronDoubleLeftIcon,
   ChevronDoubleRightIcon,
@@ -234,7 +235,7 @@ const PluginModuleStage = memo(function PluginModuleStage({
   )
 })
 
-function Shell(props: SlotProps) {
+function MainShell(props: SlotProps) {
   const useSnapshot = props.useSnapshot as ReturnType<typeof bindSnapshot>
   const useSessionView = props.useSessionView as ReturnType<typeof bindSessionView>
   const useAppModules = props.useAppModules as ReturnType<typeof bindAppModules>
@@ -941,6 +942,20 @@ function Shell(props: SlotProps) {
       {props.renderSlot('root-overlays')}
     </div>
   )
+}
+
+function Shell(props: SlotProps) {
+  const location = useLocation()
+  const params = new URLSearchParams(location.search)
+  if (params.get('popout') === 'page-block') {
+    return (
+      <>
+        <PageBlockPopout />
+        {props.renderSlot('root-overlays')}
+      </>
+    )
+  }
+  return <MainShell {...props} />
 }
 
 export function apply(ctx: Context) {

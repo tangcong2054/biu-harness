@@ -10,6 +10,12 @@ type BlockProps = {
   data: Record<string, unknown>
   update: (patch: Record<string, unknown>) => void
   writable: boolean
+  presentation?: {
+    mode: 'inline' | 'sidebar' | 'maximized' | 'minimized'
+    detached?: boolean
+    inline: () => void
+    maximize: () => void
+  }
 }
 
 type Session = {
@@ -188,7 +194,7 @@ function fmtTime(iso: string): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
-function DbbrainLimitBlock({ data, update, writable }: BlockProps) {
+function DbbrainLimitBlock({ data, update, writable, presentation }: BlockProps) {
   const [status, setStatus] = useState<{ hasCredential: boolean; credential: any; error?: string; instanceCount?: number } | null>(null)
   const [tab, setTab] = useState<string>((data.tab as string) ?? 'sessions')
 
@@ -262,20 +268,21 @@ function DbbrainLimitBlock({ data, update, writable }: BlockProps) {
    *  为什么用 Portal 而不是像 page-terminal 那样搬 DOM：本块有大量按钮，
    *  搬走会让 React 的合成事件委托链断掉（事件挂在 root 容器上），按钮全失效。
    *  Portal 仍走 React 树，事件正常。 */
-  const [max, setMax] = useState(false)
+  const [legacyMax, setLegacyMax] = useState(false)
+  const max = presentation ? presentation.mode === 'maximized' : legacyMax
 
   /** 最大化时 Esc 退出。用捕获阶段，优先于编辑器。 */
   useEffect(() => {
-    if (!max) return
+    if (presentation || !legacyMax) return
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return
       event.preventDefault()
       event.stopPropagation()
-      setMax(false)
+      setLegacyMax(false)
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [max])
+  }, [presentation, legacyMax])
 
   /** 放行鼠标拖选文字。
    *  编辑器在 .page-block 上挂了 onMouseDown → setNodeSelection()，
@@ -499,7 +506,7 @@ function DbbrainLimitBlock({ data, update, writable }: BlockProps) {
 
   const block = (
     <div
-      style={max ? S.wrapMax : S.wrap}
+      style={max && presentation ? { ...S.wrapMax, position: 'relative', inset: 'auto', zIndex: 'auto' } : max ? S.wrapMax : S.wrap}
       data-testid="dbbrain-limit-block"
       data-dbbrain-max={max ? '' : undefined}
       onMouseDown={stopMouseDown}
@@ -534,10 +541,16 @@ function DbbrainLimitBlock({ data, update, writable }: BlockProps) {
           <button
             type="button"
             style={S.btn(true, false, true)}
-            title={max ? '退出全屏（Esc）' : '最大化，铺满整个屏幕'}
-            onClick={() => setMax(!max)}
+            title={presentation ? '在独立窗口打开' : max ? '退出全屏（Esc）' : '最大化，铺满整个屏幕'}
+            onClick={() => {
+              if (presentation) {
+                presentation.maximize()
+              } else {
+                setLegacyMax(!legacyMax)
+              }
+            }}
           >
-            {max ? '退出全屏' : '全屏'}
+            {presentation ? (presentation.detached ? '聚焦窗口' : '独立窗口') : max ? '退出全屏' : '全屏'}
           </button>
         </div>
       </div>
@@ -906,7 +919,7 @@ function DbbrainLimitBlock({ data, update, writable }: BlockProps) {
   )
 
   // 非最大化：就地渲染。
-  if (!max) return block
+  if (!max || presentation) return block
 
   // 最大化：挂到 body 顶层。编辑器的 .page-block 带 overflow:hidden + isolation:isolate，
   // 就地做 fixed 会被裁掉/压不住；只有脱离该容器才能真正铺满。

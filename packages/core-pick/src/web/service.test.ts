@@ -125,3 +125,84 @@ test('attach opens chat without pick mode and can stash a send draft', () => {
   assert.deepEqual(draft, { text: '写短一点', send: true })
   assert.equal(pick.takeDraft(), null)
 })
+
+test('popout mirrors pick mode and sends picked refs back to the main window', () => {
+  class FakeBroadcastChannel {
+    static instances: FakeBroadcastChannel[] = []
+    static queue: Array<() => void> = []
+    onmessage: ((event: MessageEvent) => void) | null = null
+    closed = false
+
+    constructor(readonly name: string) {
+      FakeBroadcastChannel.instances.push(this)
+    }
+
+    postMessage(data: unknown) {
+      for (const peer of FakeBroadcastChannel.instances) {
+        if (peer === this || peer.closed || peer.name !== this.name) continue
+        FakeBroadcastChannel.queue.push(() => peer.onmessage?.({ data } as MessageEvent))
+      }
+    }
+
+    close() {
+      this.closed = true
+    }
+
+    static flush() {
+      let guard = 0
+      while (FakeBroadcastChannel.queue.length) {
+        FakeBroadcastChannel.queue.shift()?.()
+        if (++guard > 100) throw new Error('BroadcastChannel message loop')
+      }
+    }
+  }
+
+  const originalChannel = window.BroadcastChannel
+  Object.defineProperty(window, 'BroadcastChannel', {
+    configurable: true,
+    value: FakeBroadcastChannel,
+  })
+  const originalUrl = `${window.location.pathname}${window.location.search}`
+  let attached = 0
+  const onAttached = () => {
+    attached += 1
+  }
+  window.addEventListener('biu:pick-attached', onAttached)
+
+  try {
+    history.replaceState({}, '', '/database')
+    const main = new PickService(new Context())
+    history.replaceState({}, '', '/?popout=page-block&record=r1')
+    const popout = new PickService(new Context())
+    history.replaceState({}, '', '/database')
+    FakeBroadcastChannel.flush()
+
+    main.enter()
+    FakeBroadcastChannel.flush()
+    assert.equal(popout.picking, true)
+    assert.equal(popout.route(), '/database')
+
+    history.replaceState({}, '', '/?popout=page-block&record=r1')
+    popout.add({ kind: 'database-cell', id: 'r1:name', label: '名称', route: popout.route() })
+    history.replaceState({}, '', '/database')
+    FakeBroadcastChannel.flush()
+    assert.equal(attached, 1)
+    assert.deepEqual(main.refs.map((item) => item.id), ['r1:name'])
+    assert.equal(main.refs[0]?.route, '/database')
+
+    history.replaceState({}, '', '/?popout=page-block&record=r1')
+    popout.exit()
+    history.replaceState({}, '', '/database')
+    FakeBroadcastChannel.flush()
+    assert.equal(main.picking, false)
+    assert.equal(popout.picking, false)
+  } finally {
+    window.removeEventListener('biu:pick-attached', onAttached)
+    for (const channel of FakeBroadcastChannel.instances) channel.close()
+    Object.defineProperty(window, 'BroadcastChannel', {
+      configurable: true,
+      value: originalChannel,
+    })
+    history.replaceState({}, '', originalUrl)
+  }
+})

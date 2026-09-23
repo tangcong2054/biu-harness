@@ -5,6 +5,14 @@ import { pickKey, dedupePicks, type PickRef } from './types.ts'
 export type PickHover = { top: number; left: number; width: number; height: number }
 export type PickDraft = { text: string; send?: boolean }
 
+const PICK_CHANNEL = 'biu:pick:v1'
+
+type PickSyncMessage =
+  | { type: 'hello'; source: string }
+  | { type: 'request-mode'; source: string; picking: boolean }
+  | { type: 'mode'; source: string; picking: boolean; route: string }
+  | { type: 'picked'; source: string; refs: PickRef[]; attach?: boolean; draft?: PickDraft }
+
 let boundPick: PickService | undefined
 
 export function getPick() {
@@ -20,6 +28,12 @@ export class PickService extends Service {
   draft: PickDraft | null = null
   private seq = 0
   private listeners = new Set<() => void>()
+  private readonly source = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
+  private readonly popout =
+    typeof window !== 'undefined'
+    && new URLSearchParams(window.location.search).get('popout') === 'page-block'
+  private channel: BroadcastChannel | null = null
+  private pickRoute = typeof window === 'undefined' ? '/' : window.location.pathname
 
   constructor(ctx: Context) {
     super(ctx, 'pick')
@@ -28,7 +42,18 @@ export class PickService extends Service {
       if (typeof window === 'undefined') return
       const onClosed = () => this.exit()
       window.addEventListener('biu:overlay-closed', onClosed)
-      return () => window.removeEventListener('biu:overlay-closed', onClosed)
+      const Channel = window.BroadcastChannel
+      if (Channel) {
+        this.channel = new Channel(PICK_CHANNEL)
+        this.channel.onmessage = (event) => this.receive(event.data)
+        this.publish({ type: 'hello', source: this.source })
+      }
+      return () => {
+        window.removeEventListener('biu:overlay-closed', onClosed)
+        this.channel?.close()
+        this.channel = null
+        if (boundPick === this) boundPick = undefined
+      }
     })
   }
 
@@ -39,24 +64,18 @@ export class PickService extends Service {
 
   version = () => this.seq
 
+  route() {
+    return this.pickRoute
+  }
+
   enter() {
-    if (this.picking) return
-    this.picking = true
-    this.hover = null
-    this.marquee = null
-    this.marqueeHits = []
-    this.bump()
-    this.emitMode()
+    this.applyMode(true)
+    this.publishMode(true)
   }
 
   exit() {
-    if (!this.picking && !this.hover && !this.marquee) return
-    this.picking = false
-    this.hover = null
-    this.marquee = null
-    this.marqueeHits = []
-    this.bump()
-    this.emitMode()
+    this.applyMode(false)
+    this.publishMode(false)
   }
 
   toggle() {
@@ -76,17 +95,39 @@ export class PickService extends Service {
       this.bump()
       return
     }
+    this.applyRefs(refs)
+    if (this.popout) {
+      this.publish({ type: 'picked', source: this.source, refs })
+      return
+    }
+    // 选取模式下点一次对象就打开聊天窗；关窗后 picking=false，草稿同步不会再弹窗。
+    if (this.picking && typeof window !== 'undefined') this.emitAttached()
+  }
+
+  private applyRefs(refs: PickRef[]) {
     this.refs = dedupePicks([...this.refs, ...refs])
     this.hover = null
     this.marquee = null
     this.marqueeHits = []
     this.bump()
-    // 选取模式下点一次对象就打开聊天窗；关窗后 picking=false，草稿同步不会再弹窗。
-    if (this.picking && typeof window !== 'undefined') this.emitAttached()
   }
 
   /** 把选区交给对话框；不依赖选取模式。可带一句指令，composer 灌进输入框并可直接发送。 */
   attach(refs: PickRef[], draft?: PickDraft) {
+    if (this.popout) {
+      const nextDraft = draft?.text.trim()
+        ? { text: draft.text.trim(), send: Boolean(draft.send) }
+        : undefined
+      this.applyRefs(refs)
+      this.publish({
+        type: 'picked',
+        source: this.source,
+        refs,
+        attach: true,
+        ...(nextDraft ? { draft: nextDraft } : {}),
+      })
+      return
+    }
     if (draft?.text.trim()) this.draft = { text: draft.text.trim(), send: Boolean(draft.send) }
     const picking = this.picking
     this.addMany(refs)
@@ -107,6 +148,59 @@ export class PickService extends Service {
   private emitMode() {
     if (typeof window === 'undefined') return
     window.dispatchEvent(new CustomEvent('biu:pick-mode', { detail: { picking: this.picking } }))
+  }
+
+  private applyMode(picking: boolean) {
+    if (this.picking === picking && !this.hover && !this.marquee) return
+    this.picking = picking
+    this.hover = null
+    this.marquee = null
+    this.marqueeHits = []
+    this.bump()
+    this.emitMode()
+  }
+
+  private publishMode(picking: boolean) {
+    if (this.popout) {
+      this.publish({ type: 'request-mode', source: this.source, picking })
+      return
+    }
+    this.pickRoute = window.location.pathname
+    this.publish({
+      type: 'mode',
+      source: this.source,
+      picking,
+      route: this.pickRoute,
+    })
+  }
+
+  private publish(message: PickSyncMessage) {
+    this.channel?.postMessage(message)
+  }
+
+  private receive(value: unknown) {
+    if (!value || typeof value !== 'object') return
+    const message = value as Partial<PickSyncMessage>
+    if (!message.type || message.source === this.source) return
+    if (message.type === 'hello') {
+      if (!this.popout) this.publishMode(this.picking)
+      return
+    }
+    if (message.type === 'request-mode') {
+      if (this.popout || typeof message.picking !== 'boolean') return
+      this.applyMode(message.picking)
+      this.publishMode(message.picking)
+      return
+    }
+    if (message.type === 'mode') {
+      if (!this.popout || typeof message.picking !== 'boolean') return
+      if (typeof message.route === 'string' && message.route) this.pickRoute = message.route
+      this.applyMode(message.picking)
+      return
+    }
+    if (message.type !== 'picked' || this.popout || !Array.isArray(message.refs)) return
+    if (message.attach) this.attach(message.refs, message.draft)
+    else this.addMany(message.refs)
   }
 
   removeLast() {
