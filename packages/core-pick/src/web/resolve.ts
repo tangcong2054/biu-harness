@@ -10,6 +10,7 @@ const PLUGIN = 'data-biu-plugin'
 const PATH = 'data-biu-path'
 const TITLE = 'data-biu-title'
 const TEXT = 'data-biu-text'
+const SELECTION = 'data-biu-selection'
 const FIELD = 'data-biu-field'
 
 type ClientBox = { left: number; top: number; width: number; height: number }
@@ -61,6 +62,7 @@ export function resolvePickFromNode(
   let path: string | undefined
   let title: string | undefined
   let text: string | undefined
+  let selection: string | undefined
   let field: string | undefined
   let highlight: HTMLElement | null = null
   let node: Element | null = start
@@ -75,8 +77,9 @@ export function resolvePickFromNode(
       const nextPath = read(node, PATH)
       const nextTitle = read(node, TITLE)
       const nextText = read(node, TEXT)
+      const nextSelection = read(node, SELECTION)
       const nextField = read(node, FIELD)
-      if (!highlight && (nextKind || nextId || nextAction || nextLabel || nextPlugin || nextPath || nextField)) highlight = node
+      if (!highlight && (nextKind || nextId || nextAction || nextLabel || nextPlugin || nextPath || nextSelection || nextField)) highlight = node
       if (!kind) kind = nextKind
       if (!id) id = nextId
       if (!action) action = nextAction
@@ -85,6 +88,7 @@ export function resolvePickFromNode(
       if (!path) path = nextPath
       if (!title) title = nextTitle
       if (!text) text = nextText
+      if (!selection) selection = nextSelection
       if (!field) field = nextField
     }
     if (kind && id && highlight) break
@@ -94,6 +98,12 @@ export function resolvePickFromNode(
     const host = start.closest('[data-biu-plugin], [data-page-block-plugin], [data-plugin-id]')
     plugin =
       (host instanceof Element ? read(host, PLUGIN) || read(host, 'data-page-block-plugin') || read(host, 'data-plugin-id') : undefined)
+  }
+  // 子元素可以有自己的 kind/id，同时从组件根继承一份非 DOM 上下文。
+  // 这样点中结果单元格时仍会把整个组件当前展示快照交给 agent。
+  if (!selection) {
+    const host = start.closest(`[${SELECTION}]`)
+    selection = host instanceof Element ? read(host, SELECTION) : undefined
   }
   if (!kind || !id || !highlight) return editorBlockPick(start, route, surface)
   return {
@@ -107,6 +117,7 @@ export function resolvePickFromNode(
         ...(path ? { path } : {}),
         ...(field ? { field } : {}),
         ...(text ? { text } : {}),
+        ...(selection ? { selection } : {}),
         label: label || id,
         title: title || label || id,
         route,
@@ -132,6 +143,7 @@ function stripPickMarks(root: HTMLElement) {
     node.removeAttribute('data-biu-path')
     node.removeAttribute('data-biu-title')
     node.removeAttribute('data-biu-text')
+    node.removeAttribute('data-biu-selection')
     node.removeAttribute('data-biu-field')
   }
 }
@@ -179,7 +191,15 @@ function withHtmlElement(ref: PickRef, start: Element, highlight: HTMLElement): 
 function withEditorPickContext(ref: PickRef, el: HTMLElement, start: Element = el): PickRef {
   const sourced = withHtmlElement(withHostSource(ref, el), start, el)
   const locus = editorLocusFromNode(el)
-  const next = locus ? { ...withPickLocus(sourced, locus), id: ref.id, ...(sourced.element ? { element: sourced.element } : {}) } : sourced
+  const next = locus
+    ? {
+        ...withPickLocus(sourced, locus),
+        id: ref.id,
+        // 插件显式提供的非 DOM 选区（例如 xterm buffer）比编辑器块源码选区更准确。
+        ...(ref.selection ? { selection: ref.selection } : {}),
+        ...(sourced.element ? { element: sourced.element } : {}),
+      }
+    : sourced
   if (ref.kind !== 'html' || next.selection) return next
   const snippet = pickPreview(el.textContent ?? '', 120)
   return snippet ? { ...next, selection: snippet } : next

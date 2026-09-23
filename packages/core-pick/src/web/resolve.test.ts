@@ -560,6 +560,55 @@ test('clicking a cell reads field path and value from the td', () => {
   row.remove()
 })
 
+test('identified child inherits the component snapshot selection', () => {
+  const component = document.createElement('div')
+  component.setAttribute('data-biu-kind', 'websql')
+  component.setAttribute('data-biu-id', 'block-1')
+  component.setAttribute('data-biu-selection', '{"componentId":"block-1","database":"app","sql":"SELECT 1"}')
+  const cell = document.createElement('td')
+  cell.setAttribute('data-biu-kind', 'websql-cell')
+  cell.setAttribute('data-biu-id', 'block-1:result:0:0')
+  cell.setAttribute('data-biu-label', 'id · 1')
+  component.append(cell)
+  document.body.append(component)
+  const hit = resolvePickFromNode(cell, '/pages/p1')
+  assert.ok(hit)
+  assert.equal(hit.ref.id, 'block-1:result:0:0')
+  assert.equal(hit.ref.selection, '{"componentId":"block-1","database":"app","sql":"SELECT 1"}')
+  component.remove()
+})
+
+test('plugin surface exposes a non-DOM selection to the agent', () => {
+  const root = document.createElement('div')
+  const terminal = document.createElement('canvas')
+  terminal.setAttribute('data-biu-kind', 'terminal')
+  terminal.setAttribute('data-biu-id', 'terminal:s1')
+  terminal.setAttribute('data-biu-label', '终端选区')
+  terminal.setAttribute('data-biu-plugin', 'page-terminal')
+  terminal.setAttribute('data-biu-selection', 'npm test\n42 passed')
+  root.append(terminal)
+  document.body.append(root)
+  bindEditorTextHost(root, {
+    path: '/pages/p1',
+    locusFromSelection: () => null,
+    locusFromElement: () => ({
+      start_line: 1931,
+      end_line: 1931,
+      text: ':::pageBlock {kind=terminal}',
+      selection: '错误的页面源码选区',
+    }),
+  })
+  const hit = resolvePickFromNode(terminal, '/pages/p1')
+  assert.ok(hit)
+  assert.equal(hit.ref.kind, 'terminal')
+  assert.equal(hit.ref.plugin, 'page-terminal')
+  assert.equal(hit.ref.selection, 'npm test\n42 passed')
+  assert.equal(hit.ref.start_line, 1931)
+  assert.match(formatPicks([hit.ref]), /"selection":"npm test\\n42 passed"/)
+  bindEditorTextHost(root, null)
+  root.remove()
+})
+
 test('dedupePicks keeps one chip per kind+id', () => {
   const refs = dedupePicks([
     { kind: 'task', id: 't1', label: '甲', route: '/tasks' },

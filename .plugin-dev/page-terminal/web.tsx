@@ -16,6 +16,7 @@ const HISTORY_MAX = 200      // 最多保留的命令条数
 const HISTORY_OUT_LINES = 10 // 每条命令最多保留的输出行数
 const HISTORY_OUT_CHARS = 600 // 单条输出字符上限，防止撑爆 markdown
 const OUTPUT_SETTLE_MS = 600 // 输出安静这么久，就认为这条命令跑完了
+const PICK_SELECTION_CHARS = 12_000 // 避免超大终端选区撑爆 agent 上下文
 
 type HistoryEntry = { cmd: string; at: number; out?: string }
 
@@ -43,8 +44,8 @@ function parseHistory(raw: unknown): HistoryEntry[] {
 
 // ---------------------------------------------------------------------------
 // xterm 附带的「辅助节点」处理（踩坑总结，改动前务必读 README）：
-//  1. helper-textarea 是 xterm 接收键盘输入的节点，**不能 display:none**
-//     —— 隐藏元素无法聚焦，会导致整个终端打不了字。
+//  1. helper-textarea 是 xterm 接收键盘和 IME 组合输入的节点，必须让 xterm
+//     管理它的位置和尺寸；这里只保证它可聚焦且视觉透明。
 //  2. .xterm-helpers 里住着字符测量元素，**不能整块压掉**，
 //     否则它量不出字符宽度 → 字间距错乱、光标消失。
 //  3. 字符测量元素会因祖先 transform/backdrop-filter 改变包含块而显形，
@@ -59,7 +60,6 @@ const BURIED_SELECTORS = [
   '.xterm-accessibility-tree',
   '.xterm-message',
   '.live-region',
-  '.composition-view',
 ].join(',')
 
 function decodePtyChunk(data: unknown, onText: (text: string) => void) {
@@ -82,22 +82,7 @@ function decodePtyChunk(data: unknown, onText: (text: string) => void) {
 
 function styleHelperTextarea(el: HTMLElement) {
   const s = el.style
-  s.setProperty('position', 'absolute', 'important')
-  s.setProperty('left', '-9999px', 'important')
-  s.setProperty('top', '0', 'important')
-  s.setProperty('width', '1px', 'important')
-  s.setProperty('height', '1px', 'important')
-  s.setProperty('opacity', '0', 'important')
-  s.setProperty('color', 'transparent', 'important')
-  s.setProperty('caret-color', 'transparent', 'important')
-  s.setProperty('background', 'transparent', 'important')
-  s.setProperty('border', '0', 'important')
-  s.setProperty('padding', '0', 'important')
-  s.setProperty('margin', '0', 'important')
-  s.setProperty('overflow', 'hidden', 'important')
-  s.setProperty('resize', 'none', 'important')
-  s.setProperty('z-index', '-5', 'important')
-  // 不要 display:none。
+  s.setProperty('opacity', '0')
   s.removeProperty('display')
 }
 
@@ -294,7 +279,8 @@ function buryAuxiliaryNodes(root: HTMLElement) {
   }
 }
 
-const STYLE_ID = 'pt-xterm-style-v5'
+// v6 supersedes pt-xterm-style-v5 without restoring its IME-breaking position overrides.
+const STYLE_ID = 'pt-xterm-style-v6'
 const STYLE_CSS = `
 .pt-card{
   display:flex;flex-direction:column;overflow:hidden;
@@ -311,6 +297,8 @@ const STYLE_CSS = `
 .pt-title{color:rgba(242,241,237,.78);font-weight:600;letter-spacing:-.01em}
 .pt-history{border-bottom:1px solid rgba(255,255,255,.06);background:#161616}
 .pt-mount{position:absolute;inset:0;overflow:hidden;box-sizing:border-box;overscroll-behavior:contain}
+.pt-pick-layer{display:none;position:absolute;inset:0;z-index:30;background:transparent;pointer-events:none}
+.pick-mode .pt-pick-layer{display:block;pointer-events:auto;cursor:crosshair}
 .pt-mount .xterm{
   width:100%;height:100%;
   padding:9px 8px 5px 10px;
@@ -332,12 +320,6 @@ const STYLE_CSS = `
 }
 .pt-pane .xterm-screen { background: transparent !important; }
 .pt-pane canvas { background: transparent !important; }
-.pt-pane .xterm-helper-textarea{
-  position:absolute !important;top:0;left:-9999em;z-index:-5;
-  width:0;height:0;margin:0 !important;padding:0 !important;
-  overflow:hidden;resize:none;border:0 !important;outline:0 !important;
-  opacity:0 !important;background:transparent !important;
-}
 .pt-pane .xterm-char-measure-element,
 .pt-pane .xterm-width-cache-measure-container{
   position:absolute !important;top:0 !important;left:-9999em !important;
@@ -489,12 +471,14 @@ function TerminalSurface({
   useTerminalStyle()
   const pane = useRef<HTMLDivElement | null>(null)
   const mount = useRef<HTMLDivElement | null>(null)
+  const pickLayer = useRef<HTMLDivElement | null>(null)
   const instance = useRef<Terminal | null>(null)
 
   useLayoutEffect(() => {
     const paneEl = pane.current
     const element = mount.current
-    if (!paneEl || !element) return
+    const pickLayerEl = pickLayer.current
+    if (!paneEl || !element || !pickLayerEl) return
 
     let disposed = false
     let frame = 0
@@ -506,6 +490,8 @@ function TerminalSurface({
     let buryObs: MutationObserver | undefined
     let dataSub: { dispose(): void } | undefined
     let resizeSub: { dispose(): void } | undefined
+    let selectionSub: { dispose(): void } | undefined
+    let scrollSub: { dispose(): void } | undefined
     let outTimer: number | undefined
 
     const historyRef = [...history]
@@ -630,9 +616,37 @@ function TerminalSurface({
           overflow: 'hidden',
           boxSizing: 'border-box',
         })
+        const syncPickSelection = () => {
+          if (!term?.element) return
+          const selected = term.getSelection()
+          const buffer = term.buffer.active
+          const visibleLines: string[] = []
+          const visibleEnd = Math.min(buffer.length, buffer.viewportY + term.rows)
+          for (let line = buffer.viewportY; line < visibleEnd; line += 1) {
+            visibleLines.push(buffer.getLine(line)?.translateToString(true) ?? '')
+          }
+          const visible = visibleLines.join('\n').trim()
+          const raw = selected || visible
+          const content =
+            raw.length > PICK_SELECTION_CHARS
+              ? `${raw.slice(0, PICK_SELECTION_CHARS)}\n…（终端内容已截断）`
+              : raw
+          pickLayerEl.setAttribute('data-biu-kind', 'terminal')
+          pickLayerEl.setAttribute('data-biu-id', `terminal:${sessionKey}`)
+          pickLayerEl.setAttribute('data-biu-label', selected ? '终端选区' : '终端当前画面')
+          pickLayerEl.setAttribute('data-biu-plugin', name)
+          if (content) pickLayerEl.setAttribute('data-biu-selection', content)
+          else pickLayerEl.removeAttribute('data-biu-selection')
+        }
         buryAuxiliaryNodes(element)
-        buryObs = new MutationObserver(() => buryAuxiliaryNodes(element))
+        buryObs = new MutationObserver(() => {
+          buryAuxiliaryNodes(element)
+          syncPickSelection()
+        })
         buryObs.observe(element, { childList: true, subtree: true })
+        selectionSub = term.onSelectionChange(syncPickSelection)
+        scrollSub = term.onScroll(syncPickSelection)
+        syncPickSelection()
         detachScroll = attachScrollRail(term, paneEl)
         try {
           if (!fitToVisibleBox(term, element)) fit.fit()
@@ -654,20 +668,23 @@ function TerminalSurface({
         socket.addEventListener('message', (event) => {
           decodePtyChunk(event.data, (chunk) => {
             if (!chunk || disposed || !term) return
-            term.write(chunk)
+            term.write(chunk, syncPickSelection)
             recordOutput(chunk)
           })
         })
         socket.addEventListener('close', (event) => {
           if (disposed || event.code === 1000 || !term) return
           const why = event.reason?.trim() || `code ${event.code}`
-          term.write(`\r\n\x1b[31m终端未能启动：${why}\x1b[0m\r\n`)
+          term.write(`\r\n\x1b[31m终端未能启动：${why}\x1b[0m\r\n`, syncPickSelection)
         })
         dataSub = term.onData((data) => {
           recordInput(data)
           send({ type: 'input', data })
         })
-        resizeSub = term.onResize(({ cols, rows }) => send({ type: 'resize', cols, rows }))
+        resizeSub = term.onResize(({ cols, rows }) => {
+          send({ type: 'resize', cols, rows })
+          syncPickSelection()
+        })
       }
       try {
         if (!term || !fit) return
@@ -706,6 +723,8 @@ function TerminalSurface({
       detachScroll()
       dataSub?.dispose()
       resizeSub?.dispose()
+      selectionSub?.dispose()
+      scrollSub?.dispose()
       try {
         socket?.close()
       } catch {
@@ -720,6 +739,12 @@ function TerminalSurface({
     <div
       ref={pane}
       className="pt-pane"
+      onPointerDownCapture={(event) => {
+        if (!document.documentElement.classList.contains('pick-mode')) return
+        // Pick 在 pointerup 时读取属性；先拦住 xterm，避免这次点击清空刚才的选区。
+        event.preventDefault()
+        event.stopPropagation()
+      }}
       onKeyDown={(event) => event.stopPropagation()}
       onMouseDown={(event) => {
         event.stopPropagation()
@@ -745,6 +770,7 @@ function TerminalSurface({
       }}
     >
       <div ref={mount} className="pt-mount" />
+      <div ref={pickLayer} className="pt-pick-layer" aria-hidden="true" />
     </div>
   )
 }
