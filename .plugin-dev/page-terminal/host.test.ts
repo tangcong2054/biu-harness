@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { test } from 'vitest'
 import { activeSocketAfterDetach, broadcastSockets, buildMysqlArgs, isUnsafeMysqlSql, type Socket } from './host.ts'
 
@@ -11,6 +12,12 @@ function socket(sent: string[]): Socket {
     on: () => undefined,
   }
 }
+
+test('presentation icon uses the resolved terminal zoom state', () => {
+  const web = readFileSync(new URL('./web.tsx', import.meta.url), 'utf8')
+  assert.match(web, /<ExpandIcon shrink=\{zoomed\} \/>/)
+  assert.doesNotMatch(web, /\bzoom\.zoomed\b/)
+})
 
 test('mysql batch arguments keep credentials out of argv', () => {
   const args = buildMysqlArgs('select 1', {

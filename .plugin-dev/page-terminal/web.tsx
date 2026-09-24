@@ -1331,7 +1331,7 @@ function PageTerminal({
             }
           }}
         >
-          <ExpandIcon shrink={zoom.zoomed} />
+          <ExpandIcon shrink={zoomed} />
         </IconButton>
       </header>
       <HistoryPanel
