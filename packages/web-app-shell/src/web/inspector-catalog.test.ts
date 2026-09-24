@@ -27,6 +27,8 @@ test('inspector header keeps opened tabs on top and a plus menu on the right', (
   assert.match(css, /\.inspector-empty-item\s*\{[^}]*color:\s*var\(--dsw-icon\)/s)
   assert.match(css, /\.inspector-empty-item:hover\s*\{[^}]*color:\s*var\(--dsw-icon-active\)/s)
   assert.match(inspector, /item.Tab/)
+  assert.match(inspector, /focused\.closest\('\[data-testid="inspector-catalog"\]'\)/)
+  assert.match(inspector, /focused\.blur\(\)/)
   assert.match(inspector, /pruneOpenedForCollections/)
   assert.match(inspector, /biu:inspector-opened/)
 })
@@ -69,6 +71,13 @@ test('plus menu can add another database tab', () => {
   assert.match(css, /\.inspector-add-close/)
   assert.match(css, /html:not\(\.dark\) \.inspector-add-menu[\s\S]*color:\s*#5f5e5a/)
   assert.match(css, /html:not\(\.dark\) \.inspector-add-row-main svg[\s\S]*color:\s*#91918e/)
+})
+
+test('restoring a session mounts only the active inspector pane', () => {
+  assert.match(inspector, /mountedScope/)
+  assert.match(inspector, /setMountedScope\(\{ sessionId, tabs: open && tabNext \? \[tabNext\] : \[\] \}\)/)
+  assert.match(inspector, /headerTabs\.filter\(\(item\) => mountedScope\.tabs\.includes\(item\.id\)\)/)
+  assert.match(inspector, /open && mountedScope\.sessionId === sessionId/)
 })
 
 test('inspector header tabs sit on the same vertical center as the main header', () => {

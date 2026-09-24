@@ -140,6 +140,10 @@ export const SessionInspector = memo(function SessionInspector({
 
   const [tab, setTabState] = useState('')
   const [opened, setOpened] = useState<string[]>([])
+  const [mountedScope, setMountedScope] = useState<{ sessionId: string | null; tabs: string[] }>({
+    sessionId,
+    tabs: [],
+  })
   const inspectorReady = useSessionView((state) => state.inspectorReady)
   const sessionInspector = useSessionView((state) => state.sessionInspector)
   const [plusOpen, setPlusOpen] = useState(false)
@@ -204,6 +208,7 @@ export const SessionInspector = memo(function SessionInspector({
     if (!sessionId) {
       setOpened([])
       setTabState('')
+      setMountedScope({ sessionId: null, tabs: [] })
       restoreInspectorDbPaths({})
       hydratingRef.current = false
       return
@@ -211,6 +216,7 @@ export const SessionInspector = memo(function SessionInspector({
     if (!inspectorReady) {
       setOpened([])
       setTabState('')
+      setMountedScope({ sessionId, tabs: [] })
       restoreInspectorDbPaths({})
       return
     }
@@ -221,6 +227,7 @@ export const SessionInspector = memo(function SessionInspector({
     tabRef.current = tabNext
     setOpened(openedNext)
     setTabState(tabNext)
+    setMountedScope({ sessionId, tabs: open && tabNext ? [tabNext] : [] })
     restoreInspectorDbPaths(bind?.dbPaths ?? {})
     if (tabNext) {
       queueMicrotask(() => {
@@ -231,6 +238,15 @@ export const SessionInspector = memo(function SessionInspector({
       hydratingRef.current = false
     }
   }, [captureBind, inspectorReady, sessionId, sessionView])
+
+  useEffect(() => {
+    if (!open || !sessionId || !tab) return
+    setMountedScope((current) => {
+      const tabs = current.sessionId === sessionId ? current.tabs : []
+      if (tabs.includes(tab)) return current
+      return { sessionId, tabs: [...tabs, tab] }
+    })
+  }, [open, sessionId, tab])
 
   useEffect(() => {
     return subscribeInspectorDbPath(() => pushInspector({ dbPaths: snapshotInspectorDbPaths() }))
@@ -340,6 +356,10 @@ export const SessionInspector = memo(function SessionInspector({
   const extraActive = headerTabs.find((item) => item.id === tab)
 
   function pickOffer(item: (typeof extraTabs)[number]) {
+    const focused = document.activeElement
+    if (focused instanceof HTMLElement && focused.closest('[data-testid="inspector-catalog"]')) {
+      focused.blur()
+    }
     if (item.action) {
       requestInspectorAction(item.action)
       return
@@ -555,7 +575,10 @@ export const SessionInspector = memo(function SessionInspector({
       </div>
 
       <div className="inspector-stage">
-        {headerTabs.map((item) => {
+        {(open && mountedScope.sessionId === sessionId
+          ? headerTabs.filter((item) => mountedScope.tabs.includes(item.id))
+          : []
+        ).map((item) => {
           const Pane = item.entry.Component
           if (!Pane) return null
           const active = item.id === tab

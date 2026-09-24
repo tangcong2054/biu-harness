@@ -129,8 +129,8 @@ export type InboxQueueItem = {
   text: string
 }
 
-/** 打开会话与上翻分页都只拉最近 / 更早的 100 轮，不再一次全量。 */
-export const SESSION_TAIL_TURNS = 100
+/** 打开会话与上翻分页分批拉取，避免长会话一次渲染数千条事件和附件。 */
+export const SESSION_TAIL_TURNS = 24
 export const TRAJECTORY_TAIL_TURNS = 48
 export const SESSION_LOAD_TURNS = SESSION_TAIL_TURNS
 

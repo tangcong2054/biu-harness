@@ -303,6 +303,7 @@ test('stamps agent createdBy with the session title from /sessions', async () =>
   const ctx = new Context()
   const db = new DatabaseService(ctx)
   db.register(notesCollection())
+  let sessionReads = 0
   const sessions = new Map<string, { id: string; title: string }>([
     ['sess-agent-1', { id: 'sess-agent-1', title: '蓝团爱' }],
   ])
@@ -317,11 +318,17 @@ test('stamps agent createdBy with the session title from /sessions', async () =>
       },
     },
     list: () => [...sessions.values()],
-    get: (id) => sessions.get(id) ?? null,
+    get: async (id) => {
+      sessionReads += 1
+      return sessions.get(id) ?? null
+    },
   })
   const written = await runWithSession('sess-agent-1', () => db.update('/notes/n1', { status: 'done' }))
   assert.deepEqual(written.value.createdBy, { kind: 'agent', name: '蓝团爱', sessionId: 'sess-agent-1' })
   assert.deepEqual(written.value.updatedBy, [{ kind: 'agent', name: '蓝团爱', sessionId: 'sess-agent-1' }])
+  sessionReads = 0
+  await db.list('/notes')
+  assert.equal(sessionReads, 0, 'synchronous list decoration must not probe an async sessions getter')
 })
 
 test('updates stamp createdBy and updatedBy from the current actor', async () => {

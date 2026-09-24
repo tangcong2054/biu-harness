@@ -434,7 +434,7 @@ test('ingest merges live content/edits on the same seq so later files are not dr
   )
 })
 
-test('load fetches full session turns and skips trajectory until ensureTrajectory', async () => {
+test('load fetches a bounded session tail and skips trajectory until ensureTrajectory', async () => {
   const calls: string[] = []
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = String(input)
@@ -481,7 +481,7 @@ test('load fetches full session turns and skips trajectory until ensureTrajector
   await ctx.plugin(sessionView)
   const view = ctx.sessionView as SessionViewService
   await view.load('s1', { view: 'chat', wait: true })
-  assert.equal(calls.some((url) => url.includes('turns=100')), true)
+  assert.equal(calls.some((url) => url.includes('turns=24')), true)
   assert.equal(calls.some((url) => url.includes('turns=all')), false)
   assert.equal(view.get().events.some((event) => event.type === 'assistant/chunk'), false)
   assert.equal(view.get().trajectory.length, 0)
@@ -496,7 +496,7 @@ test('load fetches full session turns and skips trajectory until ensureTrajector
   await view.ensureTrajectory()
   assert.equal(calls.some((url) => url.includes('/trajectory?turns=')), true)
   assert.equal(view.get().trajectory.length, 1)
-  assert.equal(calls.some((url) => url.includes('turns=24')), false)
+  assert.equal(calls.some((url) => url.includes('/trajectory?turns=48')), true)
 })
 
 test('load applies inspector bind from GET session, not the list cache', async () => {

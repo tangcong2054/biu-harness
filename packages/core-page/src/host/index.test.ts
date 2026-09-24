@@ -364,6 +364,7 @@ test('PagesStore reads existing markdown files from .biu/page', async () => {
     'utf8',
   )
   let reads = 0
+  let lists = 0
   const inner = ctx.fs
   const store = new PagesStore({
     resolve: (rel) => inner.resolve(rel),
@@ -372,7 +373,10 @@ test('PagesStore reads existing markdown files from .biu/page', async () => {
       return inner.read(rel)
     },
     write: (rel, content) => inner.write(rel, content),
-    list: (rel) => inner.list(rel),
+    list: (rel) => {
+      lists += 1
+      return inner.list(rel)
+    },
   })
   const listed = await store.list()
   assert.equal(listed.length, 1)
@@ -386,13 +390,16 @@ test('PagesStore reads existing markdown files from .biu/page', async () => {
   const home = await store.get('home')
   assert.equal(home?.notes, 'hello\n')
   assert.equal(reads, afterListReads)
+  assert.equal(lists, 1)
   await writeFile(join(root, PAGE_ROOT, 'other.md'), dumpMarkdown({ title: 'Other' }, ''), 'utf8')
   const onlyHome = await store.list(['home'])
   assert.equal(onlyHome.length, 1)
   assert.equal(onlyHome[0]?.id, 'home')
   const all = await store.list()
-  assert.equal(all.map((row) => row.id).sort().join(','), 'home,other')
+  assert.equal(all.map((row) => row.id).join(','), 'home')
+  assert.equal(lists, 1)
   assert.equal(existsSync(join(root, PAGE_ROOT, 'home.md')), false)
+  assert.equal(existsSync(join(root, PAGE_ROOT, 'other.md')), true)
 })
 
 test('markdown and declared block fields pick asset pointers', () => {

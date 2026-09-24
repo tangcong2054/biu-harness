@@ -863,12 +863,20 @@ export class DatabaseService extends Service implements Database {
   }
 
   private peekSessionName(sessionId: string): string {
+    const serviceTitle = sessionTitleFromRow(this.sessionsService()?.peek?.(sessionId))
+    if (serviceTitle) return serviceTitle
     const sessions = this.collection('/sessions')
-    const row = sessions?.get?.(sessionId)
-    if (row && typeof (row as Promise<unknown>).then !== 'function') {
-      return sessionTitleFromRow(row)
+    // Do not invoke an async collection getter from this synchronous decoration
+    // path. The sessions getter scans summaries and logs; merely probing it once
+    // per person made a small page list take several seconds.
+    const getter = sessions?.get
+    if (getter && getter.constructor.name !== 'AsyncFunction') {
+      const row = getter(sessionId)
+      if (row && typeof (row as Promise<unknown>).then !== 'function') {
+        return sessionTitleFromRow(row)
+      }
     }
-    return sessionTitleFromRow(this.sessionsService()?.peek?.(sessionId))
+    return ''
   }
 
   private sessionsService(): { peek?: (id: string) => unknown; get?: (id: string) => Promise<unknown> } | undefined {

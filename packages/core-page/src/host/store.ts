@@ -152,20 +152,23 @@ export class PagesStore {
   ) {}
 
   private db: import('node:sqlite').DatabaseSync | null = null
+  private ready: Promise<import('node:sqlite').DatabaseSync> | null = null
 
   private async ensureDirs() {
     migrateLegacyPageDir(this.fs.resolve('.'))
     await mkdir(this.assetsDir, { recursive: true })
   }
 
-  private async openDb() {
-    await this.ensureDirs()
-    if (this.db) return this.db
-    const db = openAndMigrateBiu(this.fs.resolve(PAGE_DB), { foreignKeys: false })
-    this.db = db
-    await this.migrateMarkdown()
-    adoptCasAssets(this.fs.resolve(DATA_DIR_NAME))
-    return db
+  private openDb() {
+    this.ready ??= (async () => {
+      await this.ensureDirs()
+      const db = openAndMigrateBiu(this.fs.resolve(PAGE_DB), { foreignKeys: false })
+      this.db = db
+      await this.migrateMarkdown()
+      adoptCasAssets(this.fs.resolve(DATA_DIR_NAME))
+      return db
+    })()
+    return this.ready
   }
 
   async sqlite() {
@@ -213,7 +216,6 @@ export class PagesStore {
 
   async list(ids?: string[]): Promise<PageRow[]> {
     const db = await this.openDb()
-    await this.migrateMarkdown()
     if (ids) {
       const rows: PageRow[] = []
       for (const id of ids) {
@@ -234,7 +236,6 @@ export class PagesStore {
   async get(id: string): Promise<PageRow | null> {
     if (!ID_RE.test(id)) return null
     const db = await this.openDb()
-    await this.migrateMarkdown()
     const hit = db.prepare(`
       SELECT id, title, parent_id,
         depends_on_json, emoji, created_at, updated_at
