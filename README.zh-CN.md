@@ -667,6 +667,9 @@ export CHAT_MODEL=deepseek-chat # 可选
 | `CTX_BUDGET` | 未设置 | 兼容旧配置；设置后作为比模型预算更严格的 messages 上限，`0` 不再关闭模型安全保护 |
 | `TENCENT_TOKEN_PLAN_TPM` | `3000000` | 腾讯云 Token Plan 每模型 TPM；自动识别 `api.lkeap.cloud.tencent.com/plan/*` 并在进程内按 60 秒滚动窗口排队 |
 | `TENCENT_TOKEN_PLAN_TPM_HEADROOM` | `0.9` | Token Plan 本地限流安全系数，避免 tokenizer 估算误差再次撞上游限流 |
+| `BIU_LLM_LOG_DIR` | `.biu/logs` | LLM 限流诊断 JSONL 目录；不记录 Key、消息正文或工具参数 |
+| `BIU_LLM_LOG_MAX_BYTES` | `10485760` | 单个每日 LLM 日志文件轮转阈值（10MB） |
+| `BIU_LLM_LOG_RETENTION_DAYS` | `7` | LLM 诊断日志保留天数 |
 
 </details>
 

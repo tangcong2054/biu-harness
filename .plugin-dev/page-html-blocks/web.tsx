@@ -2,6 +2,7 @@ import { createPortal } from 'react-dom'
 import { bindHtmlSlide, collectHtmlSlides, cssBoxSize, htmlDeckEnabled, htmlDeckIndex, htmlDeckKeyAction, htmlLooksFillLayout, HTML_FILL_HOST_PX, stepHtmlDeck } from './html-deck.ts'
 import { injectHtmlSelectionBridge, parseHtmlSelectionMessage, suspendAncestorDrag } from './selection-bridge.ts'
 import { htmlBlockKey, stampHtmlPickSurfaces, stampHtmlSource } from './stamp-picks.ts'
+import { injectDeckBridge, probeDeckPages, sendDeckCommand } from './deck-bridge.ts'
 
 const React = globalThis.React
 const { useEffect, useLayoutEffect, useMemo, useRef, useState } = React
@@ -282,34 +283,104 @@ const pressBtn: Record<string, unknown> = {
   alignItems: 'center',
 }
 
-function SelectableHtmlFrame({
+/** 一格放映内容。htmlframe 走 iframe（注了桥，可被父页驱动翻页）。 */
+function DeckFrame({
+  frameRef,
   html,
-  title,
-  style,
+  kind,
+  index,
+  multi,
+  onKey,
+  onInfo,
 }: {
+  /* 由父组件持有，父组件要靠它向块内发指令 */
+  frameRef: { current: HTMLIFrameElement | null }
   html: string
-  title: string
-  style: Record<string, unknown>
+  kind: 'html' | 'htmlframe'
+  index: number
+  /* 是否多块连放：决定单页块要不要把按键交给放映器 */
+  multi?: boolean
+  onKey?: (cmd: string) => void
+  onInfo?: (info: { total: number; page: number }) => void
 }) {
-  const frameRef = useRef<HTMLIFrameElement | null>(null)
+  const keyRef = useRef(onKey)
+  keyRef.current = onKey
+  const infoRef = useRef(onInfo)
+  infoRef.current = onInfo
   const nonceRef = useRef(`html-selection-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`)
-  const bridgedHtml = useMemo(() => injectHtmlSelectionBridge(html, nonceRef.current), [html])
+  const source = useMemo(
+    () => injectHtmlSelectionBridge(injectDeckBridge(html), nonceRef.current),
+    [html],
+  )
   const selection = useFrameHtmlSelection(frameRef, nonceRef.current)
+
+  useEffect(() => {
+    if (kind !== 'htmlframe') return
+    const onMessage = (event: MessageEvent) => {
+      const frame = frameRef.current
+      if (!frame || event.source !== frame.contentWindow) return
+      const data = event.data as
+        | { __phpDeckKey?: string; __phpDeckInfo?: number; total?: number; page?: number }
+        | null
+      if (!data) return
+      if (data.__phpDeckKey) keyRef.current?.(data.__phpDeckKey)
+      if (data.__phpDeckInfo && typeof data.total === 'number') {
+        infoRef.current?.({ total: data.total, page: Number(data.page) || 0 })
+      }
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [kind, source])
+
+  const stamped = kind === 'html' ? stampHtmlSource(injectDeckBridge(html), `deck-${index}`, name) : ''
+  const fill = {
+    position: 'absolute' as const,
+    inset: 0,
+    width: '100%',
+    height: '100%',
+    maxWidth: 'none',
+    maxHeight: 'none',
+    minWidth: 0,
+    minHeight: 0,
+    border: 'none',
+    boxSizing: 'border-box' as const,
+  }
+
+  if (kind === 'htmlframe') {
+    return (
+      <>
+        <iframe
+          ref={frameRef}
+          title={`html-deck-${index}`}
+          srcDoc={source}
+          sandbox="allow-scripts"
+          onLoad={() => {
+            selection.clear()
+            /* 告诉桥：本次放映是否多块连放 */
+            try {
+              frameRef.current?.contentWindow?.postMessage({ __phpDeckCmd: 'cfg', multi: !!multi }, '*')
+            } catch {
+              /* 忽略 */
+            }
+            sendDeckCommand(frameRef.current, 'info')
+          }}
+          style={{ ...fill, background: MAG_INK, pointerEvents: 'auto' }}
+        />
+        {selection.bubble}
+      </>
+    )
+  }
   return (
-    <>
-      <iframe
-        ref={frameRef}
-        title={title}
-        srcDoc={bridgedHtml}
-        sandbox="allow-scripts"
-        onLoad={selection.clear}
-        style={{ ...style, pointerEvents: 'auto' }}
-      />
-      {selection.bubble}
-    </>
+    <div
+      data-testid="html-deck-slide"
+      style={{ ...fill, overflow: 'auto', background: 'transparent' }}
+      dangerouslySetInnerHTML={{ __html: stamped }}
+    />
   )
 }
 
+/** 放映一格 = 块的某一页。block 型每块一页；stream 型用块内那一叠当页。 */
+type DeckItem = { slide: ReturnType<typeof collectHtmlSlides>[number]; kindMode: 'htmlframe' | 'html'; page: number; total: number }
 function HtmlDeckOverlay({
   slides,
   index,
@@ -324,9 +395,106 @@ function HtmlDeckOverlay({
   const closeRef = useRef(onClose)
   closeRef.current = onClose
   const boxRef = useRef<HTMLDivElement | null>(null)
+  const frameRef = useRef<HTMLIFrameElement | null>(null)
   const [navHot, setNavHot] = useState(false)
+
+  const [item, setItem] = useState<DeckItem | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [pos, setPos] = useState(0)
+  /* 当前页的同步镜像：键盘闭包 / 周期上报都读它，避免读到过期的 state */
+  const posRef = useRef(0)
+  posRef.current = pos
+  /* 刚下发、还没被块内确认的页码。防止桥的旧上报把页码拉回去 */
+  const pendingRef = useRef<number | null>(null)
+
   const slide = slides[index]
   const total = slides.length
+  const pages = Math.max(1, item?.total ?? 1)
+  const page = Math.min(pos, pages - 1)
+
+  /* 进入一格：先按单页渲染，块内的桥会立刻上报真实页数。
+     这里刻意不做离屏探测——那会把块内容（计时器/请求/埋点）额外跑一遍。 */
+  useEffect(() => {
+    if (!slide) return
+    posRef.current = 0
+    pendingRef.current = null
+    setPos(0)
+    setItem({ slide, kindMode: slide.kind, page: 0, total: 1 })
+    setLoading(false)
+  }, [slide])
+
+  const goPage = (next: number) => {
+    const target = Math.min(Math.max(0, next), pages - 1)
+    posRef.current = target
+    pendingRef.current = target
+    setPos(target)
+    sendDeckCommand(frameRef.current, 'goto', target)
+  }
+
+  /* 换块后把新块复位到第一页 */
+  const switchTo = (next: number) => {
+    posRef.current = 0
+    pendingRef.current = null
+    setPos(0)
+    window.setTimeout(() => sendDeckCommand(frameRef.current, 'first'), 0)
+    onIndex(next)
+  }
+
+  /* 翻页 = 先翻块内的叠放页，翻到头才换块；往回同理 */
+  /* 翻块：只有真存在相邻块才切；已在首/末块就停住，不要回绕到本块第一页。 */
+  const goBlock = (delta: number) => {
+    const next = stepHtmlDeck(index, delta, total)
+    if (next === index) return
+    switchTo(next)
+  }
+
+  const step = (delta: number) => {
+    const cur = posRef.current
+    const target = cur + delta
+    if (target >= 0 && target < pages) {
+      goPage(target)
+      return
+    }
+    goBlock(delta)
+  }
+
+  const jump = (where: 'first' | 'last') => {
+    if (where === 'first') {
+      switchTo(0)
+      return
+    }
+    posRef.current = pages - 1
+    pendingRef.current = pages - 1
+    setPos(pages - 1)
+    sendDeckCommand(frameRef.current, 'last')
+    onIndex(Math.max(0, total - 1))
+  }
+
+  /*
+   * 块内自己按了方向键。注意：桥会 preventDefault 掉块内的默认处理，
+   * 所以这里必须显式把翻页指令发回块内，否则块内不会动、上报的页码会把 pos 拉回原地。
+   * 翻到边界才交给父页换块。
+   */
+  const onFrameKey = (cmd: string) => {
+    if (cmd === 'close') {
+      closeRef.current()
+      return
+    }
+    const cur = posRef.current
+    if (cmd === 'next') {
+      if (cur < pages - 1) goPage(cur + 1)
+      else goBlock(1)
+      return
+    }
+    if (cmd === 'prev') {
+      if (cur > 0) goPage(cur - 1)
+      else goBlock(-1)
+      return
+    }
+    if (cmd === 'first') jump('first')
+    else if (cmd === 'last') jump('last')
+  }
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const action = htmlDeckKeyAction(event.key)
@@ -337,13 +505,13 @@ function HtmlDeckOverlay({
       }
       event.preventDefault()
       event.stopPropagation()
-      if (action === 'first') onIndex(0)
-      else if (action === 'last') onIndex(Math.max(0, total - 1))
-      else onIndex(stepHtmlDeck(index, action, total))
+      if (action === 'first') jump(('first'))
+      else if (action === 'last') jump('last')
+      else step(action)
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [index, onIndex, total])
+  })
 
   useEffect(() => {
     const root = document.documentElement
@@ -363,19 +531,10 @@ function HtmlDeckOverlay({
   }, [])
 
   if (!slide) return null
-  const stamped = slide.kind === 'html' ? stampHtmlSource(slide.html, `deck-${index}`, name) : ''
-  const fill = {
-    position: 'absolute' as const,
-    inset: 0,
-    width: '100%',
-    height: '100%',
-    maxWidth: 'none',
-    maxHeight: 'none',
-    minWidth: 0,
-    minHeight: 0,
-    border: 'none',
-    boxSizing: 'border-box' as const,
-  }
+  const counter = pages > 1 ? `第 ${index + 1} / ${total} 块 · ${page + 1} / ${pages} 页` : `${index + 1} / ${total}`
+  const atStart = index <= 0 && page <= 0
+  const atEnd = index >= total - 1 && page >= pages - 1
+
   return createPortal(
     <div
       ref={boxRef}
@@ -409,17 +568,31 @@ function HtmlDeckOverlay({
           boxSizing: 'border-box',
         }}
       >
-        {slide.kind === 'htmlframe' ? (
-          <SelectableHtmlFrame
-            title={`html-deck-${index}`}
-            html={slide.html}
-            style={{ ...fill, background: MAG_INK }}
-          />
+        {loading || !item ? (
+          <div style={{ ...fillBox(), display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#8b93a7' }}>
+            载入中…
+          </div>
         ) : (
-          <div
-            data-testid="html-deck-slide"
-            style={{ ...fill, overflow: 'auto', background: 'transparent' }}
-            dangerouslySetInnerHTML={{ __html: stamped }}
+          <DeckFrame
+            key={`${index}-${item.total}`}
+            frameRef={frameRef}
+            html={slide.html}
+            kind={slide.kind}
+            index={index}
+            onKey={onFrameKey}
+            multi={total > 1}
+            onInfo={(info) => {
+              const t = Math.max(1, info.total)
+              setItem((cur) => (cur && cur.total !== t ? { ...cur, total: t } : cur))
+              const p = Math.min(Math.max(0, info.page), t - 1)
+              if (pendingRef.current != null) {
+                /* 还在等刚才那条指令落位：等到了就清掉，否则是过期上报，忽略 */
+                if (p === pendingRef.current) pendingRef.current = null
+                return
+              }
+              posRef.current = p
+              setPos(p)
+            }}
           />
         )}
       </div>
@@ -452,17 +625,17 @@ function HtmlDeckOverlay({
             pointerEvents: navHot ? 'auto' : 'none',
           }}
         >
-          <button type="button" style={{ ...barBtn, ...(index <= 0 ? { opacity: 0.35, cursor: 'default' } : {}) }} disabled={index <= 0} onClick={() => onIndex(stepHtmlDeck(index, -1, total))} aria-label="上一张">
+          <button type="button" style={{ ...barBtn, ...(atStart ? { opacity: 0.35, cursor: 'default' } : {}) }} disabled={atStart} onClick={() => step(-1)} aria-label="上一张">
             上一张
           </button>
           <span data-testid="html-deck-index" style={{ color: '#8b93a7', minWidth: 64, textAlign: 'center' }}>
-            {index + 1} / {total}
+            {counter}
           </span>
           <button
             type="button"
-            style={{ ...barBtn, ...(index >= total - 1 ? { opacity: 0.35, cursor: 'default' } : {}) }}
-            disabled={index >= total - 1}
-            onClick={() => onIndex(stepHtmlDeck(index, 1, total))}
+            style={{ ...barBtn, ...(atEnd ? { opacity: 0.35, cursor: 'default' } : {}) }}
+            disabled={atEnd}
+            onClick={() => step(1)}
             aria-label="下一张"
           >
             下一张
@@ -475,6 +648,16 @@ function HtmlDeckOverlay({
     </div>,
     document.body,
   )
+}
+
+function fillBox() {
+  return {
+    position: 'absolute' as const,
+    inset: 0,
+    width: '100%',
+    height: '100%',
+    boxSizing: 'border-box' as const,
+  }
 }
 
 function useHtmlDeck(
@@ -502,12 +685,14 @@ function useHtmlDeck(
     return () => bindHtmlSlide(host, null)
   }, [hostRef, html, kind, width, height, deck])
 
-  const start = () => {
+  /* 放映范围：默认只放当前块。想看同页其它块一起连放，按住 Alt 再点放大。 */
+  const start = (all = false) => {
     const host = hostRef.current?.closest('[data-page-block]') ?? null
-    const list = collectHtmlSlides(host)
-    if (!list.length) return
-    setSlides(list)
-    setIndex(htmlDeckIndex(list, host))
+    const list = all ? collectHtmlSlides(host) : collectHtmlSlides(host).filter((item) => item.host === host)
+    const scope = list.length ? list : collectHtmlSlides(host)
+    if (!scope.length) return
+    setSlides(scope)
+    setIndex(Math.max(0, htmlDeckIndex(scope, host)))
     setOpen(true)
   }
 
@@ -515,11 +700,12 @@ function useHtmlDeck(
     <HtmlDeckOverlay
       slides={slides.length ? slides : collectHtmlSlides(hostRef.current?.closest('[data-page-block]') ?? null)}
       index={index}
-      onIndex={(next) => {
-        const host = hostRef.current?.closest('[data-page-block]') ?? null
-        setSlides(collectHtmlSlides(host))
-        setIndex(next)
-      }}
+      /*
+       * 注意：这里不要重新 collect。曾因 host 解析为空而回退成「整页所有块」，
+       * 导致翻到边界时块集突然从 1 个变成 2 个、跳到别的块。
+       * 放映范围在 start() 时就定下来了，之后只改下标。
+       */
+      onIndex={setIndex}
       onClose={() => setOpen(false)}
     />
   ) : null
@@ -611,7 +797,7 @@ function FloatBar({
   editing: boolean
   setEditing: (v: boolean) => void
   ro: boolean
-  onExpand: () => void
+  onExpand: (all?: boolean) => void
   deck: boolean
   onDeck?: (next: boolean) => void
   sized?: boolean
@@ -699,7 +885,7 @@ function FloatBar({
         title="放大放映"
         aria-label="放大放映"
         onMouseDown={(event) => event.preventDefault()}
-        onClick={onExpand}
+        onClick={(event) => onExpand(event.altKey)}
         style={{ ...pressBtn }}
       >
         <ExpandGlyph />

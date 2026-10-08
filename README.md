@@ -669,6 +669,9 @@ Also: `npm run dev:host` and `npm run dev:web`.
 | `CTX_BUDGET` | unset | legacy stricter messages cap; `0` no longer disables model context safety |
 | `TENCENT_TOKEN_PLAN_TPM` | `3000000` | per-model Tencent Token Plan TPM; `api.lkeap.cloud.tencent.com/plan/*` is queued in a process-wide rolling 60-second window |
 | `TENCENT_TOKEN_PLAN_TPM_HEADROOM` | `0.9` | local Token Plan safety factor for tokenizer estimation differences |
+| `BIU_LLM_LOG_DIR` | `.biu/logs` | JSONL directory for LLM throttling diagnostics; API keys, message bodies, and tool arguments are never recorded |
+| `BIU_LLM_LOG_MAX_BYTES` | `10485760` | per-day LLM log rotation threshold (10MB) |
+| `BIU_LLM_LOG_RETENTION_DAYS` | `7` | LLM diagnostic log retention |
 
 </details>
 

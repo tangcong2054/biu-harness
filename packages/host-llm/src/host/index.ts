@@ -2,9 +2,12 @@ import { Service, type Context } from 'cordis'
 import {
   isTencentTokenPlan,
   resolveTencentTokenPlanHeadroom,
+  resolveTencentTokenPlanMaxOutput,
   resolveTencentTokenPlanTpm,
+  tencentTpmRetryDelay,
   TencentTokenPlanTpmLimiter,
 } from './tencent-token-plan-tpm.ts'
+import { appendTencentTokenPlanLog } from './tencent-token-plan-log.ts'
 
 export type ChatProvider = 'deepseek' | 'openai' | 'anthropic'
 
@@ -90,6 +93,57 @@ export function resolveModelsListUrl(baseUrl: string | undefined, provider: Chat
 export type LlmProbeResult =
   | { ok: true; latencyMs: number; detail: string }
   | { ok: false; latencyMs: number; detail: string }
+
+export class LlmHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string | number,
+    readonly requestId?: string,
+    readonly retryAfterMs?: number,
+  ) {
+    super(message)
+    this.name = 'LlmHttpError'
+  }
+}
+
+function retryAfterMs(value: string | null) {
+  if (!value) return undefined
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000)
+  const date = Date.parse(value)
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined
+}
+
+async function responseError(res: Response) {
+  let message = `llm http ${res.status}`
+  let code: string | number | undefined
+  let requestId: string | undefined
+  try {
+    const body = (await res.json()) as Record<string, unknown>
+    const raw =
+      body.error && typeof body.error === 'object'
+        ? body.error as Record<string, unknown>
+        : body
+    if (typeof raw.message === 'string' && raw.message) message = raw.message
+    if (typeof raw.code === 'string' || typeof raw.code === 'number') code = raw.code
+    const id = raw.request_id ?? raw.requestId ?? body.request_id ?? body.requestId
+    if (typeof id === 'string' && id) requestId = id
+  } catch {
+    /* ignore */
+  }
+  const diagnostics = [
+    code != null ? `code=${code}` : '',
+    requestId ? `request_id=${requestId}` : '',
+  ].filter(Boolean).join(' ')
+  return new LlmHttpError(
+    diagnostics ? `${message} (${diagnostics})` : message,
+    res.status,
+    code,
+    requestId,
+    retryAfterMs(res.headers.get('retry-after')),
+  )
+}
 
 /**
  * 轻量连通性探测：优先 GET /models；失败则发一条极短非流式 chat。
@@ -553,14 +607,7 @@ export class OpenAiCompatLlm implements LlmClient {
       signal,
     })
     if (!res.ok) {
-      let detail = `llm http ${res.status}`
-      try {
-        const err = (await res.json()) as { error?: { message?: string } }
-        if (err.error?.message) detail = err.error.message
-      } catch {
-        /* ignore */
-      }
-      throw new Error(detail)
+      throw await responseError(res)
     }
     if (!res.body) throw new Error('llm stream missing body')
     return consumeChatCompletionSse(res.body, { onDelta: options?.onDelta, onReasoningDelta: options?.onReasoningDelta, onToolDelta: options?.onToolDelta, signal })
@@ -640,14 +687,7 @@ export class AnthropicLlm implements LlmClient {
       signal,
     })
     if (!res.ok) {
-      let detail = `llm http ${res.status}`
-      try {
-        const err = (await res.json()) as { error?: { message?: string } }
-        if (err.error?.message) detail = err.error.message
-      } catch {
-        /* ignore */
-      }
-      throw new Error(detail)
+      throw await responseError(res)
     }
     if (!res.body) throw new Error('llm stream missing body')
     return consumeMessagesSse(res.body, { onDelta: options?.onDelta, onReasoningDelta: options?.onReasoningDelta, onToolDelta: options?.onToolDelta, signal })
@@ -794,30 +834,74 @@ export class LlmService extends Service {
     return {
       chat: async (messages, tools = [], signal, options) => {
         ctx.emit('llm/request', { model: config.model, provider: config.provider })
+        const tokenPlan = isTencentTokenPlan(config)
+        const maxOutputTokens = tokenPlan
+          ? resolveTencentTokenPlanMaxOutput(config, options?.maxOutputTokens)
+          : options?.maxOutputTokens
         const estimatedTotalTokens =
           options?.estimatedTotalTokens ??
           Math.ceil(JSON.stringify({ messages, tools }).length / 4) +
-            Math.max(1, Math.floor(options?.maxOutputTokens ?? config.outputReserveTokens ?? 4096))
-        const reservation = isTencentTokenPlan(config)
-          ? await this.tencentTokenPlanLimiter(config).acquire(estimatedTotalTokens, signal)
-          : undefined
-        try {
-          const reply = await client.chat(messages, tools, signal, {
-            onDelta: async (text) => {
-              ctx.emit('llm/stream', { text })
-              await options?.onDelta?.(text)
-            },
-            onReasoningDelta: options?.onReasoningDelta,
-            onToolDelta: options?.onToolDelta,
-            maxOutputTokens: options?.maxOutputTokens,
-            thinking: options?.thinking,
-            estimatedTotalTokens,
-          })
-          reservation?.finish(reply.usage)
-          return reply
-        } catch (error) {
-          reservation?.cancel()
-          throw error
+            Math.max(1, Math.floor(maxOutputTokens ?? config.outputReserveTokens ?? 4096))
+        const limiter = tokenPlan ? this.tencentTokenPlanLimiter(config) : undefined
+        for (let attempt = 0; ; attempt += 1) {
+          const reservation = limiter
+            ? await limiter.acquire(estimatedTotalTokens, signal)
+            : undefined
+          try {
+            const reply = await client.chat(messages, tools, signal, {
+              onDelta: async (text) => {
+                ctx.emit('llm/stream', { text })
+                await options?.onDelta?.(text)
+              },
+              onReasoningDelta: options?.onReasoningDelta,
+              onToolDelta: options?.onToolDelta,
+              maxOutputTokens,
+              thinking: options?.thinking,
+              estimatedTotalTokens,
+            })
+            reservation?.finish(reply.usage)
+            if (limiter && attempt > 0) {
+              const snapshot = limiter.snapshot()
+              appendTencentTokenPlanLog({
+                event: 'retry_succeeded',
+                model: config.model,
+                endpointId: config.endpointId,
+                attempt: attempt + 1,
+                estimatedTokens: estimatedTotalTokens,
+                maxOutputTokens,
+                localWindowTokens: snapshot.windowTokens,
+                localCapacity: snapshot.capacity,
+                blockedUntil: snapshot.blockedUntil,
+              })
+            }
+            return reply
+          } catch (error) {
+            reservation?.cancel()
+            const retryDelay = limiter ? tencentTpmRetryDelay(error) : undefined
+            const detail = error as Error & { code?: string | number; requestId?: string }
+            if (retryDelay === undefined || !limiter || signal?.aborted) throw error
+            limiter.defer(retryDelay)
+            const snapshot = limiter.snapshot()
+            appendTencentTokenPlanLog({
+              event: attempt >= 1 ? 'retry_failed' : 'throttled',
+              model: config.model,
+              endpointId: config.endpointId,
+              status: (detail as Error & { status?: number }).status,
+              code: detail.code,
+              requestId: detail.requestId,
+              retryAfterMs: retryDelay,
+              attempt: attempt + 1,
+              estimatedTokens: estimatedTotalTokens,
+              maxOutputTokens,
+              localWindowTokens: snapshot.windowTokens,
+              localCapacity: snapshot.capacity,
+              blockedUntil: snapshot.blockedUntil,
+            })
+            if (attempt >= 1) throw error
+            ctx.logger('host-llm').warn(
+              `Tencent Token Plan TPM throttled; retrying after ${retryDelay}ms code=${detail.code ?? 'unknown'} request_id=${detail.requestId ?? 'unknown'}`,
+            )
+          }
         }
       },
     }

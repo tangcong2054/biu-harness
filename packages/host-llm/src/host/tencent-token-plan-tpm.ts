@@ -2,6 +2,8 @@ import type { LlmConfig, LlmUsage } from './index.ts'
 
 export const DEFAULT_TENCENT_TOKEN_PLAN_TPM = 3_000_000
 export const DEFAULT_TPM_HEADROOM = 0.9
+export const DEFAULT_TENCENT_TOKEN_PLAN_MAX_OUTPUT = 16_384
+export const DEFAULT_TENCENT_TPM_RETRY_MS = 60_000
 export const TPM_WINDOW_MS = 60_000
 
 type TokenEvent = {
@@ -57,6 +59,7 @@ export class TencentTokenPlanTpmLimiter {
   private events: TokenEvent[] = []
   private nextId = 1
   private queue: Promise<void> = Promise.resolve()
+  private blockedUntil = 0
 
   constructor(options: LimiterOptions) {
     const headroom =
@@ -81,6 +84,10 @@ export class TencentTokenPlanTpmLimiter {
     while (true) {
       if (signal?.aborted) throw new Error('cancelled')
       const now = this.now()
+      if (now < this.blockedUntil) {
+        await this.sleep(this.blockedUntil - now, signal)
+        continue
+      }
       this.prune(now)
       const used = this.events.reduce((sum, event) => sum + event.tokens, 0)
       if (used + tokens <= this.capacity) {
@@ -117,6 +124,21 @@ export class TencentTokenPlanTpmLimiter {
     )
     return pending
   }
+
+  defer(ms: number) {
+    const delay = Number.isFinite(ms) && ms >= 0 ? Math.floor(ms) : DEFAULT_TENCENT_TPM_RETRY_MS
+    this.blockedUntil = Math.max(this.blockedUntil, this.now() + delay)
+  }
+
+  snapshot() {
+    const now = this.now()
+    this.prune(now)
+    return {
+      windowTokens: this.events.reduce((sum, event) => sum + event.tokens, 0),
+      capacity: this.capacity,
+      blockedUntil: this.blockedUntil > now ? this.blockedUntil : undefined,
+    }
+  }
 }
 
 export function isTencentTokenPlan(config: LlmConfig) {
@@ -148,4 +170,32 @@ export function resolveTencentTokenPlanHeadroom(
   return Number.isFinite(parsed) && parsed > 0 && parsed <= 1
     ? parsed
     : DEFAULT_TPM_HEADROOM
+}
+
+/** 显式发送给 Token Plan，避免上游按模型默认最大输出做更大的 TPM 预占。 */
+export function resolveTencentTokenPlanMaxOutput(
+  config: LlmConfig,
+  requested?: number,
+) {
+  const parsed = Number(requested ?? config.outputReserveTokens)
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.floor(parsed)
+    : DEFAULT_TENCENT_TOKEN_PLAN_MAX_OUTPUT
+}
+
+export function tencentTpmRetryDelay(error: unknown) {
+  if (!(error instanceof Error)) return undefined
+  const detail = error as Error & {
+    status?: number
+    code?: string | number
+    retryAfterMs?: number
+  }
+  const code = String(detail.code ?? '')
+  const isTpm =
+    code === '429003' ||
+    /TPM|tokens per minute|CodeTPMLimitExceeded/i.test(detail.message)
+  if (!isTpm || (detail.status != null && detail.status !== 429)) return undefined
+  return Number.isFinite(detail.retryAfterMs) && Number(detail.retryAfterMs) >= 0
+    ? Number(detail.retryAfterMs)
+    : DEFAULT_TENCENT_TPM_RETRY_MS
 }
