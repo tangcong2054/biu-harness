@@ -9,6 +9,10 @@
 - 查询结果由 Gateway 服务端分页，页面默认每页 100 行，只保留和渲染当前页；
 - Gateway Token 和数据库密码只保存在当前页面运行内存，不写入 Page 内容。
 
+## Agent UI Actions
+
+插件运行后会按需向 Biu UI Registry 注册 `set_sql`、`connect`、`execute`、`read_result`。Agent 先调用 `ui_inspect { plugin: "websql" }` 获取当前实例和参数 Schema，再通过 `ui_action` 操作；这些动作不会常驻注入模型上下文，密码也不会进入 inspect 状态。
+
 ## 示例写法
 
 ```md

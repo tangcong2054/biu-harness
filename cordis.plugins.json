@@ -39,6 +39,16 @@
   ],
   "plugins": [
     {
+      "id": "core-ui-actions",
+      "name": "Core-UI Actions",
+      "layer": "core",
+      "blurb": "Agent 与当前 Biu 浏览器之间的语义 UI 操作协议。动作按需 inspect，不把全部插件能力注入上下文。",
+      "package": "@biu/core-ui-actions/host",
+      "web": "@biu/core-ui-actions/web",
+      "togglable": false,
+      "enabled": true
+    },
+    {
       "id": "core-pick",
       "name": "Core-Pick",
       "layer": "core",

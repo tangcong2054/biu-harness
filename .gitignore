@@ -27,6 +27,13 @@ web/**/*.js.map
 .plugin-dev/**/*.js
 .plugin-dev/**/*.js.map
 .plugin-dev/**/node_modules/
+# 这三个历史 CDB 插件以可读 JS 作为沙箱源码，不是旁路编译产物。
+!.plugin-dev/cdb-slowlog/host.js
+!.plugin-dev/cdb-slowlog/web.js
+!.plugin-dev/cdb-processlist/host.js
+!.plugin-dev/cdb-processlist/web.js
+!.plugin-dev/cdb-errorlog/host.js
+!.plugin-dev/cdb-errorlog/web.js
 
 # 页面数据已迁入 .biu；保留 .page/ 以免旧工作区误提交
 .page/

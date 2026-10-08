@@ -1,0 +1,17 @@
+{
+  "name": "@biu/core-ui-actions",
+  "license": "Apache-2.0",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent 与当前 Biu 浏览器之间的语义 UI 操作协议",
+  "exports": {
+    "./protocol": "./src/protocol.ts",
+    "./host": "./src/host/index.ts",
+    "./web": "./src/web/index.ts"
+  },
+  "peerDependencies": {
+    "cordis": "4.0.0-rc.8",
+    "ws": "^8.18.3"
+  }
+}

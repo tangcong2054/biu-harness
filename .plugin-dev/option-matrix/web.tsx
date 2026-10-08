@@ -4,7 +4,10 @@ const React = globalThis.React
 const { useState, useMemo, useEffect, useRef } = React
 
 export const name = 'option-matrix'
-export const inject = ['pageEditor']
+export const inject = ['pageEditor', 'uiActions']
+
+type UiActionsApi = { register: (spec: Record<string, unknown>) => () => void }
+let uiActions: UiActionsApi | undefined
 
 type Criterion = { name: string; weight: number; higherIsBetter: boolean }
 type Scores = Record<string, Record<string, number>>
@@ -378,6 +381,15 @@ function OptionMatrix({
 
   const key = JSON.stringify(data)
   const m = useMemo(() => compute(data), [key])
+  const dataRef = useRef(data)
+  const computedRef = useRef(m)
+  const updateRef = useRef(update)
+  const writableRef = useRef(writable)
+  const instanceId = useRef(`option-matrix-${crypto.randomUUID()}`)
+  dataRef.current = data
+  computedRef.current = m
+  updateRef.current = update
+  writableRef.current = writable
   const scale = m.scale
   const options = m.options
   const criteria = m.criteria
@@ -464,6 +476,79 @@ function OptionMatrix({
   const rationale = m.winner ? rationaleFor(shownCriteria, m.rows, m.winner, m.maxTotal) : ''
 
   const md = useMemo(() => toMarkdown(data), [key])
+
+  useEffect(() => uiActions?.register({
+    plugin: name,
+    instanceId: instanceId.current,
+    kind: 'option-matrix',
+    label: dataRef.current.title || '方案对比矩阵',
+    surface: 'main',
+    state: () => ({
+      title: dataRef.current.title,
+      scale: computedRef.current.scale,
+      winner: computedRef.current.winner,
+      ranked: computedRef.current.ranked,
+    }),
+    actions: {
+      read_matrix: {
+        description: '读取方案、维度、评分、排名和推荐结论',
+        risk: 'read',
+        run: () => ({
+          data: dataRef.current,
+          winner: computedRef.current.winner,
+          ranked: computedRef.current.ranked,
+          markdown: toMarkdown(dataRef.current),
+        }),
+      },
+      set_matrix: {
+        description: '批量更新方案矩阵数据',
+        risk: 'write',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            title: { type: 'string' },
+            options: { type: 'array' },
+            criteria: { type: 'array' },
+            scores: { type: 'object' },
+            scale: { type: 'number' },
+          },
+        },
+        run: (args: Record<string, unknown>) => {
+          if (!writableRef.current) throw new Error('方案矩阵当前为只读态')
+          const allowed = ['title', 'options', 'criteria', 'scores', 'scale']
+          const patch = Object.fromEntries(Object.entries(args).filter(([key]) => allowed.includes(key)))
+          updateRef.current(patch)
+          return patch
+        },
+      },
+      set_score: {
+        description: '设置一个方案在一个维度上的评分',
+        risk: 'write',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            option: { type: 'string' },
+            criterion: { type: 'string' },
+            value: { type: 'number' },
+          },
+          required: ['option', 'criterion', 'value'],
+        },
+        run: ({ option, criterion, value }: Record<string, unknown>) => {
+          if (!writableRef.current) throw new Error('方案矩阵当前为只读态')
+          const current = dataRef.current.scores ?? {}
+          const next = {
+            ...current,
+            [String(option)]: {
+              ...(current[String(option)] ?? {}),
+              [String(criterion)]: Number(value),
+            },
+          }
+          updateRef.current({ scores: next })
+          return { option, criterion, value }
+        },
+      },
+    },
+  }), [])
 
   const cellStyle: Record<string, unknown> = {
     borderBottom: `1px solid rgba(127,127,127,.22)`,
@@ -889,8 +974,10 @@ function OptionMatrix({
 }
 
 export function apply(ctx: {
+  uiActions: UiActionsApi
   pageEditor: { registerBlock: (spec: Record<string, unknown>) => void }
 }) {
+  uiActions = ctx.uiActions
   ctx.pageEditor.registerBlock({
     kind: 'option-matrix',
     plugin: name,

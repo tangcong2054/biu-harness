@@ -289,6 +289,29 @@ $ db_action /plugins/<id> action=pack      # build into .plugin/
 ```
 
 This is a deliberate constraint: **installing something into the system goes through the same interface too.**
+
+Plugins that want Agents to operate their live UI can inject `uiActions` and register stable semantic actions. Agents initially receive only `ui_inspect`, `ui_action`, and `ui_wait`; plugin-specific actions are discovered lazily from the active browser instead of being injected into every model request.
+
+```ts
+export const inject = ['pageEditor', 'uiActions']
+
+const dispose = ctx.uiActions.register({
+  plugin: 'demo',
+  instanceId: 'main',
+  kind: 'query',
+  label: 'Query panel',
+  actions: {
+    execute: {
+      description: 'Run the current query',
+      risk: 'submit',
+      run: () => execute(),
+    },
+  },
+})
+```
+
+Native buttons, inputs, textareas, selects, and existing `data-biu-*` controls work through the zero-config DOM adapter. Complex editors, canvases, and iframes should register semantic actions.
+
 ### Pages: the container for components
 
 A component declares what it is, but *where it sits, in what order, and alongside what* is decided by the page. And **the page is the only unit in this system that has boundaries**:

@@ -61,7 +61,7 @@ function needsApproval(name: string, mode: 'auto' | 'hold') {
 }
 
 function sensitive(name: string) {
-  return /^(fs_write|str_replace_editor|bash|job_start|terminal_write|lsp_start|subagent_spawn|mcp_add_stdio)$/.test(name)
+  return /^(fs_write|str_replace_editor|bash|job_start|terminal_write|lsp_start|subagent_spawn|mcp_add_stdio|ui_action)$/.test(name)
 }
 
 export const name = 'approvals'

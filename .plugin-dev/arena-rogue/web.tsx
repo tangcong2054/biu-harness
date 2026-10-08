@@ -3,7 +3,10 @@ import { ArenaGame } from './game.ts'
 import { WEAPONS } from './weapons.ts'
 
 export const name = 'arena-rogue'
-export const inject = ['slots']
+export const inject = ['slots', 'uiActions']
+
+type UiActionsApi = { register: (spec: Record<string, unknown>) => () => void }
+let uiActions: UiActionsApi | undefined
 
 function ArenaApp() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -15,6 +18,64 @@ function ArenaApp() {
     const g = new ArenaGame()
     gameRef.current = g
     g.start()
+    const disposeActions = uiActions?.register({
+      plugin: name,
+      instanceId: 'game',
+      kind: 'canvas-game',
+      label: 'Arena Rogue',
+      surface: 'main',
+      state: () => ({
+        wave: g.wave,
+        over: g.over,
+        weapon: g.weapon,
+        weaponName: WEAPONS[g.weapon]?.name,
+        player: {
+          hp: g.player.hp,
+          maxHp: g.player.max,
+          level: g.player.level,
+          score: g.player.score,
+          kills: g.player.kills,
+        },
+      }),
+      actions: {
+        read_state: {
+          description: '读取当前游戏状态',
+          risk: 'read',
+          run: () => ({
+            wave: g.wave,
+            over: g.over,
+            weapon: g.weapon,
+            weaponName: WEAPONS[g.weapon]?.name,
+            player: g.player,
+          }),
+        },
+        restart: {
+          description: '重新开始游戏',
+          risk: 'submit',
+          run: () => {
+            g.start()
+            return { restarted: true }
+          },
+        },
+        select_weapon: {
+          description: '选择武器序号',
+          risk: 'write',
+          inputSchema: {
+            type: 'object',
+            properties: { index: { type: 'number' } },
+            required: ['index'],
+          },
+          run: ({ index }: { index?: unknown }) => {
+            const next = Math.floor(Number(index))
+            if (!Number.isInteger(next) || next < 1 || next > WEAPONS.length) {
+              throw new Error(`武器序号必须在 1-${WEAPONS.length} 之间`)
+            }
+            g.weapon = next - 1
+            return { weapon: next, name: WEAPONS[g.weapon]?.name }
+          },
+        },
+      },
+    })
     const parent = canvas.parentElement
     let raf = 0
     let last = performance.now()
@@ -104,6 +165,7 @@ function ArenaApp() {
       canvas.removeEventListener('pointermove', move)
       canvas.removeEventListener('pointerdown', press)
       window.removeEventListener('pointerup', release)
+      disposeActions?.()
     }
   }, [])
 
@@ -139,7 +201,9 @@ function ArenaApp() {
 }
 
 export function apply(ctx: {
+  uiActions: UiActionsApi
   slots: { place: (slot: string, Comp: unknown, opt: { key: string }) => void }
 }) {
+  uiActions = ctx.uiActions
   ctx.slots.place('plugin-store-extras', ArenaApp, { key: 'arena-rogue' })
 }

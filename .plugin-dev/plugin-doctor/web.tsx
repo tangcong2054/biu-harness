@@ -1,8 +1,11 @@
 const React = globalThis.React
-const { useState, useEffect } = React
+const { useState, useEffect, useRef } = React
 
 export const name = 'plugin-doctor'
-export const inject = ['pageEditor']
+export const inject = ['pageEditor', 'uiActions']
+
+type UiActionsApi = { register: (spec: Record<string, unknown>) => () => void }
+let uiActions: UiActionsApi | undefined
 
 type PluginReport = {
   id: string
@@ -104,6 +107,12 @@ function DoctorBlock(props: BlockProps) {
   const report = (props.data && props.data.report ? props.data.report : null) as ScanResult | null
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const reportRef = useRef(report)
+  const runRef = useRef<() => Promise<void>>(async () => {})
+  const instanceId = useRef(`plugin-doctor-${crypto.randomUUID()}`)
+  const stateRef = useRef({ busy, error })
+  reportRef.current = report
+  stateRef.current = { busy, error }
 
   async function run() {
     setBusy(true)
@@ -120,6 +129,31 @@ function DoctorBlock(props: BlockProps) {
       setBusy(false)
     }
   }
+  runRef.current = run
+
+  useEffect(() => uiActions?.register({
+    plugin: name,
+    instanceId: instanceId.current,
+    kind: 'plugin-doctor',
+    label: '插件体检',
+    surface: 'main',
+    state: () => ({ ...stateRef.current, report: reportRef.current }),
+    actions: {
+      scan: {
+        description: '扫描已安装插件并更新体检报告',
+        risk: 'submit',
+        run: async () => {
+          await runRef.current()
+          return reportRef.current
+        },
+      },
+      read_report: {
+        description: '读取最近一次插件体检报告',
+        risk: 'read',
+        run: () => reportRef.current,
+      },
+    },
+  }), [])
 
   return (
     <div data-testid="plugin-doctor-block" className="pd-root">
@@ -200,8 +234,10 @@ function DoctorBlock(props: BlockProps) {
 }
 
 export function apply(ctx: {
+  uiActions: UiActionsApi
   pageEditor: { registerBlock: (spec: Record<string, unknown>) => void }
 }) {
+  uiActions = ctx.uiActions
   ctx.pageEditor.registerBlock({
     kind: 'plugin-doctor',
     plugin: name,

@@ -8,7 +8,10 @@ const React = globalThis.React
 const { useEffect, useRef, useState } = React
 
 export const name = 'page-browser'
-export const inject = ['pageEditor', 'slots', 'pick']
+export const inject = ['pageEditor', 'slots', 'pick', 'uiActions']
+
+type UiActionsApi = { register: (spec: Record<string, unknown>) => () => void }
+let uiActions: UiActionsApi | undefined
 
 const UI = 'ui-sans-serif, system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif'
 const BAR = '#f2f3f5'
@@ -77,7 +80,11 @@ function BrowserSurface({
   const [nonce, setNonce] = useState(0)
   const [notice, setNotice] = useState('')
   const timer = useRef<number | undefined>(undefined)
+  const instanceId = useRef(`browser-${crypto.randomUUID()}`)
+  const stateRef = useRef({ addr, src, notice })
+  const goRef = useRef<(raw: string) => void>(() => {})
   const url = String(data.url ?? '')
+  stateRef.current = { addr, src, notice }
 
   useEffect(() => {
     setAddr(url)
@@ -106,6 +113,54 @@ function BrowserSurface({
     if (next === src) setNonce((n) => n + 1)
     else setSrc(next)
   }
+  goRef.current = go
+
+  useEffect(() => uiActions?.register({
+    plugin: name,
+    instanceId: instanceId.current,
+    kind: 'embedded-browser',
+    label: '页面浏览器',
+    surface: detached ? 'sidebar' : 'main',
+    state: () => stateRef.current,
+    actions: {
+      navigate: {
+        description: '在嵌入浏览器中打开 URL 或搜索词',
+        risk: 'navigate',
+        inputSchema: {
+          type: 'object',
+          properties: { url: { type: 'string' } },
+          required: ['url'],
+        },
+        run: ({ url }: { url?: unknown }) => {
+          goRef.current(String(url ?? ''))
+          return { url }
+        },
+      },
+      reload: {
+        description: '刷新当前嵌入页面',
+        risk: 'navigate',
+        run: () => {
+          setNonce((value) => value + 1)
+          return { reloaded: true }
+        },
+      },
+      open_sidebar: {
+        description: '在 Biu 侧栏浏览器打开当前地址',
+        risk: 'navigate',
+        run: () => {
+          const current = stateRef.current.src
+          if (!current) throw new Error('当前没有可打开的地址')
+          openSidebarBrowser(current)
+          return { url: current }
+        },
+      },
+      read_state: {
+        description: '读取当前地址和嵌入状态；跨域 iframe 内部内容不可读取',
+        risk: 'read',
+        run: () => stateRef.current,
+      },
+    },
+  }), [detached])
 
   const iconBtn: Record<string, unknown> = {
     cursor: 'pointer',
@@ -421,6 +476,7 @@ function BrowserCard({
 }
 
 export function apply(ctx: {
+  uiActions: UiActionsApi
   pageEditor: {
     registerBlock: (spec: {
       kind: string
@@ -447,6 +503,7 @@ export function apply(ctx: {
   }
   get: (name: string) => unknown
 }) {
+  uiActions = ctx.uiActions
   placeInspectorBrowser(ctx)
   ctx.pageEditor.registerBlock({
     kind: 'browser',

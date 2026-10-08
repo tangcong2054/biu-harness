@@ -11,7 +11,10 @@ const React = globalThis.React
 const { useEffect, useMemo, useRef, useState } = React
 
 export const name = 'api-playground'
-export const inject = ['pageEditor']
+export const inject = ['pageEditor', 'uiActions']
+
+type UiActionsApi = { register: (spec: Record<string, unknown>) => () => void }
+let uiActions: UiActionsApi | undefined
 
 type BlockProps = {
   data: Record<string, unknown>
@@ -291,6 +294,18 @@ function ApiPlaygroundBlock({ data, update, writable }: BlockProps) {
   const [result, setResult] = useState<Result | null>(() => stored)
   const [tab, setTab] = useState<'request' | 'response'>(stored ? 'response' : 'request')
   const [histOpen, setHistOpen] = useState(false)
+  const instanceId = useRef(`api-playground-${crypto.randomUUID()}`)
+  const formRef = useRef(form)
+  const resultRef = useRef<Result | null>(result ?? stored)
+  const sendingRef = useRef(sending)
+  const sendRef = useRef<() => Promise<Result | undefined>>(async () => undefined)
+  const updateRef = useRef(update)
+  const writableRef = useRef(writable)
+  formRef.current = form
+  resultRef.current = result ?? stored
+  sendingRef.current = sending
+  updateRef.current = update
+  writableRef.current = writable
 
   // 外部改了文档（别的 agent / 撤销 / 重开页面）时同步字段，但别抢正在输入的用户。
   useEffect(() => {
@@ -320,8 +335,9 @@ function ApiPlaygroundBlock({ data, update, writable }: BlockProps) {
     const url = form.url.trim()
     setTab('response')
     if (!url) {
-      setResult({ ok: false, error: '先填 url', ms: 0, at: Date.now() })
-      return
+      const empty = { ok: false, error: '先填 url', ms: 0, at: Date.now() }
+      setResult(empty)
+      return empty
     }
     setSending(true)
     const started = Date.now()
@@ -364,6 +380,7 @@ function ApiPlaygroundBlock({ data, update, writable }: BlockProps) {
       history: [entry, ...history].slice(0, HISTORY_LIMIT),
       last: { ...next, body: cap(asText(next.body), STORE_LIMIT) },
     })
+    return next
   }
 
   const onKeyDown = (event: { key: string; metaKey?: boolean; ctrlKey?: boolean; preventDefault: () => void; stopPropagation: () => void }) => {
@@ -392,6 +409,74 @@ function ApiPlaygroundBlock({ data, update, writable }: BlockProps) {
   }
 
   const clearHistory = () => commit({ history: [] })
+  sendRef.current = send
+
+  useEffect(() => uiActions?.register({
+    plugin: name,
+    instanceId: instanceId.current,
+    kind: 'api-request',
+    label: 'API Playground',
+    surface: 'main',
+    state: () => ({
+      method: formRef.current.method,
+      url: formRef.current.url,
+      sending: sendingRef.current,
+      response: resultRef.current
+        ? {
+            ok: resultRef.current.ok,
+            status: resultRef.current.status,
+            statusText: resultRef.current.statusText,
+            ms: resultRef.current.ms,
+            bytes: resultRef.current.bytes,
+            body: resultRef.current.body,
+            error: resultRef.current.error,
+          }
+        : null,
+    }),
+    actions: {
+      set_request: {
+        description: '设置请求方法、URL 和可选 Body；鉴权 Header 请用户在页面手动填写',
+        risk: 'write',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            method: { type: 'string', enum: METHODS },
+            url: { type: 'string' },
+            body: { type: 'string' },
+          },
+        },
+        run: (args: Record<string, unknown>) => {
+          if (!writableRef.current) throw new Error('API Playground 当前为只读态')
+          const patch: Record<string, string> = {}
+          if (typeof args.method === 'string') patch.method = args.method
+          if (typeof args.url === 'string') patch.url = args.url
+          if (typeof args.body === 'string') patch.body = args.body
+          setForm((prev) => ({ ...prev, ...patch }))
+          updateRef.current(patch)
+          return patch
+        },
+      },
+      send: {
+        description: '发送当前 API 请求',
+        risk: 'submit',
+        run: () => sendRef.current(),
+      },
+      read_response: {
+        description: '读取最近一次 API 响应',
+        risk: 'read',
+        run: () => resultRef.current,
+      },
+      clear_history: {
+        description: '清空请求历史',
+        risk: 'destructive',
+        run: () => {
+          if (!writableRef.current) throw new Error('API Playground 当前为只读态')
+          updateRef.current({ history: [] })
+          return { cleared: true }
+        },
+      },
+    },
+  }), [])
 
   const editable = writable
 
@@ -586,8 +671,10 @@ function ApiPlaygroundBlock({ data, update, writable }: BlockProps) {
 }
 
 export function apply(ctx: {
+  uiActions: UiActionsApi
   pageEditor: { registerBlock: (spec: Record<string, unknown>) => void }
 }) {
+  uiActions = ctx.uiActions
   ctx.pageEditor.registerBlock({
     kind: 'api-play',
     plugin: name,
