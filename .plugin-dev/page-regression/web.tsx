@@ -1,8 +1,11 @@
 const React = globalThis.React
-const { useState, useCallback, useEffect } = React
+const { useState, useCallback, useEffect, useRef } = React
 
 export const name = 'page-regression'
-export const inject = ['pageEditor']
+export const inject = ['pageEditor', 'uiActions']
+
+type UiActionsApi = { register: (spec: Record<string, unknown>) => () => void }
+let uiActions: UiActionsApi | undefined
 
 type BlockProps = {
   data: Record<string, unknown>
@@ -181,6 +184,10 @@ export function RegressionBlock({ data, update, writable }: BlockProps) {
   const runs = Array.isArray(data.runs) ? (data.runs as Run[]) : []
   const [busy, setBusy] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
+  const stateRef = useRef({ asserts, runs, busy })
+  const runRef = useRef<() => Promise<void>>(async () => {})
+  const instanceId = useRef(`regression-${crypto.randomUUID()}`)
+  stateRef.current = { asserts, runs, busy }
 
   const last = runs.length ? runs[runs.length - 1] : null
   const prev = runs.length > 1 ? runs[runs.length - 2] : null
@@ -213,6 +220,38 @@ export function RegressionBlock({ data, update, writable }: BlockProps) {
       setBusy(false)
     }
   }, [busy, asserts, prev, runs, update])
+  runRef.current = runAll
+
+  useEffect(() => uiActions?.register({
+    plugin: name,
+    instanceId: instanceId.current,
+    kind: 'page-regression',
+    label: '页面回归检查',
+    surface: 'main',
+    state: () => ({
+      busy: stateRef.current.busy,
+      assertions: stateRef.current.asserts,
+      lastRun: stateRef.current.runs.at(-1) ?? null,
+    }),
+    actions: {
+      run_all: {
+        description: '执行全部页面回归断言',
+        risk: 'submit',
+        run: async () => {
+          await runRef.current()
+          return stateRef.current.runs.at(-1) ?? null
+        },
+      },
+      read_results: {
+        description: '读取断言和最近一次回归结果',
+        risk: 'read',
+        run: () => ({
+          assertions: stateRef.current.asserts,
+          lastRun: stateRef.current.runs.at(-1) ?? null,
+        }),
+      },
+    },
+  }), [])
 
   const fixed = last ? last.items.filter((item) => item.delta === 'fixed').length : 0
   const broken = last ? last.items.filter((item) => item.delta === 'broken').length : 0
@@ -362,6 +401,7 @@ export function RegressionBlock({ data, update, writable }: BlockProps) {
 }
 
 export function apply(ctx: {
+  uiActions: UiActionsApi
   pageEditor: {
     registerBlock: (spec: {
       kind: string
@@ -376,6 +416,7 @@ export function apply(ctx: {
     }) => void
   }
 }) {
+  uiActions = ctx.uiActions
   ctx.pageEditor.registerBlock({
     kind: 'run',
     plugin: name,

@@ -289,6 +289,29 @@ $ db_action /plugins/<id> action=pack      # 打进 .plugin/
 ```
 
 这是一个刻意的约束：**在系统里装东西，也走同一套接口。**
+
+插件需要让 Agent 操作当前 UI 时，可以注入 `uiActions` 并注册稳定的语义动作。Agent 初始只看到 `ui_inspect`、`ui_action`、`ui_wait` 三个通用工具；具体插件动作由 `ui_inspect` 从当前浏览器按需发现，不会全部塞进模型上下文。
+
+```ts
+export const inject = ['pageEditor', 'uiActions']
+
+const dispose = ctx.uiActions.register({
+  plugin: 'demo',
+  instanceId: 'main',
+  kind: 'query',
+  label: '查询面板',
+  actions: {
+    execute: {
+      description: '执行当前查询',
+      risk: 'submit',
+      run: () => execute(),
+    },
+  },
+})
+```
+
+原生 `button`、`input`、`textarea`、`select` 和现有 `data-biu-*` 控件可由 DOM 适配器零配置操作；复杂编辑器、Canvas 和 iframe 应注册语义 Action。
+
 ### 页面：Component 的容器
 
 Component 声明自己是什么，但「放在哪、按什么顺序、和谁一起」由 Page 决定。而且 **Page 是这套体系里唯一具备边界的单位**：

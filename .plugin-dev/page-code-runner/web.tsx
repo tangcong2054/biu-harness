@@ -7,7 +7,10 @@ const React = globalThis.React
 const { useState, useCallback, useRef, useEffect } = React
 
 export const name = 'page-code-runner'
-export const inject = ['pageEditor']
+export const inject = ['pageEditor', 'uiActions']
+
+type UiActionsApi = { register: (spec: Record<string, unknown>) => () => void }
+let uiActions: UiActionsApi | undefined
 
 type BlockProps = {
   data: Record<string, unknown>
@@ -256,6 +259,7 @@ type CodeViewHandle = {
   posAt: (x: number, y: number) => number | null
   hasFocus: () => boolean
   contentHeight: () => number
+  setText: (value: string) => void
 }
 
 const editorTheme = EditorView.theme({
@@ -378,6 +382,9 @@ function RunnerEditor({
       contentHeight() {
         return view.scrollDOM.scrollHeight
       },
+      setText(next) {
+        view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: next } })
+      },
     }
     return () => {
       view.destroy()
@@ -431,6 +438,20 @@ function CodeRunnerBlock({ data, update, writable }: BlockProps) {
   const outRef = useRef<HTMLDivElement>(null)
   const caretRef = useRef(0)
   const wantFocus = useRef(false)
+  const outputRef = useRef(output)
+  const runningRef = useRef(running)
+  const runRef = useRef<() => Promise<void>>(async () => {})
+  const updateRef = useRef(update)
+  const writableRef = useRef(writable)
+  const instanceId = useRef(`code-runner-${crypto.randomUUID()}`)
+  const codeRef = useRef(localCode)
+  const langRef = useRef(lang)
+  outputRef.current = output
+  runningRef.current = running
+  updateRef.current = update
+  writableRef.current = writable
+  codeRef.current = localCode
+  langRef.current = lang
   // 未手动拖动时的高度：随内容自适应，超过上限则内部滚动
   const [autoCodeH, setAutoCodeH] = useState(MIN_CODE_H)
   const [autoOutH, setAutoOutH] = useState(0)
@@ -551,6 +572,66 @@ function CodeRunnerBlock({ data, update, writable }: BlockProps) {
     setOutput([])
     requestAnimationFrame(focusCode)
   }, [update, focusCode, persist])
+  runRef.current = run
+
+  useEffect(() => uiActions?.register({
+    plugin: name,
+    instanceId: instanceId.current,
+    kind: 'code-runner',
+    label: '代码运行器',
+    surface: 'main',
+    state: () => ({
+      lang: langRef.current,
+      code: editorRef.current?.text() ?? codeRef.current,
+      running: runningRef.current,
+      output: outputRef.current,
+    }),
+    actions: {
+      set_code: {
+        description: '设置代码内容',
+        risk: 'write',
+        inputSchema: {
+          type: 'object',
+          properties: { code: { type: 'string' } },
+          required: ['code'],
+        },
+        run: ({ code }: { code?: unknown }) => {
+          if (!writableRef.current) throw new Error('代码块当前为只读态')
+          const value = String(code ?? '')
+          editorRef.current?.setText(value)
+          setLocalCode(value)
+          updateRef.current({ code: value })
+          return { code: value }
+        },
+      },
+      run: {
+        description: '运行当前代码',
+        risk: 'submit',
+        run: async () => {
+          await runRef.current()
+          return { output: outputRef.current }
+        },
+      },
+      clear_output: {
+        description: '清空运行输出',
+        risk: 'write',
+        run: () => {
+          setOutput([])
+          return { cleared: true }
+        },
+      },
+      read_output: {
+        description: '读取当前语言、代码与运行输出',
+        risk: 'read',
+        run: () => ({
+          lang: langRef.current,
+          code: editorRef.current?.text() ?? codeRef.current,
+          running: runningRef.current,
+          output: outputRef.current,
+        }),
+      },
+    },
+  }), [])
 
   const onRootMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const target = e.target as HTMLElement | null
@@ -853,6 +934,7 @@ function CodeRunnerBlock({ data, update, writable }: BlockProps) {
 }
 
 export function apply(ctx: {
+  uiActions: UiActionsApi
   pageEditor: {
     registerBlock: (spec: {
       kind: string
@@ -867,6 +949,7 @@ export function apply(ctx: {
     }) => void
   }
 }) {
+  uiActions = ctx.uiActions
   ctx.pageEditor.registerBlock({
     kind: 'code-run',
     plugin: name,

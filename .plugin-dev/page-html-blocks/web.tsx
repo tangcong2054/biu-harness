@@ -8,7 +8,10 @@ const React = globalThis.React
 const { useEffect, useLayoutEffect, useMemo, useRef, useState } = React
 
 export const name = 'page-html-blocks'
-export const inject = ['pageEditor', 'pick']
+export const inject = ['pageEditor', 'pick', 'uiActions']
+
+type UiActionsApi = { register: (spec: Record<string, unknown>) => () => void }
+let uiActions: UiActionsApi | undefined
 
 type BlockProps = {
   data: Record<string, unknown>
@@ -32,6 +35,64 @@ type SelectionBubbleState = {
   text: string
   top: number
   left: number
+}
+
+function useHtmlBlockActions(
+  kind: 'html' | 'htmlframe',
+  html: string,
+  writable: boolean,
+  update: (patch: Record<string, unknown>) => void,
+  present: () => void,
+) {
+  const instanceId = useRef(`${kind}-${crypto.randomUUID()}`)
+  const stateRef = useRef({ html, writable })
+  const updateRef = useRef(update)
+  const presentRef = useRef(present)
+  stateRef.current = { html, writable }
+  updateRef.current = update
+  presentRef.current = present
+  useEffect(() => uiActions?.register({
+    plugin: name,
+    instanceId: instanceId.current,
+    kind,
+    label: kind === 'htmlframe' ? '动态 HTML' : '静态 HTML',
+    surface: 'main',
+    state: () => ({
+      kind,
+      writable: stateRef.current.writable,
+      htmlPreview: stateRef.current.html.slice(0, 2000),
+    }),
+    actions: {
+      read_source: {
+        description: '读取当前 HTML 源码摘要；完整源码应通过页面 db_content 获取',
+        risk: 'read',
+        run: () => ({ kind, html: stateRef.current.html }),
+      },
+      set_html: {
+        description: '替换当前 HTML 源码',
+        risk: 'write',
+        inputSchema: {
+          type: 'object',
+          properties: { html: { type: 'string' } },
+          required: ['html'],
+        },
+        run: ({ html: next }: { html?: unknown }) => {
+          if (!stateRef.current.writable) throw new Error('HTML 块当前为只读态')
+          const value = String(next ?? '')
+          updateRef.current({ html: value })
+          return { updated: true, chars: value.length }
+        },
+      },
+      start_presentation: {
+        description: '打开 HTML 全屏放映',
+        risk: 'navigate',
+        run: () => {
+          presentRef.current()
+          return { opened: true }
+        },
+      },
+    },
+  }), [kind])
 }
 
 type HtmlPickService = {
@@ -930,6 +991,7 @@ function HtmlDirectCard({ data, update, writable }: BlockProps) {
   const [hover, setHover] = useState(false)
   const hostRef = useRef<HTMLDivElement | null>(null)
   const deck = useHtmlDeck(hostRef, 'html', html, { width, height, deck: deckOn })
+  useHtmlBlockActions('html', html, writable, update, deck.start)
   const selectionBubble = useDirectHtmlSelection(hostRef)
   const stamped = useMemo(
     () => stampHtmlSource(html, htmlBlockKey(hostRef.current?.closest('[data-page-block]') ?? null, html), name),
@@ -1101,6 +1163,7 @@ function HtmlFrameCard({ data, update, writable }: BlockProps) {
   )
   const selection = useFrameHtmlSelection(frameRef, nonceRef.current)
   const deck = useHtmlDeck(hostRef, 'htmlframe', html, { height, deck: deckOn })
+  useHtmlBlockActions('htmlframe', html, writable, update, deck.start)
 
   const stampFrame = () => {
     const frame = frameRef.current
@@ -1170,6 +1233,7 @@ function HtmlFrameCard({ data, update, writable }: BlockProps) {
 /* ---------------- apply ---------------- */
 
 export function apply(ctx: {
+  uiActions: UiActionsApi
   pick: HtmlPickService
   pageEditor: {
     registerBlock: (spec: {
@@ -1185,6 +1249,7 @@ export function apply(ctx: {
     }) => void
   }
 }) {
+  uiActions = ctx.uiActions
   htmlPick = ctx.pick
   ctx.pageEditor.registerBlock({
     kind: 'html',

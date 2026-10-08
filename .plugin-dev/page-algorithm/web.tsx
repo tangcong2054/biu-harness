@@ -2,7 +2,10 @@ const React = globalThis.React
 const { useEffect, useRef, useState } = React
 
 export const name = 'page-algorithm'
-export const inject = ['pageEditor']
+export const inject = ['pageEditor', 'uiActions']
+
+type UiActionsApi = { register: (spec: Record<string, unknown>) => () => void }
+let uiActions: UiActionsApi | undefined
 
 const DEFAULTS = {
   title: '1. Two Sum',
@@ -162,7 +165,53 @@ function AlgorithmCard({
   const code = String(data.code ?? '')
   const accent = DIFF_COLOR[difficulty] ?? '#00b8a3'
   const ro = !writable
+  const dataRef = useRef({ title, difficulty, prompt, lang, code })
+  const updateRef = useRef(update)
+  const writableRef = useRef(writable)
+  const instanceId = useRef(`algorithm-${crypto.randomUUID()}`)
+  dataRef.current = { title, difficulty, prompt, lang, code }
+  updateRef.current = update
+  writableRef.current = writable
   useAlgoStyle()
+
+  useEffect(() => uiActions?.register({
+    plugin: name,
+    instanceId: instanceId.current,
+    kind: 'algorithm',
+    label: title || '算法题',
+    surface: 'main',
+    state: () => dataRef.current,
+    actions: {
+      read_problem: {
+        description: '读取算法题题面、语言和代码',
+        risk: 'read',
+        run: () => dataRef.current,
+      },
+      set_problem: {
+        description: '更新算法题字段',
+        risk: 'write',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            title: { type: 'string' },
+            difficulty: { type: 'string', enum: ['Easy', 'Medium', 'Hard'] },
+            prompt: { type: 'string' },
+            lang: { type: 'string' },
+            code: { type: 'string' },
+          },
+        },
+        run: (args: Record<string, unknown>) => {
+          if (!writableRef.current) throw new Error('算法题当前为只读态')
+          const patch = Object.fromEntries(
+            Object.entries(args).filter(([key, value]) =>
+              ['title', 'difficulty', 'prompt', 'lang', 'code'].includes(key) && typeof value === 'string'),
+          )
+          updateRef.current(patch)
+          return patch
+        },
+      },
+    },
+  }), [])
 
   return (
     <div data-testid="page-algorithm-card" className="pa-card" style={{ ['--pa-diff' as string]: accent }}>
@@ -229,6 +278,7 @@ function AlgorithmCard({
 }
 
 export function apply(ctx: {
+  uiActions: UiActionsApi
   pageEditor: {
     registerBlock: (spec: {
       kind: string
@@ -243,6 +293,7 @@ export function apply(ctx: {
     }) => void
   }
 }) {
+  uiActions = ctx.uiActions
   ctx.pageEditor.registerBlock({
     kind: 'algorithm',
     plugin: name,

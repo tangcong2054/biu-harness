@@ -4,7 +4,10 @@ const React = globalThis.React
 const { useEffect, useRef, useState } = React
 
 export const name = 'page-toc'
-export const inject = ['pageEditor']
+export const inject = ['pageEditor', 'uiActions']
+
+type UiActionsApi = { register: (spec: Record<string, unknown>) => () => void }
+let uiActions: UiActionsApi | undefined
 
 const STYLE_ID = 'page-toc-style-v2'
 const STYLE_CSS = `
@@ -62,6 +65,10 @@ function TocCard(props: { data: Record<string, unknown>; update: (patch: Record<
   useTocStyle()
   const hostRef = useRef<HTMLDivElement | null>(null)
   const [items, setItems] = useState<TocHeading[]>([])
+  const itemsRef = useRef(items)
+  const jumpRef = useRef<(id: string) => void>(() => {})
+  const instanceId = useRef(`toc-${crypto.randomUUID()}`)
+  itemsRef.current = items
   const title = typeof props.data.title === 'string' && props.data.title.trim() ? props.data.title.trim() : '目录'
 
   useEffect(() => {
@@ -85,6 +92,36 @@ function TocCard(props: { data: Record<string, unknown>; update: (patch: Record<
     const el = root ? headingElById(root, id, host) : null
     el?.scrollIntoView({ block: 'start', behavior: 'smooth' })
   }
+  jumpRef.current = jump
+
+  useEffect(() => uiActions?.register({
+    plugin: name,
+    instanceId: instanceId.current,
+    kind: 'page-toc',
+    label: title,
+    surface: 'main',
+    state: () => ({ headings: itemsRef.current }),
+    actions: {
+      list_headings: {
+        description: '读取当前页面目录标题',
+        risk: 'read',
+        run: () => ({ headings: itemsRef.current }),
+      },
+      jump_to: {
+        description: '滚动到指定标题',
+        risk: 'navigate',
+        inputSchema: {
+          type: 'object',
+          properties: { id: { type: 'string' } },
+          required: ['id'],
+        },
+        run: ({ id }: { id?: unknown }) => {
+          jumpRef.current(String(id ?? ''))
+          return { id }
+        },
+      },
+    },
+  }), [title])
 
   return (
     <div ref={hostRef} className="page-toc" data-testid="page-toc">
@@ -111,6 +148,7 @@ function TocCard(props: { data: Record<string, unknown>; update: (patch: Record<
 }
 
 export function apply(ctx: {
+  uiActions: UiActionsApi
   pageEditor: {
     registerBlock: (spec: {
       kind: string
@@ -126,6 +164,7 @@ export function apply(ctx: {
     }) => void
   }
 }) {
+  uiActions = ctx.uiActions
   ctx.pageEditor.registerBlock({
     kind: 'toc',
     plugin: name,

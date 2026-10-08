@@ -4,7 +4,10 @@ const { useState, useEffect, useMemo, useCallback, useRef } = React
 import { createPortal } from 'react-dom'
 
 export const name = 'dbbrain-limit'
-export const inject = ['pageEditor']
+export const inject = ['pageEditor', 'uiActions']
+
+type UiActionsApi = { register: (spec: Record<string, unknown>) => () => void }
+let uiActions: UiActionsApi | undefined
 
 type BlockProps = {
   data: Record<string, unknown>
@@ -263,6 +266,26 @@ function DbbrainLimitBlock({ data, update, writable, presentation }: BlockProps)
   // 待确认的危险操作
   const [pending, setPending] = useState<null | { kind: 'kill'; row: Session } | { kind: 'terminate' | 'delete'; row: FilterTask }>(null)
   const [expanded, setExpanded] = useState<string>('')
+  const instanceIdRef = useRef(`dbbrain-limit-${crypto.randomUUID()}`)
+  const loadSessionsRef = useRef<() => Promise<void>>(async () => {})
+  const loadTasksRef = useRef<() => Promise<void>>(async () => {})
+  const stateRef = useRef<Record<string, unknown>>({})
+  stateRef.current = {
+    instanceId,
+    region,
+    authUser,
+    tab,
+    busy,
+    error,
+    notice,
+    sessions,
+    sessionAt: sessAt,
+    filters: tasks,
+    filterTotal: taskTotal,
+    tokenReady,
+    needToken,
+    pending: pending ? { kind: pending.kind } : null,
+  }
 
   /** 最大化：Portal 到 body 顶层。
    *  为什么用 Portal 而不是像 page-terminal 那样搬 DOM：本块有大量按钮，
@@ -500,6 +523,73 @@ function DbbrainLimitBlock({ data, update, writable, presentation }: BlockProps)
       setBusy('')
     }
   }, [instanceId, region, dbUser, dbPassword, cSqlType, cFilterKey, cMax, cDuration, loadTasks, update])
+
+  loadSessionsRef.current = loadSessions
+  loadTasksRef.current = loadTasks
+
+  useEffect(() => uiActions?.register({
+    plugin: name,
+    instanceId: instanceIdRef.current,
+    kind: 'dbbrain-limit',
+    label: 'DBbrain 会话与 SQL 限流',
+    surface: 'main',
+    state: () => stateRef.current,
+    actions: {
+      set_instance: {
+        description: '设置腾讯云数据库实例、地域和账号；数据库密码必须由用户在页面手动填写',
+        risk: 'write',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            instanceId: { type: 'string' },
+            region: { type: 'string' },
+            authUser: { type: 'string' },
+          },
+          required: ['instanceId'],
+        },
+        run: (args: Record<string, unknown>) => {
+          if (!writable) throw new Error('DBbrain 块当前为只读态')
+          const patch: Record<string, string> = {}
+          if (typeof args.instanceId === 'string') {
+            setInstanceId(args.instanceId)
+            patch.instanceId = args.instanceId
+          }
+          if (typeof args.region === 'string') {
+            setRegion(args.region)
+            patch.region = args.region
+          }
+          if (typeof args.authUser === 'string') {
+            setAuthUser(args.authUser)
+            setDbUser(args.authUser)
+            patch.authUser = args.authUser
+          }
+          persist(patch)
+          return patch
+        },
+      },
+      load_sessions: {
+        description: '按当前筛选条件查询活跃会话',
+        risk: 'submit',
+        run: async () => {
+          await loadSessionsRef.current()
+          return stateRef.current.sessions
+        },
+      },
+      load_filters: {
+        description: '查询当前实例的 SQL 限流任务',
+        risk: 'submit',
+        run: async () => {
+          await loadTasksRef.current()
+          return stateRef.current.filters
+        },
+      },
+      read_state: {
+        description: '读取当前会话、限流任务和操作状态；不包含数据库密码',
+        risk: 'read',
+        run: () => stateRef.current,
+      },
+    },
+  }), [])
 
   const credOk = status?.hasCredential !== false
   const maxZero = Number(cMax) === 0
@@ -927,6 +1017,7 @@ function DbbrainLimitBlock({ data, update, writable, presentation }: BlockProps)
 }
 
 export function apply(ctx: {
+  uiActions: UiActionsApi
   pageEditor: {
     registerBlock: (spec: {
       kind: string
@@ -942,6 +1033,7 @@ export function apply(ctx: {
     }) => void
   }
 }) {
+  uiActions = ctx.uiActions
   ctx.pageEditor.registerBlock({
     kind: 'dbbrain-limit',
     plugin: name,

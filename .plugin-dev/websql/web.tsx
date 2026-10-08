@@ -4,7 +4,13 @@ const React = globalThis.React
 const { useEffect, useMemo, useRef, useState } = React
 
 export const name = 'websql'
-export const inject = ['pageEditor']
+export const inject = ['pageEditor', 'uiActions']
+
+type UiActionsApi = {
+  register: (spec: Record<string, unknown>) => () => void
+}
+
+let uiActions: UiActionsApi | undefined
 
 type BlockProps = {
   data: Record<string, unknown>
@@ -235,6 +241,12 @@ function WebSqlBlock({ data, update, writable, presentation }: BlockProps) {
     tables, selectedTable, columns, result, serverVersion, busy, error,
   ])
   const sharedRef = useRef(sharedState)
+  const connectRef = useRef<() => Promise<void>>(async () => {})
+  const runRef = useRef<(page?: number) => Promise<Result>>(async () => ({ ok: false }))
+  const updateRef = useRef(update)
+  const writableRef = useRef(writable)
+  updateRef.current = update
+  writableRef.current = writable
   const channelRef = useRef<BroadcastChannel | null>(null)
   const syncSource = useRef(crypto.randomUUID())
   const applyingShared = useRef(false)
@@ -419,10 +431,90 @@ function WebSqlBlock({ data, update, writable, presentation }: BlockProps) {
     setBusy('')
     if (!response.ok) {
       setError(response.error || '查询失败')
-      return
+      return response
     }
     setResult(response)
+    return response
   }
+
+  connectRef.current = connect
+  runRef.current = run
+
+  useEffect(() => {
+    if (!uiActions) return
+    return uiActions.register({
+      plugin: name,
+      instanceId: componentId,
+      kind: 'websql-query',
+      label: 'WebSQL 查询面板',
+      surface: 'main',
+      visible: () => Boolean(rootRef.current?.isConnected),
+      state: () => {
+        const current = sharedRef.current
+        return {
+          connected: current.connected,
+          database: current.database,
+          sql: current.sql,
+          busy: current.busy,
+          error: current.error,
+          result: current.result
+            ? {
+                ok: current.result.ok,
+                columns: current.result.columns ?? [],
+                rows: current.result.rows ?? [],
+                ms: current.result.ms,
+                page: current.result.page,
+                hasMore: current.result.hasMore,
+              }
+            : null,
+        }
+      },
+      actions: {
+        set_sql: {
+          description: '设置 SQL 编辑器内容',
+          risk: 'write',
+          inputSchema: {
+            type: 'object',
+            properties: { sql: { type: 'string' } },
+            required: ['sql'],
+          },
+          run: ({ sql }: { sql?: unknown }) => {
+            const value = String(sql ?? '')
+            setSql(value)
+            if (writableRef.current) updateRef.current({ sql: value })
+            return { sql: value }
+          },
+        },
+        connect: {
+          description: '使用当前连接参数连接数据库',
+          risk: 'submit',
+          run: async () => {
+            await connectRef.current()
+            return { connected: sharedRef.current.connected, error: sharedRef.current.error }
+          },
+        },
+        execute: {
+          description: '执行当前 SQL 并更新结果表格',
+          risk: 'submit',
+          run: async () => {
+            if (!sharedRef.current.connected) throw new Error('WebSQL 尚未连接数据库')
+            if (!sharedRef.current.sql.trim()) throw new Error('SQL 为空')
+            return runRef.current(1)
+          },
+        },
+        read_result: {
+          description: '读取当前 SQL、执行状态和查询结果',
+          risk: 'read',
+          run: () => ({
+            sql: sharedRef.current.sql,
+            busy: sharedRef.current.busy,
+            error: sharedRef.current.error,
+            result: sharedRef.current.result,
+          }),
+        },
+      },
+    })
+  }, [componentId])
 
   const block = (
     <div
@@ -608,8 +700,10 @@ function WebSqlBlock({ data, update, writable, presentation }: BlockProps) {
 }
 
 export function apply(ctx: {
+  uiActions: UiActionsApi
   pageEditor: { registerBlock: (spec: Record<string, unknown>) => void }
 }) {
+  uiActions = ctx.uiActions
   ctx.pageEditor.registerBlock({
     kind: 'websql',
     plugin: name,

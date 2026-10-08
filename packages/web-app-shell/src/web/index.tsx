@@ -21,6 +21,7 @@ import {
 import { useLocation, useNavigate } from 'react-router-dom'
 import type { Context } from 'cordis'
 import type { SlotProps } from '@biu/web-slots'
+import type { UiActionsService } from '@biu/core-ui-actions/web'
 import { bindSnapshot, type SnapshotService } from '@biu/web-snapshot'
 import { bindSessionView, type SessionViewService } from '@biu/web-session-view'
 import { bindProjectView, type ProjectViewService } from '@biu/web-project-view'
@@ -244,11 +245,64 @@ function MainShell(props: SlotProps) {
   const sessionView = props.sessionView as SessionViewService
   const projectView = props.projectView as ProjectViewService
   const slots = props.slots as SlotsService
+  const uiActions = (props.getUiActions as (() => UiActionsService | undefined) | undefined)?.()
   const navigate = useNavigate()
   const location = useLocation()
   const modules = useAppModules()
   const navReady = useAppModulesNavReady ? useAppModulesNavReady() : true
   const pluginModules = modules.filter((item) => item.id !== 'agent')
+
+  useEffect(() => {
+    if (!uiActions) return
+    return uiActions.register({
+    plugin: 'web-app-shell',
+    instanceId: 'main',
+    kind: 'shell',
+    label: 'Biu 应用壳',
+    surface: 'main',
+    state: () => ({ route: window.location.pathname }),
+    actions: {
+      navigate: {
+        description: '跳转到指定的 Biu 内部路径',
+        risk: 'navigate',
+        inputSchema: {
+          type: 'object',
+          properties: { path: { type: 'string' } },
+          required: ['path'],
+        },
+        run: ({ path }) => {
+          const target = String(path ?? '')
+          if (!target.startsWith('/')) throw new Error('内部路径必须以 / 开头')
+          navigate(target)
+          return { route: target }
+        },
+      },
+      open_inspector_record: {
+        description: '在右侧检查器打开指定数据库记录',
+        risk: 'navigate',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            collection: { type: 'string' },
+            recordId: { type: 'string' },
+            unique: { type: 'boolean' },
+          },
+          required: ['collection', 'recordId'],
+        },
+        run: ({ collection, recordId, unique }) => {
+          const detail = {
+            collection: String(collection ?? ''),
+            recordId: String(recordId ?? ''),
+            unique: unique !== false,
+          }
+          window.dispatchEvent(new CustomEvent('biu:inspector-reveal', { detail }))
+          return detail
+        },
+      },
+    },
+    })
+  }, [navigate, uiActions])
+
   const sessionId = useSessionView((state) => state.sessionId)
   const collections = useSnapshot((state) => state.collections)
   const danceSessions = useSessionView((state) => state.sessions)
@@ -969,6 +1023,7 @@ export function apply(ctx: Context) {
     useProjectView: bindProjectView(ctx.projectView as ProjectViewService),
     slots: ctx.slots as SlotsService,
     appModules: ctx.appModules as AppModulesService,
+    getUiActions: () => ctx.get('uiActions') as UiActionsService | undefined,
   }
   ctx.slots.fill('root', Shell, {
     children: {
