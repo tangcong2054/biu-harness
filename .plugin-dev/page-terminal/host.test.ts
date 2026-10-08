@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { test } from 'vitest'
 import { activeSocketAfterDetach, broadcastSockets, buildMysqlArgs, isUnsafeMysqlSql, type Socket } from './host.ts'
 
@@ -14,7 +15,7 @@ function socket(sent: string[]): Socket {
 }
 
 test('presentation icon uses the resolved terminal zoom state', () => {
-  const web = readFileSync(new URL('./web.tsx', import.meta.url), 'utf8')
+  const web = readFileSync(resolve(import.meta.dirname, './web.tsx'), 'utf8')
   assert.match(web, /<ExpandIcon shrink=\{zoomed\} \/>/)
   assert.doesNotMatch(web, /\bzoom\.zoomed\b/)
 })

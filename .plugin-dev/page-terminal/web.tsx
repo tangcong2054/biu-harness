@@ -1354,6 +1354,23 @@ function PageTerminal({
   return body
 }
 
+function TerminalMinimized({ data }: { data: Record<string, unknown> }) {
+  const history = parseHistory(data.history)
+  const latest = history.at(-1)
+  return (
+    <div
+      data-testid="page-terminal-minimized"
+      style={{ display: 'flex', minWidth: 0, alignItems: 'center', gap: 10 }}
+    >
+      <strong style={{ flex: '0 0 auto' }}>终端</strong>
+      <code style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        {latest?.cmd || '等待命令'}
+      </code>
+      <span style={{ flex: '0 0 auto', opacity: 0.55 }}>{history.length} 条</span>
+    </div>
+  )
+}
+
 export function apply(ctx: {
   pageEditor: {
     registerBlock: (spec: {
@@ -1366,6 +1383,11 @@ export function apply(ctx: {
       aliases?: string[]
       defaults?: Record<string, unknown>
       View: (props: {
+        data: Record<string, unknown>
+        update: (patch: Record<string, unknown>) => void
+        writable: boolean
+      }) => unknown
+      MinimizedView?: (props: {
         data: Record<string, unknown>
         update: (patch: Record<string, unknown>) => void
         writable: boolean
@@ -1384,5 +1406,6 @@ export function apply(ctx: {
     assets: [],
     defaults: DEFAULTS,
     View: PageTerminal,
+    MinimizedView: TerminalMinimized,
   })
 }

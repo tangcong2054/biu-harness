@@ -12,6 +12,7 @@ import { usePageBlockSync } from './page-block-sync.ts'
 import {
   getPagePresentation,
   PagePresentationInlineActions,
+  PagePresentationMinimized,
   PagePresentationPlaceholder,
   usePagePresentation,
 } from './presentation.tsx'
@@ -108,6 +109,7 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
     publishData(next)
   }
   const View = spec?.View
+  const MinimizedView = spec?.MinimizedView
   const hostRef = useRef<HTMLElement | null>(null)
   const inlineRef = useRef<HTMLDivElement | null>(null)
   const contentHost = useMemo(() => {
@@ -196,7 +198,20 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
       ) : View ? (
         <>
           <div ref={inlineRef} className="page-presentation-inline-slot" />
-          {presentation && presentation.mode !== 'inline' ? (
+          {presentation?.mode === 'minimized' ? (
+            <PagePresentationMinimized title={presentationTitle} onRestore={presentation.restore}>
+              {MinimizedView ? (
+                <RenderBoundary label={`${plugin || kind} minimized`}>
+                  <MinimizedView
+                    data={data}
+                    update={update}
+                    writable={editor.isEditable}
+                    presentation={presentation}
+                  />
+                </RenderBoundary>
+              ) : undefined}
+            </PagePresentationMinimized>
+          ) : presentation && presentation.mode !== 'inline' ? (
             <PagePresentationPlaceholder mode={presentation.mode} onRestore={presentation.inline} />
           ) : null}
           {createPortal(

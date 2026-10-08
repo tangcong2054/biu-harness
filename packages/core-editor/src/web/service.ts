@@ -44,6 +44,11 @@ export type PageBlockSpec = {
    */
   assets?: import('@biu/type-file-system').BlockAssetsDecl
   View: ComponentType<PageBlockViewProps>
+  /**
+   * 收起后显示在原页面中的紧凑内容。未声明时由宿主显示通用标题摘要。
+   * 完整 View 仍保留挂载，避免终端、查询等运行状态因收起而中断。
+   */
+  MinimizedView?: ComponentType<PageBlockViewProps>
 }
 
 export type SlashInsert =

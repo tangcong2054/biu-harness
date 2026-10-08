@@ -1,6 +1,6 @@
 import { Service, type Context } from 'cordis'
-import { useEffect, useRef, useSyncExternalStore } from 'react'
-import { ArrowTopRightOnSquareIcon, ViewColumnsIcon } from '@heroicons/react/16/solid'
+import { useEffect, useRef, useSyncExternalStore, type ReactNode } from 'react'
+import { ArrowTopRightOnSquareIcon, MinusIcon, ViewColumnsIcon } from '@heroicons/react/16/solid'
 
 export type PagePresentationMode = 'inline' | 'sidebar' | 'maximized' | 'minimized'
 
@@ -11,6 +11,7 @@ export type PagePresentationControls = {
   sidebar: () => void
   maximize: () => void
   minimize: () => void
+  restore: () => void
 }
 
 type Entry = {
@@ -49,8 +50,12 @@ const STYLE = `
 .page-presentation-stage{position:relative;display:flex;flex:1;min-width:0;min-height:0;overflow:hidden}
 .page-presentation-sidebar{display:flex;height:100%;min-width:0;min-height:0;flex-direction:column;overflow:hidden}
 .page-presentation-sidebar .page-presentation-stage{overflow:auto}
-.page-presentation-dock{position:fixed;right:18px;bottom:18px;z-index:2147482999;display:flex;max-width:min(560px,calc(100vw - 36px));gap:6px;overflow:auto}
-.page-presentation-chip{height:30px;max-width:220px;border:1px solid var(--dsw-border);border-radius:999px;padding:0 12px;background:var(--dsw-sidebar);color:var(--dsw-label);box-shadow:var(--dsw-shadow);font:12px/1 var(--font-sans);font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+.page-presentation-minimized{display:flex;min-width:0;align-items:center;gap:10px;border:1px solid var(--dsw-border);border-radius:8px;padding:8px 10px;background:var(--dsw-sidebar);color:var(--dsw-label);font:12px/1.4 var(--font-sans)}
+.page-presentation-minimized-content{min-width:0;flex:1;overflow:hidden}
+.page-presentation-minimized-default{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700}
+.page-presentation-minimized-restore{display:grid;width:26px;height:26px;flex:none;place-items:center;border:1px solid var(--dsw-border);border-radius:6px;padding:0;background:var(--dsw-input);color:var(--dsw-label);cursor:pointer}
+.page-presentation-minimized-restore:hover{background:var(--dsw-hover)}
+.page-presentation-minimized-restore svg{width:15px;height:15px}
 .page-presentation-inline-actions{position:absolute;right:6px;top:6px;z-index:24;display:flex;gap:4px;opacity:0;transition:opacity .12s}
 .page-block:hover>.page-presentation-inline-actions,.page-presentation-inline-actions:focus-within{opacity:1}
 .page-presentation-inline-actions button{display:grid;width:26px;height:26px;place-items:center;border:1px solid var(--dsw-border);border-radius:6px;padding:0;background:var(--dsw-sidebar);color:var(--dsw-label);cursor:pointer}
@@ -187,6 +192,7 @@ export class PagePresentationService extends Service {
       sidebar: () => this.setMode(id, 'sidebar'),
       maximize: () => void this.openDetached(id),
       minimize: () => this.setMode(id, 'minimized'),
+      restore: () => this.restore(id),
     }
   }
 
@@ -325,11 +331,6 @@ export function usePagePresentation(id?: string) {
   return id && service ? service.controls(id) : null
 }
 
-function useEntries(service: PagePresentationService) {
-  useSyncExternalStore(service.subscribe, service.version, () => 0)
-  return service.snapshots()
-}
-
 function PresentationTarget({
   service,
   id,
@@ -350,25 +351,7 @@ function PresentationTarget({
 export function PagePresentationLayer({ presentation }: { presentation?: PagePresentationService }) {
   const service = presentation ?? bound
   if (!service) return null
-  return <PagePresentationLayerInner service={service} />
-}
-
-function PagePresentationLayerInner({ service }: { service: PagePresentationService }) {
-  const entries = useEntries(service)
-  const minimized = entries.filter((item) => item.mode === 'minimized')
-  return (
-    <>
-      {minimized.length ? (
-        <div className="page-presentation-dock" data-testid="page-presentation-dock">
-          {minimized.map((item) => (
-            <button key={item.id} type="button" className="page-presentation-chip" onClick={() => service.restore(item.id)}>
-              {item.title}
-            </button>
-          ))}
-        </div>
-      ) : null}
-    </>
-  )
+  return null
 }
 
 function PresentationBar({
@@ -394,7 +377,7 @@ function PresentationBar({
         <ArrowTopRightOnSquareIcon aria-hidden />
       </button>
       <button type="button" className="page-presentation-btn" onClick={() => service.setMode(entry.id, 'minimized')}>
-        回到主页面
+        收起
       </button>
       <button type="button" className="page-presentation-btn" onClick={() => service.setMode(entry.id, 'inline')}>
         页面内
@@ -436,6 +419,9 @@ export function PagePresentationInlineActions({
   if (controls.mode !== 'inline') return null
   return (
     <div className="page-presentation-inline-actions" data-biu-ignore>
+      <button type="button" title="收起" aria-label="收起" onClick={controls.minimize}>
+        <MinusIcon aria-hidden />
+      </button>
       <button type="button" title="在右侧栏打开" aria-label="在右侧栏打开" onClick={controls.sidebar}>
         <ViewColumnsIcon aria-hidden />
       </button>
@@ -446,6 +432,33 @@ export function PagePresentationInlineActions({
         onClick={controls.maximize}
       >
         <ArrowTopRightOnSquareIcon aria-hidden />
+      </button>
+    </div>
+  )
+}
+
+export function PagePresentationMinimized({
+  title,
+  onRestore,
+  children,
+}: {
+  title: string
+  onRestore: () => void
+  children?: ReactNode
+}) {
+  return (
+    <div className="page-presentation-minimized" data-biu-ignore data-testid="page-presentation-minimized">
+      <div className="page-presentation-minimized-content">
+        {children ?? <div className="page-presentation-minimized-default">{title}</div>}
+      </div>
+      <button
+        type="button"
+        className="page-presentation-minimized-restore"
+        title="展开"
+        aria-label="展开"
+        onClick={onRestore}
+      >
+        <ViewColumnsIcon aria-hidden />
       </button>
     </div>
   )

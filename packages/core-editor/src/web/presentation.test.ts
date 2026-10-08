@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'vitest'
 import { Context } from 'cordis'
-import { PagePresentationService } from './presentation.tsx'
+import { createElement } from 'react'
+import { fireEvent, render } from '@testing-library/react'
+import { PagePresentationMinimized, PagePresentationService } from './presentation.tsx'
 
 function registered(service: PagePresentationService, id: string) {
   const inlineTarget = document.createElement('div')
@@ -86,4 +88,25 @@ test('multiple plugins can open independent windows without changing inline mode
   first.inlineTarget.remove()
   second.inlineTarget.remove()
   Reflect.deleteProperty(window, 'biuPresentation')
+})
+
+test('minimized presentation shows plugin content and restores on demand', () => {
+  let restored = 0
+  const { getByTestId, getByRole } = render(
+    createElement(
+      PagePresentationMinimized,
+      { title: '默认标题', onRestore: () => restored += 1 },
+      createElement('span', { 'data-testid': 'plugin-minimized-content' }, '最近一次查询：12 行'),
+    ),
+  )
+  assert.equal(getByTestId('plugin-minimized-content').textContent, '最近一次查询：12 行')
+  fireEvent.click(getByRole('button', { name: '展开' }))
+  assert.equal(restored, 1)
+})
+
+test('minimized presentation falls back to its title', () => {
+  const { getByText } = render(
+    createElement(PagePresentationMinimized, { title: '终端', onRestore: () => undefined }),
+  )
+  assert.ok(getByText('终端'))
 })
