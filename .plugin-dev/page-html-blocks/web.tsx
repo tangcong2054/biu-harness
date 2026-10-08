@@ -1,12 +1,13 @@
 import { createPortal } from 'react-dom'
 import { bindHtmlSlide, collectHtmlSlides, cssBoxSize, htmlDeckEnabled, htmlDeckIndex, htmlDeckKeyAction, htmlLooksFillLayout, HTML_FILL_HOST_PX, stepHtmlDeck } from './html-deck.ts'
+import { injectHtmlSelectionBridge, parseHtmlSelectionMessage, suspendAncestorDrag } from './selection-bridge.ts'
 import { htmlBlockKey, stampHtmlPickSurfaces, stampHtmlSource } from './stamp-picks.ts'
 
 const React = globalThis.React
 const { useEffect, useLayoutEffect, useMemo, useRef, useState } = React
 
 export const name = 'page-html-blocks'
-export const inject = ['pageEditor']
+export const inject = ['pageEditor', 'pick']
 
 type BlockProps = {
   data: Record<string, unknown>
@@ -24,6 +25,148 @@ const field = {
   background: 'transparent',
   color: 'inherit',
   font: 'inherit',
+}
+
+type SelectionBubbleState = {
+  text: string
+  top: number
+  left: number
+}
+
+type HtmlPickService = {
+  picking: boolean
+  attach: (refs: Array<Record<string, unknown>>) => void
+}
+
+let htmlPick: HtmlPickService | undefined
+
+function selectionId(text: string) {
+  let hash = 0
+  for (let i = 0; i < text.length; i += 1) hash = (hash * 33 + text.charCodeAt(i)) >>> 0
+  return hash.toString(16)
+}
+
+function attachHtmlSelection(text: string) {
+  const selection = text.trim().slice(0, 16_000)
+  if (!selection || !htmlPick) return false
+  htmlPick.attach([{
+    kind: 'text',
+    id: selectionId(selection),
+    label: selection.length > 80 ? `${selection.slice(0, 80)}…` : selection,
+    route: window.location.pathname,
+    selection,
+    plugin: name,
+    title: 'HTML 文字选区',
+  }])
+  return true
+}
+
+function selectionNodeElement(node: Node | null) {
+  return node instanceof Element ? node : node?.parentElement ?? null
+}
+
+function selectionInside(host: HTMLElement | null) {
+  const selection = window.getSelection()
+  if (!host || !selection || selection.rangeCount === 0 || selection.isCollapsed) return null
+  const anchor = selectionNodeElement(selection.anchorNode)
+  const focus = selectionNodeElement(selection.focusNode)
+  if (!anchor || !focus || !host.contains(anchor) || !host.contains(focus)) return null
+  if (anchor.closest('[data-biu-ignore], textarea, input')) return null
+  const text = selection.toString().trim().slice(0, 16_000)
+  if (!text) return null
+  const rect = selection.getRangeAt(0).getBoundingClientRect()
+  return {
+    text,
+    top: Math.max(8, rect.top - 40),
+    left: Math.min(window.innerWidth - 44, Math.max(8, rect.left + rect.width / 2 - 16)),
+  }
+}
+
+function SelectionBubble({ state, onAttach }: { state: SelectionBubbleState | null; onAttach: () => void }) {
+  if (!state) return null
+  return createPortal(
+    <button
+      type="button"
+      data-testid="html-selection-bubble"
+      data-biu-ignore
+      title="加入对话（Ctrl/⌘+L）"
+      aria-label="加入对话"
+      onMouseDown={(event) => event.preventDefault()}
+      onClick={onAttach}
+      style={{
+        position: 'fixed',
+        zIndex: 2147483645,
+        top: state.top,
+        left: state.left,
+        width: 32,
+        height: 32,
+        border: '1px solid var(--dsw-border)',
+        borderRadius: 8,
+        background: 'var(--dsw-float)',
+        color: 'var(--dsw-label)',
+        boxShadow: 'var(--dsw-shadow)',
+        cursor: 'pointer',
+        fontSize: 16,
+        lineHeight: '30px',
+        textAlign: 'center',
+      }}
+    >
+      ↗
+    </button>,
+    document.body,
+  )
+}
+
+function useDirectHtmlSelection(hostRef: { current: HTMLElement | null }) {
+  const [state, setState] = useState<SelectionBubbleState | null>(null)
+  const stateRef = useRef<SelectionBubbleState | null>(null)
+  useEffect(() => {
+    const sync = (clearWhenEmpty = false) => {
+      const next = selectionInside(hostRef.current)
+      if (!next && !clearWhenEmpty) return
+      stateRef.current = next
+      setState(next)
+    }
+    const onSelectionChange = () => sync(false)
+    const onMouseUp = () => sync(true)
+    const onViewport = () => sync(false)
+    const onKey = (event: KeyboardEvent) => {
+      if (
+        event.isComposing ||
+        event.altKey ||
+        event.shiftKey ||
+        !(event.metaKey || event.ctrlKey) ||
+        (event.key !== 'l' && event.key !== 'L')
+      ) return
+      const selected = selectionInside(hostRef.current) ?? stateRef.current
+      if (!selected) return
+      event.preventDefault()
+      if (attachHtmlSelection(selected.text)) {
+        window.getSelection()?.removeAllRanges()
+        stateRef.current = null
+        setState(null)
+      }
+    }
+    document.addEventListener('selectionchange', onSelectionChange)
+    document.addEventListener('mouseup', onMouseUp)
+    window.addEventListener('keydown', onKey)
+    window.addEventListener('scroll', onViewport, true)
+    window.addEventListener('resize', onViewport)
+    return () => {
+      document.removeEventListener('selectionchange', onSelectionChange)
+      document.removeEventListener('mouseup', onMouseUp)
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('scroll', onViewport, true)
+      window.removeEventListener('resize', onViewport)
+    }
+  }, [hostRef])
+  const attach = () => {
+    if (!state || !attachHtmlSelection(state.text)) return
+    window.getSelection()?.removeAllRanges()
+    stateRef.current = null
+    setState(null)
+  }
+  return <SelectionBubble state={state} onAttach={attach} />
 }
 
 /** 源码编辑区。草稿在本地，避免每次回车写回 pageBlock 把光标甩到最后。 */
@@ -139,6 +282,34 @@ const pressBtn: Record<string, unknown> = {
   alignItems: 'center',
 }
 
+function SelectableHtmlFrame({
+  html,
+  title,
+  style,
+}: {
+  html: string
+  title: string
+  style: Record<string, unknown>
+}) {
+  const frameRef = useRef<HTMLIFrameElement | null>(null)
+  const nonceRef = useRef(`html-selection-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`)
+  const bridgedHtml = useMemo(() => injectHtmlSelectionBridge(html, nonceRef.current), [html])
+  const selection = useFrameHtmlSelection(frameRef, nonceRef.current)
+  return (
+    <>
+      <iframe
+        ref={frameRef}
+        title={title}
+        srcDoc={bridgedHtml}
+        sandbox="allow-scripts"
+        onLoad={selection.clear}
+        style={{ ...style, pointerEvents: 'auto' }}
+      />
+      {selection.bubble}
+    </>
+  )
+}
+
 function HtmlDeckOverlay({
   slides,
   index,
@@ -239,10 +410,9 @@ function HtmlDeckOverlay({
         }}
       >
         {slide.kind === 'htmlframe' ? (
-          <iframe
+          <SelectableHtmlFrame
             title={`html-deck-${index}`}
-            srcDoc={slide.html}
-            sandbox="allow-scripts"
+            html={slide.html}
             style={{ ...fill, background: MAG_INK }}
           />
         ) : (
@@ -574,6 +744,7 @@ function HtmlDirectCard({ data, update, writable }: BlockProps) {
   const [hover, setHover] = useState(false)
   const hostRef = useRef<HTMLDivElement | null>(null)
   const deck = useHtmlDeck(hostRef, 'html', html, { width, height, deck: deckOn })
+  const selectionBubble = useDirectHtmlSelection(hostRef)
   const stamped = useMemo(
     () => stampHtmlSource(html, htmlBlockKey(hostRef.current?.closest('[data-page-block]') ?? null, html), name),
     [html],
@@ -614,10 +785,15 @@ function HtmlDirectCard({ data, update, writable }: BlockProps) {
         <div
           className={fill ? 'html-direct-fill-inner' : undefined}
           style={{ overflowX: sized ? undefined : 'auto', height: fill ? '100%' : undefined }}
+          onMouseDown={(event) => {
+            event.stopPropagation()
+            suspendAncestorDrag(event.currentTarget)
+          }}
           dangerouslySetInnerHTML={{ __html: stamped }}
         />
       )}
       {ro || editing ? null : <SizeGrip reveal={hover} boxRef={hostRef} onSize={(next) => update(next)} />}
+      {editing ? null : selectionBubble}
       {deck.overlay}
     </div>
   )
@@ -687,6 +863,42 @@ html,body{margin:0;height:100%;background:${MAG_INK};color:${MAG_PAPER}}
 </script>
 </body></html>`
 
+function useFrameHtmlSelection(
+  frameRef: { current: HTMLIFrameElement | null },
+  nonce: string,
+) {
+  const [state, setState] = useState<SelectionBubbleState | null>(null)
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      const message = parseHtmlSelectionMessage(event, frameRef.current, nonce)
+      if (!message) return
+      if (message.action === 'attach' || htmlPick?.picking) {
+        if (attachHtmlSelection(message.text)) setState(null)
+        return
+      }
+      const frameBox = frameRef.current?.getBoundingClientRect()
+      if (!frameBox) return
+      const rect = message.rect
+      const center = rect ? rect.left + rect.width / 2 : frameBox.width / 2
+      setState({
+        text: message.text,
+        top: Math.max(8, frameBox.top + (rect?.top ?? 0) - 40),
+        left: Math.min(window.innerWidth - 44, Math.max(8, frameBox.left + center - 16)),
+      })
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [frameRef, nonce])
+  const attach = () => {
+    if (!state || !attachHtmlSelection(state.text)) return
+    setState(null)
+  }
+  return {
+    bubble: <SelectionBubble state={state} onAttach={attach} />,
+    clear: () => setState(null),
+  }
+}
+
 function HtmlFrameCard({ data, update, writable }: BlockProps) {
   const ro = !writable
   const html = String(data.html ?? '')
@@ -696,6 +908,12 @@ function HtmlFrameCard({ data, update, writable }: BlockProps) {
   const [hover, setHover] = useState(false)
   const hostRef = useRef<HTMLDivElement | null>(null)
   const frameRef = useRef<HTMLIFrameElement | null>(null)
+  const nonceRef = useRef(`html-selection-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`)
+  const bridgedHtml = useMemo(
+    () => injectHtmlSelectionBridge(html, nonceRef.current),
+    [html],
+  )
+  const selection = useFrameHtmlSelection(frameRef, nonceRef.current)
   const deck = useHtmlDeck(hostRef, 'htmlframe', html, { height, deck: deckOn })
 
   const stampFrame = () => {
@@ -748,12 +966,16 @@ function HtmlFrameCard({ data, update, writable }: BlockProps) {
           ref={frameRef}
           data-testid="page-html-frame-preview"
           title="html-frame"
-          srcDoc={html}
+          srcDoc={bridgedHtml}
           sandbox="allow-scripts"
-          onLoad={stampFrame}
-          style={{ display: 'block', width: '100%', height, border: 'none', background: MAG_INK }}
+          onLoad={() => {
+            selection.clear()
+            stampFrame()
+          }}
+          style={{ display: 'block', width: '100%', height, border: 'none', background: MAG_INK, pointerEvents: 'auto' }}
         />
       )}
+      {editing ? null : selection.bubble}
       {deck.overlay}
     </div>
   )
@@ -762,6 +984,7 @@ function HtmlFrameCard({ data, update, writable }: BlockProps) {
 /* ---------------- apply ---------------- */
 
 export function apply(ctx: {
+  pick: HtmlPickService
   pageEditor: {
     registerBlock: (spec: {
       kind: string
@@ -776,6 +999,7 @@ export function apply(ctx: {
     }) => void
   }
 }) {
+  htmlPick = ctx.pick
   ctx.pageEditor.registerBlock({
     kind: 'html',
     plugin: name,
