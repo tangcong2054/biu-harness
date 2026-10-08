@@ -566,3 +566,10 @@ test('excalidraw board onChange does not setState', async () => {
   assert.match(src, /export const inject/)
   assert.match(src, /View: Board/)
 })
+
+test('system prompt requires distinct plugin descriptions and declared actions', async () => {
+  const src = await readFile(resolve(import.meta.dirname, './index.ts'), 'utf8')
+  assert.match(src, /先查看是否已有相似插件/)
+  assert.match(src, /插件描述必须和其它插件明显不同/)
+  assert.match(src, /必须说明它支持哪些 Action/)
+})
