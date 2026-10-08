@@ -1,8 +1,15 @@
 import { Service, type Context } from 'cordis'
 import type { AssistantReply, ChatOptions, LlmClient, LlmConfig, LlmMessage, LlmUsage } from '@biu/host-llm'
 import { runWithSession } from '@biu/host-sessions/scope'
-import { applyContextBudget, liftToolImages } from '@biu/host-sessions'
+import { estimateTokens, fitMessagesToTokenBudget, liftToolImages } from '@biu/host-sessions'
 import { runWithToolPolicy, runWithToolProgress, type AgentToolMode } from '@biu/host-tools'
+import {
+  buildAutoCompactMessages,
+  messageTokenTotal,
+  projectedRequestTokens,
+  resolveContextPolicy,
+  type ContextPolicy,
+} from './context-policy.ts'
 
 /** 工具结果写入事件日志( tool/result )时统一上限字符数；超长裁剪，避免上下文被单次工具输出撑爆。 */
 export const MAX_TOOL_RESULT_CHARS = 16_000
@@ -41,7 +48,65 @@ export class AgentLoop implements AgentRunner {
     private llm: LlmClient,
     private sessionId: string,
     private signal: AbortSignal,
+    private config: LlmConfig = {
+      provider: 'openai',
+      apiKey: '',
+      model: 'unknown',
+      contextWindowTokens: 200_000,
+      outputReserveTokens: 16_384,
+    },
   ) {}
+
+  private async autoCompact(messages: LlmMessage[], policy: ContextPolicy): Promise<boolean> {
+    const request = buildAutoCompactMessages(messages, policy.hardMessageTokens)
+    if (request.overBudget || request.droppedMessages > 0) {
+      this.ctx.logger('host-agent-loop').warn(
+        `auto compact skipped: complete history cannot fit compaction request session=${this.sessionId} dropped=${request.droppedMessages}`,
+      )
+      return false
+    }
+    try {
+      const reply = await this.llm.chat(request.messages, [], this.signal, {
+        maxOutputTokens: policy.compactMaxOutputTokens,
+        thinking: 'disabled',
+        estimatedTotalTokens: projectedRequestTokens(
+          request.messages,
+          [],
+          policy.compactMaxOutputTokens,
+        ),
+      })
+      const summary = reply.content?.trim() || ''
+      if (!summary) {
+        this.ctx.logger('host-agent-loop').warn(
+          `auto compact returned empty summary session=${this.sessionId}`,
+        )
+        return false
+      }
+      const beforeTokens = messageTokenTotal(messages)
+      const afterTokens = estimateTokens(summary)
+      await this.ctx.sessions.append(this.sessionId, {
+        type: 'tool/call',
+        id: `auto-compact-${Date.now().toString(36)}`,
+        name: 'context_compact_submit',
+        arguments: JSON.stringify({
+          text: summary,
+          auto: true,
+          beforeTokens,
+          afterTokens,
+        }),
+      })
+      this.ctx.logger('host-agent-loop').info(
+        `auto compact session=${this.sessionId} before=${beforeTokens} after=${afterTokens}`,
+      )
+      return true
+    } catch (error) {
+      if (this.signal.aborted) throw error
+      this.ctx.logger('host-agent-loop').warn(
+        `auto compact failed session=${this.sessionId}: ${String(error)}`,
+      )
+      return false
+    }
+  }
 
   async run(claimed: ClaimedInput[]): Promise<AgentTurn> {
     let extras = [
@@ -216,23 +281,50 @@ export class AgentLoop implements AgentRunner {
         throw new Error('cancelled')
       }
 
-      const rawMessages = await liftToolImages(session.deriveMessages(this.sessionId), this.sessionId)
-      if (this.signal.aborted) {
-        await session.append(this.sessionId, { type: 'turn/end', turn, reason: 'cancelled' })
-        throw new Error('cancelled')
-      }
-      const inputComp = session.statInputComposition(this.sessionId)
+      let rawMessages = await liftToolImages(session.deriveMessages(this.sessionId), this.sessionId)
+      let inputComp = session.statInputComposition(this.sessionId)
       const attachUsage = (usage?: LlmUsage) =>
         usage !== undefined
           ? { ...usage, histPct: inputComp.histPct }
           : undefined
-      // 预算默认 100 万 token（约 1M），仅在显式超界时才考虑截断；不主动压缩/不偷跑窗口丢弃。
-      // 压缩只应发生：你显式调用 compact_submit 写入压缩点。设 CTX_BUDGET=0 可完全禁用预算保护（原样发送）。
-      const budget = Number(process.env.CTX_BUDGET ?? 1000000)
-      const messages = budget > 0 ? applyContextBudget(rawMessages, budget) : rawMessages
       let reply: AssistantReply
       try {
-        reply = await this.llm.chat(messages, this.ctx.tools.schemas(), this.signal, {
+        if (this.signal.aborted) throw new Error('cancelled')
+        const tools = this.ctx.tools.schemas()
+        const policy = resolveContextPolicy(this.config, tools)
+        const messageTokens = messageTokenTotal(rawMessages)
+        const nonSystemMessages = rawMessages.filter((message) => message.role !== 'system').length
+        if (
+          policy.autoCompactEnabled &&
+          policy.autoCompactMessageTokens > 0 &&
+          (inputComp.histChars > 0 || nonSystemMessages >= 3) &&
+          messageTokens >= policy.autoCompactMessageTokens
+        ) {
+          const compacted = await this.autoCompact(rawMessages, policy)
+          if (compacted) {
+            rawMessages = await liftToolImages(session.deriveMessages(this.sessionId), this.sessionId)
+            inputComp = session.statInputComposition(this.sessionId)
+          }
+        }
+
+        const fitted = fitMessagesToTokenBudget(rawMessages, policy.hardMessageTokens)
+        if (fitted.overBudget) {
+          throw new Error(
+            `本地上下文超过模型硬预算：${fitted.estimatedTokens} > ${policy.hardMessageTokens} token；请缩短当前输入或提高模型上下文`,
+          )
+        }
+        if (fitted.droppedMessages > 0) {
+          this.ctx.logger('host-agent-loop').warn(
+            `context hard trim session=${this.sessionId} dropped=${fitted.droppedMessages}`,
+          )
+        }
+
+        reply = await this.llm.chat(fitted.messages, tools, this.signal, {
+          estimatedTotalTokens: projectedRequestTokens(
+            fitted.messages,
+            tools,
+            policy.outputReserveTokens,
+          ),
           onDelta: async (text) => {
             queueChunk(text)
           },
@@ -405,7 +497,7 @@ export class AgentLoopService extends Service {
             return { content: text, toolCalls: [] }
           },
         }
-    return new AgentLoop(this.ctx, llm, sessionId, signal)
+    return new AgentLoop(this.ctx, llm, sessionId, signal, config)
   }
 }
 

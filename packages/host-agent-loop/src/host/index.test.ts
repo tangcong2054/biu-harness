@@ -56,6 +56,109 @@ test('loop appends multiple assistant/chunk deltas from onDelta', async () => {
   assert.equal(message?.type === 'assistant/message' && message.usage?.inputTokens, 1)
 })
 
+test('loop automatically compacts semantic history before the normal model request', async () => {
+  const { ctx, sessionId } = await spine()
+  await ctx.sessions.append(sessionId, { type: 'turn/start', turn: 1 })
+  await ctx.sessions.append(sessionId, {
+    type: 'user/message',
+    text: `旧任务资料：${'x'.repeat(12_000)}`,
+    kind: 'wake',
+  })
+  await ctx.sessions.append(sessionId, { type: 'assistant/message', text: '旧阶段已经完成。' })
+  await ctx.sessions.append(sessionId, { type: 'turn/end', turn: 1, reason: 'complete' })
+
+  const calls: Array<{
+    messages: LlmMessage[]
+    tools: unknown[]
+    options?: { maxOutputTokens?: number; thinking?: string }
+  }> = []
+  const replies: AssistantReply[] = [
+    {
+      content: '目标：继续新请求。已完成：旧阶段。当前任务：执行下一步。',
+      toolCalls: [],
+    },
+    { content: '继续完成', toolCalls: [], usage: { inputTokens: 100, outputTokens: 10 } },
+  ]
+  const llm: LlmClient = {
+    async chat(messages, tools = [], _signal, options) {
+      calls.push({ messages, tools, options })
+      const reply = replies.shift()
+      if (!reply) throw new Error('unexpected extra request')
+      if (reply.content) await options?.onDelta?.(reply.content)
+      return reply
+    },
+  }
+  const loop = new AgentLoop(
+    ctx,
+    llm,
+    sessionId,
+    new AbortController().signal,
+    {
+      provider: 'openai',
+      apiKey: 'k',
+      model: 'demo',
+      contextWindowTokens: 5_000,
+      outputReserveTokens: 500,
+    },
+  )
+  const turn = await loop.run([{ kind: 'wake', text: '执行下一步' }])
+  assert.equal(turn.text, '继续完成')
+  assert.equal(calls.length, 2)
+  assert.deepEqual(calls[0]?.tools, [])
+  assert.equal(calls[0]?.options?.thinking, 'disabled')
+  assert.equal(calls[0]?.options?.maxOutputTokens, 500)
+
+  const compact = (await ctx.sessions.require(sessionId)).events.find(
+    (event) => event.type === 'tool/call' && event.name === 'context_compact_submit',
+  )
+  const compactArgs =
+    compact?.type === 'tool/call'
+      ? (JSON.parse(compact.arguments) as {
+          text?: string
+          auto?: boolean
+          beforeTokens?: number
+          afterTokens?: number
+        })
+      : {}
+  assert.equal(
+    compactArgs.text,
+    '目标：继续新请求。已完成：旧阶段。当前任务：执行下一步。',
+  )
+  assert.equal(compactArgs.auto, true)
+  assert.ok(Number(compactArgs.beforeTokens) > Number(compactArgs.afterTokens))
+  const normalContext = JSON.stringify(calls[1]?.messages)
+  assert.match(normalContext, /已压缩的历史摘要/)
+  assert.match(normalContext, /当前任务：执行下一步/)
+  assert.doesNotMatch(normalContext, /x{100}/)
+})
+
+test('loop rejects locally when the current turn alone cannot fit the model hard budget', async () => {
+  const { ctx, sessionId } = await spine()
+  let called = false
+  const llm: LlmClient = {
+    async chat() {
+      called = true
+      return { content: 'should not run', toolCalls: [] }
+    },
+  }
+  const loop = new AgentLoop(
+    ctx,
+    llm,
+    sessionId,
+    new AbortController().signal,
+    {
+      provider: 'openai',
+      apiKey: 'k',
+      model: 'tiny',
+      contextWindowTokens: 1_000,
+      outputReserveTokens: 100,
+    },
+  )
+  const turn = await loop.run([{ kind: 'wake', text: 'x'.repeat(8_000) }])
+  assert.equal(called, false)
+  assert.match(turn.text, /本地上下文超过模型硬预算/)
+})
+
 test('loop invokes multiple tools concurrently', async () => {
   const { ctx, sessionId } = await spine()
   let inflight = 0

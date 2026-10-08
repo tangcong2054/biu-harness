@@ -5,7 +5,7 @@ import type { ChatMessage } from './chat-types.ts'
 import { isAgentToolMode, normalizeAgentMode, type AgentToolMode } from '@biu/host-tools'
 import type { LlmConfig } from '@biu/host-llm'
 import { probeLlmConnection } from '@biu/host-llm'
-import { LLM_MODEL_CATALOG, LLM_ENDPOINT_PRESETS, describeProvider, defaultModelFor, CHAT_PROVIDERS, findEndpointPreset, normalizeBaseUrl, inferModelCapabilities, defaultModeValues, applyModeToLlm, hasKnob } from './model-catalog.ts'
+import { LLM_MODEL_CATALOG, LLM_ENDPOINT_PRESETS, describeProvider, defaultModelFor, CHAT_PROVIDERS, findEndpointPreset, normalizeBaseUrl, inferModelCapabilities, defaultModeValues, applyModeToLlm, contextWindowTokenCount, hasKnob } from './model-catalog.ts'
 import type { ChatProvider, LlmModelDef, LlmEndpointDef, ReasoningEffort, ThinkingMode, ContextWindow, SpeedMode, ModelModeValues } from './model-catalog.ts'
 export type { ChatProvider, LlmModelDef, LlmEndpointDef, ReasoningEffort, ThinkingMode, ContextWindow, SpeedMode, ModelCapabilities } from './model-catalog.ts'
 export { LLM_ENDPOINT_PRESETS, LLM_MODEL_CATALOG } from './model-catalog.ts'
@@ -579,9 +579,12 @@ export class ChatService extends Service {
     }
     return {
       provider,
+      endpointId,
       apiKey: key,
       model: effective.model,
       ...(endpoint ? { baseUrl: effectiveBaseUrl(this.config, endpoint) } : {}),
+      contextWindowTokens: contextWindowTokenCount(mode.context),
+      outputReserveTokens: provider === 'anthropic' ? 4_096 : 16_384,
       ...applyModeToLlm(caps, mode),
     }
   }

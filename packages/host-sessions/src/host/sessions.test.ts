@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import { Context } from 'cordis'
 import * as sessionStore from '@biu/host-session-store'
 import * as sessions from './index.ts'
-import { SESSION_FORMAT_VERSION, deriveMessages, applyContextBudget, estimateTokens, statInputComposition } from './index.ts'
+import { SESSION_FORMAT_VERSION, deriveMessages, applyContextBudget, estimateRequestTokens, estimateTokens, fitMessagesToTokenBudget, statInputComposition } from './index.ts'
 import type { SessionEvent } from './index.ts'
 import type { LlmMessage } from '@biu/host-llm'
 
@@ -433,6 +433,48 @@ test('applyContextBudget does not split assistant tool_calls from their tool res
   assert.ok(assistant)
   assert.ok(toolAt > 0)
   assert.equal(out[toolAt - 1], assistant)
+})
+
+test('estimateRequestTokens includes tool schemas, unlike the legacy message-only budget', () => {
+  const messages: LlmMessage[] = [{ role: 'user', content: 'hello' }]
+  const plain = estimateRequestTokens(messages)
+  const withTools = estimateRequestTokens(messages, [
+    { type: 'function', function: { name: 'big_tool', description: 'x'.repeat(4000) } },
+  ])
+  assert.ok(withTools > plain + 900)
+})
+
+test('strict context fit keeps complete recent user/assistant/tool turns', () => {
+  const recent: LlmMessage[] = [
+    { role: 'user', content: 'run' },
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'call_x', type: 'function', function: { name: 'bash', arguments: '{}' } }],
+    },
+    { role: 'tool', tool_call_id: 'call_x', content: 'out' },
+  ]
+  const messages: LlmMessage[] = [
+    { role: 'system', content: 'SYS' },
+    { role: 'user', content: 'old'.repeat(1000) },
+    { role: 'assistant', content: 'old answer'.repeat(200) },
+    ...recent,
+  ]
+  const recentBudget = estimateRequestTokens([{ role: 'system', content: 'SYS' }, ...recent])
+  const fitted = fitMessagesToTokenBudget(messages, recentBudget + 4)
+  assert.equal(fitted.overBudget, false)
+  assert.ok(fitted.droppedMessages >= 2)
+  assert.deepEqual(fitted.messages, [{ role: 'system', content: 'SYS' }, ...recent])
+})
+
+test('strict context fit refuses to send when system plus current turn cannot fit', () => {
+  const messages: LlmMessage[] = [
+    { role: 'system', content: 'system' },
+    { role: 'user', content: 'x'.repeat(4000) },
+  ]
+  const fitted = fitMessagesToTokenBudget(messages, 100)
+  assert.equal(fitted.overBudget, true)
+  assert.equal(fitted.messages.some((message) => message.role === 'user'), false)
 })
 
 test('deriveMessages projects pasted images as multimodal content', () => {

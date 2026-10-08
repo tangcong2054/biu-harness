@@ -12,11 +12,17 @@ import {
   defaultThinkingFor,
   knobIds,
   applyModeToLlm,
+  contextWindowTokenCount,
 } from './model-catalog.ts'
 
 test('resolveChatCompletionsUrl uses defaults when baseUrl missing', () => {
   assert.equal(resolveChatCompletionsUrl(undefined, 'deepseek'), 'https://api.deepseek.com/chat/completions')
   assert.equal(resolveChatCompletionsUrl(undefined, 'openai'), 'https://api.openai.com/v1/chat/completions')
+})
+
+test('context window UI values map to numeric limits used by the agent loop', () => {
+  assert.equal(contextWindowTokenCount('200k'), 200_000)
+  assert.equal(contextWindowTokenCount('1m'), 1_000_000)
 })
 
 test('resolveChatCompletionsUrl appends path and accepts full URL', () => {

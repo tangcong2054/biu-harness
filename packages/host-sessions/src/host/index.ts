@@ -263,17 +263,115 @@ export function estimateTokens(text: string): number {
   return Math.ceil(ascii / 4 + cjk / 1.5)
 }
 
-function msgTokens(m: LlmMessage): number {
+export function estimateMessageTokens(m: LlmMessage): number {
   if (Array.isArray(m.content)) {
     let n = 0
     for (const part of m.content) {
       if (part.type === 'text') n += estimateTokens(part.text)
       else n += 1200
     }
-    return n + (typeof m.tool_calls?.length === 'number' ? m.tool_calls.length * 6 : 0)
+    return n + (typeof m.tool_calls?.length === 'number' ? m.tool_calls.length * 6 : 0) + 4
   }
   const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '')
-  return estimateTokens(content) + (typeof m.tool_calls?.length === 'number' ? m.tool_calls.length * 6 : 0)
+  return estimateTokens(content) + (typeof m.tool_calls?.length === 'number' ? m.tool_calls.length * 6 : 0) + 4
+}
+
+export function estimateToolSchemaTokens(tools: unknown[]): number {
+  if (!tools.length) return 0
+  try {
+    return estimateTokens(JSON.stringify(tools))
+  } catch {
+    return 0
+  }
+}
+
+export function estimateRequestTokens(messages: LlmMessage[], tools: unknown[] = []): number {
+  return (
+    messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0) +
+    estimateToolSchemaTokens(tools)
+  )
+}
+
+type MessageGroup = { messages: LlmMessage[]; tokens: number }
+
+/**
+ * 每个 user 开启一个对话原子组，后续 assistant/tool 都归入该组直到下一个 user。
+ * 这样既不会拆 assistant.tool_calls/tool results，也不会留下失去用户问题的孤立回答。
+ */
+function contextGroups(messages: LlmMessage[]): { prefix: LlmMessage[]; groups: MessageGroup[] } {
+  let cursor = 0
+  const prefix: LlmMessage[] = []
+  while (messages[cursor]?.role === 'system') {
+    prefix.push(messages[cursor]!)
+    cursor += 1
+  }
+  const groups: MessageGroup[] = []
+  let current: LlmMessage[] = []
+  const flush = () => {
+    if (!current.length) return
+    groups.push({
+      messages: current,
+      tokens: current.reduce((sum, message) => sum + estimateMessageTokens(message), 0),
+    })
+    current = []
+  }
+  while (cursor < messages.length) {
+    const message = messages[cursor]!
+    cursor += 1
+    if (
+      message.role === 'user' &&
+      current.length &&
+      current.some((item) => item.role !== 'user')
+    ) {
+      flush()
+    }
+    current.push(message)
+  }
+  flush()
+  return { prefix, groups }
+}
+
+export type ContextFit = {
+  messages: LlmMessage[]
+  estimatedTokens: number
+  droppedMessages: number
+  overBudget: boolean
+}
+
+/**
+ * 严格上下文窗口：保留全部 system 前缀和尽可能多的连续最新消息。
+ * 若 system + 最新原子组本身已超预算，返回 overBudget，由调用方在本地报错，绝不发给上游。
+ */
+export function fitMessagesToTokenBudget(messages: LlmMessage[], budgetTokens: number): ContextFit {
+  const budget = Math.max(0, Math.floor(budgetTokens))
+  const { prefix, groups } = contextGroups(messages)
+  const prefixTokens = prefix.reduce((sum, message) => sum + estimateMessageTokens(message), 0)
+  if (prefixTokens > budget) {
+    return {
+      messages: prefix,
+      estimatedTokens: prefixTokens,
+      droppedMessages: messages.length - prefix.length,
+      overBudget: true,
+    }
+  }
+
+  let used = prefixTokens
+  const kept: MessageGroup[] = []
+  for (let index = groups.length - 1; index >= 0; index -= 1) {
+    const group = groups[index]!
+    if (used + group.tokens > budget) break
+    kept.unshift(group)
+    used += group.tokens
+  }
+  const output = [...prefix, ...kept.flatMap((group) => group.messages)]
+  const latest = groups.at(-1)
+  const latestWasKept = !latest || kept.includes(latest)
+  return {
+    messages: output,
+    estimatedTokens: used,
+    droppedMessages: messages.length - output.length,
+    overBudget: !latestWasKept,
+  }
 }
 
 /**
@@ -282,7 +380,7 @@ function msgTokens(m: LlmMessage): number {
  */
 export function applyContextBudget(messages: LlmMessage[], budgetTokens: number, keepRecent = 14): LlmMessage[] {
   if (budgetTokens <= 0 || messages.length === 0) return messages
-  const total = messages.reduce((s, m) => s + msgTokens(m), 0)
+  const total = messages.reduce((s, m) => s + estimateMessageTokens(m), 0)
   if (total <= budgetTokens) return messages
   const head = Math.max(1, messages[0]?.role === 'system' ? 1 : 0)
   const start = messages.slice(0, head)

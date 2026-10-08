@@ -1,9 +1,17 @@
 import { Service, type Context } from 'cordis'
+import {
+  isTencentTokenPlan,
+  resolveTencentTokenPlanHeadroom,
+  resolveTencentTokenPlanTpm,
+  TencentTokenPlanTpmLimiter,
+} from './tencent-token-plan-tpm.ts'
 
 export type ChatProvider = 'deepseek' | 'openai' | 'anthropic'
 
 export interface LlmConfig {
   provider: ChatProvider
+  /** 入口标识；用于区分同协议下的供应商能力（例如腾讯云 Token Plan）。 */
+  endpointId?: string
   apiKey: string
   model: string
   /**
@@ -15,6 +23,10 @@ export interface LlmConfig {
   /** DeepSeek V4 / Claude 扩展思考：显式开关，避免上游默认开思考把页面卡死。 */
   thinking?: 'enabled' | 'disabled'
   reasoningEffort?: 'high' | 'max'
+  /** Agent 本地上下文管理使用；不会原样发送给上游。 */
+  contextWindowTokens?: number
+  /** 为正常回答 / thinking 预留的窗口空间。 */
+  outputReserveTokens?: number
 }
 
 export function attachProviderOptions(
@@ -331,6 +343,12 @@ export interface ChatOptions {
   onReasoningDelta?: (text: string) => void | Promise<void>
   /** 工具调用增量（name 出现后就开始推，长参数不必等整段生成完）。 */
   onToolDelta?: (call: { id: string; name: string; arguments: string }) => void | Promise<void>
+  /** 单次调用输出上限；主要供自动 compact 使用，避免摘要失控。 */
+  maxOutputTokens?: number
+  /** 单次覆盖思考模式；自动 compact 默认关闭思考，减少延迟和 Token。 */
+  thinking?: 'enabled' | 'disabled'
+  /** 调用前估算的输入 + 最大输出 Token，供供应商 TPM adapter 预留额度。 */
+  estimatedTotalTokens?: number
 }
 
 export interface LlmClient {
@@ -512,11 +530,18 @@ export class OpenAiCompatLlm implements LlmClient {
       stream: true,
       stream_options: { include_usage: true },
     }
+    if (options?.maxOutputTokens && options.maxOutputTokens > 0) {
+      body.max_tokens = Math.floor(options.maxOutputTokens)
+    }
     if (tools.length) {
       body.tools = tools
       body.tool_choice = 'auto'
     }
-    attachProviderOptions(body, this.config, 'openai-compat')
+    attachProviderOptions(
+      body,
+      options?.thinking ? { ...this.config, thinking: options.thinking } : this.config,
+      'openai-compat',
+    )
     const res = await fetch(url, {
       method: 'POST',
       headers: {
@@ -566,7 +591,7 @@ export class AnthropicLlm implements LlmClient {
       .join('\n\n')
     const body: Record<string, unknown> = {
       model: this.config.model,
-      max_tokens: 4096,
+      max_tokens: Math.floor(options?.maxOutputTokens || 4096),
       ...(system ? { system } : {}),
       messages: messages
         .filter((m) => m.role !== 'system')
@@ -598,7 +623,11 @@ export class AnthropicLlm implements LlmClient {
         }
       })
     }
-    attachProviderOptions(body, this.config, 'anthropic')
+    attachProviderOptions(
+      body,
+      options?.thinking ? { ...this.config, thinking: options.thinking } : this.config,
+      'anthropic',
+    )
     const res = await fetch(endpoint, {
       method: 'POST',
       headers: {
@@ -738,8 +767,22 @@ async function consumeMessagesSse(
 }
 
 export class LlmService extends Service {
+  private readonly tencentTokenPlanLimiters = new Map<string, TencentTokenPlanTpmLimiter>()
+
   constructor(ctx: Context) {
     super(ctx, 'llm')
+  }
+
+  private tencentTokenPlanLimiter(config: LlmConfig) {
+    const limit = resolveTencentTokenPlanTpm()
+    const headroom = resolveTencentTokenPlanHeadroom()
+    const key = `${config.baseUrl ?? ''}\0${config.apiKey}\0${config.model}\0${limit}\0${headroom}`
+    let limiter = this.tencentTokenPlanLimiters.get(key)
+    if (!limiter) {
+      limiter = new TencentTokenPlanTpmLimiter({ limit, headroom })
+      this.tencentTokenPlanLimiters.set(key, limiter)
+    }
+    return limiter
   }
 
   forConfig(config: LlmConfig): LlmClient {
@@ -751,15 +794,31 @@ export class LlmService extends Service {
     return {
       chat: async (messages, tools = [], signal, options) => {
         ctx.emit('llm/request', { model: config.model, provider: config.provider })
-        const reply = await client.chat(messages, tools, signal, {
-          onDelta: async (text) => {
-            ctx.emit('llm/stream', { text })
-            await options?.onDelta?.(text)
-          },
-          onReasoningDelta: options?.onReasoningDelta,
-          onToolDelta: options?.onToolDelta,
-        })
-        return reply
+        const estimatedTotalTokens =
+          options?.estimatedTotalTokens ??
+          Math.ceil(JSON.stringify({ messages, tools }).length / 4) +
+            Math.max(1, Math.floor(options?.maxOutputTokens ?? config.outputReserveTokens ?? 4096))
+        const reservation = isTencentTokenPlan(config)
+          ? await this.tencentTokenPlanLimiter(config).acquire(estimatedTotalTokens, signal)
+          : undefined
+        try {
+          const reply = await client.chat(messages, tools, signal, {
+            onDelta: async (text) => {
+              ctx.emit('llm/stream', { text })
+              await options?.onDelta?.(text)
+            },
+            onReasoningDelta: options?.onReasoningDelta,
+            onToolDelta: options?.onToolDelta,
+            maxOutputTokens: options?.maxOutputTokens,
+            thinking: options?.thinking,
+            estimatedTotalTokens,
+          })
+          reservation?.finish(reply.usage)
+          return reply
+        } catch (error) {
+          reservation?.cancel()
+          throw error
+        }
       },
     }
   }

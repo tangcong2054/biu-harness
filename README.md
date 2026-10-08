@@ -662,6 +662,13 @@ Also: `npm run dev:host` and `npm run dev:web`.
 | `SHARE_PROXY_UI` | `dev:host` points at Vite | share pages use `5173` in dev; `npm start` uses the build output |
 | `CORDIS_WORKSPACE` | `.workspace` | default workspace |
 | `DEEPSEEK_API_KEY` etc. | | can also be stored in the UI only |
+| `BIU_AUTO_COMPACT` | `true` | automatically write a semantic compact point near the model context threshold; set `false` to disable |
+| `BIU_AUTO_COMPACT_RATIO` | `0.6` | automatic compaction trigger as a fraction of the model context window |
+| `BIU_CONTEXT_HARD_RATIO` | `0.8` | hard per-request context fraction; keeps complete recent turns and rejects locally if the current turn still cannot fit |
+| `BIU_COMPACT_MAX_OUTPUT` | `4096` | maximum output tokens for an automatic compaction summary |
+| `CTX_BUDGET` | unset | legacy stricter messages cap; `0` no longer disables model context safety |
+| `TENCENT_TOKEN_PLAN_TPM` | `3000000` | per-model Tencent Token Plan TPM; `api.lkeap.cloud.tencent.com/plan/*` is queued in a process-wide rolling 60-second window |
+| `TENCENT_TOKEN_PLAN_TPM_HEADROOM` | `0.9` | local Token Plan safety factor for tokenizer estimation differences |
 
 </details>
 

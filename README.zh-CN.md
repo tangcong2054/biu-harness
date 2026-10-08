@@ -660,6 +660,13 @@ export CHAT_MODEL=deepseek-chat # 可选
 | `SHARE_PROXY_UI` | `dev:host` 默认指向 Vite | 开发时分享页走 `5173`；`npm start` 用构建产物 |
 | `CORDIS_WORKSPACE` | `.workspace` | 默认工作区 |
 | `DEEPSEEK_API_KEY` 等 | | 也可只在 UI 里存 |
+| `BIU_AUTO_COMPACT` | `true` | 达到模型上下文阈值时自动生成语义摘要；设 `false` 关闭 |
+| `BIU_AUTO_COMPACT_RATIO` | `0.6` | 自动 Compact 触发比例（模型上下文窗口的 20%～95%） |
+| `BIU_CONTEXT_HARD_RATIO` | `0.8` | 单次请求硬限制比例；超过后只保留完整的最近对话组，仍放不下则本地拒绝 |
+| `BIU_COMPACT_MAX_OUTPUT` | `4096` | 自动 Compact 摘要最大输出 Token |
+| `CTX_BUDGET` | 未设置 | 兼容旧配置；设置后作为比模型预算更严格的 messages 上限，`0` 不再关闭模型安全保护 |
+| `TENCENT_TOKEN_PLAN_TPM` | `3000000` | 腾讯云 Token Plan 每模型 TPM；自动识别 `api.lkeap.cloud.tencent.com/plan/*` 并在进程内按 60 秒滚动窗口排队 |
+| `TENCENT_TOKEN_PLAN_TPM_HEADROOM` | `0.9` | Token Plan 本地限流安全系数，避免 tokenizer 估算误差再次撞上游限流 |
 
 </details>
 

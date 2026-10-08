@@ -735,6 +735,10 @@ export type ModelModeValues = {
   context: ContextWindow
 }
 
+export function contextWindowTokenCount(value: ContextWindow): number {
+  return value === '1m' ? 1_000_000 : 200_000
+}
+
 export const THINKING_KNOB: ModelToggleKnob = {
   id: 'thinking',
   kind: 'toggle',
