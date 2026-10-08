@@ -1,0 +1,16 @@
+{
+  "id": "dbbrain-limit",
+  "name": "DBbrain 限流 & 会话",
+  "blurb": "页面里插一个块，直连腾讯云 DBbrain OpenAPI（dbbrain.tencentcloudapi.com，2021-05-27）：① 查当前活跃会话（DescribeMySqlProcessList，可按 User/DB/State/Command/时长/SQL 过滤）并逐个 Kill（KillMySqlThreads，Prepare+Commit 同请求内连做，避开 10 秒过期）；② 管理 SQL 限流（DescribeSqlFilters 列表 / CreateSqlFilter 新建 / ModifySqlFilters 终止 / DeleteSqlFilters 删除），写操作走 VerifyUserAccount 换 SessionToken（内存缓存 5 分钟，不落盘）。CAM 凭证读环境变量或 .biu/cdb-limit-secret.json，不回传浏览器；数据库密码不持久化。无头插件。",
+  "tags": [
+    "page",
+    "editor",
+    "cdb",
+    "dbbrain",
+    "limit",
+    "session",
+    "kill"
+  ],
+  "headless": true,
+  "createdAt": 1789720000000
+}

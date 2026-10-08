@@ -1,0 +1,10 @@
+{
+  "id": "cdb-errorlog",
+  "name": "CDB 错误日志块",
+  "blurb": "页面里插一个块：填 IP/端口/时间范围，点「查询」经 CDB MCP 拉取错误日志（cdb.error.query_error_logs），按「每条报错一行」展示（时间戳 [等级 错误码] 具体报错），可按 level / 内容关键词过滤，支持复制与全屏。外观与慢日志块一致。CDB 会自动按 ip+port 反查 long_instance_id/region。无头插件，路由 POST /api/cdb-errorlog/query。",
+  "tags": ["page", "editor", "cdb", "errorlog", "log"],
+  "author": "",
+  "authorUrl": "",
+  "createdAt": 1789879000000,
+  "headless": true
+}
