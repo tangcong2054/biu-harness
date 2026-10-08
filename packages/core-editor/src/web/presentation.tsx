@@ -56,11 +56,17 @@ const STYLE = `
 .page-presentation-minimized-restore{display:grid;width:26px;height:26px;flex:none;place-items:center;border:1px solid var(--dsw-border);border-radius:6px;padding:0;background:var(--dsw-input);color:var(--dsw-label);cursor:pointer}
 .page-presentation-minimized-restore:hover{background:var(--dsw-hover)}
 .page-presentation-minimized-restore svg{width:15px;height:15px}
-.page-presentation-inline-actions{position:absolute;right:6px;top:6px;z-index:24;display:flex;gap:4px;opacity:0;transition:opacity .12s}
+.page-presentation-traffic{display:flex;gap:6px;align-items:center;flex:none}
+.page-presentation-light{width:12px;height:12px;border-radius:50%;border:0;padding:0;cursor:pointer;display:grid;place-items:center}
+.page-presentation-light svg{width:7px;height:7px;color:#fff;opacity:0;transition:opacity .1s;pointer-events:none}
+.page-presentation-traffic:hover .page-presentation-light svg,.page-presentation-inline-actions:hover .page-presentation-light svg{opacity:1}
+.page-presentation-light.is-close{background:#ff5f57}
+.page-presentation-light.is-min{background:#febc2e}
+.page-presentation-light.is-max{background:#28c840}
+.page-presentation-inline-actions{position:absolute;left:8px;top:8px;z-index:24;display:flex;gap:6px;opacity:0;transition:opacity .12s}
 .page-block:hover>.page-presentation-inline-actions,.page-presentation-inline-actions:focus-within{opacity:1}
-.page-presentation-inline-actions button{display:grid;width:26px;height:26px;place-items:center;border:1px solid var(--dsw-border);border-radius:6px;padding:0;background:var(--dsw-sidebar);color:var(--dsw-label);cursor:pointer}
-.page-presentation-inline-actions svg,.page-presentation-btn.is-icon svg{width:15px;height:15px}
 .page-presentation-btn.is-icon{display:grid;width:28px;padding:0;place-items:center}
+.page-presentation-btn.is-icon svg{width:15px;height:15px}
 .page-presentation-placeholder{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:44px;border:1px dashed var(--dsw-border);border-radius:8px;padding:8px 10px;color:var(--dsw-label-3);font:12px/1.4 var(--font-sans)}
 .page-presentation-placeholder button{border:0;background:transparent;color:var(--dsw-pick);font:inherit;font-weight:700;cursor:pointer}
 .page-presentation-content[data-presentation-mode=sidebar] .pt-card,
@@ -365,23 +371,31 @@ function PresentationBar({
 }) {
   return (
     <div className="page-presentation-bar" data-biu-ignore>
+      <div className="page-presentation-traffic">
+        <button
+          type="button"
+          className="page-presentation-light is-close"
+          title="回到页面"
+          aria-label="回到页面"
+          onClick={() => service.setMode(entry.id, 'inline')}
+        />
+        <button
+          type="button"
+          className="page-presentation-light is-min"
+          title="收起"
+          aria-label="收起"
+          onClick={() => service.setMode(entry.id, 'minimized')}
+        />
+        <button
+          type="button"
+          className="page-presentation-light is-max"
+          title={entry.detached ? '聚焦独立窗口' : '在独立窗口打开'}
+          aria-label={entry.detached ? '聚焦独立窗口' : '在独立窗口打开'}
+          onClick={() => void service.openDetached(entry.id)}
+        />
+      </div>
       <span className="page-presentation-title">{entry.title}</span>
       <span className="page-presentation-spacer" />
-      <button
-        type="button"
-        className="page-presentation-btn is-icon"
-        title={entry.detached ? '聚焦独立窗口' : '在独立窗口打开'}
-        aria-label={entry.detached ? '聚焦独立窗口' : '在独立窗口打开'}
-        onClick={() => void service.openDetached(entry.id)}
-      >
-        <ArrowTopRightOnSquareIcon aria-hidden />
-      </button>
-      <button type="button" className="page-presentation-btn" onClick={() => service.setMode(entry.id, 'minimized')}>
-        收起
-      </button>
-      <button type="button" className="page-presentation-btn" onClick={() => service.setMode(entry.id, 'inline')}>
-        页面内
-      </button>
     </div>
   )
 }
@@ -419,14 +433,15 @@ export function PagePresentationInlineActions({
   if (controls.mode !== 'inline') return null
   return (
     <div className="page-presentation-inline-actions" data-biu-ignore>
-      <button type="button" title="收起" aria-label="收起" onClick={controls.minimize}>
+      <button type="button" className="page-presentation-light is-close" title="收起" aria-label="收起" onClick={controls.minimize}>
         <MinusIcon aria-hidden />
       </button>
-      <button type="button" title="在右侧栏打开" aria-label="在右侧栏打开" onClick={controls.sidebar}>
+      <button type="button" className="page-presentation-light is-min" title="在右侧栏打开" aria-label="在右侧栏打开" onClick={controls.sidebar}>
         <ViewColumnsIcon aria-hidden />
       </button>
       <button
         type="button"
+        className="page-presentation-light is-max"
         title={controls.detached ? '聚焦独立窗口' : '在独立窗口打开'}
         aria-label={controls.detached ? '聚焦独立窗口' : '在独立窗口打开'}
         onClick={controls.maximize}
