@@ -20,7 +20,7 @@ export async function apply(ctx: Context) {
   ctx.inject(['systemPrompt'], (inner) => {
     inner.systemPrompt.register(
       'plugin.creation',
-      '创建插件前，先查看是否已有相似插件。插件描述必须和其它插件明显不同。创建插件时，必须说明它支持哪些 Action。',
+      '创建插件前，先查看是否已有相似插件。插件描述必须和其它插件明显不同。创建插件时，必须说明它支持哪些 ui_action。',
     )
   })
 }
