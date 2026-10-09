@@ -312,6 +312,10 @@ const dispose = ctx.uiActions.register({
 
 原生 `button`、`input`、`textarea`、`select` 和现有 `data-biu-*` 控件可由 DOM 适配器零配置操作；复杂编辑器、Canvas 和 iframe 应注册语义 Action。
 
+UI RPC 只接受同源工作台并使用进程级临时 Token，命令绑定当前 Session。`destructive` 动作始终走 Host 人工审批；Hold 模式下 `write/submit` 也要审批。`ui_inspect` 默认只返回 15 个动作描述且不带状态，显式插件命中后不再扫描内部 DOM。`ui_action.steps` 可在同一目标上批量执行最多 10 个非破坏动作。
+
+UI Action 生命周期以脱敏 JSONL 异步写入 `.biu/logs/ui-actions-YYYY-MM-DD.jsonl`；不记录参数、DOM State 或结果正文。当前内存指标可从本机 `/api/ui-actions/metrics` 查看，日志写入失败或队列溢出不会阻塞 Agent。
+
 ### 页面：Component 的容器
 
 Component 声明自己是什么，但「放在哪、按什么顺序、和谁一起」由 Page 决定。而且 **Page 是这套体系里唯一具备边界的单位**：
@@ -693,6 +697,9 @@ export CHAT_MODEL=deepseek-chat # 可选
 | `BIU_LLM_LOG_DIR` | `.biu/logs` | LLM 限流诊断 JSONL 目录；不记录 Key、消息正文或工具参数 |
 | `BIU_LLM_LOG_MAX_BYTES` | `10485760` | 单个每日 LLM 日志文件轮转阈值（10MB） |
 | `BIU_LLM_LOG_RETENTION_DAYS` | `7` | LLM 诊断日志保留天数 |
+| `BIU_UI_ACTION_LOG_DIR` | `.biu/logs` | UI Action 脱敏 JSONL 日志目录 |
+| `BIU_UI_ACTION_LOG_MAX_BYTES` | `10485760` | 单个每日 UI Action 日志轮转阈值（10MB） |
+| `BIU_UI_ACTION_LOG_RETENTION_DAYS` | `7` | UI Action 日志保留天数 |
 
 </details>
 

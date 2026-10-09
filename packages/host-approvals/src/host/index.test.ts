@@ -95,6 +95,30 @@ test('db_delete deny in auto mode blocks the tool', async () => {
   await assert.rejects(() => invoke, /denied: db_delete/)
 })
 
+test('runtime risk can force a trusted approval in auto mode', async () => {
+  const ctx = await setup()
+  ctx.approvals.mode = 'auto'
+  const approval = ctx.approvals.request({
+    name: 'ui_action',
+    args: { ref: 'ui:demo:main', actions: ['delete'], risks: ['destructive'] },
+  }, true)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const [item] = ctx.approvals.list()
+  assert.ok(item)
+  assert.equal(item.name, 'ui_action')
+  ctx.approvals.decide(item.id, true)
+  assert.equal(await approval, true)
+})
+
+test('runtime write risk skips approval in auto mode', async () => {
+  const ctx = await setup()
+  assert.equal(
+    await ctx.approvals.request({ name: 'ui_action', args: { risks: ['write'] } }),
+    true,
+  )
+  assert.equal(ctx.approvals.list().length, 0)
+})
+
 test('approvals do not push inbox notices', async () => {
   const { readFileSync } = await import('node:fs')
   const { resolve } = await import('node:path')

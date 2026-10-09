@@ -10,6 +10,10 @@
     "./host": "./src/host/index.ts",
     "./web": "./src/web/index.ts"
   },
+  "dependencies": {
+    "@biu/host-approvals": "0.1.0",
+    "@biu/host-sessions": "0.1.0"
+  },
   "peerDependencies": {
     "cordis": "4.0.0-rc.8",
     "ws": "^8.18.3"

@@ -1,6 +1,9 @@
 import type { Context } from 'cordis'
 import {
   UI_ACTIONS_WS_PATH,
+  UI_ACTIONS_PROTOCOL_VERSION,
+  UI_ACTIONS_MAX_MESSAGE_BYTES,
+  type UiActionBatchRequest,
   type UiClientMessage,
   type UiCommand,
   type UiCommandResult,
@@ -49,6 +52,9 @@ class UiActionsWebClient {
   private stopped = false
   private retryMs = 250
   private retryTimer: ReturnType<typeof setTimeout> | null = null
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  private token = ''
+  private readonly commands = new Map<string, AbortController>()
   private readonly id = clientId()
   private unsubscribeRegistry: (() => void) | undefined
 
@@ -62,8 +68,14 @@ class UiActionsWebClient {
     window.addEventListener('blur', this.stateChanged)
     window.addEventListener('popstate', this.stateChanged)
     document.addEventListener('visibilitychange', this.stateChanged)
-    this.connect()
+    this.heartbeatTimer = setInterval(this.stateChanged, 5000)
+    void this.bootstrap()
     return () => this.stop()
+  }
+
+  private sessionId() {
+    const match = location.pathname.match(/^\/s\/([^/]+)/)
+    return match ? decodeURIComponent(match[1]!) : undefined
   }
 
   private focused() {
@@ -76,8 +88,11 @@ class UiActionsWebClient {
       clientId: this.id,
       route: location.pathname,
       title: document.title,
+      sessionId: this.sessionId(),
       focused: this.focused(),
       registryVersion: this.service.version,
+      protocolVersion: UI_ACTIONS_PROTOCOL_VERSION,
+      targetCount: this.service.targetCount,
     }
   }
 
@@ -90,13 +105,29 @@ class UiActionsWebClient {
       type: 'registry-changed',
       clientId: this.id,
       registryVersion: this.service.version,
+      targetCount: this.service.targetCount,
     })
+  }
+
+  private async bootstrap() {
+    try {
+      const response = await fetch('/api/ui-actions/bootstrap', { credentials: 'same-origin' })
+      if (!response.ok) throw new Error(`bootstrap ${response.status}`)
+      const body = await response.json() as { token?: string; protocolVersion?: number }
+      if (!body.token || body.protocolVersion !== UI_ACTIONS_PROTOCOL_VERSION) {
+        throw new Error('UI Actions protocol mismatch')
+      }
+      this.token = body.token
+      this.connect()
+    } catch {
+      this.scheduleReconnect()
+    }
   }
 
   private connect() {
     if (this.stopped) return
     try {
-      const socket = new WebSocket(wsUrl())
+      const socket = new WebSocket(`${wsUrl()}?token=${encodeURIComponent(this.token)}`)
       this.socket = socket
       socket.onopen = () => {
         this.retryMs = 250
@@ -105,8 +136,11 @@ class UiActionsWebClient {
           clientId: this.id,
           route: location.pathname,
           title: document.title,
+          sessionId: this.sessionId(),
           focused: this.focused(),
           registryVersion: this.service.version,
+          protocolVersion: UI_ACTIONS_PROTOCOL_VERSION,
+          targetCount: this.service.targetCount,
         })
       }
       socket.onmessage = (event) => {
@@ -126,7 +160,7 @@ class UiActionsWebClient {
     if (this.stopped || this.retryTimer) return
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null
-      this.connect()
+      void this.bootstrap()
     }, this.retryMs)
     this.retryMs = Math.min(5000, this.retryMs * 2)
   }
@@ -137,34 +171,50 @@ class UiActionsWebClient {
   }
 
   private async onMessage(raw: unknown) {
+    if (new TextEncoder().encode(String(raw)).length > UI_ACTIONS_MAX_MESSAGE_BYTES) return
     let command: UiHostMessage
     try {
       command = JSON.parse(String(raw)) as UiHostMessage
     } catch {
       return
     }
+    if (command.type === 'cancel') {
+      this.commands.get(command.requestId)?.abort()
+      return
+    }
     if (command.type !== 'command') return
+    const controller = new AbortController()
+    this.commands.set(command.requestId, controller)
     let response: UiCommandResult
     try {
-      const result = await this.execute(command)
+      const result = await this.execute(command, controller.signal)
       response = { type: 'result', requestId: command.requestId, ok: true, result }
     } catch (error) {
       response = { type: 'result', requestId: command.requestId, ok: false, error: String(error) }
     }
+    this.commands.delete(command.requestId)
     this.send(response)
     this.stateChanged()
   }
 
-  private execute(command: UiCommand) {
+  private execute(command: UiCommand, signal: AbortSignal) {
     if (command.command === 'inspect') return this.service.inspect(command.args, this.id)
-    if (command.command === 'action') return this.service.execute(command.args)
-    return this.service.wait(command.args)
+    if (command.command === 'action') {
+      return 'steps' in command.args
+        ? this.service.executeBatch(command.args as UiActionBatchRequest, signal)
+        : this.service.execute(command.args, signal)
+    }
+    return this.service.wait(command.args, signal)
   }
 
   stop() {
     this.stopped = true
     if (this.retryTimer) clearTimeout(this.retryTimer)
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     this.retryTimer = null
+    this.heartbeatTimer = null
+    for (const controller of this.commands.values()) controller.abort()
+    this.commands.clear()
     this.unsubscribeRegistry?.()
     this.unsubscribeRegistry = undefined
     window.removeEventListener('focus', this.stateChanged)

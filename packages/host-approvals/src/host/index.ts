@@ -16,17 +16,23 @@ export class ApprovalsService extends Service {
     super(ctx, 'approvals')
     ctx.tools.guard(async (req) => {
       if (!needsApproval(req.name, this.mode)) return req
-      const id = crypto.randomUUID()
-      const allow = await new Promise<boolean>((resolve) => {
-        const timer = setTimeout(() => {
-          if (!this.pending.has(id)) return
-          this.pending.delete(id)
-          resolve(false)
-        }, this.holdTimeoutMs)
-        this.pending.set(id, { req, resolve, timer })
-        this.notify?.({ id, name: req.name, args: req.args })
-      })
+      const allow = await this.request(req, true)
       return allow ? req : { ...req, deny: `denied: ${req.name}` }
+    })
+  }
+
+  /** UI Action 等运行时才能确定风险的能力，在执行前通过这里请求可信的人类审批。 */
+  request(req: ToolRequest, force = false) {
+    if (!force && this.mode === 'auto') return Promise.resolve(true)
+    const id = crypto.randomUUID()
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        if (!this.pending.has(id)) return
+        this.pending.delete(id)
+        resolve(false)
+      }, this.holdTimeoutMs)
+      this.pending.set(id, { req, resolve, timer })
+      this.notify?.({ id, name: req.name, args: req.args })
     })
   }
 
@@ -61,7 +67,7 @@ function needsApproval(name: string, mode: 'auto' | 'hold') {
 }
 
 function sensitive(name: string) {
-  return /^(fs_write|str_replace_editor|bash|job_start|terminal_write|lsp_start|subagent_spawn|mcp_add_stdio|ui_action)$/.test(name)
+  return /^(fs_write|str_replace_editor|bash|job_start|terminal_write|lsp_start|subagent_spawn|mcp_add_stdio)$/.test(name)
 }
 
 export const name = 'approvals'
