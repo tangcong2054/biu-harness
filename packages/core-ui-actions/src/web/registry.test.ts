@@ -34,7 +34,7 @@ test('registered actions are discovered lazily and executed by ref', async () =>
       },
     },
   })
-  const inspected = service.inspect({ plugin: 'demo', includeDom: false }, 'client-1')
+  const inspected = service.inspect({ plugin: 'demo', includeDom: false, includeState: true }, 'client-1')
   assert.equal(inspected.targets.length, 1)
   assert.equal(inspected.targets[0]?.actions[0]?.id, 'fill')
   assert.equal(inspected.targets[0]?.state?.password, '[redacted]')
@@ -118,4 +118,109 @@ test('wait observes registered state changes', async () => {
     timeoutMs: 500,
   })
   assert.equal(result.matched, true)
+})
+
+test('inspect defaults to descriptors only and skips DOM when semantic targets exist', () => {
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+    x: 0, y: 0, top: 0, left: 0, right: 10, bottom: 10, width: 10, height: 10, toJSON: () => ({}),
+  })
+  const button = document.createElement('button')
+  button.textContent = 'DOM button'
+  document.body.append(button)
+  const service = new UiActionsService(new Context())
+  service.register({
+    plugin: 'demo',
+    instanceId: 'semantic',
+    kind: 'panel',
+    label: 'Semantic',
+    state: () => ({ text: 'large state' }),
+    actions: {},
+  })
+  const result = service.inspect({ plugin: 'demo' }, 'client')
+  assert.equal(result.targets.length, 1)
+  assert.equal(result.targets[0]?.ref.startsWith('ui:'), true)
+  assert.equal(result.targets[0]?.state, undefined)
+})
+
+test('sensitive containers hide all descendant DOM controls', () => {
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+    x: 0, y: 0, top: 0, left: 0, right: 10, bottom: 10, width: 10, height: 10, toJSON: () => ({}),
+  })
+  const secret = document.createElement('section')
+  secret.setAttribute('data-biu-sensitive', '')
+  secret.append(document.createElement('input'), document.createElement('button'))
+  document.body.append(secret)
+  const service = new UiActionsService(new Context())
+  assert.equal(service.inspect({ includeDom: true }, 'client').targets.length, 0)
+})
+
+test('batch executes ordered non-destructive actions and rejects destructive ones', async () => {
+  const service = new UiActionsService(new Context())
+  const values: string[] = []
+  service.register({
+    plugin: 'demo',
+    instanceId: 'batch',
+    kind: 'panel',
+    label: 'Batch',
+    actions: {
+      add: {
+        description: 'add',
+        risk: 'write',
+        run: ({ value }) => { values.push(String(value)) },
+      },
+      remove: {
+        description: 'remove',
+        risk: 'destructive',
+        run: () => { values.pop() },
+      },
+    },
+  })
+  const ref = service.inspect({ plugin: 'demo', includeDom: false }, 'client').targets[0]!.ref
+  const result = await service.executeBatch({
+    ref,
+    steps: [
+      { action: 'add', args: { value: 'a' } },
+      { action: 'add', args: { value: 'b' } },
+    ],
+  })
+  assert.equal(result.ok, true)
+  assert.deepEqual(values, ['a', 'b'])
+  await assert.rejects(
+    () => service.executeBatch({ ref, steps: [{ action: 'remove' }] }),
+    /不允许 destructive/,
+  )
+  assert.deepEqual(values, ['a', 'b'])
+})
+
+test('structured wait compares nested state and oversized results are truncated', async () => {
+  const service = new UiActionsService(new Context())
+  let count = 0
+  service.register({
+    plugin: 'demo',
+    instanceId: 'structured',
+    kind: 'status',
+    label: 'Structured',
+    state: () => ({ count }),
+    actions: {
+      huge: {
+        description: 'huge',
+        risk: 'read',
+        run: () => Object.fromEntries(
+          Array.from({ length: 50 }, (_, index) => [`field${index}`, 'x'.repeat(2000)]),
+        ),
+      },
+    },
+  })
+  const ref = service.inspect({ plugin: 'demo', includeDom: false }, 'client').targets[0]!.ref
+  setTimeout(() => { count = 2 }, 5)
+  const waited = await service.wait({
+    ref,
+    path: 'state.count',
+    operator: 'gte',
+    value: 2,
+    timeoutMs: 500,
+  })
+  assert.equal(waited.matched, true)
+  const result = await service.execute({ ref, action: 'huge' })
+  assert.equal(result.truncated, true)
 })

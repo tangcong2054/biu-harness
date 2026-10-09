@@ -312,6 +312,10 @@ const dispose = ctx.uiActions.register({
 
 Native buttons, inputs, textareas, selects, and existing `data-biu-*` controls work through the zero-config DOM adapter. Complex editors, canvases, and iframes should register semantic actions.
 
+UI RPC accepts only the same-origin workbench and uses a process-scoped temporary token; commands are bound to the current Session. `destructive` actions always require trusted Host approval, while Hold mode also approves `write/submit`. `ui_inspect` defaults to 15 descriptors without state and skips DOM scanning once semantic targets are found. `ui_action.steps` batches up to 10 non-destructive actions on one target.
+
+UI Action lifecycle metadata is buffered asynchronously into redacted `.biu/logs/ui-actions-YYYY-MM-DD.jsonl` files; arguments, DOM state, and result bodies are never logged. Local in-memory metrics are available at `/api/ui-actions/metrics`, and logging failures or queue overflow never block the Agent.
+
 ### Pages: the container for components
 
 A component declares what it is, but *where it sits, in what order, and alongside what* is decided by the page. And **the page is the only unit in this system that has boundaries**:
@@ -695,6 +699,9 @@ Also: `npm run dev:host` and `npm run dev:web`.
 | `BIU_LLM_LOG_DIR` | `.biu/logs` | JSONL directory for LLM throttling diagnostics; API keys, message bodies, and tool arguments are never recorded |
 | `BIU_LLM_LOG_MAX_BYTES` | `10485760` | per-day LLM log rotation threshold (10MB) |
 | `BIU_LLM_LOG_RETENTION_DAYS` | `7` | LLM diagnostic log retention |
+| `BIU_UI_ACTION_LOG_DIR` | `.biu/logs` | redacted UI Action JSONL directory |
+| `BIU_UI_ACTION_LOG_MAX_BYTES` | `10485760` | per-day UI Action log rotation threshold (10MB) |
+| `BIU_UI_ACTION_LOG_RETENTION_DAYS` | `7` | UI Action log retention |
 
 </details>
 

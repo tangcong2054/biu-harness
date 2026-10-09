@@ -47,6 +47,11 @@ export type UiActionRequest = {
   args?: Record<string, unknown>
 }
 
+export type UiActionBatchRequest = {
+  ref: string
+  steps: Array<{ action: string; args?: Record<string, unknown> }>
+}
+
 export type UiActionResult = {
   ref: string
   action: string
@@ -56,21 +61,37 @@ export type UiActionResult = {
   result?: unknown
   state?: Record<string, unknown>
   registryVersion: number
+  truncated?: boolean
 }
+
+export type UiActionBatchResult = {
+  ref: string
+  ok: boolean
+  results: UiActionResult[]
+  registryVersion: number
+  truncated?: boolean
+}
+
+export type UiWaitOperator = 'eq' | 'ne' | 'includes' | 'exists' | 'gt' | 'gte' | 'lt' | 'lte'
 
 export type UiWaitRequest = {
   ref: string
-  condition: 'exists' | 'visible' | 'hidden' | 'enabled' | 'disabled' | 'text-includes'
-  value?: string
+  condition?: 'exists' | 'visible' | 'hidden' | 'enabled' | 'disabled' | 'text-includes'
+  path?: string
+  operator?: UiWaitOperator
+  value?: unknown
   timeoutMs?: number
 }
 
 export type UiWaitResult = {
   ref: string
-  condition: UiWaitRequest['condition']
+  condition?: UiWaitRequest['condition']
+  path?: string
+  operator?: UiWaitOperator
   matched: boolean
   elapsedMs: number
   target?: UiTargetDescriptor
+  truncated?: boolean
 }
 
 export type UiClientHello = {
@@ -78,8 +99,11 @@ export type UiClientHello = {
   clientId: string
   route: string
   title?: string
+  sessionId?: string
   focused: boolean
   registryVersion: number
+  protocolVersion: number
+  targetCount: number
 }
 
 export type UiClientState = {
@@ -87,20 +111,29 @@ export type UiClientState = {
   clientId: string
   route: string
   title?: string
+  sessionId?: string
   focused: boolean
   registryVersion: number
+  protocolVersion: number
+  targetCount: number
 }
 
 export type UiRegistryChanged = {
   type: 'registry-changed'
   clientId: string
   registryVersion: number
+  targetCount: number
 }
 
 export type UiCommand =
   | { type: 'command'; requestId: string; command: 'inspect'; args: UiInspectQuery }
-  | { type: 'command'; requestId: string; command: 'action'; args: UiActionRequest }
+  | { type: 'command'; requestId: string; command: 'action'; args: UiActionRequest | UiActionBatchRequest }
   | { type: 'command'; requestId: string; command: 'wait'; args: UiWaitRequest }
+
+export type UiCancelCommand = {
+  type: 'cancel'
+  requestId: string
+}
 
 export type UiCommandResult = {
   type: 'result'
@@ -111,8 +144,11 @@ export type UiCommandResult = {
 }
 
 export type UiClientMessage = UiClientHello | UiClientState | UiRegistryChanged | UiCommandResult
-export type UiHostMessage = UiCommand
+export type UiHostMessage = UiCommand | UiCancelCommand
 
 export const UI_ACTIONS_WS_PATH = '/ws/ui-actions'
+export const UI_ACTIONS_PROTOCOL_VERSION = 1
 export const UI_ACTIONS_DEFAULT_TIMEOUT_MS = 15_000
 export const UI_ACTIONS_MAX_TIMEOUT_MS = 60_000
+export const UI_ACTIONS_MAX_RESULT_BYTES = 32 * 1024
+export const UI_ACTIONS_MAX_MESSAGE_BYTES = 512 * 1024

@@ -196,14 +196,14 @@ export class DomUiAdapter {
     for (const [ref, el] of this.elements) {
       if (!el.isConnected) this.elements.delete(ref)
     }
-    const limit = Math.min(100, Math.max(1, Math.floor(query.limit ?? 30)))
+    const limit = Math.min(100, Math.max(1, Math.floor(query.limit ?? 15)))
     const nodes = query.ref
       ? [this.elements.get(query.ref)].filter((el): el is HTMLElement => Boolean(el))
       : Array.from(document.querySelectorAll<HTMLElement>(DOM_SELECTOR))
     const out: UiTargetDescriptor[] = []
     for (const el of nodes) {
-      if (el.matches(SENSITIVE_SELECTOR) || el.closest('[data-biu-ignore]')) continue
-      const target = this.target(el, query.includeState !== false)
+      if (el.closest(SENSITIVE_SELECTOR) || el.closest('[data-biu-ignore]')) continue
+      const target = this.target(el, query.includeState === true)
       if (query.plugin && target.plugin !== query.plugin) continue
       if (query.scope && query.scope !== 'current' && target.surface !== query.scope) continue
       if (query.action && !target.actions.some((action) => action.id === query.action)) continue
