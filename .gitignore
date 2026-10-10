@@ -27,9 +27,10 @@ web/**/*.js.map
 .plugin-dev/**/*.js
 .plugin-dev/**/*.js.map
 .plugin-dev/**/node_modules/
-# CDB 与 dbbrain 插件只留在本地
+# CDB、dbbrain 与 websql 插件只留在本地
 .plugin-dev/cdb-*/
 .plugin-dev/dbbrain-*/
+.plugin-dev/websql/
 
 # 页面数据已迁入 .biu；保留 .page/ 以免旧工作区误提交
 .page/
