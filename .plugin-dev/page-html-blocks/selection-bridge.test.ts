@@ -19,6 +19,9 @@ test('injects the sandbox selection bridge before body end', () => {
   assert.ok(out.indexOf('data-biu-html-selection-bridge') < out.indexOf('</body>'))
   assert.match(out, /event\.metaKey\|\|event\.ctrlKey/)
   assert.match(out, /event\.preventDefault\(\)/)
+  assert.match(out, /selectionchange/)
+  assert.match(out, /publish\('clear',''\)/)
+  assert.match(out, /window\.addEventListener\('blur'/)
 })
 
 test('validates iframe source and nonce before accepting selection text', () => {
@@ -49,6 +52,17 @@ test('validates iframe source and nonce before accepting selection text', () => 
       'wrong',
     ),
     null,
+  )
+  assert.equal(
+    parseHtmlSelectionMessage(
+      {
+        source: frame.contentWindow,
+        data: { type: HTML_SELECTION_MESSAGE, nonce: 'n', action: 'clear', text: '' },
+      } as MessageEvent,
+      frame,
+      'n',
+    )?.action,
+    'clear',
   )
   frame.remove()
 })
@@ -96,6 +110,8 @@ test('web view wires static and iframe selection into core-pick', () => {
   assert.match(source, /event\.key !== 'l'/)
   assert.match(source, /suspendAncestorDrag\(event\.currentTarget\)/)
   assert.match(source, /parseHtmlSelectionMessage/)
+  assert.match(source, /message\.action === 'clear'/)
+  assert.match(source, /pointerdown/)
   assert.match(source, /srcDoc=\{bridgedHtml\}/)
   assert.match(source, /sandbox="allow-scripts"/)
   assert.doesNotMatch(source, /allow-same-origin/)

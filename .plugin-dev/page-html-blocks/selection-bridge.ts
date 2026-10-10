@@ -4,7 +4,7 @@ export const MAX_HTML_SELECTION_CHARS = 16_000
 export type HtmlSelectionMessage = {
   type: typeof HTML_SELECTION_MESSAGE
   nonce: string
-  action: 'preview' | 'attach'
+  action: 'preview' | 'attach' | 'clear'
   text: string
   rect?: { top: number; left: number; width: number; height: number }
 }
@@ -23,7 +23,10 @@ export function parseHtmlSelectionMessage(
   if (!event.data || typeof event.data !== 'object') return null
   const data = event.data as Record<string, unknown>
   if (data.type !== HTML_SELECTION_MESSAGE || data.nonce !== nonce) return null
-  if (data.action !== 'preview' && data.action !== 'attach') return null
+  if (data.action !== 'preview' && data.action !== 'attach' && data.action !== 'clear') return null
+  if (data.action === 'clear') {
+    return { type: HTML_SELECTION_MESSAGE, nonce, action: 'clear', text: '' }
+  }
   const text = cleanSelectionText(data.text)
   if (!text) return null
   const raw = data.rect
@@ -54,17 +57,47 @@ export function injectHtmlSelectionBridge(html: string, nonce: string) {
   const constants = JSON.stringify({ type: HTML_SELECTION_MESSAGE, nonce })
   const script = `<script data-biu-html-selection-bridge>(function(){
 var cfg=${constants};
+function publish(action,text,rect){
+  parent.postMessage({type:cfg.type,nonce:cfg.nonce,action:action,text:text,rect:rect},'*');
+}
 function snapshot(action,event){
   if(event&&event.isTrusted===false)return;
   var sel=window.getSelection();
   var text=sel&&!sel.isCollapsed?String(sel):'';
   text=text.replace(/\\u0000/g,'').trim().slice(0,${MAX_HTML_SELECTION_CHARS});
-  if(!text)return;
+  if(!text){if(action==='preview')publish('clear','');return;}
   var rect={top:0,left:0,width:0,height:0};
   try{var r=sel.getRangeAt(0).getBoundingClientRect();rect={top:r.top,left:r.left,width:r.width,height:r.height}}catch(_){}
-  parent.postMessage({type:cfg.type,nonce:cfg.nonce,action:action,text:text,rect:rect},'*');
+  publish(action,text,rect);
 }
-document.addEventListener('mouseup',function(event){setTimeout(function(){snapshot('preview',event)},0)},true);
+var timer=0;
+var before='';
+var origin=null;
+function readText(){
+  var sel=window.getSelection();
+  var text=sel&&!sel.isCollapsed?String(sel):'';
+  return text.replace(/\\u0000/g,'').trim().slice(0,${MAX_HTML_SELECTION_CHARS});
+}
+document.addEventListener('mousedown',function(event){
+  if(event&&event.isTrusted===false)return;
+  before=readText();
+  origin={x:event.clientX,y:event.clientY};
+  clearTimeout(timer);
+  publish('clear','');
+},true);
+document.addEventListener('mouseup',function(event){
+  if(event&&event.isTrusted===false)return;
+  var drag=origin&&(Math.abs(event.clientX-origin.x)>4||Math.abs(event.clientY-origin.y)>4);
+  origin=null;
+  clearTimeout(timer);
+  timer=setTimeout(function(){
+    var text=readText();
+    if(!text||(!drag&&text===before)){publish('clear','');return;}
+    snapshot('preview',null);
+  },0);
+},true);
+document.addEventListener('selectionchange',function(){if(!readText()){clearTimeout(timer);publish('clear','');}});
+window.addEventListener('blur',function(){clearTimeout(timer);publish('clear','');});
 document.addEventListener('keydown',function(event){
   if(event.isComposing||event.altKey||event.shiftKey||!(event.metaKey||event.ctrlKey)||(event.key!=='l'&&event.key!=='L'))return;
   var sel=window.getSelection();

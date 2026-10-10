@@ -1117,9 +1117,14 @@ function useFrameHtmlSelection(
 ) {
   const [state, setState] = useState<SelectionBubbleState | null>(null)
   useEffect(() => {
+    let holdBubble = false
     const onMessage = (event: MessageEvent) => {
       const message = parseHtmlSelectionMessage(event, frameRef.current, nonce)
       if (!message) return
+      if (message.action === 'clear') {
+        if (!holdBubble) setState(null)
+        return
+      }
       if (message.action === 'attach' || htmlPick?.picking) {
         if (attachHtmlSelection(message.text)) setState(null)
         return
@@ -1134,8 +1139,33 @@ function useFrameHtmlSelection(
         left: Math.min(window.innerWidth - 44, Math.max(8, frameBox.left + center - 16)),
       })
     }
+    const bubbleTarget = (event: Event) => {
+      const target = event.target
+      const el = target instanceof Element ? target : target instanceof Node ? target.parentElement : null
+      return el?.closest('[data-testid="html-selection-bubble"]') ?? null
+    }
+    const onPointerDown = (event: PointerEvent) => {
+      if (bubbleTarget(event)) {
+        holdBubble = true
+        return
+      }
+      setState(null)
+    }
+    const releaseBubble = () => {
+      window.setTimeout(() => {
+        holdBubble = false
+      }, 300)
+    }
     window.addEventListener('message', onMessage)
-    return () => window.removeEventListener('message', onMessage)
+    document.addEventListener('pointerdown', onPointerDown, true)
+    document.addEventListener('pointerup', releaseBubble, true)
+    document.addEventListener('pointercancel', releaseBubble, true)
+    return () => {
+      window.removeEventListener('message', onMessage)
+      document.removeEventListener('pointerdown', onPointerDown, true)
+      document.removeEventListener('pointerup', releaseBubble, true)
+      document.removeEventListener('pointercancel', releaseBubble, true)
+    }
   }, [frameRef, nonce])
   const attach = () => {
     if (!state || !attachHtmlSelection(state.text)) return
