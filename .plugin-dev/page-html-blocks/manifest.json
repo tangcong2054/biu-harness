@@ -1,0 +1,16 @@
+{
+  "id": "page-html-blocks",
+  "name": "HTML",
+  "blurb": "斜杠插入静态HTML（不跑脚本）或动态HTML（能跑脚本）。",
+  "tags": [
+    "page",
+    "editor",
+    "html",
+    "iframe",
+    "slide"
+  ],
+  "author": "Biu",
+  "authorUrl": "https://github.com/helloooooooooooooo97/biu-harness",
+  "createdAt": 1788577761418,
+  "headless": true
+}
