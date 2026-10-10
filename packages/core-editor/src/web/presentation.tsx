@@ -1,6 +1,6 @@
 import { Service, type Context } from 'cordis'
 import { useEffect, useRef, useSyncExternalStore, type ReactNode } from 'react'
-import { ArrowTopRightOnSquareIcon, MinusIcon, ViewColumnsIcon } from '@heroicons/react/16/solid'
+import { ViewColumnsIcon } from '@heroicons/react/16/solid'
 
 export type PagePresentationMode = 'inline' | 'sidebar' | 'maximized' | 'minimized'
 
@@ -59,6 +59,7 @@ const STYLE = `
 .page-presentation-traffic{display:flex;gap:6px;align-items:center;flex:none}
 .page-presentation-light{width:12px;height:12px;border-radius:50%;border:0;padding:0;cursor:pointer;display:grid;place-items:center}
 .page-presentation-light svg{width:7px;height:7px;color:#fff;opacity:0;transition:opacity .1s;pointer-events:none}
+.page-presentation-light .mac-traffic-glyph{width:12px;height:12px;color:rgba(0,0,0,.62)}
 .page-presentation-traffic:hover .page-presentation-light svg,.page-presentation-inline-actions:hover .page-presentation-light svg{opacity:1}
 .page-presentation-light.is-close{background:#ff5f57}
 .page-presentation-light.is-min{background:#febc2e}
@@ -92,6 +93,23 @@ function ensureStyle() {
   style.id = STYLE_ID
   style.textContent = STYLE
   if (style.parentNode !== document.head) document.head.appendChild(style)
+}
+
+function MacMinimizeGlyph() {
+  return (
+    <svg className="mac-traffic-glyph" viewBox="0 0 12 12" aria-hidden>
+      <path d="M2.5 6h7" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function MacZoomGlyph() {
+  return (
+    <svg className="mac-traffic-glyph" viewBox="0 0 12 12" aria-hidden>
+      <path fill="#1a642d" d="M3.78 3.78H7.34L3.78 7.34Z" />
+      <path fill="#1a642d" d="M8.22 8.22H4.66L8.22 4.66Z" />
+    </svg>
+  )
 }
 
 function paneId(id: string) {
@@ -385,14 +403,18 @@ function PresentationBar({
           title="收起"
           aria-label="收起"
           onClick={() => service.setMode(entry.id, 'minimized')}
-        />
+        >
+          <MacMinimizeGlyph />
+        </button>
         <button
           type="button"
           className="page-presentation-light is-max"
           title={entry.detached ? '聚焦独立窗口' : '在独立窗口打开'}
           aria-label={entry.detached ? '聚焦独立窗口' : '在独立窗口打开'}
           onClick={() => void service.openDetached(entry.id)}
-        />
+        >
+          <MacZoomGlyph />
+        </button>
       </div>
       <span className="page-presentation-title">{entry.title}</span>
       <span className="page-presentation-spacer" />
@@ -434,7 +456,7 @@ export function PagePresentationInlineActions({
   return (
     <div className="page-presentation-inline-actions" data-biu-ignore>
       <button type="button" className="page-presentation-light is-close" title="收起" aria-label="收起" onClick={controls.minimize}>
-        <MinusIcon aria-hidden />
+        <MacMinimizeGlyph />
       </button>
       <button type="button" className="page-presentation-light is-min" title="在右侧栏打开" aria-label="在右侧栏打开" onClick={controls.sidebar}>
         <ViewColumnsIcon aria-hidden />
@@ -446,7 +468,7 @@ export function PagePresentationInlineActions({
         aria-label={controls.detached ? '聚焦独立窗口' : '在独立窗口打开'}
         onClick={controls.maximize}
       >
-        <ArrowTopRightOnSquareIcon aria-hidden />
+        <MacZoomGlyph />
       </button>
     </div>
   )
