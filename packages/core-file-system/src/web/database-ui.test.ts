@@ -48,6 +48,14 @@ test('decorate merges Actions; later layer wins', () => {
   assert.equal(ui.chrome('/plugins').Actions, Second)
 })
 
+test('decorate keeps the collection toolbar entry', () => {
+  const ctx = new Context()
+  const ui = new DatabaseUiService(ctx)
+  const StoreButton = () => null
+  ui.decorate('/plugins', { ToolbarRight: StoreButton })
+  assert.equal(ui.chrome('/plugins').ToolbarRight, StoreButton)
+})
+
 test('decorate keeps Icon as the record mark, later layer wins', () => {
   const ctx = new Context()
   const ui = new DatabaseUiService(ctx)
