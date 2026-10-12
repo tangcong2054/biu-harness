@@ -1,8 +1,38 @@
-import { ArchiveBoxArrowDownIcon, PlayIcon, StopIcon } from '@heroicons/react/16/solid'
+import { ArchiveBoxArrowDownIcon, BuildingStorefrontIcon, PlayIcon, StopIcon } from '@heroicons/react/16/solid'
 import { TrashGlyph } from '@biu/web-session-view/trash-glyph'
 import { asHttpHref } from '@biu/type-file-system'
 import type { CollectionActionInfo, DbRecord } from '@biu/type-file-system'
 import type { CollectionChrome, FsActionProps, FsActionsProps, FsCellProps } from '@biu/type-file-system/ui'
+import { buildAppPath } from '@biu/web-session-view'
+
+export function pluginCatalogHref() {
+  return buildAppPath({
+    kind: 'collection-view',
+    moduleId: 'database',
+    path: '/database',
+    collection: '/plugin-catalog',
+  })
+}
+
+function PluginStoreButton() {
+  return (
+    <button
+      type="button"
+      className="fsdb-create-btn"
+      data-testid="plugin-catalog-open"
+      title="打开插件商店"
+      aria-label="打开插件商店"
+      onClick={() => {
+        const href = pluginCatalogHref()
+        window.history.pushState({}, '', href)
+        window.dispatchEvent(new PopStateEvent('popstate'))
+      }}
+    >
+      <BuildingStorefrontIcon aria-hidden className="size-[14px]" />
+      插件商店
+    </button>
+  )
+}
 
 function PluginTitle({ record, label }: { record: DbRecord; label: string }) {
   const enabled = record.enabled === true || record.enabled === 'true'
@@ -157,6 +187,7 @@ export const pluginsChrome: CollectionChrome = {
   cells: {
     author: PluginAuthorCell,
   },
+  ToolbarRight: PluginStoreButton,
   Title: PluginTitle,
   Actions: PluginActions,
 }

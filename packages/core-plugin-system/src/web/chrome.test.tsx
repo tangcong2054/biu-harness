@@ -2,7 +2,7 @@ import { test } from 'vitest'
 import assert from 'node:assert/strict'
 import { render } from '@testing-library/react'
 import type { CollectionActionInfo } from '@biu/type-file-system'
-import { pluginsChrome } from './chrome.tsx'
+import { pluginCatalogHref, pluginsChrome } from './chrome.tsx'
 
 const actions: CollectionActionInfo[] = [
   { id: 'start', label: '运行', when: { installed: true, running: false } },
@@ -62,4 +62,13 @@ test('plugin title puts a green dot left of the name when enabled', () => {
   const dot = on.container.querySelector('[data-testid="plugin-enabled-dot"]')
   assert.ok(dot)
   assert.ok(dot?.nextElementSibling?.textContent?.includes('画板'))
+})
+
+test('plugin toolbar opens the plugin catalog', () => {
+  const Toolbar = pluginsChrome.ToolbarRight
+  assert.ok(Toolbar)
+  const { getByRole } = render(<Toolbar />)
+  const button = getByRole('button', { name: '打开插件商店' })
+  button.click()
+  assert.equal(window.location.pathname, pluginCatalogHref())
 })

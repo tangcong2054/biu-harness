@@ -957,7 +957,11 @@ export function CollectionBrowser({
     if (wait) await new Promise((resolve) => window.setTimeout(resolve, wait))
     setRefreshing(false)
     if (!ok) return
-    setNotice('刷新成功')
+    showNotice('刷新成功')
+  }
+
+  function showNotice(message: string) {
+    setNotice(message)
     window.clearTimeout(noticeTimer.current)
     noticeTimer.current = window.setTimeout(() => setNotice(''), 1800)
   }
@@ -1747,6 +1751,7 @@ export function CollectionBrowser({
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ path: `${dataPath}/${row.id}`, action: action.id }),
       })
+      showNotice(`${action.label}成功`)
       quietUntil.current = Date.now() + 800
       window.setTimeout(() => {
         quietUntil.current = 0
@@ -2946,6 +2951,7 @@ export function CollectionBrowser({
             ) : null}
           </div>
           <div className="tasks-toolbar-right" ref={toolbarRightRef}>
+            {chrome?.ToolbarRight ? <chrome.ToolbarRight /> : null}
             <HeadlessDismiss
               enabled={searchExpanded}
               onDismiss={() => {
