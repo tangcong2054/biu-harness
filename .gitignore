@@ -4,6 +4,8 @@ dist/
 .cordis/
 # 已安装插件是本地产物，整目录不入库
 .plugin/
+# 本机插件商店数据。地址在 plugin-registry.config.json
+.plugin-registry/
 .workspace/
 *.log
 .DS_Store

@@ -1,0 +1,6 @@
+{
+  "id": "local",
+  "dataDir": ".plugin-registry",
+  "url": "",
+  "note": "url 为空时由本机进程提供商店，数据在 dataDir。部署到远端后只把 url 改成 API 根地址（例如 https://plugins.example.com/api/plugin-registry/v1），id 保持不变，已安装插件的所有者记录才能对上。"
+}

@@ -175,10 +175,33 @@ async function readManifest(dir: string): Promise<StoreManifest> {
   }
 }
 
-type StoreState = { enabled: string[]; lastRunAt: Record<string, number> }
+export type PluginOrigin = { registryId: string; ownerId: string }
+
+export type RemoteFlag = {
+  remoteCodeVersion: string
+  localCodeVersion: string
+  updateAvailable: boolean
+  idConflict: boolean
+  ownerId: string
+}
+
+export type InstalledBundle = {
+  id: string
+  codeVersion: string
+  ownerId: string
+  registryId: string
+  files: Record<string, string>
+  assets?: Record<string, string>
+}
+
+type StoreState = {
+  enabled: string[]
+  lastRunAt: Record<string, number>
+  origins: Record<string, PluginOrigin>
+}
 
 function emptyState(): StoreState {
-  return { enabled: [], lastRunAt: {} }
+  return { enabled: [], lastRunAt: {}, origins: {} }
 }
 
 function parseState(raw: unknown): StoreState {
@@ -192,16 +215,33 @@ function parseState(raw: unknown): StoreState {
       if (/^[a-z][a-z0-9-]{1,40}$/.test(id) && Number.isFinite(n) && n > 0) lastRunAt[id] = Math.floor(n)
     }
   }
-  if (!Array.isArray(enabled)) return { enabled: [], lastRunAt }
+  const originsRaw = (raw as { origins?: unknown }).origins
+  const origins: Record<string, PluginOrigin> = {}
+  if (originsRaw && typeof originsRaw === 'object') {
+    for (const [id, value] of Object.entries(originsRaw as Record<string, unknown>)) {
+      if (!/^[a-z][a-z0-9-]{1,40}$/.test(id) || !value || typeof value !== 'object') continue
+      const row = value as { registryId?: unknown; ownerId?: unknown }
+      const registryId = String(row.registryId ?? '').trim()
+      const ownerId = String(row.ownerId ?? '').trim()
+      if (!/^[a-z][a-z0-9-]{1,40}$/.test(registryId) || !/^own_[a-f0-9]{16}$/.test(ownerId)) continue
+      origins[id] = { registryId, ownerId }
+    }
+  }
+  if (!Array.isArray(enabled)) return { enabled: [], lastRunAt, origins }
   return {
     enabled: [...new Set(enabled.map((id) => String(id)).filter((id) => /^[a-z][a-z0-9-]{1,40}$/.test(id)))].sort(),
     lastRunAt,
+    origins,
   }
 }
+
+const BUNDLE_TEXT = ['manifest.json', 'host.js', 'web.js', 'README.md'] as const
+const BUNDLE_MEDIA = /^[A-Za-z0-9._-]+\.(mp3|wav|ogg|m4a)$/i
 
 export class PluginStoreService extends Service {
   private state: StoreState = emptyState()
   private listCache: StoreListing[] | null = null
+  private remoteSource: { flags(): Promise<Record<string, RemoteFlag>> } | null = null
 
   constructor(
     ctx: Context,
@@ -249,7 +289,7 @@ export class PluginStoreService extends Service {
     const next = new Set(this.state.enabled)
     if (enabled) next.add(id)
     else next.delete(id)
-    this.state = { enabled: [...next].sort(), lastRunAt: this.state.lastRunAt }
+    this.state = { ...this.state, enabled: [...next].sort() }
     this.writeState()
   }
 
@@ -377,6 +417,7 @@ export class PluginStoreService extends Service {
     )
     const items: StoreListing[] = []
     for (const name of names.sort()) {
+      if (name.startsWith('.')) continue
       const dir = join(this.pluginDir, name)
       if (!(await stat(dir)).isDirectory()) continue
       if (!existsSync(join(dir, 'manifest.json'))) continue
@@ -434,8 +475,83 @@ export class PluginStoreService extends Service {
     this.invalidateList()
     const lastRunAt = { ...this.state.lastRunAt }
     delete lastRunAt[id]
-    this.state = { ...this.state, lastRunAt }
+    const origins = { ...this.state.origins }
+    delete origins[id]
+    this.state = { ...this.state, lastRunAt, origins }
     this.writeState()
+  }
+
+  originOf(id: string): PluginOrigin | undefined {
+    return this.state.origins[id]
+  }
+
+  rememberOrigin(id: string, origin: PluginOrigin) {
+    if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
+    this.state = { ...this.state, origins: { ...this.state.origins, [id]: origin } }
+    this.writeState()
+  }
+
+  attachRegistry(source: { flags(): Promise<Record<string, RemoteFlag>> }) {
+    this.remoteSource = source
+  }
+
+  async remoteFlags() {
+    if (!this.remoteSource) return {}
+    try {
+      return await this.remoteSource.flags()
+    } catch {
+      return {}
+    }
+  }
+
+  /** 把商店里的打包结果写入 .plugin/<id>/。来源对不上且本地已有同 id 时拒绝覆盖。 */
+  async installBundle(bundle: InstalledBundle) {
+    const id = String(bundle.id ?? '').trim()
+    if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
+    const manifestText = bundle.files?.['manifest.json']
+    if (!manifestText) throw new Error('manifest.json required')
+    const manifest = JSON.parse(manifestText) as { id?: unknown }
+    if (String(manifest.id ?? '').trim() !== id) throw new Error('manifest.id does not match plugin id')
+    const origin = { registryId: String(bundle.registryId ?? '').trim(), ownerId: String(bundle.ownerId ?? '').trim() }
+    if (!/^[a-z][a-z0-9-]{1,40}$/.test(origin.registryId) || !/^own_[a-f0-9]{16}$/.test(origin.ownerId)) {
+      throw new Error('invalid plugin origin')
+    }
+    if (this.installConflict(id, origin)) throw new Error(`plugin id conflict: ${id}`)
+    const wasEnabled = this.isEnabled(id)
+    if (wasEnabled) await this.hub().drop(id)
+    const staging = join(this.pluginDir, '.incoming', id)
+    await rm(staging, { recursive: true, force: true })
+    mkdirSync(staging, { recursive: true })
+    for (const name of BUNDLE_TEXT) {
+      const text = bundle.files[name]
+      if (text == null) continue
+      await writeFile(join(staging, name), text)
+    }
+    for (const [name, body] of Object.entries(bundle.assets ?? {})) {
+      if (!BUNDLE_MEDIA.test(name)) continue
+      const assetsDir = join(staging, 'assets')
+      mkdirSync(assetsDir, { recursive: true })
+      await writeFile(join(assetsDir, name), Buffer.from(body, 'base64'))
+    }
+    const codeVersion = await hashInstalledPluginCode(staging)
+    if (!codeVersion || codeVersion !== bundle.codeVersion) {
+      await rm(staging, { recursive: true, force: true })
+      throw new Error(`bundle hash mismatch for ${id}`)
+    }
+    const dest = this.pluginPath(id)
+    await rm(dest, { recursive: true, force: true })
+    mkdirSync(this.pluginDir, { recursive: true })
+    const { rename } = await import('node:fs/promises')
+    await rename(staging, dest)
+    this.rememberOrigin(id, origin)
+    if (wasEnabled) await this.mountFromDisk(await readManifest(dest), dest)
+    return { id, codeVersion, remounted: wasEnabled }
+  }
+
+  private installConflict(id: string, origin: PluginOrigin) {
+    const current = this.state.origins[id]
+    if (current && current.registryId === origin.registryId && current.ownerId === origin.ownerId) return false
+    return existsSync(join(this.pluginPath(id), 'manifest.json')) || existsSync(join(this.sandboxPath(id), 'manifest.json'))
   }
 
   private readmeDir(id: string) {

@@ -948,7 +948,7 @@ function MainShell(props: SlotProps) {
                   {settingsTab === 'plugins' ? (
                     <section>
                       <h3 className="settings-pane-title">插件</h3>
-                      <p className="settings-muted settings-pane-lead">安装、开关和管理页面块。</p>
+                      <p className="settings-muted settings-pane-lead">安装、开关和管理页面块。商店在数据表「插件商店」（/plugin-catalog）。</p>
                       {props.renderSlot('sidebar')}
                     </section>
                   ) : null}
