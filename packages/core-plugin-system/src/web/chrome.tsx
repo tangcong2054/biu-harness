@@ -3,16 +3,6 @@ import { TrashGlyph } from '@biu/web-session-view/trash-glyph'
 import { asHttpHref } from '@biu/type-file-system'
 import type { CollectionActionInfo, DbRecord } from '@biu/type-file-system'
 import type { CollectionChrome, FsActionProps, FsActionsProps, FsCellProps } from '@biu/type-file-system/ui'
-import { buildAppPath } from '@biu/web-session-view'
-
-export function pluginCatalogHref() {
-  return buildAppPath({
-    kind: 'collection-view',
-    moduleId: 'database',
-    path: '/database',
-    collection: '/plugin-catalog',
-  })
-}
 
 function PluginStoreButton() {
   return (
@@ -20,12 +10,14 @@ function PluginStoreButton() {
       type="button"
       className="fsdb-create-btn"
       data-testid="plugin-catalog-open"
-      title="打开插件商店"
-      aria-label="打开插件商店"
+      title="在右侧打开插件商店"
+      aria-label="在右侧打开插件商店"
       onClick={() => {
-        const href = pluginCatalogHref()
-        window.history.pushState({}, '', href)
-        window.dispatchEvent(new PopStateEvent('popstate'))
+        window.dispatchEvent(
+          new CustomEvent('biu:inspector-reveal', {
+            detail: { collection: '/plugin-catalog', unique: true },
+          }),
+        )
       }}
     >
       <BuildingStorefrontIcon aria-hidden className="size-[14px]" />

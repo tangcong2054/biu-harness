@@ -49,7 +49,7 @@ export function pluginCatalogCollection(client: PluginRegistryClient): Collectio
       moduleId: 'plugin-catalog',
       route: '/plugin-catalog',
       title: '插件商店',
-      inspector: false,
+      inspector: true,
       blurb: '远端插件目录，不是本机已安装插件。人从数据表打开「插件商店」。搜索 db_list /plugin-catalog q=关键词。安装 db_action /plugin-catalog/<id> action=install，可选 args.version 钉住 codeVersion。更新 db_action action=update，只在 updateAvailable 为 true 时可用。idConflict 为 true 表示本机已有同 id 但不是这家商店的同一所有者，不能覆盖。装完后到 /plugins 用 start 运行。发布走 /plugins/<id> action=publish。',
       order: 31,
       icon: 'puzzle-piece',

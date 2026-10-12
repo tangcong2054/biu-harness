@@ -132,6 +132,7 @@ test('publish, search, install, update and reject a different token', async () =
       const remote = new PluginRegistryClient(consumer, localRegistryTransport(registry), 'local', registryTokenPath(consumerDir))
       consumer.attachRegistry(remote)
       const catalog = pluginCatalogCollection(remote)
+      assert.equal(catalog.view?.inspector, true)
       const before = await catalog.list?.()
       assert.equal(before?.[0]?.installed, undefined)
       assert.equal(before?.[0]?.updateAvailable, undefined)

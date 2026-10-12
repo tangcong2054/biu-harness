@@ -2,7 +2,7 @@ import { test } from 'vitest'
 import assert from 'node:assert/strict'
 import { render } from '@testing-library/react'
 import type { CollectionActionInfo } from '@biu/type-file-system'
-import { pluginCatalogHref, pluginsChrome } from './chrome.tsx'
+import { pluginsChrome } from './chrome.tsx'
 
 const actions: CollectionActionInfo[] = [
   { id: 'start', label: '运行', when: { installed: true, running: false } },
@@ -64,11 +64,17 @@ test('plugin title puts a green dot left of the name when enabled', () => {
   assert.ok(dot?.nextElementSibling?.textContent?.includes('画板'))
 })
 
-test('plugin toolbar opens the plugin catalog', () => {
+test('plugin toolbar opens the plugin catalog in the inspector', () => {
   const Toolbar = pluginsChrome.ToolbarRight
   assert.ok(Toolbar)
+  let detail: unknown
+  const onReveal = (event: Event) => {
+    detail = (event as CustomEvent).detail
+  }
+  window.addEventListener('biu:inspector-reveal', onReveal)
   const { getByRole } = render(<Toolbar />)
-  const button = getByRole('button', { name: '打开插件商店' })
+  const button = getByRole('button', { name: '在右侧打开插件商店' })
   button.click()
-  assert.equal(window.location.pathname, pluginCatalogHref())
+  window.removeEventListener('biu:inspector-reveal', onReveal)
+  assert.deepEqual(detail, { collection: '/plugin-catalog', unique: true })
 })
