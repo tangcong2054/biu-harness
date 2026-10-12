@@ -1,0 +1,16 @@
+{
+  "id": "med-ruleset",
+  "name": "医疗口径版本",
+  "blurb": "页面里插一块：读 med_demo.t_rule 的入组规则（条件文本 + version），改阈值点「发布新版本」→ 真 INSERT 一条 version+1 的规则；点「按这条规则跑」用插件内置的受限解析器把条件文本翻成 SQL 真查患者，人数与命中名单写进 med_demo.t_rule_run，并与上一版结果 diff（多出/少了哪些患者）。每个指标值都能点回它的来源病历（source_file / doc_no）。写操作只能写 t_rule 和 t_rule_run。headless，路由前缀 /api/med-ruleset。",
+  "tags": [
+    "page",
+    "editor",
+    "medical",
+    "rule",
+    "mysql"
+  ],
+  "author": "Biu",
+  "authorUrl": "",
+  "createdAt": 1791620150164,
+  "headless": true
+}

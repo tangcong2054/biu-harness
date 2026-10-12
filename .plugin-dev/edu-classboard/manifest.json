@@ -1,0 +1,16 @@
+{
+  "id": "edu-classboard",
+  "name": "教育答题与学情",
+  "blurb": "页面里插一块，左边学生真答题（点选项→提交，host 侧判分并把这条作答 INSERT 进 edu_demo.t_attempt，返回新 attempt_id），右边老师看学情（按知识点正确率、按学生正确率自动分「重讲/巩固/跳过」三组），点「写下备课计划」把分组结论写进 edu_demo.t_group_plan。写操作只能写这两张表，SQL 是插件里硬编码的模板，不接受任意 SQL。headless，路由前缀 /api/edu-classboard。",
+  "tags": [
+    "page",
+    "editor",
+    "education",
+    "quiz",
+    "mysql"
+  ],
+  "author": "Biu",
+  "authorUrl": "",
+  "createdAt": 1791620150133,
+  "headless": true
+}

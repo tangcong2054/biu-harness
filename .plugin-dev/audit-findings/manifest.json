@@ -1,0 +1,16 @@
+{
+  "id": "audit-findings",
+  "name": "审计发现底稿",
+  "blurb": "页面里插一块：从 audit_demo.t_audit_rule 读出规则（规则是表里的数据，带 version，不是写在提示词里），选一条点「跑规则」真执行 SQL，每条命中都能展开「规则+证据+金额」；点「确认」把结论落成一条 audit_demo.t_audit_finding 底稿（含指纹、规则版本、确认人、时间）。再跑一次自动与上次 diff，标出新增/消失/仍在。写操作只能写 t_audit_finding 这张表。headless，路由前缀 /api/audit-findings。",
+  "tags": [
+    "page",
+    "editor",
+    "audit",
+    "finance",
+    "mysql"
+  ],
+  "author": "Biu",
+  "authorUrl": "",
+  "createdAt": 1791620150144,
+  "headless": true
+}

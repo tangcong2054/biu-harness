@@ -1,0 +1,16 @@
+{
+  "id": "cost-reconcile",
+  "name": "造价三方对账",
+  "blurb": "页面里插一块：把 cost_demo 的合同清单（t_cost_item）、签证变更（t_cost_change）、结算（t_settlement）按清单编码三方对齐，算出差额与超支率。改一条签证的量或单价（真 INSERT 进 t_cost_change）→ 差异立刻重算，能看出哪一条变化影响了多少钱。点「写结论」把一条差异落成 cost_demo.t_cost_diff（子目/差额/原因/确认人）。写操作只能写 t_cost_change 和 t_cost_diff。headless，路由前缀 /api/cost-reconcile。",
+  "tags": [
+    "page",
+    "editor",
+    "cost",
+    "construction",
+    "mysql"
+  ],
+  "author": "Biu",
+  "authorUrl": "",
+  "createdAt": 1791620150154,
+  "headless": true
+}
