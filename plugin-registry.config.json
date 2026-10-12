@@ -1,6 +1,8 @@
 {
   "id": "local",
   "dataDir": ".plugin-registry",
-  "url": "",
-  "note": "url 为空时由本机进程提供商店，数据在 dataDir。部署到远端后只把 url 改成 API 根地址（例如 https://plugins.example.com/api/plugin-registry/v1），id 保持不变，已安装插件的所有者记录才能对上。"
+  "url": "http://127.0.0.1:3151/api/plugin-registry/v1",
+  "listenHost": "127.0.0.1",
+  "listenPort": 3151,
+  "note": "npm run registry:dev 单独启动商店。部署到远端后把 url 改成远端 API 根地址；Registry 服务端可用环境变量覆盖 dataDir/listenHost/listenPort。id 保持不变，已安装插件的所有者记录才能对上。"
 }

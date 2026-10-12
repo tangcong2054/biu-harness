@@ -21,9 +21,15 @@ export { pluginsCollection } from './collection.ts'
 export async function apply(ctx: Context) {
   const store = await openStore(ctx)
   const config = loadRegistryConfig()
-  const registry = new PluginRegistryStore(config.dataDir, config.id)
-  registerRegistryRoutes(ctx, registry)
-  const transport = config.url ? httpRegistryTransport(config.url) : localRegistryTransport(registry)
+  let transport
+  if (config.url) {
+    transport = httpRegistryTransport(config.url)
+  } else {
+    // 兼容旧配置；正式部署和本地模拟均应启动独立 Registry 服务并配置 url。
+    const registry = new PluginRegistryStore(config.dataDir, config.id)
+    registerRegistryRoutes(ctx, registry)
+    transport = localRegistryTransport(registry)
+  }
   const client = new PluginRegistryClient(store, transport, config.id, registryTokenPath(dirname(store.sandboxDir)))
   store.attachRegistry(client)
   ctx.inject(['database'], (inner) => {

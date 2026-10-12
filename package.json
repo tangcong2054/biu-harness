@@ -24,6 +24,7 @@
     "dev:host": "SHARE_PORT=3142 SHARE_HOST=0.0.0.0 SHARE_PROXY_UI=http://127.0.0.1:5173 tsx host/index.ts",
     "dev:host:nowatch": "SHARE_PORT=3142 SHARE_HOST=0.0.0.0 SHARE_PROXY_UI=http://127.0.0.1:5173 tsx host/index.ts",
     "dev:web": "vite",
+    "registry:dev": "tsx packages/core-plugin-system/src/host/registry-server.ts",
     "build": "vite build",
     "start": "SHARE_PORT=3142 SHARE_HOST=0.0.0.0 tsx host/index.ts",
     "test": "vitest run",

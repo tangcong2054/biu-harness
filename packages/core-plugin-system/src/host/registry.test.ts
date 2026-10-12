@@ -9,6 +9,7 @@ import type { CatalogEntry } from '@biu/host-hub'
 import { pluginCatalogCollection } from './catalog.ts'
 import { loadRegistryConfig } from './registry-config.ts'
 import { PluginRegistryClient, localRegistryTransport, registryTokenPath } from './registry-client.ts'
+import { createRegistryServer } from './registry-server.ts'
 import { PluginRegistryStore, ownerIdForToken } from './registry.ts'
 import { PluginStoreService } from './store.ts'
 
@@ -62,7 +63,33 @@ test('registry config reads id, dataDir and url', async () => {
     assert.equal(config.id, 'shop')
     assert.equal(config.dataDir, join(dir, 'store-data'))
     assert.equal(config.url, 'https://plugins.example.com/api/plugin-registry/v1')
+    assert.equal(config.listenHost, '127.0.0.1')
+    assert.equal(config.listenPort, 3151)
   } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('standalone registry server exposes health and catalog APIs', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-registry-server-'))
+  const registry = new PluginRegistryStore(dir, 'local')
+  const server = createRegistryServer(registry)
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, '127.0.0.1', resolve)
+    })
+    const address = server.address()
+    assert.ok(address && typeof address === 'object')
+    const root = `http://127.0.0.1:${address.port}/api/plugin-registry/v1`
+    const health = await fetch(`${root}/health`)
+    assert.equal(health.status, 200)
+    assert.deepEqual(await health.json(), { ok: true, registryId: 'local' })
+    const catalog = await fetch(`${root}/plugins`)
+    assert.equal(catalog.status, 200)
+    assert.deepEqual(await catalog.json(), { ok: true, registryId: 'local', plugins: [] })
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
     await rm(dir, { recursive: true, force: true })
   }
 })
