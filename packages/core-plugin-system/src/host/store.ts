@@ -937,7 +937,9 @@ export class PluginStoreService extends Service {
             manifest,
           })
         }
-        this.accountStore()?.ensurePluginOwnerAssignments?.(manifest.id)
+        if (manifest.builtin === true) {
+          this.accountStore()?.ensurePluginOwnerAssignments?.(manifest.id)
+        }
         await this.mountFromDisk(manifest, hit)
       } catch (error) {
         this.ctx.logger('core-plugin-system').error(error)
