@@ -28,6 +28,7 @@ export function isRegisteredBuiltinPlugin(pluginId: string) {
 export type PluginAssignmentSubject =
   | { type: 'account'; id: string }
   | { type: 'member_view'; id: string }
+  | { type: 'workspace'; id: string }
 
 export type PluginPackageInput = {
   id: string
@@ -1273,7 +1274,23 @@ export class CollabStore {
 
   canAccessPlugin(accountId: string, workspaceId: string, pluginId: string) {
     if (!accountId || !workspaceId || !pluginId || !this.isMember(accountId, workspaceId)) return false
-    return this.hasPluginLoad(accountId, workspaceId, pluginId)
+    return this.workspaceHasPlugin(workspaceId, pluginId, accountId)
+  }
+
+  workspaceHasPlugin(workspaceId: string, pluginId: string, accountId = '') {
+    if (!workspaceId || !pluginId) return false
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS ok FROM plugin_assignments
+         WHERE workspace_id = ? AND plugin_id = ?
+           AND (
+             (subject_type = 'workspace' AND subject_id = ?)
+             OR (subject_type = 'account' AND subject_id = ?)
+           )
+         LIMIT 1`,
+      )
+      .get(workspaceId, pluginId, workspaceId, accountId) as { ok?: number } | undefined
+    return Boolean(row)
   }
 
   hasPluginLoad(accountId: string, workspaceId: string, pluginId: string) {
@@ -1311,6 +1328,9 @@ export class CollabStore {
     const id = pluginId.trim()
     if (!/^[a-z][a-z0-9-]{1,40}$/.test(id)) throw new CollabError('插件 ID 不合法', 400)
     if (loaded) {
+      if (!this.workspaceHasPlugin(workspaceId, id, accountId)) {
+        throw new CollabError('当前空间尚未安装这个插件', 409)
+      }
       this.db
         .prepare(
           `INSERT INTO plugin_loads (workspace_id, account_id, plugin_id, loaded_at)
@@ -1333,7 +1353,7 @@ export class CollabStore {
       .all(workspaceId) as Array<{ plugin_id: string }>
     return rows
       .map((row) => row.plugin_id)
-      .filter((pluginId) => this.canAccessPlugin(accountId, workspaceId, pluginId))
+      .filter((pluginId) => this.workspaceHasPlugin(workspaceId, pluginId, accountId))
   }
 
   ensurePluginOwnerAssignments(pluginId: string, now = Date.now()) {
@@ -1345,7 +1365,7 @@ export class CollabStore {
       .prepare(
         `INSERT OR IGNORE INTO plugin_assignments
           (workspace_id, plugin_id, plugin_version, subject_type, subject_id, created_by, created_at)
-         SELECT w.id, ?, '', 'account', w.owner_id, w.owner_id, ?
+         SELECT w.id, ?, '', 'workspace', w.id, w.owner_id, ?
          FROM workspaces w`,
       )
       .run(pluginId, now)
@@ -1360,11 +1380,12 @@ export class CollabStore {
         .prepare(
           `SELECT workspace_id, plugin_id, plugin_version, subject_type, subject_id, created_by, created_at
            FROM plugin_assignments
-           WHERE workspace_id = ? AND subject_type = 'account' AND subject_id = ?
+           WHERE workspace_id = ?
+             AND ((subject_type = 'workspace' AND subject_id = ?) OR (subject_type = 'account' AND subject_id = ?))
              AND (? = '' OR plugin_id = ?)
            ORDER BY plugin_id`,
         )
-        .all(workspaceId, actorId, pluginId, pluginId)
+        .all(workspaceId, workspaceId, actorId, pluginId, pluginId)
     }
     return this.db
       .prepare(
@@ -1391,11 +1412,14 @@ export class CollabStore {
     if (!subjectId) throw new CollabError('授权对象不能为空', 400)
     const role = this.workspaceRole(actorId, workspaceId)
     const manager = role === 'owner' || role === 'admin'
+    if (subject.type === 'workspace' && subjectId !== workspaceId) {
+      throw new CollabError('插件空间授权对象不合法', 400)
+    }
     if (!manager && (subject.type !== 'account' || subjectId !== actorId)) {
       throw new CollabError('普通成员只能为自己启用插件', 403)
     }
     if (subject.type === 'account') this.requireMember(subjectId, workspaceId)
-    if (subject.type !== 'account' && subject.type !== 'member_view') {
+    if (subject.type !== 'account' && subject.type !== 'member_view' && subject.type !== 'workspace') {
       throw new CollabError('插件授权对象不合法', 400)
     }
     const approved = this.db
@@ -1431,6 +1455,9 @@ export class CollabStore {
     this.requireMember(actorId, workspaceId)
     const role = this.workspaceRole(actorId, workspaceId)
     const manager = role === 'owner' || role === 'admin'
+    if (subject.type === 'workspace' && subject.id !== workspaceId) {
+      throw new CollabError('插件空间授权对象不合法', 400)
+    }
     if (!manager && (subject.type !== 'account' || subject.id !== actorId)) {
       throw new CollabError('普通成员只能为自己停用插件', 403)
     }
@@ -1443,6 +1470,29 @@ export class CollabStore {
     if (!removed.changes) throw new CollabError('插件授权不存在', 404)
     this.auditPlugin(actorId, workspaceId, pluginId, 'assignment.revoke', { subject }, now)
     return { workspaceId, pluginId, subjectType: subject.type, subjectId: subject.id }
+  }
+
+  installPluginForWorkspace(actorId: string, workspaceId: string, pluginId: string, pluginVersion = '') {
+    return this.grantPluginAssignment(
+      actorId,
+      workspaceId,
+      pluginId,
+      { type: 'workspace', id: workspaceId },
+      pluginVersion,
+    )
+  }
+
+  uninstallPluginFromWorkspace(actorId: string, workspaceId: string, pluginId: string) {
+    const result = this.revokePluginAssignment(
+      actorId,
+      workspaceId,
+      pluginId,
+      { type: 'workspace', id: workspaceId },
+    )
+    this.db
+      .prepare('DELETE FROM plugin_loads WHERE workspace_id = ? AND plugin_id = ?')
+      .run(workspaceId, pluginId)
+    return result
   }
 
   listPluginAudit(actorId: string, workspaceId = '', limit = 100) {

@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { pathToFileURL } from 'node:url'
 import { loadRegistryConfig } from './registry-config.ts'
-import { PluginRegistryStore, type PluginBundle } from './registry.ts'
+import { PluginRegistryStore, type PluginBundle, type RegistryReviewStatus } from './registry.ts'
 
 const API_PREFIX = '/api/plugin-registry/v1'
 const MAX_BODY_BYTES = 8 * 1024 * 1024
@@ -66,8 +66,52 @@ export function createRegistryServer(registry: PluginRegistryStore) {
         return
       }
       if (req.method === 'GET' && url.pathname === `${API_PREFIX}/plugins`) {
-        const plugins = await registry.search(url.searchParams.get('q') ?? '', url.searchParams.get('tag') ?? '')
+        const plugins = await registry.search(
+          url.searchParams.get('q') ?? '',
+          url.searchParams.get('tag') ?? '',
+          bearer(req.headers.authorization),
+        )
         send(res, 200, { ok: true, registryId: registry.registryId, plugins })
+        return
+      }
+      if (req.method === 'GET' && url.pathname === `${API_PREFIX}/reviews`) {
+        const plugins = await registry.listReviews(
+          bearer(req.headers.authorization),
+          url.searchParams.get('status') ?? '',
+        )
+        send(res, 200, { ok: true, registryId: registry.registryId, plugins })
+        return
+      }
+      const actionMatch = new RegExp(`^${API_PREFIX}/plugins/([^/]+)/([^/]+)/(withdraw|unpublish|review)$`).exec(url.pathname)
+      if (req.method === 'POST' && actionMatch) {
+        const id = decode(actionMatch[1] ?? '')
+        const version = decode(actionMatch[2] ?? '')
+        const action = actionMatch[3]
+        const token = bearer(req.headers.authorization)
+        if (action === 'withdraw') {
+          send(res, 200, { ok: true, ...await registry.withdraw(id, version, token) })
+          return
+        }
+        if (action === 'unpublish') {
+          send(res, 200, { ok: true, ...await registry.unpublish(id, version, token) })
+          return
+        }
+        const body = await readJson(req) as { status?: RegistryReviewStatus; reason?: string; reviewer?: string }
+        const status =
+          body.status === 'approved' || body.status === 'rejected' || body.status === 'quarantined' || body.status === 'revoked'
+            ? body.status
+            : 'rejected'
+        send(res, 200, {
+          ok: true,
+          ...await registry.review(
+            id,
+            version,
+            status,
+            String(body.reason ?? ''),
+            token,
+            String(body.reviewer ?? 'operator'),
+          ),
+        })
         return
       }
       const match = new RegExp(`^${API_PREFIX}/plugins/([^/]+)(?:/([^/]+))?$`).exec(url.pathname)
@@ -78,12 +122,12 @@ export function createRegistryServer(registry: PluginRegistryStore) {
       const id = decode(match[1] ?? '')
       const version = decode(match[2] ?? '')
       if (req.method === 'GET' && version) {
-        const bundle = await registry.bundle(id, version)
+        const bundle = await registry.bundle(id, version, bearer(req.headers.authorization))
         send(res, bundle ? 200 : 404, bundle ?? { error: 'not found' })
         return
       }
       if (req.method === 'GET') {
-        const detail = await registry.detail(id)
+        const detail = await registry.detail(id, bearer(req.headers.authorization))
         send(res, detail ? 200 : 404, detail ?? { error: 'not found' })
         return
       }

@@ -34,7 +34,13 @@ export function pluginCatalogCollection(client: PluginRegistryClient): Collectio
         remoteCodeVersion: row.codeVersion,
         localCodeVersion: flag?.localCodeVersion ?? '',
         ownerId: row.ownerId,
-        installed: Boolean(flag?.localCodeVersion),
+        ownedByRequester: row.ownedByRequester === true,
+        reviewStatus: row.reviewStatus,
+        reviewReason: row.reviewReason,
+        scanStatus: row.scanStatus,
+        scanIssues: row.scanIssues,
+        cached: flag?.cached === true,
+        installed: flag?.installed === true,
         updateAvailable: flag?.updateAvailable === true,
         idConflict: flag?.idConflict === true,
         registryId: listed.registryId || client.registryId,
@@ -59,7 +65,7 @@ export function pluginCatalogCollection(client: PluginRegistryClient): Collectio
       labelField: 'title',
       contentField: 'readme',
       contentBackend: 'computed',
-      columns: ['title', 'blurb', 'tags', 'installed', 'updateAvailable', 'remoteCodeVersion', 'author'],
+      columns: ['title', 'blurb', 'tags', 'installed', 'updateAvailable', 'reviewStatus', 'remoteCodeVersion', 'author'],
       fields: {
         ...REQUIRED_RECORD_FIELDS,
         title: { type: 'string', label: '标题' },
@@ -67,11 +73,17 @@ export function pluginCatalogCollection(client: PluginRegistryClient): Collectio
         tags: { type: 'multi-select', label: '标签' },
         author: { type: 'string', label: '作者' },
         installed: { type: 'boolean', label: '已安装' },
+        cached: { type: 'boolean', label: '宿主已缓存' },
         updateAvailable: { type: 'boolean', label: '可更新' },
         idConflict: { type: 'boolean', label: 'ID 冲突' },
         remoteCodeVersion: { type: 'string', label: '商店版本' },
         localCodeVersion: { type: 'string', label: '本地版本' },
         ownerId: { type: 'string', label: '所有者' },
+        ownedByRequester: { type: 'boolean', label: '我的上传' },
+        reviewStatus: { type: 'select', label: '审核状态' },
+        reviewReason: { type: 'string', label: '审核/异常原因' },
+        scanStatus: { type: 'select', label: '检测状态' },
+        scanIssues: { type: 'string[]', label: '检测问题' },
         registryId: { type: 'string', label: '商店' },
         hasHost: { type: 'boolean', label: 'Host' },
         hasWeb: { type: 'boolean', label: 'Web' },
@@ -106,6 +118,105 @@ export function pluginCatalogCollection(client: PluginRegistryClient): Collectio
         description: '下载商店 latest 并覆盖 .plugin/<id>/。插件正在运行时会卸掉再挂上新的 host.js / web.js。',
         run: async (id) => client.update(id),
       },
+      {
+        id: 'uninstall',
+        label: '从空间卸载',
+        when: { installed: true },
+        description: '只移除当前 Workspace 的插件安装关系；商店版本和宿主缓存保留。',
+        run: async (id) => client.uninstall(id),
+      },
+      {
+        id: 'withdraw',
+        label: '撤回提交',
+        when: { ownedByRequester: true, reviewStatus: 'pending' },
+        description: '上传者撤回自己的待审核版本；不会影响当前 Workspace 已安装的副本。',
+        run: async (id) => client.withdraw(id),
+      },
+      {
+        id: 'unpublish',
+        label: '下架',
+        when: { ownedByRequester: true, reviewStatus: 'approved' },
+        description: '上传者下架已公开版本，禁止新安装；已安装 Workspace 暂时保留。',
+        run: async (id) => client.unpublish(id),
+      },
+    ],
+  }
+}
+
+export function pluginReviewsCollection(client: PluginRegistryClient): CollectionSpec {
+  const list = async (query?: { q?: string }) => {
+    const rows = await client.reviews()
+    const q = String(query?.q ?? '').trim().toLowerCase()
+    return rows
+      .filter((row) => !q || `${row.id}\n${row.name}\n${row.blurb}\n${row.reviewReason}\n${row.scanIssues.join('\n')}`.toLowerCase().includes(q))
+      .map((row) => omitEmpty({
+        id: `${row.id}@${row.codeVersion}`,
+        pluginId: row.id,
+        title: `${row.name} · ${row.codeVersion}`,
+        blurb: row.blurb,
+        tags: row.tags,
+        author: row.author,
+        codeVersion: row.codeVersion,
+        ownerId: row.ownerId,
+        reviewStatus: row.reviewStatus,
+        reviewReason: row.reviewReason,
+        scanStatus: row.scanStatus,
+        scanIssues: row.scanIssues,
+        submittedAt: row.updatedAt,
+      }))
+  }
+  const reviewAction = (
+    id: 'approve' | 'reject' | 'quarantine' | 'revoke',
+    label: string,
+    status: 'approved' | 'rejected' | 'quarantined' | 'revoked',
+  ) => ({
+    id,
+    label,
+    description: `${label}商店插件版本。args.reason 可填写运营原因。`,
+    parameters: { type: 'object', properties: { reason: { type: 'string' } } },
+    run: async (_id: string, record: DbRecord, args: Record<string, unknown> = {}) =>
+      client.review(String(record.pluginId), String(record.codeVersion), status, String(args.reason ?? '')),
+  })
+  return {
+    id: 'plugin-reviews',
+    path: '/plugin-reviews',
+    label: '插件审核',
+    view: {
+      moduleId: 'plugin-reviews',
+      route: '/plugin-reviews',
+      title: '插件审核',
+      inspector: true,
+      blurb: '插件商店运营端。仅 BIU_PLUGIN_REGISTRY_OPERATORS 中的账号可见，用于审核、驳回、隔离和撤销版本。',
+      order: 32,
+      icon: 'puzzle-piece',
+    },
+    records: { update: false, create: false, delete: false },
+    schema: {
+      labelField: 'title',
+      columns: ['title', 'reviewStatus', 'scanStatus', 'scanIssues', 'reviewReason', 'author', 'submittedAt'],
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', label: '版本' },
+        pluginId: { type: 'string', label: '插件 ID' },
+        blurb: { type: 'string', label: '简介' },
+        tags: { type: 'multi-select', label: '标签' },
+        author: { type: 'string', label: '作者' },
+        codeVersion: { type: 'string', label: '代码版本' },
+        ownerId: { type: 'string', label: '所有者' },
+        reviewStatus: { type: 'select', label: '审核状态' },
+        reviewReason: { type: 'string', label: '审核原因' },
+        scanStatus: { type: 'select', label: '检测状态' },
+        scanIssues: { type: 'string[]', label: '检测问题' },
+        submittedAt: { type: 'datetime', label: '提交时间' },
+      },
+    },
+    list,
+    get: async (id) => (await list()).find((row) => row.id === id) ?? null,
+    actions: [
+      reviewAction('approve', '审核通过', 'approved'),
+      reviewAction('reject', '驳回', 'rejected'),
+      reviewAction('quarantine', '异常隔离', 'quarantined'),
+      reviewAction('revoke', '撤销版本', 'revoked'),
     ],
   }
 }

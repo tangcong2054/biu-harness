@@ -102,7 +102,7 @@ test('publish, search, install, update and reject a different token', async () =
     const ctx = new Context()
     const { dropped, adopted } = stubHub(ctx)
     const store = new PluginStoreService(ctx, join(dir, '.plugin'), join(dir, 'store.json'), join(dir, '.plugin-dev')).open()
-    const registry = new PluginRegistryStore(join(dir, 'registry'), 'local')
+    const registry = new PluginRegistryStore(join(dir, 'registry'), 'local', 'admin-token')
     const client = new PluginRegistryClient(store, localRegistryTransport(registry), 'local', registryTokenPath(dir))
     store.attachRegistry(client)
 
@@ -111,6 +111,10 @@ test('publish, search, install, update and reject a different token', async () =
     assert.equal(published.ownerId, ownerIdForToken(await readToken(dir)))
     assert.equal(published.registryId, 'local')
 
+    assert.equal((await registry.search('慢日志')).length, 0)
+    const ownPending = await registry.search('慢日志', '', await readToken(dir))
+    assert.equal(ownPending[0]?.reviewStatus, 'pending')
+    await registry.review('slow-log', published.codeVersion!, 'approved', '', 'admin-token')
     const found = await registry.search('慢日志')
     assert.equal(found.length, 1)
     assert.equal(found[0]?.id, 'slow-log')
@@ -141,11 +145,12 @@ test('publish, search, install, update and reject a different token', async () =
       assert.match(host, /return 1/)
       assert.equal(await existsSandbox(consumerDir, 'slow-log'), false)
 
-      await registry.publish('slow-log', {
+      const second = await registry.publish('slow-log', {
         'manifest.json': manifest('slow-log'),
         'host.js': `export const name = 'slow-log'\nexport function apply() { return 2 }\n`,
         'README.md': '# 慢日志\n',
       }, {}, await readToken(dir))
+      await registry.review('slow-log', second.codeVersion, 'approved', '', 'admin-token')
       const listed = await catalog.list?.()
       assert.equal(listed?.[0]?.updateAvailable, true)
       assert.notEqual(listed?.[0]?.localCodeVersion, listed?.[0]?.remoteCodeVersion)
@@ -160,10 +165,11 @@ test('publish, search, install, update and reject a different token', async () =
     }
 
     await store.openPlugin('slow-log')
-    await registry.publish('slow-log', {
+    const third = await registry.publish('slow-log', {
       'manifest.json': manifest('slow-log'),
       'host.js': `export const name = 'slow-log'\nexport function apply() { return 3 }\n`,
     }, {}, await readToken(dir))
+    await registry.review('slow-log', third.codeVersion, 'approved', '', 'admin-token')
     await client.update('slow-log')
     assert.deepEqual(dropped, ['slow-log'])
     assert.deepEqual(adopted, ['slow-log', 'slow-log'])
@@ -182,11 +188,12 @@ test('install refuses a local id that belongs to someone else', async () => {
     const ctx = new Context()
     stubHub(ctx)
     const store = new PluginStoreService(ctx, join(dir, '.plugin'), join(dir, 'store.json'), join(dir, '.plugin-dev')).open()
-    const registry = new PluginRegistryStore(join(dir, 'registry'), 'local')
-    await registry.publish('slow-log', {
+    const registry = new PluginRegistryStore(join(dir, 'registry'), 'local', 'admin-token')
+    const published = await registry.publish('slow-log', {
       'manifest.json': manifest('slow-log'),
       'host.js': `export const name = 'slow-log'\nexport function apply() {}\n`,
     }, {}, 'biu_plug_owner')
+    await registry.review('slow-log', published.codeVersion, 'approved', '', 'admin-token')
     await store.initSandbox({ id: 'slow-log', name: '本地草稿', hostJs: `export const name = 'slow-log'\nexport function apply() {}\n` })
     const client = new PluginRegistryClient(store, localRegistryTransport(registry), 'local', registryTokenPath(dir))
     await assert.rejects(() => client.install('slow-log'), /plugin id conflict: slow-log/)
@@ -194,6 +201,35 @@ test('install refuses a local id that belongs to someone else', async () => {
     const row = (await catalog.list?.())?.[0]
     assert.equal(row?.idConflict, true)
     assert.equal(row?.updateAvailable, undefined)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('uploader can withdraw pending and unpublish approved versions', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-registry-review-'))
+  try {
+    const registry = new PluginRegistryStore(dir, 'local', 'admin-token')
+    const token = 'biu_plug_owner'
+    const first = await registry.publish('review-demo', {
+      'manifest.json': manifest('review-demo'),
+      'host.js': `export const name = 'review-demo'\nexport function apply() {}\n`,
+      'README.md': '# Review demo\n',
+    }, {}, token)
+    assert.equal((await registry.search('', '', token))[0]?.reviewStatus, 'pending')
+    await registry.withdraw('review-demo', first.codeVersion, token)
+    assert.equal((await registry.search('', '', token))[0]?.reviewStatus, 'withdrawn')
+
+    const second = await registry.publish('review-demo', {
+      'manifest.json': manifest('review-demo'),
+      'host.js': `export const name = 'review-demo'\nexport function apply() { return 2 }\n`,
+      'README.md': '# Review demo\n',
+    }, {}, token)
+    await registry.review('review-demo', second.codeVersion, 'approved', '', 'admin-token')
+    assert.equal((await registry.search())[0]?.reviewStatus, 'approved')
+    await registry.unpublish('review-demo', second.codeVersion, token)
+    assert.equal((await registry.search()).length, 0)
+    assert.equal((await registry.search('', '', token))[0]?.reviewStatus, 'unpublished')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

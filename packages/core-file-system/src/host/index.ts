@@ -883,7 +883,7 @@ export class DatabaseService extends Service implements Database {
     const actor = authorization?.currentActor()
     if (authorization && actor) {
       return rows.filter((row) => {
-        if (collection === '/plugin-catalog') {
+        if (collection === '/plugin-catalog' || collection === '/plugin-reviews') {
           return action === 'resource:read' || action === 'resource:list'
         }
         if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
@@ -910,7 +910,7 @@ export class DatabaseService extends Service implements Database {
     const workspaceId = store?.activeWorkspaceId() ?? ''
     const grants = new Map<string, Map<string, Set<string>>>()
     return rows.filter((row) => {
-      if (collection === '/plugin-catalog') {
+      if (collection === '/plugin-catalog' || collection === '/plugin-reviews') {
         return action === 'resource:read' || action === 'resource:list'
       }
       if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
@@ -1088,7 +1088,7 @@ export class DatabaseService extends Service implements Database {
     action: PermissionAction = 'resource:read',
     record?: { id?: unknown },
   ) {
-    if (spec.path === '/plugin-catalog') {
+    if (spec.path === '/plugin-catalog' || spec.path === '/plugin-reviews') {
       if (
         action === 'resource:read' ||
         action === 'resource:list' ||

@@ -1,11 +1,11 @@
 import { dirname } from 'node:path'
 import type { Context } from 'cordis'
-import { pluginCatalogCollection } from './catalog.ts'
+import { pluginCatalogCollection, pluginReviewsCollection } from './catalog.ts'
 import { pluginsCollection } from './collection.ts'
 import { loadRegistryConfig } from './registry-config.ts'
 import { httpRegistryTransport, localRegistryTransport, PluginRegistryClient, registryTokenPath } from './registry-client.ts'
 import { registerRegistryRoutes } from './registry-http.ts'
-import { PluginRegistryStore } from './registry.ts'
+import { loadRegistryAdminToken, PluginRegistryStore } from './registry.ts'
 import { openStore } from './store.ts'
 
 export const name = 'core-plugin-system'
@@ -30,11 +30,18 @@ export async function apply(ctx: Context) {
     registerRegistryRoutes(ctx, registry)
     transport = localRegistryTransport(registry)
   }
-  const client = new PluginRegistryClient(store, transport, config.id, registryTokenPath(dirname(store.sandboxDir)))
+  const client = new PluginRegistryClient(
+    store,
+    transport,
+    config.id,
+    registryTokenPath(dirname(store.sandboxDir)),
+    loadRegistryAdminToken(config.dataDir),
+  )
   store.attachRegistry(client)
   ctx.inject(['database'], (inner) => {
     inner.database.register(pluginsCollection(store, client))
     inner.database.register(pluginCatalogCollection(client))
+    inner.database.register(pluginReviewsCollection(client))
   })
   ctx.inject(['systemPrompt'], (inner) => {
     inner.systemPrompt.register(

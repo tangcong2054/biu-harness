@@ -11,6 +11,18 @@ const MEDIA = /^[A-Za-z0-9._-]+\.(mp3|wav|ogg|m4a)$/i
 const README_EXCERPT = 400
 
 export type PluginProvide = { kind: string; label: string; aliases: string[] }
+export type RegistryReviewStatus = 'pending' | 'approved' | 'rejected' | 'quarantined' | 'withdrawn' | 'unpublished' | 'revoked'
+export type RegistryScanStatus = 'clean' | 'warning' | 'blocked'
+
+export type RegistryReview = {
+  status: RegistryReviewStatus
+  reason: string
+  submittedAt: number
+  reviewedAt: number
+  reviewedBy: string
+  scanStatus: RegistryScanStatus
+  scanIssues: string[]
+}
 
 export type RegistryIndexEntry = {
   id: string
@@ -27,6 +39,11 @@ export type RegistryIndexEntry = {
   ownerId: string
   provides: PluginProvide[]
   readmeExcerpt: string
+  reviewStatus: RegistryReviewStatus
+  reviewReason: string
+  scanStatus: RegistryScanStatus
+  scanIssues: string[]
+  ownedByRequester?: boolean
 }
 
 export type RegistryDetail = RegistryIndexEntry & {
@@ -46,6 +63,7 @@ export type PluginBundle = {
 
 type OwnerFile = { ownerId: string; tokenHash: string }
 type LatestFile = { codeVersion: string; updatedAt: number }
+type ReviewInputStatus = Extract<RegistryReviewStatus, 'approved' | 'rejected' | 'quarantined' | 'revoked'>
 
 export function pluginIdOk(id: string) {
   return PLUGIN_ID.test(id)
@@ -61,6 +79,20 @@ export function tokenHash(token: string) {
 
 export function ownerIdForToken(token: string) {
   return `own_${tokenHash(token).slice(0, 16)}`
+}
+
+export function loadRegistryAdminToken(dataDir: string) {
+  const fromEnv = String(process.env.BIU_PLUGIN_REGISTRY_ADMIN_TOKEN ?? '').trim()
+  if (fromEnv) return fromEnv
+  const path = join(dataDir, 'admin-token')
+  if (existsSync(path)) {
+    const token = readFileSync(path, 'utf8').trim()
+    if (token) return token
+  }
+  const token = `biu_registry_admin_${randomBytes(24).toString('base64url')}`
+  mkdirSync(dataDir, { recursive: true })
+  writeFileSync(path, `${token}\n`, { mode: 0o600 })
+  return token
 }
 
 function tokensMatch(got: string, expectedHash: string) {
@@ -92,13 +124,34 @@ function parseTags(raw: unknown): string[] {
   return [...new Set(list.map((item) => String(item).trim()).filter(Boolean))].slice(0, 32)
 }
 
+function scanFiles(files: Record<string, string>, assets: Record<string, string>) {
+  const issues: string[] = []
+  const code = `${files['host.js'] ?? ''}\n${files['web.js'] ?? ''}`
+  if (!files['README.md']?.trim()) issues.push('缺少 README')
+  if (/\beval\s*\(|new\s+Function\s*\(/.test(code)) issues.push('包含动态代码执行')
+  if (/child_process|node:child_process/.test(code)) issues.push('包含子进程能力')
+  const bytes =
+    Object.values(files).reduce((sum, value) => sum + Buffer.byteLength(value), 0) +
+    Object.values(assets).reduce((sum, value) => sum + Buffer.byteLength(value, 'base64'), 0)
+  if (bytes > 8 * 1024 * 1024) issues.push('安装包超过 8MB')
+  const blocked = issues.some((item) => item === '包含动态代码执行' || item === '安装包超过 8MB')
+  return {
+    scanStatus: blocked ? 'blocked' as const : issues.length ? 'warning' as const : 'clean' as const,
+    scanIssues: issues,
+  }
+}
+
 export class PluginRegistryStore {
+  private readonly adminTokenHash: string
+
   constructor(
     readonly dataDir: string,
     readonly registryId: string,
+    adminToken = loadRegistryAdminToken(dataDir),
   ) {
     if (!pluginIdOk(registryId)) throw new Error(`invalid plugin registry id: ${registryId}`)
     mkdirSync(this.pluginRoot(), { recursive: true })
+    this.adminTokenHash = adminToken.trim() ? tokenHash(adminToken.trim()) : ''
     this.assertIdentity()
   }
 
@@ -119,11 +172,23 @@ export class PluginRegistryStore {
     }
   }
 
-  async search(q = '', tag = ''): Promise<RegistryIndexEntry[]> {
+  async search(q = '', tag = '', token = ''): Promise<RegistryIndexEntry[]> {
     const index = await this.readIndex()
+    const byId = new Map(index.map((row) => [row.id, row]))
+    if (token) {
+      const names = existsSync(this.pluginRoot()) ? await readdir(this.pluginRoot()) : []
+      for (const id of names) {
+        const owner = this.readOwner(id)
+        const latest = this.readLatest(id)
+        if (!owner || !latest || !tokensMatch(token, owner.tokenHash)) continue
+        const own = await this.entryFor(id, latest.codeVersion, latest.updatedAt)
+        if (own) byId.set(id, { ...own, ownedByRequester: true })
+      }
+    }
     const query = q.trim().toLowerCase()
     const wanted = tag.trim().toLowerCase()
-    return index.filter((row) => {
+    return [...byId.values()].filter((row) => {
+      if (row.reviewStatus !== 'approved' && !row.ownedByRequester) return false
       if (wanted && !row.tags.some((item) => item.toLowerCase() === wanted)) return false
       if (!query) return true
       const aliases = row.provides.flatMap((item) => [item.kind, item.label, ...item.aliases])
@@ -132,22 +197,29 @@ export class PluginRegistryStore {
     })
   }
 
-  async detail(id: string): Promise<RegistryDetail | null> {
+  async detail(id: string, token = ''): Promise<RegistryDetail | null> {
     if (!pluginIdOk(id)) return null
-    const index = await this.readIndex()
-    const row = index.find((item) => item.id === id)
+    const owner = this.readOwner(id)
+    const latest = this.readLatest(id)
+    const owned = Boolean(owner && token && tokensMatch(token, owner.tokenHash))
+    const publicRows = await this.readIndex()
+    const row = owned && latest
+      ? await this.entryFor(id, latest.codeVersion, latest.updatedAt)
+      : publicRows.find((item) => item.id === id)
     if (!row) return null
     const versions = await this.versions(id)
     const readme = await this.readText(id, row.codeVersion, 'README.md')
-    return { ...row, registryId: this.registryId, readme, versions }
+    return { ...row, ...(owned ? { ownedByRequester: true } : {}), registryId: this.registryId, readme, versions }
   }
 
-  async bundle(id: string, version: string): Promise<PluginBundle | null> {
+  async bundle(id: string, version: string, token = ''): Promise<PluginBundle | null> {
     if (!pluginIdOk(id) || !VERSION_ID.test(version)) return null
     const dir = this.versionDir(id, version)
     if (!existsSync(join(dir, 'manifest.json'))) return null
     const owner = this.readOwner(id)
     if (!owner) return null
+    const review = this.readReview(id, version)
+    if (review.status !== 'approved' && !tokensMatch(token, owner.tokenHash)) return null
     const files: Record<string, string> = {}
     for (const name of TEXT_FILES) {
       const path = join(dir, name)
@@ -199,7 +271,8 @@ export class PluginRegistryStore {
     const codeVersion = await hashInstalledPluginCode(staging)
     if (!codeVersion) throw new Error('plugin bundle has no code')
     const dest = this.versionDir(id, codeVersion)
-    if (!existsSync(join(dest, 'manifest.json'))) {
+    const isNewVersion = !existsSync(join(dest, 'manifest.json'))
+    if (isNewVersion) {
       mkdirSync(join(this.pluginRoot(), id), { recursive: true })
       await rm(dest, { recursive: true, force: true })
       const { rename } = await import('node:fs/promises')
@@ -212,6 +285,17 @@ export class PluginRegistryStore {
       await rm(staging, { recursive: true, force: true })
     }
     const now = Date.now()
+    if (isNewVersion) {
+      const scan = scanFiles(files, assets)
+      this.writeJson(join(dest, 'review.json'), {
+        status: scan.scanStatus === 'blocked' ? 'quarantined' : 'pending',
+        reason: scan.scanStatus === 'blocked' ? scan.scanIssues.join('；') : '',
+        submittedAt: now,
+        reviewedAt: 0,
+        reviewedBy: '',
+        ...scan,
+      } satisfies RegistryReview)
+    }
     this.writeJson(join(this.pluginRoot(), id, 'owner.json'), {
       ownerId,
       tokenHash: tokenHash(secret),
@@ -221,7 +305,177 @@ export class PluginRegistryStore {
       updatedAt: now,
     } satisfies LatestFile)
     await this.rebuildIndex()
-    return { id, codeVersion, ownerId, registryId: this.registryId, updatedAt: now }
+    const review = this.readReview(id, codeVersion)
+    return { id, codeVersion, ownerId, registryId: this.registryId, updatedAt: now, reviewStatus: review.status }
+  }
+
+  async withdraw(id: string, version: string, token: string) {
+    const owner = this.requireOwner(id, token)
+    const review = this.readReview(id, version)
+    if (!['pending', 'rejected', 'quarantined'].includes(review.status)) {
+      throw new Error(`cannot withdraw ${review.status} version`)
+    }
+    this.writeReview(id, version, { ...review, status: 'withdrawn', reason: '上传者已撤回' })
+    await this.rebuildIndex()
+    return { id, codeVersion: version, ownerId: owner.ownerId, reviewStatus: 'withdrawn' as const }
+  }
+
+  async unpublish(id: string, version: string, token: string) {
+    const owner = this.requireOwner(id, token)
+    const review = this.readReview(id, version)
+    if (review.status !== 'approved') throw new Error(`cannot unpublish ${review.status} version`)
+    this.writeReview(id, version, { ...review, status: 'unpublished', reason: '上传者已下架' })
+    await this.rebuildIndex()
+    return { id, codeVersion: version, ownerId: owner.ownerId, reviewStatus: 'unpublished' as const }
+  }
+
+  async review(
+    id: string,
+    version: string,
+    status: ReviewInputStatus,
+    reason: string,
+    adminToken: string,
+    reviewer = 'operator',
+  ) {
+    this.requireAdmin(adminToken)
+    if (!pluginIdOk(id) || !VERSION_ID.test(version) || !existsSync(join(this.versionDir(id, version), 'manifest.json'))) {
+      throw new Error('unknown registry version')
+    }
+    const current = this.readReview(id, version)
+    const next: RegistryReview = {
+      ...current,
+      status,
+      reason: reason.trim(),
+      reviewedAt: Date.now(),
+      reviewedBy: reviewer.trim() || 'operator',
+    }
+    this.writeReview(id, version, next)
+    if (status === 'approved') {
+      this.writeJson(join(this.pluginRoot(), id, 'approved.json'), {
+        codeVersion: version,
+        updatedAt: next.reviewedAt,
+      } satisfies LatestFile)
+    }
+    await this.rebuildIndex()
+    return { id, codeVersion: version, reviewStatus: status, reviewReason: next.reason }
+  }
+
+  async listReviews(adminToken: string, status = '') {
+    this.requireAdmin(adminToken)
+    const names = existsSync(this.pluginRoot()) ? await readdir(this.pluginRoot()) : []
+    const rows: RegistryIndexEntry[] = []
+    for (const id of names.sort()) {
+      if (!pluginIdOk(id)) continue
+      for (const version of await this.versions(id)) {
+        const review = this.readReview(id, version)
+        const row = await this.entryFor(id, version, Math.max(review.submittedAt, review.reviewedAt))
+        if (!row || (status && row.reviewStatus !== status)) continue
+        rows.push(row)
+      }
+    }
+    return rows.sort((a, b) => b.updatedAt - a.updatedAt)
+  }
+
+  private requireOwner(id: string, token: string) {
+    const owner = this.readOwner(id)
+    if (!owner || !tokensMatch(token.trim(), owner.tokenHash)) throw new Error('plugin owner token required')
+    return owner
+  }
+
+  private requireAdmin(token: string) {
+    if (!this.adminTokenHash || !tokensMatch(token.trim(), this.adminTokenHash)) {
+      throw new Error('registry operator token required')
+    }
+  }
+
+  private readReview(id: string, version: string): RegistryReview {
+    const path = join(this.versionDir(id, version), 'review.json')
+    if (existsSync(path)) {
+      try {
+        const raw = JSON.parse(readFileSync(path, 'utf8')) as Partial<RegistryReview>
+        const status = String(raw.status ?? '') as RegistryReviewStatus
+        if (['pending', 'approved', 'rejected', 'quarantined', 'withdrawn', 'unpublished', 'revoked'].includes(status)) {
+          return {
+            status,
+            reason: String(raw.reason ?? ''),
+            submittedAt: Number(raw.submittedAt) || 0,
+            reviewedAt: Number(raw.reviewedAt) || 0,
+            reviewedBy: String(raw.reviewedBy ?? ''),
+            scanStatus: raw.scanStatus === 'blocked' || raw.scanStatus === 'warning' ? raw.scanStatus : 'clean',
+            scanIssues: Array.isArray(raw.scanIssues) ? raw.scanIssues.map(String) : [],
+          }
+        }
+      } catch {
+        /* legacy version defaults to approved below */
+      }
+    }
+    return {
+      status: 'approved',
+      reason: '',
+      submittedAt: 0,
+      reviewedAt: 0,
+      reviewedBy: 'legacy',
+      scanStatus: 'clean',
+      scanIssues: [],
+    }
+  }
+
+  private writeReview(id: string, version: string, review: RegistryReview) {
+    this.writeJson(join(this.versionDir(id, version), 'review.json'), review)
+  }
+
+  private async publicVersion(id: string) {
+    const approved = this.readPointer(id, 'approved.json')
+    if (approved && this.readReview(id, approved.codeVersion).status === 'approved') {
+      return approved.codeVersion
+    }
+    const latest = this.readLatest(id)
+    const versions = await this.versions(id)
+    const ordered = [
+      ...(latest ? [latest.codeVersion] : []),
+      ...versions
+        .filter((version) => version !== latest?.codeVersion)
+        .sort((a, b) => {
+          const left = this.readReview(id, a)
+          const right = this.readReview(id, b)
+          return Math.max(right.reviewedAt, right.submittedAt) - Math.max(left.reviewedAt, left.submittedAt)
+        }),
+    ]
+    return ordered.find((version) => this.readReview(id, version).status === 'approved') ?? ''
+  }
+
+  private async entryFor(id: string, version: string, updatedAt: number): Promise<RegistryIndexEntry | null> {
+    const owner = this.readOwner(id)
+    const dir = this.versionDir(id, version)
+    if (!owner || !existsSync(join(dir, 'manifest.json'))) return null
+    const manifest = JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8')) as Record<string, unknown>
+    const readme = await this.readText(id, version, 'README.md')
+    let bytes = 0
+    for (const name of TEXT_FILES) {
+      const file = join(dir, name)
+      if (existsSync(file)) bytes += (await stat(file)).size
+    }
+    const review = this.readReview(id, version)
+    return {
+      id,
+      name: String(manifest.name ?? id),
+      blurb: String(manifest.blurb ?? ''),
+      tags: parseTags(manifest.tags),
+      author: String(manifest.author ?? ''),
+      headless: manifest.headless === true,
+      hasHost: existsSync(join(dir, 'host.js')),
+      hasWeb: existsSync(join(dir, 'web.js')),
+      bytes,
+      updatedAt,
+      codeVersion: version,
+      ownerId: owner.ownerId,
+      provides: parseProvides(manifest.provides),
+      readmeExcerpt: readme.trim().slice(0, README_EXCERPT),
+      reviewStatus: review.status,
+      reviewReason: review.reason,
+      scanStatus: review.scanStatus,
+      scanIssues: review.scanIssues,
+    }
   }
 
   private versionDir(id: string, version: string) {
@@ -265,7 +519,15 @@ export class PluginRegistryStore {
     if (!existsSync(path)) return this.rebuildIndex()
     try {
       const raw = JSON.parse(readFileSync(path, 'utf8')) as unknown
-      return Array.isArray(raw) ? raw as RegistryIndexEntry[] : []
+      return Array.isArray(raw)
+        ? (raw as RegistryIndexEntry[]).map((row) => ({
+            ...row,
+            reviewStatus: row.reviewStatus ?? 'approved',
+            reviewReason: row.reviewReason ?? '',
+            scanStatus: row.scanStatus ?? 'clean',
+            scanIssues: row.scanIssues ?? [],
+          }))
+        : []
     } catch {
       return this.rebuildIndex()
     }
@@ -277,42 +539,22 @@ export class PluginRegistryStore {
     const rows: RegistryIndexEntry[] = []
     for (const id of names.sort()) {
       if (!pluginIdOk(id)) continue
+      const version = await this.publicVersion(id)
+      if (!version) continue
       const latest = this.readLatest(id)
-      const owner = this.readOwner(id)
-      if (!latest || !owner) continue
-      const dir = this.versionDir(id, latest.codeVersion)
-      if (!existsSync(join(dir, 'manifest.json'))) continue
-      const manifest = JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8')) as Record<string, unknown>
-      const readme = await this.readText(id, latest.codeVersion, 'README.md')
-      let bytes = 0
-      for (const name of TEXT_FILES) {
-        const file = join(dir, name)
-        if (!existsSync(file)) continue
-        bytes += (await stat(file)).size
-      }
-      rows.push({
-        id,
-        name: String(manifest.name ?? id),
-        blurb: String(manifest.blurb ?? ''),
-        tags: parseTags(manifest.tags),
-        author: String(manifest.author ?? ''),
-        headless: manifest.headless === true,
-        hasHost: existsSync(join(dir, 'host.js')),
-        hasWeb: existsSync(join(dir, 'web.js')),
-        bytes,
-        updatedAt: latest.updatedAt,
-        codeVersion: latest.codeVersion,
-        ownerId: owner.ownerId,
-        provides: parseProvides(manifest.provides),
-        readmeExcerpt: readme.trim().slice(0, README_EXCERPT),
-      })
+      const row = await this.entryFor(id, version, latest?.updatedAt ?? 0)
+      if (row) rows.push(row)
     }
     this.writeJson(join(this.dataDir, 'index.json'), rows)
     return rows
   }
 
   private readLatest(id: string): LatestFile | null {
-    const path = join(this.pluginRoot(), id, 'latest.json')
+    return this.readPointer(id, 'latest.json')
+  }
+
+  private readPointer(id: string, name: string): LatestFile | null {
+    const path = join(this.pluginRoot(), id, name)
     if (!existsSync(path)) return null
     try {
       const raw = JSON.parse(readFileSync(path, 'utf8')) as Partial<LatestFile>
