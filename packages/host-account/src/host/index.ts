@@ -906,12 +906,13 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
     try {
       const me = actor(route)
       const body = (await route.json()) as { name?: string }
-      if (account.workspaceLocation(route.params.id!) === 'cloud') {
+      const workspaceId = route.params.id!
+      if (!isOnlineRuntime() && account.workspaceLocation(workspaceId) === 'cloud') {
         const connection = account.cloudConnection(me.id)
         if (!connection) throw new CollabError('请先登录云端账号', 401)
         let response: Response
         try {
-          response = await fetch(`${connection.origin}/api/account/workspaces/${route.params.id}`, {
+          response = await fetch(`${connection.origin}/api/account/workspaces/${workspaceId}`, {
             method: 'PATCH',
             headers: { authorization: `Bearer ${connection.token}`, 'content-type': 'application/json' },
             body: JSON.stringify(body),
@@ -936,10 +937,22 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
           role: payload.role,
           createdAt: payload.createdAt,
         })
+        ctx.http.broadcastWorkspace(workspaceId, 'workspace/changed', {
+          workspaceId,
+          name: String(payload.name ?? ''),
+        })
         route.send(200, { ...payload, location: 'cloud' })
         return
       }
-      route.send(200, account.store.renameWorkspace(me.id, route.params.id!, String(body.name ?? '')))
+      const workspace = account.store.renameWorkspace(me.id, workspaceId, String(body.name ?? ''))
+      ctx.http.broadcastWorkspace(workspaceId, 'workspace/changed', {
+        workspaceId,
+        name: workspace.name,
+      })
+      route.send(200, {
+        ...workspace,
+        location: account.workspaceLocation(workspaceId),
+      })
     } catch (error) {
       fail(route, error)
     }

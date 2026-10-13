@@ -348,6 +348,47 @@ test('http sync keeps the desktop and server copies aligned', async () => {
   }
 })
 
+test('online host renames its authoritative workspace without a cloud relay', async () => {
+  const previous = process.env.BIU_ONLINE
+  process.env.BIU_ONLINE = '1'
+  const dir = mkdtempSync(join(tmpdir(), 'biu-online-workspace-rename-'))
+  dirs.push(dir)
+  const publicDir = join(dir, 'public')
+  mkdirSync(publicDir)
+  writeFileSync(join(publicDir, 'index.html'), '<html></html>')
+  const ctx = new Context()
+  const ready = new Promise<number>((resolve) => ctx.on('http/ready', ({ port }) => resolve(port)))
+  const httpFiber = await ctx.plugin(http, { port: 0, host: '127.0.0.1', publicDir, sharePort: 0 })
+  const accountFiber = await ctx.plugin(account, { sqlitePath: join(dir, 'server.sqlite') })
+  const port = await ready
+  try {
+    const origin = `http://127.0.0.1:${port}`
+    const registered = (await fetch(`${origin}/api/account/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'rename@example.com', password: 'secret1' }),
+    }).then((res) => res.json())) as { token: string; workspaceId: string }
+    const response = await fetch(`${origin}/api/account/workspaces/${registered.workspaceId}`, {
+      method: 'PATCH',
+      headers: {
+        authorization: `Bearer ${registered.token}`,
+        'x-biu-workspace-id': registered.workspaceId,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ name: '在线项目空间' }),
+    })
+    const body = await response.json() as { name?: string; location?: string; error?: string }
+    assert.equal(response.status, 200, body.error)
+    assert.equal(body.name, '在线项目空间')
+    assert.equal(body.location, 'cloud')
+  } finally {
+    await accountFiber.dispose()
+    await httpFiber.dispose()
+    if (previous === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previous
+  }
+})
+
 test('a local account can create or reuse the matching cloud identity', async () => {
   const previousOnline = process.env.BIU_ONLINE
   const previousOrigin = process.env.BIU_REMOTE_ORIGIN
