@@ -1,8 +1,30 @@
-import { ArchiveBoxArrowDownIcon, PlayIcon, StopIcon } from '@heroicons/react/16/solid'
+import { ArchiveBoxArrowDownIcon, BuildingStorefrontIcon, PlayIcon, StopIcon } from '@heroicons/react/16/solid'
 import { TrashGlyph } from '@biu/web-session-view/trash-glyph'
 import { asHttpHref } from '@biu/type-file-system'
 import type { CollectionActionInfo, DbRecord } from '@biu/type-file-system'
 import type { CollectionChrome, FsActionProps, FsActionsProps, FsCellProps } from '@biu/type-file-system/ui'
+
+function PluginStoreButton() {
+  return (
+    <button
+      type="button"
+      className="fsdb-create-btn"
+      data-testid="plugin-catalog-open"
+      title="在右侧打开插件商店"
+      aria-label="在右侧打开插件商店"
+      onClick={() => {
+        window.dispatchEvent(
+          new CustomEvent('biu:inspector-reveal', {
+            detail: { collection: '/plugin-catalog', unique: true },
+          }),
+        )
+      }}
+    >
+      <BuildingStorefrontIcon aria-hidden className="size-[14px]" />
+      插件商店
+    </button>
+  )
+}
 
 function PluginTitle({ record, label }: { record: DbRecord; label: string }) {
   const enabled = record.enabled === true || record.enabled === 'true'
@@ -157,6 +179,7 @@ export const pluginsChrome: CollectionChrome = {
   cells: {
     author: PluginAuthorCell,
   },
+  ToolbarRight: PluginStoreButton,
   Title: PluginTitle,
   Actions: PluginActions,
 }

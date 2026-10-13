@@ -6,6 +6,7 @@ import {
   PLUGIN_SANDBOX_DESCRIPTION,
   PLUGIN_SANDBOX_PROPERTIES,
 } from './plugin-create.ts'
+import type { PluginRegistryClient } from './registry-client.ts'
 import type { PluginStoreService, StoreListing } from './store.ts'
 
 type SandboxListing = Awaited<ReturnType<PluginStoreService['listSandboxes']>>[number]
@@ -92,15 +93,27 @@ function mergeLifecycle(
   throw new Error('empty plugin row')
 }
 
-export function pluginsCollection(store: PluginStoreService): CollectionSpec {
+export function pluginsCollection(store: PluginStoreService, registry?: PluginRegistryClient): CollectionSpec {
   const list = async () => {
     const [installed, sandboxes] = await Promise.all([store.list(), store.listSandboxes()])
     const ids = new Set([...installed.map((row) => row.id), ...sandboxes.map((row) => row.id)])
     const byInstalled = new Map(installed.map((row) => [row.id, row]))
     const bySandbox = new Map(sandboxes.map((row) => [row.id, row]))
+    const flags = typeof store.remoteFlags === 'function' ? await store.remoteFlags() : {}
     return [...ids]
       .sort()
-      .map((id) => mergeLifecycle(byInstalled.get(id), bySandbox.get(id), store))
+      .map((id) => {
+        const row = mergeLifecycle(byInstalled.get(id), bySandbox.get(id), store)
+        const flag = flags[id]
+        if (!flag) return row
+        return omitEmpty({
+          ...row,
+          remoteCodeVersion: flag.remoteCodeVersion,
+          localCodeVersion: flag.localCodeVersion,
+          updateAvailable: flag.updateAvailable,
+          idConflict: flag.idConflict,
+        })
+      })
   }
   const find = async (id: string) => {
     const row = (await list()).find((item) => item.id === id) ?? null
@@ -116,7 +129,7 @@ export function pluginsCollection(store: PluginStoreService): CollectionSpec {
       route: '/plugins',
       title: '插件',
       inspector: true,
-      blurb: '这是插件（可安装的小程序），不是代理。用户说「再开一个 agent」请去 /sessions db_create，不要在这张表 create。已安装（.plugin）和沙箱（.plugin-dev）同一张表。列表 db_list /plugins；sandboxPath 是源码绝对路径，pluginPath 是安装产物绝对路径，Session 绑定其他项目时也按这两个字段找代码。README 用 db_content /plugins/<id>。页面块插件先读介绍里的「示例写法」再写 :::pageBlock。name 等只读（facet/tags 仍可写）。不能 db_create。窗口尺寸看 shellWidth/shellHeight。codeVersion 是已安装 host.js+web.js 的内容短哈希，和加载 URL 的 v 参数相同。安装只能 sandbox 再 pack：先 db_action path=/plugins/<插件id> action=sandbox 建 .plugin-dev/<id>/（记录可以还不存在），写完代码再 action=pack 打进 .plugin。不要直写 .plugin。start=打开已安装插件窗口（when：installed 且未 running）；stop=关掉运行中的插件（when：installed 且 running）；uninstall=删除 .plugin/<id>/（沙箱还在则这行还在）。',
+      blurb: '这是插件（可安装的小程序），不是代理。用户说「再开一个 agent」请去 /sessions db_create，不要在这张表 create。已安装（.plugin）和沙箱（.plugin-dev）同一张表。列表 db_list /plugins；sandboxPath 是源码绝对路径，pluginPath 是安装产物绝对路径，Session 绑定其他项目时也按这两个字段找代码。README 用 db_content /plugins/<id>。页面块插件先读介绍里的「示例写法」再写 :::pageBlock。name 等只读（facet/tags 仍可写）。不能 db_create。窗口尺寸看 shellWidth/shellHeight。codeVersion 是已安装 host.js+web.js 的内容短哈希，和加载 URL 的 v 参数相同。自己写插件：db_action path=/plugins/<插件id> action=sandbox 建 .plugin-dev/<id>/，写完 action=pack 打进 .plugin，再 action=publish 上传商店。从商店安装走 /plugin-catalog action=install，不要为了安装去建沙箱。updateAvailable 为 true 时 action=update 下载最新版并在运行中则重新挂载。start=打开已安装插件窗口（when：installed 且未 running）；stop=关掉运行中的插件（when：installed 且 running）；uninstall=删除 .plugin/<id>/（沙箱还在则这行还在）。',
       order: 30,
       icon: 'puzzle-piece',
     },
@@ -142,6 +155,7 @@ export function pluginsCollection(store: PluginStoreService): CollectionSpec {
         'hasHost',
         'hasWeb',
         'codeVersion',
+        'updateAvailable',
         'headless',
       ],
       fields: {
@@ -162,6 +176,10 @@ export function pluginsCollection(store: PluginStoreService): CollectionSpec {
         hasHost: { type: 'boolean', label: 'Host' },
         hasWeb: { type: 'boolean', label: 'Web' },
         codeVersion: { type: 'string', label: '代码版本' },
+        remoteCodeVersion: { type: 'string', label: '商店版本' },
+        localCodeVersion: { type: 'string', label: '本地版本' },
+        updateAvailable: { type: 'boolean', label: '可更新' },
+        idConflict: { type: 'boolean', label: 'ID 冲突' },
         headless: { type: 'boolean', label: '无头' },
         author: { type: 'string', label: '作者' },
         authorUrl: { type: 'url', label: '作者链接' },
@@ -229,6 +247,26 @@ export function pluginsCollection(store: PluginStoreService): CollectionSpec {
         description: PLUGIN_PACK_DESCRIPTION,
         parameters: { type: 'object', description: PLUGIN_PACK_DESCRIPTION, properties: {} },
         run: async (id) => store.pack(id),
+      },
+      {
+        id: 'publish',
+        label: '发布到商店',
+        when: { installed: true },
+        description: '把 .plugin/<id>/ 的打包结果上传到插件商店。有沙箱时先 pack。同一把本机发布密钥才能更新已占用的 id。',
+        run: async (id) => {
+          if (!registry) throw new Error('plugin registry is not configured')
+          return registry.publish(id)
+        },
+      },
+      {
+        id: 'update',
+        label: '从商店更新',
+        when: { updateAvailable: true },
+        description: '下载商店最新版覆盖 .plugin/<id>/。正在运行时会重新挂载。',
+        run: async (id) => {
+          if (!registry) throw new Error('plugin registry is not configured')
+          return registry.update(id)
+        },
       },
       {
         id: 'uninstall',

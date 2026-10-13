@@ -9,6 +9,7 @@ export const ALL_ROW_VIEWS_PATH = '*'
 
 function mergeChrome(layers: CollectionChrome[]): CollectionChrome {
   const cells: CollectionChrome['cells'] = {}
+  let ToolbarRight: CollectionChrome['ToolbarRight']
   let Action: CollectionChrome['Action']
   let Actions: CollectionChrome['Actions']
   let DetailTools: CollectionChrome['DetailTools']
@@ -22,6 +23,7 @@ function mergeChrome(layers: CollectionChrome[]): CollectionChrome {
   const panes: NonNullable<CollectionChrome['panes']> = []
   for (const layer of layers) {
     Object.assign(cells, layer.cells)
+    if (layer.ToolbarRight) ToolbarRight = layer.ToolbarRight
     if (layer.Action) Action = layer.Action
     if (layer.Actions) Actions = layer.Actions
     if (layer.DetailTools) DetailTools = layer.DetailTools
@@ -40,7 +42,7 @@ function mergeChrome(layers: CollectionChrome[]): CollectionChrome {
       }
     }
   }
-  return { cells, Action, Actions, DetailTools, Icon, Title, Board, Content, panes: panes.length ? panes : undefined, openRow, listViews, lockedFiltersFromSearch }
+  return { cells, ToolbarRight, Action, Actions, DetailTools, Icon, Title, Board, Content, panes: panes.length ? panes : undefined, openRow, listViews, lockedFiltersFromSearch }
 }
 
 function mergeViews(layers: CollectionViewType[]): CollectionViewType[] {

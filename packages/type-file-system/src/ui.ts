@@ -43,6 +43,8 @@ export type FsDetailPane = {
 
 export type CollectionChrome = {
   cells?: Partial<Record<string, ComponentType<FsCellProps>>>
+  /** 集合表格右上角工具栏的专属入口。 */
+  ToolbarRight?: ComponentType
   Action?: ComponentType<FsActionProps>
   /** 整组动作。有则宿主不再按条 map，前端完全由登记方 decorate。 */
   Actions?: ComponentType<FsActionsProps>
