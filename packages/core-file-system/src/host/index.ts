@@ -883,6 +883,9 @@ export class DatabaseService extends Service implements Database {
     const actor = authorization?.currentActor()
     if (authorization && actor) {
       return rows.filter((row) => {
+        if (collection === '/plugin-catalog') {
+          return action === 'resource:read' || action === 'resource:list'
+        }
         if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
           return action === 'resource:read' || action === 'resource:list'
         }
@@ -907,6 +910,9 @@ export class DatabaseService extends Service implements Database {
     const workspaceId = store?.activeWorkspaceId() ?? ''
     const grants = new Map<string, Map<string, Set<string>>>()
     return rows.filter((row) => {
+      if (collection === '/plugin-catalog') {
+        return action === 'resource:read' || action === 'resource:list'
+      }
       if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
         return action === 'resource:read' || action === 'resource:list'
       }
@@ -1082,6 +1088,14 @@ export class DatabaseService extends Service implements Database {
     action: PermissionAction = 'resource:read',
     record?: { id?: unknown },
   ) {
+    if (spec.path === '/plugin-catalog') {
+      if (
+        action === 'resource:read' ||
+        action === 'resource:list' ||
+        action === 'resource:update'
+      ) return
+      throw new Error('permission denied: INSUFFICIENT_PERMISSION')
+    }
     if (this.builtinPlugin(spec, id, record)) {
       if (action === 'resource:read' || action === 'resource:list') return
       throw new Error('permission denied: INSUFFICIENT_PERMISSION')
