@@ -244,6 +244,9 @@ function copyMerge(src: string, dest: string) {
     const from = join(src, name)
     const to = join(dest, name)
     try {
+      const sidecar = /^(.*\.sqlite)-(?:wal|shm)$/.exec(name)
+      // 目标主库已存在时，绝不能把另一份 SQLite 的 WAL/SHM 单独拼进来。
+      if (sidecar && existsSync(join(dest, sidecar[1]!))) continue
       if (!existsSync(to)) {
         cpSync(from, to, { recursive: true })
         continue
