@@ -243,13 +243,18 @@ function copyMerge(src: string, dest: string) {
   for (const name of readdirSync(src)) {
     const from = join(src, name)
     const to = join(dest, name)
-    if (!existsSync(to)) {
-      cpSync(from, to, { recursive: true })
-      continue
+    try {
+      if (!existsSync(to)) {
+        cpSync(from, to, { recursive: true })
+        continue
+      }
+      const fromStat = statSync(from)
+      const toStat = statSync(to)
+      if (fromStat.isDirectory() && toStat.isDirectory()) copyMerge(from, to)
+    } catch (error) {
+      // SQLite 的 -wal/-shm 会在扫描与复制之间消失；跳过瞬时文件即可。
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
-    const fromStat = statSync(from)
-    const toStat = statSync(to)
-    if (fromStat.isDirectory() && toStat.isDirectory()) copyMerge(from, to)
   }
 }
 
