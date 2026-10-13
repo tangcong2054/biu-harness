@@ -55,13 +55,19 @@ export class AccountService extends Service {
     const origin = process.env.BIU_REMOTE_ORIGIN
     if (!isOnlineRuntime() && origin) {
       this.replica = new RecordReplica(db, httpRemote(origin))
+      let snapshotSyncing = false
       const timer = setInterval(() => {
         const device = this.replica?.active()
-        if (!device?.token) return
-        void exchangeSnapshot(ctx, origin, device.token, device.accountId, device.workspaceId).catch((error) => {
-          console.warn('[replica] sync failed', error)
-        })
-      }, 3000)
+        if (!device?.token || snapshotSyncing) return
+        snapshotSyncing = true
+        void exchangeSnapshot(ctx, origin, device.token, device.accountId, device.workspaceId)
+          .catch((error) => {
+            console.warn('[replica] sync failed', error)
+          })
+          .finally(() => {
+            snapshotSyncing = false
+          })
+      }, 15_000)
       ctx.on('dispose', () => clearInterval(timer))
       ctx.on('account/request', (event) => {
         const localAccountId = String((event as { accountId?: string }).accountId ?? '')
@@ -391,6 +397,7 @@ function fail(route: RouteContext, error: unknown) {
 
 export function apply(ctx: Context, config: AccountConfig = {}) {
   const account = new AccountService(ctx, config)
+  const workspaceRefreshes = new Set<string>()
 
   function actor(route: RouteContext) {
     const token = bearer(route)
@@ -816,22 +823,18 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
           .filter((workspace) => account.workspaceLocation(workspace.id) === 'cloud')
           .map((workspace) => ({ ...workspace, location: 'cloud' as const }))
       let cloud: Array<Record<string, unknown>> = isOnlineRuntime() ? cachedCloud() : []
-      let cloudUnavailable = false
       if (!isOnlineRuntime() && account.cloudConnection(me.id)) {
         cloud = cachedCloud()
-        try {
-          const relayed = await relayAccount(route, account, me.id, '/api/account/workspaces')
-          if (relayed?.status && relayed.status < 300) {
-            cacheWorkspaceList(account, me.id, relayed.payload)
-            cloud = (Array.isArray(relayed.payload.workspaces) ? relayed.payload.workspaces : []).map((workspace) => ({
-              ...(workspace as Record<string, unknown>),
-              location: 'cloud',
-            }))
-          } else if (relayed) {
-            cloudUnavailable = true
-          }
-        } catch {
-          cloudUnavailable = true
+        if (!workspaceRefreshes.has(me.id)) {
+          workspaceRefreshes.add(me.id)
+          void relayAccount(route, account, me.id, '/api/account/workspaces')
+            .then((relayed) => {
+              if (!relayed?.status || relayed.status >= 300) return
+              cacheWorkspaceList(account, me.id, relayed.payload)
+              ctx.http.broadcast('account/workspaces-changed', { accountId: me.id })
+            })
+            .catch(() => undefined)
+            .finally(() => workspaceRefreshes.delete(me.id))
         }
       }
       if (!isOnlineRuntime() && !account.cloudConnection(me.id)) {
@@ -842,7 +845,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
       route.send(200, {
         workspaces: [...local, ...cloud],
         cloudConnected: Boolean(account.cloudConnection(me.id)),
-        cloudUnavailable,
+        cloudUnavailable: false,
       })
     } catch (error) {
       fail(route, error)

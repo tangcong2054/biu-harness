@@ -182,7 +182,10 @@ export async function exchangeSnapshot(
     authorization: `Bearer ${token}`,
     ...(workspaceId ? { 'x-biu-workspace-id': workspaceId } : {}),
   }
-  const pulled = await fetch(`${root}/api/replica/snapshot`, { headers })
+  const pulled = await fetch(`${root}/api/replica/snapshot`, {
+    headers,
+    signal: AbortSignal.timeout(10_000),
+  })
   if (!pulled.ok) return
   const body = (await pulled.json()) as MirrorSnapshot
   await runWithAccount(accountId, () =>
