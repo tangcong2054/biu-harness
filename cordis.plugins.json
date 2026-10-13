@@ -22,6 +22,7 @@
     { "id": "agents", "package": "@biu/host-agents", "togglable": false, "enabled": true },
     { "id": "subagents", "package": "@biu/host-subagents", "togglable": false, "enabled": true },
     { "id": "live-sessions", "package": "@biu/host-live-sessions", "togglable": false, "enabled": true },
+    { "id": "account", "package": "@biu/host-account", "togglable": false, "enabled": true },
     { "id": "hub", "package": "@biu/host-hub", "togglable": false, "enabled": true }
   ],
   "web": [

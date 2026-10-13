@@ -12,16 +12,16 @@ export default defineConfig({
   plugins: [react(), tailwindcss(), cordisPluginsVite(root)],
   appType: 'spa',
   server: {
-    port: 5173,
+    port: Number(process.env.BIU_WEB_PORT || 5173),
     strictPort: true,
-    host: '127.0.0.1',
+    host: true,
     watch: {
       // 商店插件写在仓库根 .plugin，不能触发 Vite 整页刷新
       ignored: ['**/.plugin/**', '**/.plugin-dev/**'],
     },
     proxy: {
-      '/api': 'http://127.0.0.1:3141',
-      '/ws': { target: 'ws://127.0.0.1:3141', ws: true },
+      '/api': `http://127.0.0.1:${process.env.BIU_API_PORT || '3141'}`,
+      '/ws': { target: `ws://127.0.0.1:${process.env.BIU_API_PORT || '3141'}`, ws: true },
     },
   },
   test: {

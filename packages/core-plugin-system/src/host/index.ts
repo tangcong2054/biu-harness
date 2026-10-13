@@ -39,7 +39,7 @@ export async function apply(ctx: Context) {
   ctx.inject(['systemPrompt'], (inner) => {
     inner.systemPrompt.register(
       'plugin.creation',
-      '创建插件前，先 db_list /plugin-catalog q=关键词，确认商店里没有能用的插件。没有再在 /plugins 里 sandbox、pack。插件描述必须和其它插件明显不同。创建插件时，必须说明它支持哪些 ui_action。',
+      '创建插件前，先查看是否已有相似插件：用 db_list /plugin-catalog q=关键词确认商店里没有能用的插件。没有再在 /plugins 里 sandbox、pack。插件描述必须和其它插件明显不同。创建插件时，必须说明它支持哪些 Action（包括 ui_action）。',
     )
   })
 }

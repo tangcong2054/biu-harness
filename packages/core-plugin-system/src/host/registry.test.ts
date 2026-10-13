@@ -64,7 +64,7 @@ test('registry config reads id, dataDir and url', async () => {
     assert.equal(config.dataDir, join(dir, 'store-data'))
     assert.equal(config.url, 'https://plugins.example.com/api/plugin-registry/v1')
     assert.equal(config.listenHost, '127.0.0.1')
-    assert.equal(config.listenPort, 3151)
+    assert.equal(config.listenPort, 3161)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

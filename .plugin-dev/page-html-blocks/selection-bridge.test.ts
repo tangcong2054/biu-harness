@@ -102,7 +102,7 @@ test('temporarily disables draggable page block while selecting text', () => {
 })
 
 test('web view wires static and iframe selection into core-pick', () => {
-  const source = readFileSync(resolve(import.meta.dirname, './web.tsx'), 'utf8')
+  const source = readFileSync(resolve(import.meta.dirname, './web/index.tsx'), 'utf8')
   assert.match(source, /inject = \['pageEditor', 'pick', 'uiActions'\]/)
   assert.match(source, /htmlPick\.attach/)
   assert.doesNotMatch(source, /@biu\//)

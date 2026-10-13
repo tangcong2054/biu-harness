@@ -21,7 +21,7 @@ const explicit = new Set([
   'plugin-doctor',
   'websql',
 ])
-const domOnly = new Set(['page-video'])
+const domOnly = new Set(['audit-findings', 'cost-reconcile', 'edu-classboard', 'med-ruleset', 'page-video'])
 const complex = new Set(['page-excalidraw', 'page-terminal'])
 const sourceMissing = new Set<string>()
 
@@ -35,7 +35,13 @@ test('every sandbox plugin has an explicit UI Action coverage classification', (
 
 test('plugins classified explicit inject and register uiActions', () => {
   for (const id of explicit) {
-    const sourceFile = existsSync(resolve(root, id, 'web.tsx')) ? 'web.tsx' : 'web.js'
+    const sourceFile = existsSync(resolve(root, id, 'web/index.tsx'))
+      ? 'web/index.tsx'
+      : existsSync(resolve(root, id, 'web/index.ts'))
+        ? 'web/index.ts'
+        : existsSync(resolve(root, id, 'web.tsx'))
+          ? 'web.tsx'
+          : 'web.js'
     const source = readFileSync(resolve(root, id, sourceFile), 'utf8')
     assert.match(source, /(?:inject|INJ)\s*=\s*\[[^\]]*['"]uiActions['"]/, `${id} 没有 inject uiActions`)
     assert.match(source, /(?:uiActions|UIA)\?*\.register|(?:uiActions|UIA)\.register/, `${id} 没有注册语义 Action`)

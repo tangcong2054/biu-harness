@@ -1,8 +1,8 @@
 import { createPortal } from 'react-dom'
 import { bindHtmlSlide, collectHtmlSlides, cssBoxSize, htmlDeckEnabled, htmlDeckIndex, htmlDeckKeyAction, htmlLooksFillLayout, HTML_FILL_HOST_PX, stepHtmlDeck } from './html-deck.ts'
-import { injectHtmlSelectionBridge, parseHtmlSelectionMessage, suspendAncestorDrag } from './selection-bridge.ts'
+import { injectHtmlSelectionBridge, parseHtmlSelectionMessage, suspendAncestorDrag } from '../selection-bridge.ts'
 import { htmlBlockKey, stampHtmlPickSurfaces, stampHtmlSource } from './stamp-picks.ts'
-import { injectDeckBridge, probeDeckPages, sendDeckCommand } from './deck-bridge.ts'
+import { injectDeckBridge, probeDeckPages, sendDeckCommand } from '../deck-bridge.ts'
 
 const React = globalThis.React
 const { useEffect, useLayoutEffect, useMemo, useRef, useState } = React

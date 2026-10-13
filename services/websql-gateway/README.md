@@ -82,6 +82,6 @@ WEBSQL_MYSQL_BIN=/opt/homebrew/opt/mysql@8.0/bin/mysql
 ## 本地测试
 
 ```sh
-node --test services/websql-gateway/policy.test.mjs
+node --test services/websql-gateway/policy.node.mjs
 curl http://127.0.0.1:43120/v1/health
 ```

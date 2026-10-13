@@ -45,7 +45,7 @@ import { SessionInspector } from './session-inspector.tsx'
 import { SessionConfigDialog } from '@biu/web-session-view/dialog'
 import { FolderGlyph } from '@biu/web-session-view/folder-glyph'
 import { OverlayChatWindow } from './overlay-window.tsx'
-import { ShellSettingsAbout, ShellSettingsAccount, ShellSettingsAppearance, ShellSettingsMcp, ShellSettingsShortcuts, ShellSettingsUpdate } from './shell-chrome.tsx'
+import { AuthGate, ShellSettingsAbout, ShellSettingsAccount, ShellSettingsAppearance, ShellSettingsMembers, ShellSettingsMcp, ShellSettingsShortcuts, ShellSettingsUpdate, ShellSettingsWorkspace } from './shell-chrome.tsx'
 import { hydrateWorkspaceProfile } from '@biu/public-ui'
 import { hydrateTheme } from './theme.ts'
 import { hydratePagePrefs } from '@biu/core-file-system/page-width'
@@ -61,13 +61,14 @@ import {
   AdjustmentsHorizontalIcon,
   ArrowDownTrayIcon,
   CommandLineIcon,
+  CircleStackIcon,
   InformationCircleIcon,
   LinkIcon,
   MapIcon,
-  PuzzlePieceIcon,
   QueueListIcon,
   SwatchIcon,
   UserCircleIcon,
+  UserGroupIcon,
   XMarkIcon,
 } from '@heroicons/react/16/solid'
 
@@ -327,7 +328,26 @@ function MainShell(props: SlotProps) {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState<string>('account')
+  const [workspaceLocation, setWorkspaceLocation] = useState<'device' | 'cloud'>('device')
   const [configOpen, setConfigOpen] = useState(false)
+  useEffect(() => {
+    if (!settingsOpen) return
+    let live = true
+    void fetch('/api/profile')
+      .then((response) => (response.ok ? response.json() : null))
+      .then((profile: { dataLocation?: 'device' | 'cloud' } | null) => {
+        if (!live) return
+        const next = profile?.dataLocation === 'cloud' ? 'cloud' : 'device'
+        setWorkspaceLocation(next)
+        if (next === 'device') setSettingsTab((current) => (current === 'members' ? 'workspace' : current))
+      })
+      .catch(() => {
+        if (live) setWorkspaceLocation('device')
+      })
+    return () => {
+      live = false
+    }
+  }, [settingsOpen])
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
       return localStorage.getItem('cordis.sidebar.collapsed') === '1'
@@ -402,11 +422,19 @@ function MainShell(props: SlotProps) {
     },
     [persistSidebar, sidebarWidth],
   )
-  const openSettings = useCallback(() => setSettingsOpen(true), [])
+  const openSettings = useCallback((tab?: string) => {
+    if (tab) setSettingsTab(tab)
+    setSettingsOpen(true)
+  }, [])
   useEffect(() => {
     void hydrateWorkspaceProfile()
+    const onLibrary = () => {
+      void hydrateWorkspaceProfile()
+    }
+    window.addEventListener('fsdb:change', onLibrary)
     void hydrateTheme()
     void hydratePagePrefs()
+    return () => window.removeEventListener('fsdb:change', onLibrary)
   }, [])
   useEffect(() => {
     if (!settingsOpen) return
@@ -910,15 +938,16 @@ function MainShell(props: SlotProps) {
                 <ul className="settings-rail-list">
                   {[
                     { key: 'account', label: '账户', Icon: UserCircleIcon },
+                    { key: 'workspace', label: '空间', Icon: CircleStackIcon },
+                    { key: 'members', label: '成员', Icon: UserGroupIcon },
                     { key: 'appearance', label: '外观', Icon: SwatchIcon },
-                    { key: 'plugins', label: '插件', Icon: PuzzlePieceIcon },
                     { key: 'mcp', label: 'MCP', Icon: LinkIcon },
                     { key: 'shortcuts', label: '快捷键', Icon: CommandLineIcon },
                     { key: 'routes', label: '路由', Icon: MapIcon },
                     { key: 'events', label: '事件', Icon: QueueListIcon },
                     { key: 'update', label: '更新', Icon: ArrowDownTrayIcon },
                     { key: 'about', label: '关于', Icon: InformationCircleIcon },
-                  ].map((item) => (
+                  ].filter((item) => item.key !== 'members' || workspaceLocation === 'cloud').map((item) => (
                     <li key={item.key}>
                       <button
                         type="button"
@@ -944,6 +973,8 @@ function MainShell(props: SlotProps) {
                 </button>
                 <div className="settings-pane">
                   {settingsTab === 'account' ? <ShellSettingsAccount /> : null}
+                  {settingsTab === 'workspace' ? <ShellSettingsWorkspace /> : null}
+                  {settingsTab === 'members' && workspaceLocation === 'cloud' ? <ShellSettingsMembers /> : null}
                   {settingsTab === 'appearance' ? <ShellSettingsAppearance /> : null}
                   {settingsTab === 'plugins' ? (
                     <section>
@@ -1025,7 +1056,13 @@ export function apply(ctx: Context) {
     appModules: ctx.appModules as AppModulesService,
     getUiActions: () => ctx.get('uiActions') as UiActionsService | undefined,
   }
-  ctx.slots.fill('root', Shell, {
+  ctx.slots.fill('root', function ShellEntry(props: SlotProps) {
+    return (
+      <AuthGate>
+        <Shell {...props} />
+      </AuthGate>
+    )
+  }, {
     children: {
       sidebar: { kind: 'single' },
       demos: { kind: 'list' },

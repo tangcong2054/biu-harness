@@ -17,7 +17,7 @@ test('static HTML selection can be attached with Ctrl+L and keeps block dragging
     update: (patch: Record<string, unknown>) => void
     writable: boolean
   }) => React.ReactNode>()
-  const { apply, inject } = await import('./web.tsx')
+  const { apply, inject } = await import('./web/index.tsx')
   assert.deepEqual(inject, ['pageEditor', 'pick', 'uiActions'])
   apply({
     uiActions: {

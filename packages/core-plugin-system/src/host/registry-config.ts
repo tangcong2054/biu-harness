@@ -37,7 +37,7 @@ export function loadRegistryConfig(cwd = process.cwd(), path = registryConfigPat
   const dataDir = isAbsolute(dirRaw) ? dirRaw : resolve(cwd, dirRaw)
   const url = String(process.env.BIU_PLUGIN_REGISTRY ?? raw.url ?? '').trim().replace(/\/+$/, '')
   const listenHost = String(process.env.BIU_PLUGIN_REGISTRY_HOST ?? raw.listenHost ?? '127.0.0.1').trim() || '127.0.0.1'
-  const listenPort = Number(process.env.BIU_PLUGIN_REGISTRY_PORT ?? raw.listenPort ?? 3151)
+  const listenPort = Number(process.env.BIU_PLUGIN_REGISTRY_PORT ?? raw.listenPort ?? 3161)
   if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
     throw new Error(`invalid plugin registry port: ${listenPort}`)
   }
