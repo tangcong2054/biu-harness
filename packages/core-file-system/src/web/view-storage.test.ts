@@ -15,6 +15,7 @@ import {
   isRecordStarred,
   viewDisplayKey,
   viewForPath,
+  viewsKey,
   withViewDisplay,
 } from './view-storage.ts'
 
@@ -24,7 +25,7 @@ test('authoritative empty saved views hide stale local workspace data', () => {
   Object.defineProperty(globalThis, 'localStorage', {
     configurable: true,
     value: {
-      getItem: (key: string) => key === `fsdb.views:${path}` ? JSON.stringify(stale) : null,
+      getItem: (key: string) => key === viewsKey(path) ? JSON.stringify(stale) : null,
       setItem: () => undefined,
       removeItem: () => undefined,
     },
@@ -32,6 +33,18 @@ test('authoritative empty saved views hide stale local workspace data', () => {
   assert.equal(loadViews(path)[0]?.id, 'old')
   rememberViews(path, [])
   assert.deepEqual(loadViews(path), [])
+})
+
+test('browser view memory is isolated by workspace', () => {
+  const path = '/workspace-scoped-views'
+  sessionStorage.setItem('biu.workspaceId', 'ws-a')
+  rememberViews(path, [{ id: 'a', name: 'A', mode: 'table' }])
+  sessionStorage.setItem('biu.workspaceId', 'ws-b')
+  rememberViews(path, [{ id: 'b', name: 'B', mode: 'table' }])
+  assert.deepEqual(loadViews(path).map((view) => view.id), ['b'])
+  sessionStorage.setItem('biu.workspaceId', 'ws-a')
+  assert.deepEqual(loadViews(path).map((view) => view.id), ['a'])
+  sessionStorage.removeItem('biu.workspaceId')
 })
 
 test('index all views do not group by share', () => {

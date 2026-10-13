@@ -99,8 +99,8 @@ export const BIU_TABLES: Record<string, TableSpec> = {
     indexes: ['shares_target'],
   },
   saved_views: {
-    columns: ['collection', 'view_id', 'payload_json', 'updated_at'],
-    indexes: [],
+    columns: ['workspace_id', 'collection', 'view_id', 'payload_json', 'updated_at'],
+    indexes: ['saved_views_workspace'],
   },
   sessions: {
     columns: ['id', 'version', 'project_json', 'event_count', 'title', 'updated_at', 'mascot_json', 'config_json'],
@@ -294,7 +294,7 @@ export const BIU_TABLES: Record<string, TableSpec> = {
   },
 }
 
-export const LATEST_BIU_SCHEMA = 40
+export const LATEST_BIU_SCHEMA = 41
 
 export const CREATE_CORE_SQL = `
 CREATE TABLE IF NOT EXISTS pages (
@@ -430,12 +430,14 @@ CREATE TABLE IF NOT EXISTS shares (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS shares_target ON shares(kind, collection, view_id, record_id);
 CREATE TABLE IF NOT EXISTS saved_views (
+  workspace_id TEXT NOT NULL DEFAULT '',
   collection TEXT NOT NULL,
   view_id TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   updated_at INTEGER NOT NULL,
-  PRIMARY KEY (collection, view_id)
+  PRIMARY KEY (workspace_id, collection, view_id)
 );
+CREATE INDEX IF NOT EXISTS saved_views_workspace ON saved_views(workspace_id, collection);
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   version INTEGER NOT NULL,

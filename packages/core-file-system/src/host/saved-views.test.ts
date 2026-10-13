@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import { builtinAllViewId } from '../catalog-views.ts'
 import { SavedViewsStore, clientViewFromDbRow, viewsCollection } from './saved-views.ts'
 
@@ -116,6 +117,30 @@ test('saved views persist created fields and updates across reopen', async () =>
   assert.equal(hit?.groupBy, 'status')
   assert.equal(hit?.sortField, 'dueAt')
   assert.equal(hit?.filters, '{"status":"doing"}')
+})
+
+test('saved views are isolated by workspace across reopen', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'fsdb-tenant-views-')), 'biu.sqlite')
+  const tables = [
+    { path: '/pages', id: 'pages', kind: 'collection' as const, label: '页面', view: { moduleId: 'pages', route: '/pages', title: '页面' } },
+  ]
+  const first = new SavedViewsStore().open(file)
+  await runWithRequestWorkspace('ws-a', async () => {
+    first.replace('/pages', [{ id: 'mine', name: 'A 的视图' }])
+  })
+  await runWithRequestWorkspace('ws-b', async () => {
+    first.replace('/pages', [{ id: 'mine', name: 'B 的视图' }])
+  })
+  const second = new SavedViewsStore().open(file)
+  const names = async (workspaceId: string) =>
+    runWithRequestWorkspace(workspaceId, async () =>
+      (await viewsCollection(second, () => tables).list())
+        .filter((row) => row.viewId === 'mine')
+        .map((row) => row.title),
+    )
+  assert.deepEqual(await names('ws-a'), ['A 的视图'])
+  assert.deepEqual(await names('ws-b'), ['B 的视图'])
+  assert.deepEqual(await names('ws-c'), [])
 })
 
 test('clientViewFromDbRow keeps flat filters and sorts for the live table', () => {

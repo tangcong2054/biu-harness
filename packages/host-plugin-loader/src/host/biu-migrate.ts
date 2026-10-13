@@ -577,6 +577,45 @@ export const BIU_MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS cloud_connections_active ON cloud_connections(local_account_id, active);
     `)
   } },
+  { version: 41, module: 'core-file-system', name: 'saved-views.workspace-scope', up: (db) => {
+    const localWorkspace = process.env.BIU_ONLINE === '1'
+      ? ''
+      : String(
+          (
+            db.prepare(
+              `SELECT value FROM collab_state
+               WHERE key IN ('home', 'active')
+               ORDER BY CASE key WHEN 'home' THEN 0 ELSE 1 END
+               LIMIT 1`,
+            ).get() as { value?: unknown } | undefined
+          )?.value ??
+          (
+            db.prepare('SELECT id AS value FROM workspaces ORDER BY created_at, id LIMIT 1').get() as
+              | { value?: unknown }
+              | undefined
+          )?.value ??
+          '',
+        )
+    db.exec(`
+      CREATE TABLE saved_views_v41 (
+        workspace_id TEXT NOT NULL DEFAULT '',
+        collection TEXT NOT NULL,
+        view_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (workspace_id, collection, view_id)
+      );
+    `)
+    db.prepare(
+      `INSERT INTO saved_views_v41 (workspace_id, collection, view_id, payload_json, updated_at)
+       SELECT ?, collection, view_id, payload_json, updated_at FROM saved_views`,
+    ).run(localWorkspace)
+    db.exec(`
+      DROP TABLE saved_views;
+      ALTER TABLE saved_views_v41 RENAME TO saved_views;
+      CREATE INDEX IF NOT EXISTS saved_views_workspace ON saved_views(workspace_id, collection);
+    `)
+  } },
 ]
 
 export function assertBiuMigrationLog(rows: Array<{ version: number }> = BIU_MIGRATIONS) {

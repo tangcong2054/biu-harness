@@ -1,6 +1,6 @@
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { openAndMigrateBiu } from '@biu/host-plugin-loader/data-dir'
+import { currentRequestWorkspaceId, openAndMigrateBiu } from '@biu/host-plugin-loader/data-dir'
 import type { CollectionInfo, CollectionSpec, DbRecord } from '@biu/type-file-system'
 import { normalizeSchemaValue, recordBuiltinValues, REQUIRED_RECORD_FIELDS } from '@biu/type-file-system'
 import { builtinAllView, isReadOnlyViewId } from '../catalog-views.ts'
@@ -25,7 +25,7 @@ type DatabaseSync = import('node:sqlite').DatabaseSync
 
 export type StoredView = Partial<SavedView> & Pick<SavedView, 'id' | 'name'> & { createdBy?: string }
 
-type ViewRow = { collection: string; payload_json: string }
+type ViewRow = { workspace_id: string; collection: string; payload_json: string }
 
 export class SavedViewsStore {
   private byPath = new Map<string, StoredView[]>()
@@ -38,10 +38,25 @@ export class SavedViewsStore {
     return this
   }
 
+  private workspaceId() {
+    return currentRequestWorkspaceId()
+  }
+
+  private key(collectionPath: string, workspaceId = this.workspaceId()) {
+    return `${workspaceId}\0${normalizeCollectionPath(collectionPath)}`
+  }
+
+  private scopedEntries() {
+    const prefix = `${this.workspaceId()}\0`
+    return [...this.byPath.entries()]
+      .filter(([key]) => key.startsWith(prefix))
+      .map(([key, views]) => [key.slice(prefix.length), views] as const)
+  }
+
   private hydrate() {
     if (!this.db) return
     this.byPath.clear()
-    const rows = this.db.prepare('SELECT collection, payload_json FROM saved_views').all() as ViewRow[]
+    const rows = this.db.prepare('SELECT workspace_id, collection, payload_json FROM saved_views').all() as ViewRow[]
     for (const row of rows) {
       const collection = normalizeCollectionPath(row.collection)
       if (!collection || collection === '/' || collection === '/views') continue
@@ -55,27 +70,31 @@ export class SavedViewsStore {
       const id = String(parsed.id ?? '').trim()
       const name = String(parsed.name ?? id).trim()
       if (!id || isReadOnlyViewId(id) || parsed.builtin) continue
-      const list = this.byPath.get(collection) ?? []
+      const key = this.key(collection, row.workspace_id)
+      const list = this.byPath.get(key) ?? []
       list.push({ ...parsed, id, name })
-      this.byPath.set(collection, list)
+      this.byPath.set(key, list)
     }
   }
 
   private persistPath(collectionPath: string) {
     if (!this.db) return
     const path = normalizeCollectionPath(collectionPath)
-    const views = this.byPath.get(path) ?? []
+    const workspaceId = this.workspaceId()
+    const key = this.key(path, workspaceId)
+    const views = this.byPath.get(key) ?? []
     const upsert = this.db.prepare(
-      `INSERT INTO saved_views (collection, view_id, payload_json, updated_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(collection, view_id) DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`,
+      `INSERT INTO saved_views (workspace_id, collection, view_id, payload_json, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(workspace_id, collection, view_id)
+       DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`,
     )
     this.db.exec('BEGIN IMMEDIATE')
     try {
-      this.db.prepare('DELETE FROM saved_views WHERE collection = ?').run(path)
+      this.db.prepare('DELETE FROM saved_views WHERE workspace_id = ? AND collection = ?').run(workspaceId, path)
       for (const view of views) {
         if (view.builtin || isReadOnlyViewId(String(view.id))) continue
-        upsert.run(path, String(view.id), JSON.stringify(view), Date.now())
+        upsert.run(workspaceId, path, String(view.id), JSON.stringify(view), Date.now())
       }
       this.db.exec('COMMIT')
     } catch (error) {
@@ -85,7 +104,7 @@ export class SavedViewsStore {
   }
 
   viewsFor(collectionPath: string, accountId = ''): StoredView[] {
-    const views = this.byPath.get(normalizeCollectionPath(collectionPath)) ?? []
+    const views = this.byPath.get(this.key(collectionPath)) ?? []
     if (!isIndexCollection(collectionPath)) return views
     return views.filter((view) => view.createdBy === accountId)
   }
@@ -93,20 +112,22 @@ export class SavedViewsStore {
   /** 索引表上的视图按创建人分开存：这次写入只替换当前账号自己的视图。 */
   replaceOwned(collectionPath: string, views: StoredView[], accountId: string) {
     const path = normalizeCollectionPath(collectionPath)
-    const prev = this.byPath.get(path) ?? []
+    const key = this.key(path)
+    const prev = this.byPath.get(key) ?? []
     const kept = prev.filter((view) => view.createdBy && view.createdBy !== accountId)
     const foreign = new Set(kept.map((view) => view.id))
     const mine = views
       .filter((view) => !view.builtin && !isReadOnlyViewId(String(view.id)) && !foreign.has(String(view.id)))
       .map((view) => ({ ...view, id: String(view.id), name: String(view.name || view.id), createdBy: accountId }))
-    this.byPath.set(path, [...kept, ...mine])
+    this.byPath.set(key, [...kept, ...mine])
     this.persistPath(path)
   }
 
   replace(collectionPath: string, views: StoredView[]) {
     const path = normalizeCollectionPath(collectionPath)
+    const key = this.key(path)
     this.byPath.set(
-      path,
+      key,
       views
         .filter((view) => !view.builtin && !isReadOnlyViewId(String(view.id)))
         .map((view) => ({ ...view, id: String(view.id), name: String(view.name || view.id) })),
@@ -130,13 +151,13 @@ export class SavedViewsStore {
       const label = String(labels.get(path) ?? table.label ?? path)
       const all = builtinAllView({ path, label, view: table.view })
       emit(path, label, all)
-      for (const view of this.byPath.get(path) ?? []) {
+      for (const view of this.byPath.get(this.key(path)) ?? []) {
         if (view.builtin || isReadOnlyViewId(view.id)) continue
         if (isIndexCollection(path) && view.createdBy !== accountId) continue
         emit(path, label, view)
       }
     }
-    for (const [path, views] of this.byPath) {
+    for (const [path, views] of this.scopedEntries()) {
       if (tables.some((table) => normalizeCollectionPath(table.path) === path)) continue
       for (const view of views) {
         if (view.builtin || isReadOnlyViewId(view.id)) continue
@@ -157,7 +178,8 @@ export class SavedViewsStore {
     const label = table?.view?.title ?? table?.label ?? tablePath
     const id = String(fields.viewId ?? '').trim() || `${Date.now()}`
     if (isReadOnlyViewId(id)) throw new Error('builtin view is read-only')
-    const views = this.byPath.get(tablePath) ?? []
+    const key = this.key(tablePath)
+    const views = this.byPath.get(key) ?? []
     if (views.some((view) => view.id === id)) throw new Error(`view exists: ${id}`)
     const name = uniqueViewName(String(fields.title ?? fields.name ?? '新视图').trim() || '新视图', views)
     const view: StoredView = {
@@ -180,19 +202,19 @@ export class SavedViewsStore {
       updatedAt: Date.now(),
       ...(isIndexCollection(tablePath) ? { createdBy: accountId } : {}),
     }
-    this.byPath.set(tablePath, [...views, view])
+    this.byPath.set(key, [...views, view])
     this.persistPath(tablePath)
     return asRecord(tablePath, label, view)
   }
 
   remove(id: string, accountId = ''): boolean {
     if (isReadOnlyViewId(viewIdOfRow(id))) throw new Error('builtin view is read-only')
-    for (const [path, views] of this.byPath) {
+    for (const [path, views] of this.scopedEntries()) {
       const hit = views.find((view) => rowId(path, view.id) === id)
       if (hit && isIndexCollection(path) && hit.createdBy !== accountId) throw new Error('unknown view: ' + id)
       const next = views.filter((view) => rowId(path, view.id) !== id)
       if (next.length === views.length) continue
-      this.byPath.set(path, next)
+      this.byPath.set(this.key(path), next)
       this.persistPath(path)
       return true
     }
@@ -201,7 +223,7 @@ export class SavedViewsStore {
 
   write(id: string, patch: Record<string, unknown>, accountId = ''): DbRecord {
     if (isReadOnlyViewId(viewIdOfRow(id))) throw new Error('builtin view is read-only')
-    for (const [path, views] of this.byPath) {
+    for (const [path, views] of this.scopedEntries()) {
       const idx = views.findIndex((view) => rowId(path, view.id) === id)
       if (idx < 0) continue
       const cur = views[idx]!

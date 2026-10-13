@@ -44,7 +44,7 @@ test('empty database fast path matches upgraded v1 fixture', () => {
 test('BIU_MIGRATIONS versions are unique and increasing', () => {
   assertBiuMigrationLog()
   assert.equal(BIU_MIGRATIONS.at(-1)?.version, LATEST_BIU_SCHEMA)
-  assert.equal(BIU_MIGRATIONS.at(-1)?.name, 'cloud.many-accounts')
+  assert.equal(BIU_MIGRATIONS.at(-1)?.name, 'saved-views.workspace-scope')
   assert.throws(() => assertBiuMigrationLog([{ version: 2 }, { version: 2 }]), /重复/)
   assert.throws(() => assertBiuMigrationLog([{ version: 3 }, { version: 1 }]), /单调递增/)
 })
@@ -79,6 +79,41 @@ test('viewer role migration preserves workspace viewers', () => {
   const row = db.prepare(`SELECT role FROM workspace_members WHERE workspace_id = 'viewer-w1'`).get() as { role: string }
   assert.equal(row.role, 'viewer')
   db.close()
+})
+
+test('saved view migration scopes local rows and leaves online legacy rows unassigned', () => {
+  const previous = process.env.BIU_ONLINE
+  try {
+    for (const [mode, expected] of [['0', 'ws-local'], ['1', '']] as const) {
+      const db = openSqlite(':memory:')
+      migrateBiu(db, {}, 40)
+      db.exec(`
+        DROP TABLE saved_views;
+        CREATE TABLE saved_views (
+          collection TEXT NOT NULL,
+          view_id TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (collection, view_id)
+        );
+        INSERT INTO accounts (id, name, token, password_hash, created_at)
+        VALUES ('acc-local', 'Local', 'token-local', '', 1);
+        INSERT INTO workspaces (id, name, owner_id, created_at)
+        VALUES ('ws-local', 'Local', 'acc-local', 1);
+        INSERT INTO collab_state (key, value) VALUES ('active', 'ws-local');
+        INSERT INTO saved_views (collection, view_id, payload_json, updated_at)
+        VALUES ('/pages', 'mine', '{"id":"mine","name":"Mine"}', 1);
+      `)
+      process.env.BIU_ONLINE = mode
+      migrateBiu(db, {}, 41)
+      const row = db.prepare(`SELECT workspace_id FROM saved_views WHERE view_id = 'mine'`).get() as { workspace_id: string }
+      assert.equal(row.workspace_id, expected)
+      db.close()
+    }
+  } finally {
+    if (previous === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previous
+  }
 })
 
 test('snapshotBefore writes a pre-migration copy', () => {

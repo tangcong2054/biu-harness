@@ -4,22 +4,30 @@ import { listCollection } from './db-client.ts'
 import { looksLikeFilterTree, normalizeFilterGroup, parseSortsInput } from '../query-logic.ts'
 import { normalizeSavedView, type SavedView } from './saved-view.ts'
 
+export function workspaceViewScope() {
+  try {
+    return sessionStorage.getItem('biu.workspaceId') || localStorage.getItem('biu.workspaceId') || 'local'
+  } catch {
+    return 'local'
+  }
+}
+
 export function viewsKey(collectionPath: string) {
-  return `fsdb.views:${collectionPath}`
+  return `fsdb.views:${workspaceViewScope()}:${collectionPath}`
 }
 
 export function activeViewStorageKey(collectionPath: string) {
-  return `fsdb.activeView:${collectionPath}`
+  return `fsdb.activeView:${workspaceViewScope()}:${collectionPath}`
 }
 
 const memoryViews = new Map<string, SavedView[]>()
 
 export function rememberViews(collectionPath: string, views: SavedView[]) {
-  memoryViews.set(collectionPath, views.map((view) => normalizeSavedView(view)))
+  memoryViews.set(viewsKey(collectionPath), views.map((view) => normalizeSavedView(view)))
 }
 
 export function loadViews(collectionPath: string): SavedView[] {
-  const remembered = memoryViews.get(collectionPath)
+  const remembered = memoryViews.get(viewsKey(collectionPath))
   if (remembered) return remembered
   try {
     const raw = localStorage.getItem(viewsKey(collectionPath))
@@ -37,11 +45,11 @@ const memoryRecords = new Map<string, CrumbRecord[]>()
 const memoryRecordMeta = new Map<string, CrumbRecord>()
 
 function recordsKey(collectionPath: string, viewId?: string) {
-  return `${collectionPath}\0${viewId ?? ''}`
+  return `${workspaceViewScope()}\0${collectionPath}\0${viewId ?? ''}`
 }
 
 function recordMetaKey(collectionPath: string, recordId: string) {
-  return `${collectionPath}\0id:${recordId}`
+  return `${workspaceViewScope()}\0${collectionPath}\0id:${recordId}`
 }
 
 function keepCrumbLabel(row: CrumbRecord, prev?: CrumbRecord) {
@@ -399,7 +407,7 @@ const DISPLAY_KEYS = [
 export type ViewDisplayPatch = Partial<Pick<SavedView, (typeof DISPLAY_KEYS)[number]>>
 
 export function viewDisplayKey(collectionPath: string, viewId: string) {
-  return `fsdb.viewDisplay:${collectionPath}:${viewId}`
+  return `fsdb.viewDisplay:${workspaceViewScope()}:${collectionPath}:${viewId}`
 }
 
 function pickDisplay(patch: Partial<SavedView>): ViewDisplayPatch {

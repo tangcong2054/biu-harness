@@ -1,6 +1,7 @@
 import { beforeEach, test } from 'vitest'
 import assert from 'node:assert/strict'
 import { databaseAllViewPath, databaseRecordPath } from './database-path.ts'
+import { viewsKey } from './view-storage.ts'
 import {
   getInspectorDbPath,
   isInspectorDatabasePath,
@@ -426,7 +427,7 @@ test('applyDatabaseChannelPayload upserts a created view then opens it', () => {
   )
   assert.equal(getInspectorDbPath('database:/tasks'), '/database/tasks/view/board-1')
   assert.equal(isInspectorAgentWorking('/tasks'), false)
-  const stored = JSON.parse(mem['fsdb.views:/tasks'] ?? '[]') as Array<{ id: string; name: string; mode: string; filters?: Record<string, string> }>
+  const stored = JSON.parse(mem[viewsKey('/tasks')] ?? '[]') as Array<{ id: string; name: string; mode: string; filters?: Record<string, string> }>
   assert.equal(stored[0]?.id, 'board-1')
   assert.equal(stored[0]?.name, '看板')
   assert.equal(stored[0]?.mode, 'table')
@@ -466,8 +467,8 @@ test('view db_update writes the source table view, not /views', () => {
     'main',
   )
   window.removeEventListener('fsdb:saved-view', onSaved)
-  assert.equal(mem['fsdb.views:/views'], undefined)
-  const stored = JSON.parse(mem['fsdb.views:/pages'] ?? '[]') as Array<{ id: string; filters?: Record<string, string> }>
+  assert.equal(mem[viewsKey('/views')], undefined)
+  const stored = JSON.parse(mem[viewsKey('/pages')] ?? '[]') as Array<{ id: string; filters?: Record<string, string> }>
   assert.equal(stored[0]?.id, 'mine')
   assert.equal(stored[0]?.filters?.project, 'biu')
   assert.equal(seen[0]?.collection, '/pages')
