@@ -47,6 +47,14 @@ function wsUrl() {
   return `${protocol}//${location.host}${UI_ACTIONS_WS_PATH}`
 }
 
+function workspaceId() {
+  try {
+    return sessionStorage.getItem('biu.workspaceId') || localStorage.getItem('biu.workspaceId') || ''
+  } catch {
+    return ''
+  }
+}
+
 class UiActionsWebClient {
   private socket: WebSocket | null = null
   private stopped = false
@@ -54,6 +62,7 @@ class UiActionsWebClient {
   private retryTimer: ReturnType<typeof setTimeout> | null = null
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private token = ''
+  private socketWorkspace = ''
   private readonly commands = new Map<string, AbortController>()
   private readonly id = clientId()
   private unsubscribeRegistry: (() => void) | undefined
@@ -97,6 +106,10 @@ class UiActionsWebClient {
   }
 
   private stateChanged = () => {
+    if (this.socket && this.socketWorkspace !== workspaceId()) {
+      this.socket.close()
+      return
+    }
     this.send(this.stateMessage())
   }
 
@@ -127,7 +140,11 @@ class UiActionsWebClient {
   private connect() {
     if (this.stopped) return
     try {
-      const socket = new WebSocket(`${wsUrl()}?token=${encodeURIComponent(this.token)}`)
+      const workspace = workspaceId()
+      const params = new URLSearchParams({ uiToken: this.token })
+      if (workspace) params.set('workspaceId', workspace)
+      const socket = new WebSocket(`${wsUrl()}?${params}`)
+      this.socketWorkspace = workspace
       this.socket = socket
       socket.onopen = () => {
         this.retryMs = 250
@@ -147,7 +164,10 @@ class UiActionsWebClient {
         void this.onMessage(event.data)
       }
       socket.onclose = () => {
-        if (this.socket === socket) this.socket = null
+        if (this.socket === socket) {
+          this.socket = null
+          this.socketWorkspace = ''
+        }
         this.scheduleReconnect()
       }
       socket.onerror = () => socket.close()

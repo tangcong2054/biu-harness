@@ -2,6 +2,7 @@ import { Service, type Context } from 'cordis'
 import type { IncomingMessage } from 'node:http'
 import type { WebSocket } from 'ws'
 import { currentSessionId } from '@biu/host-sessions/scope'
+import { currentAccountId, currentRequestWorkspaceId } from '@biu/host-plugin-loader/data-dir'
 import { UiActionsObservability, type UiActionLogEntry } from './observability.ts'
 import {
   UI_ACTIONS_DEFAULT_TIMEOUT_MS,
@@ -28,6 +29,8 @@ type Client = {
   registryVersion: number
   targetCount: number
   seenAt: number
+  accountId: string
+  workspaceId: string
 }
 
 type Pending = {
@@ -74,6 +77,7 @@ export class UiActionsHostService extends Service {
   readonly observability = new UiActionsObservability()
   private readonly clients = new Map<string, Client>()
   private readonly bySocket = new Map<WebSocket, string>()
+  private readonly socketTenant = new WeakMap<WebSocket, { accountId: string; workspaceId: string }>()
   private readonly pending = new Map<string, Pending>()
   private readonly inspectCache = new Map<string, unknown>()
   private readonly connectionToken = crypto.randomUUID()
@@ -84,15 +88,32 @@ export class UiActionsHostService extends Service {
 
   start() {
     return this.ctx.http.ws(UI_ACTIONS_WS_PATH, (socket, request) => {
-      const token = new URL(request.url ?? UI_ACTIONS_WS_PATH, 'http://localhost').searchParams.get('token')
+      const url = new URL(request.url ?? UI_ACTIONS_WS_PATH, 'http://localhost')
+      const token = url.searchParams.get('uiToken')
       if (!allowedOrigin(request) || token !== this.connectionToken) {
         socket.close(1008, 'unauthorized')
         return
       }
+      this.socketTenant.set(socket, this.resolveTenant(request, url.searchParams.get('workspaceId') ?? ''))
       socket.on('message', (raw) => this.onMessage(socket, String(raw)))
       socket.on('close', () => this.onClose(socket))
       socket.on('error', () => this.onClose(socket))
     })
+  }
+
+  private resolveTenant(request: IncomingMessage, workspaceId: string) {
+    const cookie = String(request.headers.cookie ?? '')
+    const encoded = cookie
+      .split(';')
+      .map((part) => part.trim())
+      .find((part) => part.startsWith('biu_account=') || part.startsWith('biu_legacy_account='))
+    const token = encoded ? decodeURIComponent(encoded.slice(encoded.indexOf('=') + 1)) : ''
+    const accountId = (
+      this.ctx.get('account') as {
+        store?: { accountByToken?(token: string): { id: string } | null }
+      } | undefined
+    )?.store?.accountByToken?.(token)?.id ?? ''
+    return { accountId, workspaceId }
   }
 
   bootstrap(request: IncomingMessage) {
@@ -135,6 +156,8 @@ export class UiActionsHostService extends Service {
         registryVersion: message.registryVersion,
         targetCount: message.targetCount,
         seenAt: Date.now(),
+        accountId: this.socketTenant.get(socket)?.accountId ?? '',
+        workspaceId: this.socketTenant.get(socket)?.workspaceId ?? '',
       })
       if (invalidate) this.clearClientCache(message.clientId)
       return
@@ -253,15 +276,21 @@ export class UiActionsHostService extends Service {
   }
 
   private select(clientId?: string, sessionId?: string) {
+    const accountId = currentAccountId()
+    const workspaceId = currentRequestWorkspaceId()
+    const tenantMatches = (client: Client) =>
+      (!accountId || client.accountId === accountId) &&
+      (!workspaceId || client.workspaceId === workspaceId)
     if (clientId) {
       const exact = this.clients.get(clientId)
       if (!exact) throw new Error(`UI 客户端不可用：${clientId}`)
+      if (!tenantMatches(exact)) throw new Error('UI 客户端不属于当前账号或 Workspace')
       if (sessionId && exact.sessionId !== sessionId) {
         throw new Error(`UI 客户端不属于当前 Session：${sessionId}`)
       }
       return exact
     }
-    const clients = [...this.clients.values()]
+    const clients = [...this.clients.values()].filter(tenantMatches)
     if (!clients.length) throw new Error('没有已连接的 Biu UI 客户端；请先打开本机工作台')
     const candidates = sessionId
       ? clients.filter((client) => client.sessionId === sessionId)

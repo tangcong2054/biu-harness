@@ -51,7 +51,7 @@ test('host tools discover and execute actions through the active browser RPC', a
   const bootstrap = await fetch(`http://127.0.0.1:${port}/api/ui-actions/bootstrap`).then((res) => res.json()) as {
     token: string
   }
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/ws/ui-actions?token=${bootstrap.token}`)
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/ws/ui-actions?uiToken=${bootstrap.token}`)
   try {
     await new Promise<void>((resolve, reject) => {
       socket.once('open', () => resolve())
