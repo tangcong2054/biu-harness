@@ -1,11 +1,23 @@
 import assert from 'node:assert/strict'
+import { writeFileSync } from 'node:fs'
+import { mkdtemp } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'vitest'
 import type { SessionRecord } from '@biu/type-session'
 import {
   cloudSafePersistedConfig,
   persistedChatConfig,
+  readAdminApiKeys,
   redactCloudSessionSecrets,
 } from './index.ts'
+
+test('online host reads endpoint-specific keys from its private admin file', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'biu-chat-secrets-'))
+  const path = join(dir, 'chat-secrets.json')
+  writeFileSync(path, JSON.stringify({ apiKeys: { 'token-plan': 'server-only-key', empty: '' } }))
+  assert.deepEqual(readAdminApiKeys(path), { 'token-plan': 'server-only-key' })
+})
 
 test('online chat config neither loads nor persists user API keys', () => {
   const loaded = cloudSafePersistedConfig(

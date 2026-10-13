@@ -140,8 +140,23 @@ function emptyKeys(): Record<string, string> {
   return { deepseek: '', openai: '', anthropic: '' }
 }
 
+export function readAdminApiKeys(path = dataPath(dataHome(), 'chat-secrets.json')) {
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as { apiKeys?: unknown }
+    if (!raw.apiKeys || typeof raw.apiKeys !== 'object' || Array.isArray(raw.apiKeys)) return {}
+    const out: Record<string, string> = {}
+    for (const [id, value] of Object.entries(raw.apiKeys as Record<string, unknown>)) {
+      const key = typeof value === 'string' ? value.trim() : ''
+      if (id.trim() && key) out[id.trim()] = key
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
 function defaults(): ChatConfig {
-  const envKeys = emptyKeys()
+  const envKeys = { ...emptyKeys(), ...readAdminApiKeys() }
   if (process.env.DEEPSEEK_API_KEY) envKeys.deepseek = process.env.DEEPSEEK_API_KEY
   if (process.env.OPENAI_API_KEY) envKeys.openai = process.env.OPENAI_API_KEY
   if (process.env.ANTHROPIC_API_KEY) envKeys.anthropic = process.env.ANTHROPIC_API_KEY
@@ -301,13 +316,14 @@ function isLocalEndpoint(endpoint: LlmEndpointDef): boolean {
 }
 
 /** 取某个入口的持久化 key；环境变量始终优先（不会被磁盘文件覆盖 UI 清空）。 */
-function keyFor(endpointId: string, saved: Partial<ChatConfig> | null): string {
+function keyFor(endpointId: string, saved: Partial<ChatConfig> | null, adminKeys: Record<string, string>): string {
   const envMap: Record<string, string | undefined> = {
     deepseek: process.env.DEEPSEEK_API_KEY,
     openai: process.env.OPENAI_API_KEY,
     anthropic: process.env.ANTHROPIC_API_KEY,
   }
   if (envMap[endpointId]) return envMap[endpointId]!
+  if (adminKeys[endpointId]?.trim()) return adminKeys[endpointId]!.trim()
   const savedKeys = saved?.apiKeys
   if (savedKeys && typeof savedKeys === 'object' && typeof savedKeys[endpointId] === 'string') {
     const key = savedKeys[endpointId] || ''
@@ -387,7 +403,7 @@ function mergePersisted(base: ChatConfig, saved: Partial<ChatConfig> | null): Ch
   if (!saved) return base
   const customEndpoints = mergeCustomEndpoints(saved)
   const customModels = mergeCustomModels(saved)
-  const apiKeys: Record<string, string> = { ...emptyKeys() }
+  const apiKeys: Record<string, string> = { ...base.apiKeys }
   // 合并所有已知入口的 key
   const allEndpointIds = new Set<string>([
     ...CHAT_PROVIDERS,
@@ -395,7 +411,7 @@ function mergePersisted(base: ChatConfig, saved: Partial<ChatConfig> | null): Ch
     ...customEndpoints.map((e) => e.id),
     ...(saved.apiKeys && typeof saved.apiKeys === 'object' ? Object.keys(saved.apiKeys) : []),
   ])
-  for (const id of allEndpointIds) apiKeys[id] = keyFor(id, saved)
+  for (const id of allEndpointIds) apiKeys[id] = keyFor(id, saved, base.apiKeys)
 
   const baseUrls: Record<string, string> = {}
   if (saved.baseUrls && typeof saved.baseUrls === 'object') {
