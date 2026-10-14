@@ -43,6 +43,9 @@ export class SnapshotService extends Service {
   private value: Snapshot = empty
   private listeners = new Set<() => void>()
   private messageHandlers = new Map<string, Set<(payload: unknown) => void>>()
+  /** 401/403 或租户握手被拒后不再重连，避免官网未登录时轮询 /api/snapshot。 */
+  private authStopped = false
+  private socket: WebSocket | null = null
 
   constructor(ctx: Context) {
     super(ctx, 'snapshot')
@@ -106,18 +109,30 @@ export class SnapshotService extends Service {
   }
 
   private async pull() {
+    if (this.authStopped) return
     try {
       const res = await fetch('/api/snapshot')
+      if (res.status === 401 || res.status === 403) {
+        this.stopForAuth()
+        return
+      }
       if (res.ok) this.replace(await res.json())
     } catch {
       /* 无 host 时控制台为空 */
     }
   }
 
+  private stopForAuth() {
+    this.authStopped = true
+    this.socket?.close()
+    this.socket = null
+  }
+
   private async boot() {
     for (let i = 0; i < 30; i++) {
       try {
         const res = await fetch('/api/snapshot')
+        if (res.status === 401 || res.status === 403) return
         if (res.ok) {
           this.replace(await res.json())
           break
@@ -127,7 +142,7 @@ export class SnapshotService extends Service {
       }
       await new Promise((resolve) => setTimeout(resolve, 100))
     }
-    this.connect()
+    if (!this.authStopped) this.connect()
   }
 
   private connect() {
@@ -137,6 +152,7 @@ export class SnapshotService extends Service {
       const workspaceId = preview ? '' : (sessionStorage.getItem('biu.workspaceId') || localStorage.getItem('biu.workspaceId') || '')
       const query = preview ? '?landingPreview=1' : workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : ''
       const ws = new WebSocket(`${proto}://${location.host}/ws${query}`)
+      this.socket = ws
       ws.onopen = () => {
         void this.pull()
       }
@@ -215,8 +231,15 @@ export class SnapshotService extends Service {
         // 通用总线：把消息转发给外部通过 onMessage 注册的处理器（如 core-task-system 的 tasks/view-switch）
         this.dispatch(parsed.type, parsed.payload)
       }
-      ws.onclose = () => {
+      ws.onclose = (event) => {
+        if (this.socket === ws) this.socket = null
         if (import.meta.env.MODE === 'test') return
+        if (this.authStopped) return
+        // 4401 未登录、4403 不在这个空间：重连只会再打一遍 /api/snapshot。
+        if (event.code === 4401 || event.code === 4403) {
+          this.authStopped = true
+          return
+        }
         setTimeout(() => this.connect(), 1200)
       }
     } catch {
