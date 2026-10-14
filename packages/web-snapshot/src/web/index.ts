@@ -39,6 +39,20 @@ export interface Snapshot {
 
 const empty: Snapshot = { seq: 0, plugins: [], pages: [], routes: [], events: [], services: [] }
 
+function hasAccountToken() {
+  if (typeof localStorage === 'undefined') return true
+  try {
+    return Boolean(localStorage.getItem('biu.account.token'))
+  } catch {
+    return true
+  }
+}
+
+function isLandingPreview() {
+  if (typeof window === 'undefined') return false
+  return new URLSearchParams(window.location.search).get('landingPreview') === '1'
+}
+
 export class SnapshotService extends Service {
   private value: Snapshot = empty
   private listeners = new Set<() => void>()
@@ -46,14 +60,35 @@ export class SnapshotService extends Service {
   /** 401/403 或租户握手被拒后不再重连，避免官网未登录时轮询 /api/snapshot。 */
   private authStopped = false
   private socket: WebSocket | null = null
+  private booted = false
 
   constructor(ctx: Context) {
     super(ctx, 'snapshot')
-    if (typeof window !== 'undefined') {
-      const onAccountChange = () => void this.pull()
-      window.addEventListener('biu:account-token', onAccountChange)
-      ctx.on('dispose', () => window.removeEventListener('biu:account-token', onAccountChange))
+    if (typeof window === 'undefined') {
+      this.start()
+      return
     }
+    const onAccountChange = () => {
+      if (!hasAccountToken() && !isLandingPreview()) {
+        this.stopForAuth()
+        return
+      }
+      if (!this.booted || this.authStopped) {
+        this.start()
+        return
+      }
+      void this.pull()
+    }
+    window.addEventListener('biu:account-token', onAccountChange)
+    this.ctx.effect(() => () => window.removeEventListener('biu:account-token', onAccountChange))
+    // 官网未登录时拉快照会 401。登录、账号切换后由事件重新启动。
+    if (hasAccountToken() || isLandingPreview()) this.start()
+  }
+
+  private start() {
+    if (this.booted) return
+    this.booted = true
+    this.authStopped = false
     void this.boot()
   }
 
@@ -124,6 +159,7 @@ export class SnapshotService extends Service {
 
   private stopForAuth() {
     this.authStopped = true
+    this.booted = false
     this.socket?.close()
     this.socket = null
   }
@@ -132,7 +168,10 @@ export class SnapshotService extends Service {
     for (let i = 0; i < 30; i++) {
       try {
         const res = await fetch('/api/snapshot')
-        if (res.status === 401 || res.status === 403) return
+        if (res.status === 401 || res.status === 403) {
+          this.stopForAuth()
+          return
+        }
         if (res.ok) {
           this.replace(await res.json())
           break
@@ -238,6 +277,7 @@ export class SnapshotService extends Service {
         // 4401 未登录、4403 不在这个空间：重连只会再打一遍 /api/snapshot。
         if (event.code === 4401 || event.code === 4403) {
           this.authStopped = true
+          this.booted = false
           return
         }
         setTimeout(() => this.connect(), 1200)
