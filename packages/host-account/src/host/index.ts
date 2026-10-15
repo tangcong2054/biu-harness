@@ -873,13 +873,13 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
       if (isOperationsRuntime()) throw new CollabError('运营端使用固定 Workspace', 403)
       const me = actor(route)
       const body = (await route.json()) as { name?: string; location?: string }
-      if (isOnlineRuntime() && body.location !== 'cloud') throw new CollabError('云端只能创建云端空间', 400)
+      const name = String(body.name ?? '').trim() || (body.location === 'device' ? '本机空间' : '云端空间')
+      if (isOnlineRuntime()) {
+        const workspace = account.store.createWorkspace(me.id, name)
+        route.send(201, { ...workspace, location: 'cloud' })
+        return
+      }
       if (body.location === 'cloud') {
-        if (isOnlineRuntime()) {
-          const workspace = account.store.createWorkspace(me.id, String(body.name ?? ''))
-          route.send(201, { ...workspace, location: 'cloud' })
-          return
-        }
         const connection = account.cloudConnection(me.id)
         if (!connection) throw new CollabError('请先登录云端账号', 401)
         let response: Response
@@ -887,7 +887,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
           response = await fetch(`${connection.origin}/api/account/workspaces`, {
             method: 'POST',
             headers: { authorization: `Bearer ${connection.token}`, 'content-type': 'application/json' },
-            body: JSON.stringify({ name: body.name }),
+            body: JSON.stringify({ name, location: 'cloud' }),
           })
         } catch {
           throw new CollabError('云端暂时连不上', 503)
@@ -904,7 +904,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
         account.store.upsertPulledWorkspace({
           accountId: me.id,
           id: payload.id,
-          name: String(payload.name ?? body.name ?? ''),
+          name: String(payload.name ?? name),
           ownerId: payload.ownerId,
           role: payload.role || 'owner',
           createdAt: payload.createdAt,
@@ -915,7 +915,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
         route.send(201, { ...payload, location: 'cloud' })
         return
       }
-      const workspace = account.store.createWorkspace(me.id, String(body.name ?? ''))
+      const workspace = account.store.createWorkspace(me.id, name)
       route.send(201, { ...workspace, location: 'device' })
     } catch (error) {
       fail(route, error)
