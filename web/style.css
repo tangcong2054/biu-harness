@@ -9033,24 +9033,9 @@ video.site-demo-shot[controls] { pointer-events: auto; }
   padding: 72px var(--site-gutter) 56px;
   box-sizing: border-box;
 }
-.site-footer-base {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 24px;
-  flex-wrap: wrap;
-}
-/* 底部行两侧字号统一 */
-.site-footer-tagline,
-.site-footer-legal {
-  margin: 0;
-  color: rgba(255, 255, 255, .88);
-  font-size: 13px;
-  line-height: 1.6;
-}
 .site-footer-columns {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 48px;
 }
 .site-footer-columns > div {
@@ -9169,7 +9154,6 @@ html:not(.has-js) .site [data-reveal] {
   .site-final-cta h2 { margin-top: var(--site-label-gap); font-size: clamp(36px, 10vw, 44px); }
   .site-footer { gap: 40px; padding: 48px 20px; }
   .site-footer-columns { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 32px 36px; }
-  .site-footer-base { flex-direction: column; gap: 12px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .site [data-reveal] {
@@ -9781,11 +9765,6 @@ html:not(.dark) .tasks-viewdd-menu .tasks-viewdd-check svg {
   .site .site-blog-item { grid-template-columns: minmax(0, 1fr); gap: 8px; }
   .site-article { padding-top: 96px; }
 }
-
-/* 页脚法务行 */
-.site-footer-legal { font-size: 13px; color: rgba(255, 255, 255, .88); }
-.site-footer-legal a { color: rgba(255, 255, 255, .88); text-decoration: none; }
-.site-footer-legal a:hover { color: #fff; }
 
 .sr-only {
   position: absolute;

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { DownloadIcon, GitHubButton, SiteChrome, SiteFinalCta, type SiteAction } from './site-chrome.tsx'
+import { SiteChrome, type SiteAction } from './site-chrome.tsx'
 import { usePageMeta } from './use-page-meta.ts'
 
 /**
@@ -143,8 +143,7 @@ export function MarketingHome({ onLogin, onStart }: { onLogin: SiteAction; onSta
               把它们放进同一页，就是一套为你的客户准备好的服务。
             </p>
             <div className="site-cta-actions">
-              <Link className="site-cta-primary" to="/download"><DownloadIcon />免费下载</Link>
-              <GitHubButton label="GitHub" />
+              <button type="button" className="site-cta-primary" onClick={onStart}>开始使用</button>
             </div>
             <img
               className="site-hero-shot"
@@ -231,7 +230,6 @@ export function MarketingHome({ onLogin, onStart }: { onLogin: SiteAction; onSta
           </div>
           <p className="site-capabilities-note" data-reveal>
             多数文档工具的块类型是固定的，嵌进来的网页也读不到你的数据。BIU 的块由插件提供，谁都能写，写好就能和页面里的其他块一起工作。
-            <Link to="/compare/vs-notion">看和 Notion 的对比 →</Link>
           </p>
         </section>
 
@@ -293,7 +291,6 @@ export function MarketingHome({ onLogin, onStart }: { onLogin: SiteAction; onSta
           </div>
         </section>
 
-        <SiteFinalCta title={<>开源，免费，<br />现在就能用</>} />
     </SiteChrome>
   )
 }
