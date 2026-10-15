@@ -46,6 +46,11 @@ export class SnapshotService extends Service {
 
   constructor(ctx: Context) {
     super(ctx, 'snapshot')
+    if (typeof window !== 'undefined') {
+      const onAccountChange = () => void this.pull()
+      window.addEventListener('biu:account-token', onAccountChange)
+      ctx.on('dispose', () => window.removeEventListener('biu:account-token', onAccountChange))
+    }
     void this.boot()
   }
 

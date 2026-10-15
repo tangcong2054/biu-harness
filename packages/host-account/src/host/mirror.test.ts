@@ -3,7 +3,7 @@ import { test } from 'vitest'
 import { Context } from 'cordis'
 import { Service } from 'cordis'
 import type { SessionRecord } from '@biu/type-session'
-import { applySnapshot, cloudCopyId, takeSnapshot } from './mirror.ts'
+import { applySnapshot, cloudCopyId, cloudWorkspaceHeaders, forwardCloud, takeSnapshot } from './mirror.ts'
 
 test('cache keeps local sessions and replaces cloud sessions', async () => {
   const ctx = new Context()
@@ -87,3 +87,64 @@ test('cloud copy ids are new and task ids keep the task prefix', () => {
   assert.match(page, /^c[0-9a-f]+$/)
   assert.match(task, /^task_[0-9a-f]+$/)
 })
+
+async function accountCtx(active: string | null, location: 'device' | 'cloud') {
+  const ctx = new Context()
+  class Account extends Service {
+    store = { activeWorkspaceId: () => active }
+    constructor(ctx: Context) {
+      super(ctx, 'account')
+    }
+    workspaceLocation() {
+      return location
+    }
+  }
+  await ctx.plugin(Account)
+  return ctx
+}
+
+test('cloud forwarding carries the active cloud workspace', async () => {
+  assert.deepEqual(cloudWorkspaceHeaders(await accountCtx('ws_cloud', 'cloud')), { 'x-biu-workspace-id': 'ws_cloud' })
+  assert.deepEqual(cloudWorkspaceHeaders(await accountCtx('ws_device', 'device')), {})
+  assert.deepEqual(cloudWorkspaceHeaders(await accountCtx(null, 'cloud')), {})
+  assert.deepEqual(cloudWorkspaceHeaders(new Context()), {})
+})
+
+test('forwardCloud sends the workspace header to the cloud', async () => {
+  const previous = process.env.BIU_REMOTE_ORIGIN
+  const realFetch = globalThis.fetch
+  const seen: Array<Record<string, string>> = []
+  process.env.BIU_REMOTE_ORIGIN = 'http://cloud.test'
+  globalThis.fetch = (async (_url: unknown, init?: { headers?: Record<string, string> }) => {
+    seen.push(init?.headers ?? {})
+    return new Response('{}', { status: 200 })
+  }) as typeof fetch
+  try {
+    const ctx = new Context()
+    class Account extends Service {
+      store = { activeWorkspaceId: () => 'ws_cloud' }
+      constructor(ctx: Context) {
+        super(ctx, 'account')
+      }
+      workspaceLocation() {
+        return 'cloud' as const
+      }
+      isRemote() {
+        return true
+      }
+      linkedCloud() {
+        return { origin: 'http://cloud.test', token: 'tok' }
+      }
+    }
+    await ctx.plugin(Account)
+    const res = await forwardCloud(ctx, '/pages', 'p079', '/api/db/content', { body: { path: '/pages/p079' } })
+    assert.equal(res?.status, 200)
+    assert.equal(seen[0]?.['x-biu-workspace-id'], 'ws_cloud')
+    assert.equal(seen[0]?.authorization, 'Bearer tok')
+  } finally {
+    globalThis.fetch = realFetch
+    if (previous === undefined) delete process.env.BIU_REMOTE_ORIGIN
+    else process.env.BIU_REMOTE_ORIGIN = previous
+  }
+})
+

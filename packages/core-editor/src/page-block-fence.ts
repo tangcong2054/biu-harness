@@ -1,4 +1,5 @@
 import { formatPageBlockFence, parsePageBlockData, parsePageBlockMeta } from './web/page-block-meta.ts'
+import { randomUUID } from './web/random-id.ts'
 
 const FENCE = /^:::pageBlock(?:\s+\{([^}]*)\})?\s*\n([\s\S]*?)\n:::/gm
 
@@ -21,7 +22,7 @@ export type PageBlockAttrsPatch = {
 }
 
 export function createPageBlockId() {
-  return crypto.randomUUID().replace(/-/g, '').slice(0, 8)
+  return randomUUID().replace(/-/g, '').slice(0, 8)
 }
 
 export function isPageBlockId(raw: unknown) {

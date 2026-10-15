@@ -4,6 +4,7 @@
 host 侧用 Node 的 `fetch` **真发** HTTP 请求，把**状态码 / 耗时 / 响应头 / 响应体**画回块里。
 
 - 两个视角：**请求**（headers / body 编辑） ↔ **响应**（状态码、耗时、大小、响应头、响应体，JSON 自动美化）。
+- 响应区小工具（v3 新增）：**格式化 / 原始** 一键切换；**复制 body**、**复制 curl**（把当前请求导成可直接贴进终端的 curl 命令）。
 - **请求历史（最近 20 条）写进块数据 `data.history`**，跟着文档走——不是跟着浏览器走，也能被 agent 读。
 - 安全边界：只放行 `http:` / `https:`；**15s 超时**；响应体超过 **200 KB 截断**并在块里标出「已截断」。
 - 无头插件（`headless: true`）。host 侧只注册一条路由：`POST /api/api-playground/send`。
@@ -50,6 +51,21 @@ curl http://127.0.0.1:3141/api/api-playground/health
 
 出错也返回 200，`ok:false` + `error`（前端好统一渲染）：
 `只允许 http/https，收到 file:`、`URL 解析失败：…`、`请求超时（15000ms）`、`fetch failed`。
+
+## Agent 可调动作（uiActions）
+
+块挂载后会向宿主登记 `api-request` 实例，动作如下（`plugin=api-playground`）：
+
+| 动作 | risk | 说明 |
+|---|---|---|
+| `set_request` | write | 设置 `method` / `url` / `body`（鉴权 Header 请人手动填） |
+| `send` | submit | 发送当前请求 |
+| `read_response` | read | 读最近一次响应（含 `ok` / `status` / `ms` / `bytes` / `body`） |
+| `set_format` | write | 响应体展示：`formatted`（美化 JSON）或 `raw`（原始文本） |
+| `as_curl` | read | 导出当前请求对应的 curl 命令，不发送 |
+| `clear_history` | destructive | 清空请求历史 |
+
+`state()` 会一并报出 `method` / `url` / `sending` / `format` / `response`。
 
 ## 踩过的坑
 

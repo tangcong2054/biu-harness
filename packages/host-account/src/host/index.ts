@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs'
 import { Service, type Context } from 'cordis'
-import { biuSqlitePath, currentAccountId, eventsSqlitePath, isOnlineRuntime, openAndMigrateBiu, openSqlite } from '@biu/host-plugin-loader/data-dir'
+import { biuSqlitePath, currentAccountId, eventsSqlitePath, isOnlineRuntime, isOperationsRuntime, openAndMigrateBiu, openSqlite } from '@biu/host-plugin-loader/data-dir'
 import type { RouteContext } from '@biu/type-http'
 import { CollabError, CollabStore } from './store.ts'
 import { httpRemote, RecordReplica } from './replica.ts'
@@ -39,6 +39,14 @@ export class AccountService extends Service {
     const db = openAndMigrateBiu(config.sqlitePath ?? biuSqlitePath())
     this.db = db
     this.store = new CollabStore(db)
+    if ((isOnlineRuntime() && !process.env.VITEST) || isOperationsRuntime()) {
+      this.store.bootstrapOperations({
+        email: process.env.BIU_OPERATIONS_ADMIN_EMAIL || 'admin',
+        password: process.env.BIU_OPERATIONS_ADMIN_PASSWORD || (isOperationsRuntime() ? undefined : '97ortanon'),
+        name: process.env.BIU_OPERATIONS_ADMIN_NAME || '平台管理员',
+        workspaceName: process.env.BIU_OPERATIONS_WORKSPACE_NAME || 'Biu 平台运营',
+      })
+    }
     this.authorization = this.store.authorization
     db.exec(`CREATE TABLE IF NOT EXISTS record_place (
       collection TEXT NOT NULL,
@@ -403,6 +411,9 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
     const token = bearer(route)
     const found = token ? account.store.accountByToken(token) : null
     if (!found) throw new CollabError('需要登录', 401)
+    if (isOperationsRuntime() && !account.store.isOperationsOperator(found.id)) {
+      throw new CollabError('没有平台运营权限', 403)
+    }
     rememberLogin(route, token)
     return found
   }
@@ -621,6 +632,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/register', async (route) => {
     try {
+      if (isOperationsRuntime()) throw new CollabError('运营端不开放自助注册', 403)
       const body = (await route.json()) as { email?: string; password?: string }
       const password = String(body.password ?? '')
       const email = String(body.email ?? '')
@@ -645,6 +657,10 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
         String(body.password ?? ''),
         String(route.req.headers['user-agent'] ?? '浏览器'),
       )
+      if (isOperationsRuntime() && !account.store.isOperationsOperator(found.id)) {
+        account.store.revokeSession(found.token)
+        throw new CollabError('没有平台运营权限', 403)
+      }
       const workspaceId = account.store.enter(found.id)
       rememberLogin(route, found.token)
       ctx.http.broadcast('database', { ts: Date.now() })
@@ -760,7 +776,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
   ctx.http.route('GET', '/api/account/me', async (route) => {
     try {
       const me = actor(route)
-      route.send(200, { ...me, online: isOnlineRuntime() })
+      route.send(200, { ...me, online: isOnlineRuntime(), operations: isOperationsRuntime() })
     } catch (error) {
       fail(route, error)
     }
@@ -854,6 +870,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/workspaces', async (route) => {
     try {
+      if (isOperationsRuntime()) throw new CollabError('运营端使用固定 Workspace', 403)
       const me = actor(route)
       const body = (await route.json()) as { name?: string; location?: string }
       if (isOnlineRuntime() && body.location !== 'cloud') throw new CollabError('云端只能创建云端空间', 400)
@@ -963,6 +980,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('DELETE', '/api/account/workspaces/:id', async (route) => {
     try {
+      if (isOperationsRuntime() || route.params.id === 'ws_operations') throw new CollabError('不能删除运营 Workspace', 403)
       const me = actor(route)
       const body = (await route.json().catch(() => ({}))) as { name?: string }
       const confirmName = String(body.name ?? '')

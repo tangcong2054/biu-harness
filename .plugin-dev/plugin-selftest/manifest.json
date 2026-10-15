@@ -1,0 +1,20 @@
+{
+  "id": "plugin-selftest",
+  "name": "运行时自检卡片",
+  "blurb": "有窗口的最小测试插件：点「跑一遍自检」在浏览器里跑一组运行时检查（React 运行时、JS 基础运算、crypto.randomUUID、fetch、存储、窗口尺寸与 DPR），逐条显示 通过/失败 和耗时，用来验证 sandbox → pack → 窗口渲染这条链路是否正常。",
+  "tags": [
+    "demo",
+    "tool",
+    "test"
+  ],
+  "author": "用户",
+  "authorUrl": "",
+  "createdAt": 1791964697029,
+  "shell": {
+    "width": 420,
+    "height": 340,
+    "minWidth": 300,
+    "minHeight": 220,
+    "resizable": true
+  }
+}

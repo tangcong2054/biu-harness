@@ -4,7 +4,7 @@ import { createRequire } from 'node:module'
 import { mkdirSync, writeFileSync, readFileSync, existsSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DATA_DIR_NAME, LEGACY_DATA_DIR_NAME, LEGACY_PAGE_ROOT, PAGE_DB, PAGE_ROOT, adoptPackedUserData, biuSqlitePath, dataDir, dataHome, dataPath, isDesktopRuntime, isOnlineRuntime, migrateDataDir, migrateLegacyPageDir, profilePath, runWithWorkspace } from './data-dir.ts'
+import { DATA_DIR_NAME, LEGACY_DATA_DIR_NAME, LEGACY_PAGE_ROOT, PAGE_DB, PAGE_ROOT, adoptPackedUserData, biuSqlitePath, dataDir, dataHome, dataPath, isDesktopRuntime, isOnlineRuntime, isOperationsRuntime, migrateDataDir, migrateLegacyPageDir, profilePath, runWithWorkspace } from './data-dir.ts'
 import { adoptCasAssets } from './adopt-cas-assets.ts'
 import { hashedAssetName, hashedAssetRel } from './asset-cas.ts'
 
@@ -19,16 +19,23 @@ function writeLegacyDb(path: string, value: string) {
 
 test('runtime mode helpers read BIU_ONLINE lazily', () => {
   const previous = process.env.BIU_ONLINE
+  const previousOperations = process.env.BIU_OPERATIONS
   try {
     process.env.BIU_ONLINE = '1'
     assert.equal(isOnlineRuntime(), true)
     assert.equal(isDesktopRuntime(), false)
+    process.env.BIU_OPERATIONS = '1'
+    assert.equal(isOperationsRuntime(), true)
     process.env.BIU_ONLINE = '0'
+    process.env.BIU_OPERATIONS = '0'
     assert.equal(isOnlineRuntime(), false)
     assert.equal(isDesktopRuntime(), true)
+    assert.equal(isOperationsRuntime(), false)
   } finally {
     if (previous === undefined) delete process.env.BIU_ONLINE
     else process.env.BIU_ONLINE = previous
+    if (previousOperations === undefined) delete process.env.BIU_OPERATIONS
+    else process.env.BIU_OPERATIONS = previousOperations
   }
 })
 

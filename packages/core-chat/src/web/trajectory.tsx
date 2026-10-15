@@ -596,6 +596,8 @@ function detailFields(
   }
   if (event.type === 'assistant/message') {
     const rows = [{ label: 'text', value: `${event.text.length} chars` }]
+    if (event.requestId) rows.push({ label: 'request_id', value: event.requestId })
+    if (event.responseId) rows.push({ label: 'response_id', value: event.responseId })
     if (event.tool_calls?.length) rows.push({ label: 'tool_calls', value: String(event.tool_calls.length) })
     if (request) rows.push({ label: 'request', value: `${request.length} messages (derived)` })
     return rows

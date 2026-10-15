@@ -1,11 +1,11 @@
-import type { Plugin } from 'cordis'
-import { Context } from 'cordis'
+import { Context, Service, type Plugin } from 'cordis'
 import * as React from 'react'
 import * as ReactDOM from 'react-dom'
 import { createRoot, hydrateRoot } from 'react-dom/client'
 import { flushSync } from 'react-dom'
 import * as ReactJSXRuntime from 'react/jsx-runtime'
 import { PageEditorService } from '@biu/core-editor/web'
+import { PickService } from '@biu/core-pick/web'
 import { installShareCollectionChrome } from './share-chrome.ts'
 
 let shareCtx: Context | null = null
@@ -40,9 +40,22 @@ export function shareWebPluginOf(loaded: unknown): Plugin | undefined {
   return loaded as Plugin
 }
 
+const SHARE_PLUGIN_INJECT = new Set(['pageEditor', 'databaseUi', 'pick', 'uiActions'])
+
 export function sharePluginInjectOk(inject: unknown) {
   const list = Array.isArray(inject) ? inject.map((item) => String(item)) : []
-  return list.every((item) => item === 'pageEditor' || item === 'databaseUi')
+  return list.every((item) => SHARE_PLUGIN_INJECT.has(item))
+}
+
+/** 分享页不连工作台的 UI Actions 通道，只提供插件注册需要的空实现。 */
+class ShareUiActions extends Service {
+  constructor(ctx: Context) {
+    super(ctx, 'uiActions')
+  }
+
+  register() {
+    return () => {}
+  }
 }
 
 function installShareReactGlobals() {
@@ -61,6 +74,8 @@ export function bootShareRuntime() {
   installShareReactGlobals()
   shareCtx = new Context()
   new PageEditorService(shareCtx)
+  new PickService(shareCtx)
+  new ShareUiActions(shareCtx)
   installShareCollectionChrome(shareCtx)
   return shareCtx
 }

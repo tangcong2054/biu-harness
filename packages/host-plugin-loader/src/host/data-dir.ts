@@ -50,6 +50,7 @@ export const PAGE_DB = `${DATA_DIR_NAME}/biu.sqlite`
 
 /** Runtime mode is read lazily so tests and embedded hosts can set it before boot. */
 export const isOnlineRuntime = () => process.env.BIU_ONLINE === '1'
+export const isOperationsRuntime = () => process.env.BIU_OPERATIONS === '1'
 export const isDesktopRuntime = () => !isOnlineRuntime()
 
 /** Leftover page-only folder; new files go under `.biu/assets`. */

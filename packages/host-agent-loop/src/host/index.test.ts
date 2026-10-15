@@ -56,6 +56,50 @@ test('loop appends multiple assistant/chunk deltas from onDelta', async () => {
   assert.equal(message?.type === 'assistant/message' && message.usage?.inputTokens, 1)
 })
 
+test('loop records provider request ids on every assistant/message step', async () => {
+  const { ctx, sessionId } = await spine()
+  ctx.tools.register({
+    name: 'noop',
+    description: 'noop',
+    parameters: { type: 'object', properties: {} },
+    execute: () => 'ok',
+  })
+  const llm = new ScriptedLlm([
+    {
+      content: null,
+      toolCalls: [{ id: 'c1', name: 'noop', arguments: '{}' }],
+      requestId: 'req-step-0',
+      responseId: 'chatcmpl-0',
+    },
+    { content: 'done', toolCalls: [], requestId: 'req-step-1' },
+  ])
+  const loop = new AgentLoop(ctx, llm, sessionId, new AbortController().signal)
+  await loop.run([{ kind: 'wake', text: 'hi' }])
+  const messages = (await ctx.sessions.require(sessionId)).events.filter((event) => event.type === 'assistant/message')
+  assert.deepEqual(
+    messages.map((event) =>
+      event.type === 'assistant/message' ? [event.requestId ?? null, event.responseId ?? null] : null,
+    ),
+    [
+      ['req-step-0', 'chatcmpl-0'],
+      ['req-step-1', null],
+    ],
+  )
+})
+
+test('loop keeps the provider request id when the model call fails', async () => {
+  const { ctx, sessionId } = await spine()
+  const llm: LlmClient = {
+    async chat() {
+      throw Object.assign(new Error('llm http 500 (request_id=req-fail)'), { requestId: 'req-fail' })
+    },
+  }
+  const loop = new AgentLoop(ctx, llm, sessionId, new AbortController().signal)
+  await loop.run([{ kind: 'wake', text: 'hi' }])
+  const message = (await ctx.sessions.require(sessionId)).events.find((event) => event.type === 'assistant/message')
+  assert.equal(message?.type === 'assistant/message' && message.requestId, 'req-fail')
+})
+
 test('loop automatically compacts semantic history before the normal model request', async () => {
   const { ctx, sessionId } = await spine()
   await ctx.sessions.append(sessionId, { type: 'turn/start', turn: 1 })

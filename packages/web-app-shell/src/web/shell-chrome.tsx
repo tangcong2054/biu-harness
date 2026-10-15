@@ -29,7 +29,8 @@ import { persistWorkspaceProfile, useWorkspaceProfile } from '@biu/public-ui'
 import { LayoutPrefsMenu } from '@biu/core-file-system/layout-prefs-menu'
 import { getPagePrefs, hydratePagePrefs, subscribePageWidth } from '@biu/core-file-system/page-width'
 
-import { MarketingHome } from './marketing-home.tsx'
+import { MarketingSite } from './marketing-site/index.tsx'
+import { BrandPrint, useBrandConfig } from './marketing-site/brand-mark.tsx'
 import { clearWorkspaceId, readWorkspaceId, writeWorkspaceId } from './tenant-fetch.ts'
 
 function isLandingPreview() {
@@ -430,6 +431,8 @@ export function ShellSettingsAccount() {
 }
 
 const ACCOUNT_KEY = 'biu.account.token'
+/** 校验失败后的重试间隔（ms）：退避三次，覆盖 dev server 重启的窗口。 */
+const VERIFY_RETRY_DELAYS = [400, 1200, 3000] as const
 const ACCOUNT_EVENT = 'biu:account-token'
 
 function bridgeLegacyAccountCookie() {
@@ -461,11 +464,19 @@ export function writeAccountToken(next: string) {
 function readAuthRoute(): 'login' | 'register' | null {
   if (typeof window === 'undefined') return null
   if (window.location.pathname === '/login') return 'login'
-  if (window.location.pathname === '/register') return 'register'
+  if (window.location.pathname === '/register' || window.location.pathname === '/signup') return 'register'
   return null
 }
 
+function setBrowserPath(path: string, mode: 'push' | 'replace' = 'push') {
+  if (typeof window === 'undefined' || window.location.pathname === path) return
+  if (mode === 'replace') window.history.replaceState({}, '', path)
+  else window.history.pushState({}, '', path)
+  window.dispatchEvent(new PopStateEvent('popstate'))
+}
+
 export function AuthGate({ children }: { children: ReactNode }) {
+  const brand = useBrandConfig()
   const initialRoute = readAuthRoute()
   const [token, setToken] = useState(readAccountToken)
   const [verified, setVerified] = useState(false)
@@ -494,10 +505,8 @@ export function AuthGate({ children }: { children: ReactNode }) {
     const sync = () => {
       const next = readAuthRoute()
       setAuthRoute(next)
-      if (next) {
-        setMode(next)
-        setAuthOpen(true)
-      }
+      setAuthOpen(Boolean(next))
+      if (next) setMode(next)
     }
     window.addEventListener('popstate', sync)
     return () => window.removeEventListener('popstate', sync)
@@ -508,17 +517,13 @@ export function AuthGate({ children }: { children: ReactNode }) {
     setAuthOpen(true)
     setAuthRoute(next)
     const path = next === 'register' ? '/register' : '/login'
-    if (typeof window !== 'undefined' && window.location.pathname !== path) {
-      window.history.pushState({}, '', path)
-    }
+    setBrowserPath(path)
   }
 
   function leaveAuth() {
     setAuthOpen(false)
     setAuthRoute(null)
-    if (typeof window !== 'undefined' && (window.location.pathname === '/login' || window.location.pathname === '/register')) {
-      window.history.pushState({}, '', '/')
-    }
+    setBrowserPath('/')
   }
 
   useEffect(() => {
@@ -527,26 +532,46 @@ export function AuthGate({ children }: { children: ReactNode }) {
       return
     }
     let live = true
+    let timer: ReturnType<typeof setTimeout> | undefined
     setVerified(false)
     const confirm = () => accountFetch(token, '/api/account/me')
-    void confirm()
-      .catch(async (err) => {
-        if (err instanceof Error && err.message === '不在这个空间') {
-          clearWorkspaceId()
-          return confirm()
-        }
-        throw err
-      })
-      .then(() => {
-        if (live) setVerified(true)
-      })
-      .catch((err) => {
-        if (!live) return
-        writeAccountToken('')
-        setError(err instanceof Error ? err.message : '登录已失效')
-      })
+
+    // 网络类失败（dev server 重启、断网、5xx）退避重试。
+    // 凭证失效（401/403）不重试 —— 重试也没用，直接清 token。
+    const attempt = (round: number) => {
+      void confirm()
+        .catch(async (err) => {
+          if (err instanceof Error && err.message === '不在这个空间') {
+            clearWorkspaceId()
+            return confirm()
+          }
+          throw err
+        })
+        .then(() => {
+          if (live) setVerified(true)
+        })
+        .catch((err) => {
+          if (!live) return
+          if (isAuthFailure(err)) {
+            // 凭证真的失效，才清 token。
+            writeAccountToken('')
+            setError(err instanceof Error ? err.message : '登录已失效')
+            return
+          }
+          // 非凭证问题：保留 token，退避后重试，不踢出登录态。
+          if (round < VERIFY_RETRY_DELAYS.length) {
+            setError('网络异常，正在重试')
+            timer = setTimeout(() => attempt(round + 1), VERIFY_RETRY_DELAYS[round])
+            return
+          }
+          setError('网络异常，未能确认登录状态')
+        })
+    }
+    attempt(0)
+
     return () => {
       live = false
+      if (timer) clearTimeout(timer)
     }
   }, [token])
 
@@ -573,19 +598,52 @@ export function AuthGate({ children }: { children: ReactNode }) {
     }
   }, [token, verified, workspaceInvite])
 
+  useEffect(() => {
+    if (!token || !verified) return
+    if (window.location.pathname !== '/login' && window.location.pathname !== '/register') return
+    setBrowserPath('/', 'replace')
+    setAuthRoute(null)
+    setAuthOpen(false)
+  }, [token, verified])
+
   if (isLandingPreview()) return children
   if (token && verified && !joining) return children
-  if (!token && !authOpen && !authRoute && !guestInvite && !workspaceInvite) {
+  if (!token && !guestInvite) {
     return (
-      <MarketingHome
+      <MarketingSite
         onLogin={() => goAuth('login')}
         onStart={() => goAuth('register')}
+        auth={{
+          mode,
+          onModeChange: (next) => {
+            setMode(next)
+            setAuthOpen(true)
+            setAuthRoute(next)
+            setBrowserPath(next === 'register' ? '/register' : '/login')
+          },
+          workspaceInvite: Boolean(workspaceInvite),
+          onSubmit: async ({ email, password: secret }) => {
+            const path = mode === 'register' ? '/api/account/register' : '/api/account/login'
+            const body = await accountFetch('', path, {
+              method: 'POST',
+              body: JSON.stringify({ email, password: secret }),
+            })
+            clearWorkspaceId()
+            if (body.workspaceId) writeWorkspaceId(String(body.workspaceId))
+            writeAccountToken(String(body.token ?? ''))
+            setPassword('')
+            setError('')
+          },
+        }}
       />
     )
   }
   if (token) {
     return (
       <div className="auth-gate" data-testid="auth-verifying">
+        <div className="site-print" aria-hidden>
+          <BrandPrint config={brand} />
+        </div>
         <p className="auth-status">正在验证登录状态</p>
       </div>
     )
@@ -593,6 +651,9 @@ export function AuthGate({ children }: { children: ReactNode }) {
 
   return (
     <div className="auth-gate" data-testid="auth-gate">
+      <div className="site-print" aria-hidden>
+        <BrandPrint config={brand} />
+      </div>
       {guestInvite ? (
         <form
           className="auth-panel"
@@ -650,7 +711,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
                 setPassword('')
                 setError('')
                 if (window.location.pathname === '/login' || window.location.pathname === '/register') {
-                  window.history.replaceState({}, '', '/')
+                  setBrowserPath('/', 'replace')
                   setAuthRoute(null)
                 }
               })
@@ -731,6 +792,15 @@ export function defaultSessionPath(sessions: Array<{ id?: string; updatedAt?: nu
   return best ? `/s/${encodeURIComponent(best.id)}` : '/'
 }
 
+/** 带 HTTP 状态码的请求错误，用于区分「凭证失效」和「网络/服务故障」。 */
+export type AccountFetchError = Error & { status?: number }
+
+/** 只有这两个状态码才算凭证真的失效，此时才应该清 token。 */
+export function isAuthFailure(err: unknown): boolean {
+  const status = (err as AccountFetchError | null)?.status
+  return status === 401 || status === 403
+}
+
 async function accountFetch(token: string, path: string, init?: RequestInit) {
   const res = await fetch(path, {
     ...init,
@@ -741,7 +811,12 @@ async function accountFetch(token: string, path: string, init?: RequestInit) {
     },
   })
   const body = (await res.json().catch(() => ({}))) as { error?: string }
-  if (!res.ok) throw new Error(body.error || '请求失败')
+  if (!res.ok) {
+    // message 保持原样（调用方按文案判断），另附 status 供上层区分。
+    const err = new Error(body.error || '请求失败') as AccountFetchError
+    err.status = res.status
+    throw err
+  }
   return body as Record<string, unknown>
 }
 

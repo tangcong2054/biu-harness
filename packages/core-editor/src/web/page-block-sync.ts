@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef } from 'react'
+import { randomUUID } from './random-id.ts'
 
 type SyncMessage =
   | { type: 'request'; source: string }
@@ -13,7 +14,7 @@ export function usePageBlockSync(
   data: Record<string, unknown>,
   onRemote: (data: Record<string, unknown>) => void,
 ) {
-  const sourceRef = useRef(crypto.randomUUID())
+  const sourceRef = useRef(randomUUID())
   const channelRef = useRef<BroadcastChannel | null>(null)
   const dataRef = useRef(data)
   const remoteRef = useRef(onRemote)

@@ -30,6 +30,10 @@ export type SessionEvent = {
         /** 该次 llm.chat 输入中「历史 turn」占比（0~1）；后端 agent-loop 在 derive 时挂载。 */
         histPct?: number
       }
+      /** 本步模型调用的供应商请求 id。 */
+      requestId?: string
+      /** 供应商回复 id，拿不到 requestId 时兜底展示。 */
+      responseId?: string
     }
   | { type: 'assistant/chunk'; text: string; channel?: 'reasoning' }
   | { type: 'tool/call'; id: string; name: string; arguments: string }
@@ -99,6 +103,13 @@ export type ChatStepStat = {
   histPct?: number
   /** 该 step 耗时（ms）：由 step/start → step/end（或回合结束）的日志 ts 差值估算。 */
   durationMs?: number
+  /** 该 step 模型调用的供应商请求 id（无则用回复 id 兜底）。 */
+  requestId?: string
+}
+
+/** 展示用的请求 id：优先供应商 request id，其次回复 id。 */
+export function eventRequestId(event: { requestId?: string; responseId?: string }): string | undefined {
+  return event.requestId || event.responseId || undefined
 }
 
 export type ChatNode =
@@ -428,7 +439,10 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
       const r = ensureReply(event.seq)
       if (event.usage) addUsage(event.usage)
       if (currentStep != null) {
-        ensureStepStat(currentStep).messageChars += event.text?.length ?? 0
+        const stat = ensureStepStat(currentStep)
+        stat.messageChars += event.text?.length ?? 0
+        const requestId = eventRequestId(event)
+        if (requestId) stat.requestId = requestId
       }
       if (r.streamingId) {
         const idx = r.parts.findIndex((part) => part.id === r.streamingId)

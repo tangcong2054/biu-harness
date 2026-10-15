@@ -94,6 +94,8 @@ export function ChatConfig(props?: { onClose?: () => void }) {
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testHint, setTestHint] = useState('')
+  const [probedModels, setProbedModels] = useState<string[]>([])
+  const [syncingModels, setSyncingModels] = useState(false)
 
   const [adding, setAdding] = useState(false)
   const [presetId, setPresetId] = useState('')
@@ -265,6 +267,7 @@ export function ChatConfig(props?: { onClose?: () => void }) {
     setError('')
     setStatus('')
     setTestHint('')
+    setProbedModels([])
     setKeyDraft('')
     setNewModelName('')
     const ep = endpoints.find((e) => e.id === id)
@@ -364,6 +367,7 @@ export function ChatConfig(props?: { onClose?: () => void }) {
     if (!active || testing) return
     setTesting(true)
     setTestHint('')
+    setProbedModels([])
     setError('')
     try {
       const res = await fetch('/api/chat/config/test', {
@@ -381,6 +385,7 @@ export function ChatConfig(props?: { onClose?: () => void }) {
         ok?: boolean
         detail?: string
         latencyMs?: number
+        models?: string[]
         config?: ChatPublicConfig
       }
       // 失败：服务端拉黑入口（绿点变灰、下拉不可选）；成功：解除拉黑并可写入草稿 Key
@@ -388,15 +393,48 @@ export function ChatConfig(props?: { onClose?: () => void }) {
       if (data.ok) {
         setKeyDraft('')
         setTestHint(data.detail || '连接成功')
+        setProbedModels(
+          Array.isArray(data.models) ? data.models.map((id) => String(id).trim()).filter(Boolean) : [],
+        )
         setStatus('连接正常')
       } else {
         setTestHint('')
+        setProbedModels([])
         setError(data.detail || `连接失败（HTTP ${res.status}）· 已从可选模型中移除`)
       }
     } catch (err) {
       setError(String(err))
     } finally {
       setTesting(false)
+    }
+  }
+
+  const probedModelSet = useMemo(() => new Set(probedModels), [probedModels])
+  const modelListMatchesProbe =
+    probedModels.length > 0 &&
+    activeModels.length === probedModels.length &&
+    activeModels.every((model) => probedModelSet.has(model.model))
+
+  async function onReplaceModels() {
+    if (!active || !probedModels.length || syncingModels) return
+    setSyncingModels(true)
+    setError('')
+    try {
+      const res = await fetch('/api/chat/config', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replaceModels: { endpointId: activeId, models: probedModels } }),
+      })
+      if (!res.ok) {
+        setError(`替换模型列表失败：HTTP ${res.status}`)
+        return
+      }
+      applyPublic((await res.json()) as ChatPublicConfig, activeId)
+      setStatus(`已替换为上游 ${probedModels.length} 个模型`)
+    } catch (err) {
+      setError(String(err))
+    } finally {
+      setSyncingModels(false)
     }
   }
 
@@ -991,7 +1029,19 @@ export function ChatConfig(props?: { onClose?: () => void }) {
                     onChange={(e) => setKeyDraft(e.target.value)}
                   />
                   {testHint ? (
-                    <span className="text-[11px] text-(--dsw-ok)">{testHint}</span>
+                    <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-(--dsw-ok)">
+                      <span>{testHint}</span>
+                      {probedModels.length && !modelListMatchesProbe ? (
+                        <button
+                          type="button"
+                          className="font-medium underline decoration-(--dsw-ok)/40 underline-offset-2 hover:opacity-80 disabled:opacity-50"
+                          disabled={syncingModels}
+                          onClick={() => void onReplaceModels()}
+                        >
+                          {syncingModels ? '替换中…' : '替换下面的模型列表'}
+                        </button>
+                      ) : null}
+                    </span>
                   ) : null}
                 </label> : (
                   <div className="rounded-lg border border-(--dsw-border) bg-(--dsw-hover) px-3 py-2.5 text-[11px] leading-5 text-(--dsw-label-3)">

@@ -108,6 +108,11 @@ interface ChatConfig {
   /** 用户在某入口下追加的模型名。 */
   customModels: LlmModelDef[]
   /**
+   * 这些入口的模型列表以 customModels 为准，不再并入内置目录。
+   * 测试连接后「替换下面的模型列表」会写入。
+   */
+  syncedModelEndpoints: string[]
+  /**
    * 探测失败 / 用户主动断开的入口：强制视为未配置，
    * 避免坏 Key（含环境变量）仍显示绿点并出现在模型下拉。
    */
@@ -171,6 +176,7 @@ function defaults(): ChatConfig {
     baseUrls: {},
     customEndpoints: [],
     customModels: [],
+    syncedModelEndpoints: [],
     blockedEndpoints: [],
     model:
       process.env.CHAT_MODEL ||
@@ -229,6 +235,7 @@ export function persistedChatConfig(config: ChatConfig, online = isOnlineRuntime
     baseUrls: config.baseUrls,
     customEndpoints: config.customEndpoints,
     customModels: config.customModels,
+    syncedModelEndpoints: config.syncedModelEndpoints ?? [],
     blockedEndpoints: config.blockedEndpoints,
   }
 }
@@ -437,6 +444,9 @@ function mergePersisted(base: ChatConfig, saved: Partial<ChatConfig> | null): Ch
     baseUrls,
     customEndpoints,
     customModels,
+    syncedModelEndpoints: Array.isArray(saved.syncedModelEndpoints)
+      ? [...new Set(saved.syncedModelEndpoints.map((id) => String(id).trim()).filter(Boolean))]
+      : [],
     blockedEndpoints: Array.isArray(saved.blockedEndpoints)
       ? [...new Set(saved.blockedEndpoints.map((id) => String(id).trim()).filter(Boolean))]
       : [],
@@ -465,11 +475,20 @@ function allEndpoints(config: ChatConfig): LlmEndpointDef[] {
 }
 
 function allModels(config: ChatConfig): LlmModelDef[] {
+  const synced = new Set(config.syncedModelEndpoints ?? [])
   const customIds = new Set(config.customModels.map((m) => m.id))
   return [
-    ...LLM_MODEL_CATALOG.filter((m) => !customIds.has(m.id)),
+    ...LLM_MODEL_CATALOG.filter((m) => !synced.has(m.endpointId) && !customIds.has(m.id)),
     ...config.customModels,
   ]
+}
+
+function customModelId(endpointId: string, model: string) {
+  return `custom-model-${endpointId}-${model}`.replace(/[^a-zA-Z0-9._:-]+/g, '-')
+}
+
+function markModelListSynced(config: ChatConfig, endpointId: string) {
+  if (!config.syncedModelEndpoints.includes(endpointId)) config.syncedModelEndpoints.push(endpointId)
 }
 
 function resolveEndpoint(config: ChatConfig, endpointId: string): LlmEndpointDef | undefined {
@@ -814,6 +833,8 @@ export class ChatService extends Service {
       addEndpoint: { id?: string; label: string; baseUrl: string; protocol?: 'openai-compat' | 'anthropic'; provider?: ChatProvider; note?: string }
       /** 追加模型到某入口 */
       addModel: { endpointId: string; model: string; label?: string; note?: string }
+      /** 用上游 GET /models 的结果替换该入口的模型列表 */
+      replaceModels: { endpointId: string; models: string[] }
       removeCustomEndpoint: string
       removeCustomModel: string
     }>,
@@ -937,7 +958,7 @@ export class ChatService extends Service {
       if (endpointId && model) {
         const ep = resolveEndpoint(this.config, endpointId)
         const provider = ep?.provider ?? 'openai'
-        const id = `custom-model-${endpointId}-${model}`.replace(/[^a-zA-Z0-9._:-]+/g, '-')
+        const id = customModelId(endpointId, model)
         const def: LlmModelDef = {
           id,
           label: (next.addModel.label ?? model).trim() || model,
@@ -956,10 +977,46 @@ export class ChatService extends Service {
         this.config.model = model
       }
     }
+    if (next.replaceModels && typeof next.replaceModels === 'object') {
+      const endpointId = String(next.replaceModels.endpointId ?? '').trim()
+      const names = [...new Set(
+        (Array.isArray(next.replaceModels.models) ? next.replaceModels.models : [])
+          .map((name) => String(name).trim())
+          .filter((name) => name.length > 0 && name.length <= 200),
+      )].slice(0, 500)
+      const ep = endpointId ? resolveEndpoint(this.config, endpointId) : undefined
+      if (ep && names.length) {
+        const provider = ep.provider
+        const kept = this.config.customModels.filter((m) => m.endpointId !== endpointId)
+        const seenIds = new Set<string>()
+        const defs: LlmModelDef[] = []
+        for (const model of names) {
+          const id = customModelId(endpointId, model)
+          if (seenIds.has(id)) continue
+          seenIds.add(id)
+          defs.push({
+            id,
+            label: model,
+            endpointId,
+            provider,
+            model,
+            category: 'custom',
+            builtin: false,
+          })
+        }
+        this.config.customModels = [...kept, ...defs]
+        markModelListSynced(this.config, endpointId)
+        if (this.config.endpointId === endpointId && !names.includes(this.config.model)) {
+          this.config.model = names[0]!
+          this.config.provider = provider
+        }
+      }
+    }
     if (typeof next.removeCustomEndpoint === 'string' && next.removeCustomEndpoint.trim()) {
       const id = next.removeCustomEndpoint.trim()
       this.config.customEndpoints = this.config.customEndpoints.filter((e) => e.id !== id)
       this.config.customModels = this.config.customModels.filter((m) => m.endpointId !== id)
+      this.config.syncedModelEndpoints = this.config.syncedModelEndpoints.filter((item) => item !== id)
       delete this.config.apiKeys[id]
       delete this.config.baseUrls[id]
       unblockEndpoint(this.config, id)
@@ -1335,6 +1392,7 @@ export function apply(ctx: Context) {
       setBaseUrl: Partial<Record<string, string | null>>
       addEndpoint: { id?: string; label: string; baseUrl: string; protocol?: 'openai-compat' | 'anthropic'; provider?: ChatProvider; note?: string }
       addModel: { endpointId: string; model: string; label?: string; note?: string }
+      replaceModels: { endpointId: string; models: string[] }
       removeCustomEndpoint: string
       removeCustomModel: string
     }>

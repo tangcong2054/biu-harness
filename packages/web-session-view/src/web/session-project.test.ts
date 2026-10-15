@@ -335,6 +335,34 @@ test('reply projects per-step token/tool/message stats', () => {
   assert.equal(reply.parts.at(-1)?.step, 1)
 })
 
+test('reply steps carry the provider request id, falling back to the response id', () => {
+  const nodes = projectNodes([
+    { type: 'turn/start', turn: 1, seq: 1, ts: 1000 },
+    { type: 'user/message', text: 'hi', kind: 'wake', seq: 2, ts: 1100 },
+    { type: 'step/start', turn: 1, step: 0, seq: 3, ts: 1200 },
+    {
+      type: 'assistant/message',
+      text: '',
+      tool_calls: [{ id: 'c1', name: 'bash', arguments: '{}' }],
+      requestId: 'req-0',
+      responseId: 'chatcmpl-0',
+      seq: 4,
+      ts: 1300,
+    },
+    { type: 'step/end', turn: 1, step: 0, seq: 5, ts: 1400 },
+    { type: 'step/start', turn: 1, step: 1, seq: 6, ts: 1500 },
+    { type: 'assistant/message', text: 'done', responseId: 'chatcmpl-1', seq: 7, ts: 1600 },
+    { type: 'step/end', turn: 1, step: 1, seq: 8, ts: 1700 },
+    { type: 'step/start', turn: 1, step: 2, seq: 9, ts: 1800 },
+    { type: 'assistant/message', text: 'no id', seq: 10, ts: 1900 },
+    { type: 'step/end', turn: 1, step: 2, seq: 11, ts: 2000 },
+    { type: 'turn/end', turn: 1, reason: 'complete', seq: 12, ts: 2100 },
+  ])
+  const reply = nodes.find((node) => node.kind === 'reply')
+  if (reply?.kind !== 'reply') throw new Error('missing reply')
+  assert.deepEqual(reply.steps?.map((step) => step.requestId ?? null), ['req-0', 'chatcmpl-1', null])
+})
+
 test('projectTrajectory skips assistant/chunk (dsh-style; message is authoritative)', () => {
   const rows = projectTrajectory([
     { type: 'turn/start', turn: 1, seq: 1, ts: 1 },

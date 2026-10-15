@@ -62,7 +62,8 @@ const EMPTY_FILTERS: Record<string, string> = {}
 function CollectionPage(props: SlotProps) {
   const tables = (props.tables as CollectionInfo[] | undefined) ?? []
   const orderedTables = useMemo(() => {
-    const { user, index, system } = sortDataCollections(tables)
+    const visible = tables.filter((table) => table.view?.route)
+    const { user, index, system } = sortDataCollections(visible)
     return [...user, ...index, ...system]
   }, [tables])
   const tablePathsKey = orderedTables.map((table) => table.path).join('\0')

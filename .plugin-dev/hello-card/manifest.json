@@ -1,0 +1,19 @@
+{
+  "id": "hello-card",
+  "name": "问候卡片",
+  "blurb": "最小示例插件：一个有窗口的 Web 插件，弹出 360x240 卡片，显示问候语和一个计数按钮，用于演示 sandbox → pack 的完整流程。",
+  "tags": [
+    "demo",
+    "tool"
+  ],
+  "author": "用户",
+  "authorUrl": "",
+  "createdAt": 1791862077823,
+  "shell": {
+    "width": 360,
+    "height": 240,
+    "minWidth": 200,
+    "minHeight": 160,
+    "resizable": true
+  }
+}

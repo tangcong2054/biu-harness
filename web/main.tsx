@@ -1,3 +1,4 @@
+import { installInsecureRandomUUID } from '../packages/core-editor/src/web/random-id.ts'
 import { Context } from 'cordis'
 import './types.ts'
 import './style.css'
@@ -6,6 +7,7 @@ import { applyPagePrefs } from '../packages/core-file-system/src/web/page-width.
 import { webRuntimeLoaders } from 'virtual:cordis-web-runtime'
 import { isShareHref, mountShareApp } from './share-mount.tsx'
 
+installInsecureRandomUUID()
 applyStoredTheme()
 applyPagePrefs()
 

@@ -186,7 +186,7 @@ export function pluginReviewsCollection(client: PluginRegistryClient): Collectio
       route: '/plugin-reviews',
       title: '插件审核',
       inspector: true,
-      blurb: '插件商店运营端。仅 BIU_PLUGIN_REGISTRY_OPERATORS 中的账号可见，用于审核、驳回、隔离和撤销版本。',
+      blurb: '平台运营端的插件审核队列。仅运营 Workspace 中具备 owner/admin 角色的账号可见，用于审核、驳回、隔离和撤销版本。',
       order: 32,
       icon: 'puzzle-piece',
     },

@@ -6,6 +6,9 @@
  * 把状态码、耗时、响应头、响应体（JSON 自动美化）画回块里。
  *
  * 请求历史写进块 data.history（最近 20 条）——跟着文档走，不是跟着浏览器走。
+ *
+ * v3（本次）：响应体给「格式化 / 原始」开关；响应区加「复制 body」「复制 curl」按钮，
+ * 复制走 navigator.clipboard，失败时退化成不报错的静默提示。
  */
 const React = globalThis.React
 const { useEffect, useMemo, useRef, useState } = React
@@ -60,7 +63,7 @@ const STORE_LIMIT = 20000
 const HISTORY_LIMIT = 20
 const PREVIEW_LIMIT = 4000
 
-const STYLE_ID = 'api-playground-style-v2'
+const STYLE_ID = 'api-playground-style-v3'
 const STYLE_CSS = `
 .ap-root {
   display: flex;
@@ -136,6 +139,21 @@ const STYLE_CSS = `
 .ap-chip-err { color: var(--dsw-danger); background: color-mix(in srgb, var(--dsw-danger) 14%, transparent); }
 .ap-note { font-size: 12px; color: var(--dsw-label-2); }
 .ap-pane { display: flex; flex-direction: column; gap: 8px; }
+.ap-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.ap-mini {
+  height: 22px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--dsw-label-2);
+  background: transparent;
+  border: 1px solid var(--dsw-border);
+  border-radius: 5px;
+  padding: 0 7px;
+  cursor: pointer;
+}
+.ap-mini:hover { background: var(--dsw-hover); }
+.ap-mini:disabled { opacity: 0.45; cursor: default; }
+.ap-mini-on { color: var(--dsw-label); background: var(--dsw-hover); }
 .ap-field { display: flex; flex-direction: column; gap: 4px; }
 .ap-label { font-size: 12px; font-weight: 650; color: var(--dsw-label-3); }
 .ap-area {
@@ -252,6 +270,27 @@ function formatBytes(bytes: number) {
   return `${(bytes / 1024 / 1024).toFixed(2)} MB`
 }
 
+/** 单引号包壳，供 curl 复制用；内部单引号按 shell 规则转义。 */
+function shellQuote(text: string) {
+  return `'${text.split("'").join("'\\''")}'`
+}
+
+/** 把 textarea 里的 `Key: Value` 多行文本解析成请求头对象（与 host 侧同规则）。 */
+function parseHeaderLines(raw: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const line of (raw ?? '').split(/\r?\n/)) {
+    const text = line.trim()
+    if (!text || text.startsWith('#')) continue
+    const at = text.indexOf(':')
+    if (at <= 0) continue
+    out[text.slice(0, at).trim()] = text.slice(at + 1).trim()
+  }
+  return out
+}
+
+/** 这些方法不带 body。 */
+const BODYLESS_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+
 function formatClock(at: number) {
   if (!Number.isFinite(at)) return ''
   const d = new Date(at)
@@ -294,16 +333,23 @@ function ApiPlaygroundBlock({ data, update, writable }: BlockProps) {
   const [result, setResult] = useState<Result | null>(() => stored)
   const [tab, setTab] = useState<'request' | 'response'>(stored ? 'response' : 'request')
   const [histOpen, setHistOpen] = useState(false)
+  /** 响应体是否强制显示原始文本（默认 JSON 自动美化）。 */
+  const [rawView, setRawView] = useState(false)
+  /** 复制按钮的瞬时反馈：null 表示没按过。 */
+  const [copied, setCopied] = useState<string | null>(null)
   const instanceId = useRef(`api-playground-${crypto.randomUUID()}`)
   const formRef = useRef(form)
   const resultRef = useRef<Result | null>(result ?? stored)
   const sendingRef = useRef(sending)
+  const rawViewRef = useRef(rawView)
   const sendRef = useRef<() => Promise<Result | undefined>>(async () => undefined)
+  const toCurlRef = useRef<() => string>(() => '')
   const updateRef = useRef(update)
   const writableRef = useRef(writable)
   formRef.current = form
   resultRef.current = result ?? stored
   sendingRef.current = sending
+  rawViewRef.current = rawView
   updateRef.current = update
   writableRef.current = writable
 
@@ -322,6 +368,7 @@ function ApiPlaygroundBlock({ data, update, writable }: BlockProps) {
   const active = result ?? stored
   const activeHeaders = active?.headers ?? {}
   const bodyView = useMemo(() => pretty(asText(active?.body)), [active?.body])
+  const shownBody = rawView ? asText(active?.body) : bodyView.text
 
   const commit = (patch: Record<string, unknown>) => {
     if (!writable) return
@@ -409,7 +456,36 @@ function ApiPlaygroundBlock({ data, update, writable }: BlockProps) {
   }
 
   const clearHistory = () => commit({ history: [] })
+
+  const flashCopied = (label: string) => {
+    setCopied(label)
+    window.setTimeout(() => setCopied((cur) => (cur === label ? null : cur)), 1400)
+  }
+
+  /** 复制到剪贴板；无权限 / 非安全上下文时不抛错，只回报失败。 */
+  const copyText = async (text: string, label: string) => {
+    if (!text) return
+    try {
+      await navigator.clipboard.writeText(text)
+      flashCopied(label)
+    } catch {
+      flashCopied(`${label}失败`)
+    }
+  }
+
+  /** 把当前请求拼成一条可以直接贴进终端的 curl。 */
+  const toCurl = () => {
+    const parts = [`curl -X ${form.method} ${shellQuote(form.url.trim())}`]
+    for (const [key, value] of Object.entries(parseHeaderLines(form.headers))) {
+      parts.push(`  -H ${shellQuote(`${key}: ${value}`)}`)
+    }
+    if (!BODYLESS_METHODS.has(form.method) && form.body.trim()) {
+      parts.push(`  --data-raw ${shellQuote(form.body.trim())}`)
+    }
+    return parts.join(' \\\n')
+  }
   sendRef.current = send
+  toCurlRef.current = toCurl
 
   useEffect(() => uiActions?.register({
     plugin: name,
@@ -421,6 +497,7 @@ function ApiPlaygroundBlock({ data, update, writable }: BlockProps) {
       method: formRef.current.method,
       url: formRef.current.url,
       sending: sendingRef.current,
+      format: rawViewRef.current ? 'raw' : 'formatted',
       response: resultRef.current
         ? {
             ok: resultRef.current.ok,
@@ -460,6 +537,25 @@ function ApiPlaygroundBlock({ data, update, writable }: BlockProps) {
         description: '发送当前 API 请求',
         risk: 'submit',
         run: () => sendRef.current(),
+      },
+      set_format: {
+        description: '切换响应体展示：formatted=自动美化 JSON，raw=原始文本',
+        risk: 'write',
+        inputSchema: {
+          type: 'object',
+          properties: { mode: { type: 'string', enum: ['formatted', 'raw'] } },
+          required: ['mode'],
+        },
+        run: (args: Record<string, unknown>) => {
+          const raw = args.mode === 'raw'
+          setRawView(raw)
+          return { mode: raw ? 'raw' : 'formatted' }
+        },
+      },
+      as_curl: {
+        description: '把当前请求导出成一条 curl 命令（只读，不发送）',
+        risk: 'read',
+        run: () => ({ curl: toCurlRef.current() }),
       },
       read_response: {
         description: '读取最近一次 API 响应',
@@ -617,11 +713,41 @@ function ApiPlaygroundBlock({ data, update, writable }: BlockProps) {
                 </details>
               ) : null}
               <div className="ap-field">
-                <span className="ap-label">
-                  响应体{bodyView.json ? ' · 已自动美化 JSON' : ''}
-                </span>
+                <div className="ap-actions">
+                  <span className="ap-label">
+                    响应体{bodyView.json && !rawView ? ' · 已自动美化 JSON' : ''}
+                  </span>
+                  {bodyView.json ? (
+                    <button
+                      type="button"
+                      className={rawView ? 'ap-mini' : 'ap-mini ap-mini-on'}
+                      data-testid="api-playground-fmt"
+                      onClick={() => setRawView((v: boolean) => !v)}
+                      title="在美化与原始文本之间切换"
+                    >
+                      {rawView ? '原始' : '格式化'}
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="ap-mini"
+                    data-testid="api-playground-copy-body"
+                    onClick={() => void copyText(asText(active.body), '已复制 body')}
+                  >
+                    {copied === '已复制 body' ? '已复制' : '复制 body'}
+                  </button>
+                  <button
+                    type="button"
+                    className="ap-mini"
+                    data-testid="api-playground-copy-curl"
+                    onClick={() => void copyText(toCurl(), '已复制 curl')}
+                    title="复制当前请求的 curl 命令"
+                  >
+                    {copied === '已复制 curl' ? '已复制' : '复制 curl'}
+                  </button>
+                </div>
                 <pre className="ap-pre" data-testid="api-playground-res-body">
-                  {bodyView.text || '（空响应体）'}
+                  {shownBody || '（空响应体）'}
                 </pre>
               </div>
             </React.Fragment>

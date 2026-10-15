@@ -224,16 +224,28 @@ export function skipHubEvent(name: string, args?: unknown[]) {
 
 function listSnapshotCollections(ctx: Context) {
   const db = ctx.get('database') as
-    | { collectionsList?: () => Array<{ id: string; path: string; label?: string; view?: unknown }> }
+    | {
+        collectionsList?: () => Array<{ id: string; path: string; label?: string; view?: unknown }>
+        publishCollection?: (item: { id: string; path: string; label?: string; view?: unknown }) => {
+          id: string
+          path: string
+          kind: 'collection'
+          label: string
+          view: unknown
+        }
+      }
     | undefined
   if (!db?.collectionsList) return []
-  return db.collectionsList().map((item) => ({
-    id: item.id,
-    path: item.path,
-    kind: 'collection' as const,
-    label: item.label ?? item.id,
-    view: item.view ?? null,
-  }))
+  return db.collectionsList().map((item) => {
+    if (db.publishCollection) return db.publishCollection(item)
+    return {
+      id: item.id,
+      path: item.path,
+      kind: 'collection' as const,
+      label: item.label ?? item.id,
+      view: item.view ?? null,
+    }
+  })
 }
 
 function isStorePackage(packageName?: string) {

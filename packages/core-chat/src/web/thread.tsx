@@ -110,6 +110,42 @@ function MetaItem({
   )
 }
 
+/** 供应商 request id：显示前 8 位，点击复制完整 id。 */
+function RequestIdItem({ requestId }: { requestId: string }) {
+  const [copied, setCopied] = useState(false)
+  const copy = useCallback(() => {
+    void navigator.clipboard?.writeText(requestId).then(
+      () => {
+        setCopied(true)
+        window.setTimeout(() => setCopied(false), 1200)
+      },
+      () => undefined,
+    )
+  }, [requestId])
+  return (
+    <span
+      className="chat-reply-meta-item chat-reply-request-id"
+      role="button"
+      tabIndex={0}
+      style={{ cursor: 'copy' }}
+      title={`request_id: ${requestId}（点击复制）`}
+      aria-label={`复制 request_id ${requestId}`}
+      onClick={copy}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          copy()
+        }
+      }}
+    >
+      <span className="chat-reply-meta-icon" aria-hidden>
+        {copied ? <CheckIcon className="size-3" /> : <Square2StackIcon className="size-3" />}
+      </span>
+      <span className="chat-reply-meta-value">{copied ? '已复制' : requestId.slice(0, 8)}</span>
+    </span>
+  )
+}
+
 function StepBar({ stat, replyId }: { stat: ChatStepStat; replyId: string }) {
   const usage: TrajectoryUsage = {
     inputTokens: stat.inputTokens,
@@ -145,6 +181,7 @@ function StepBar({ stat, replyId }: { stat: ChatStepStat; replyId: string }) {
             title="本步耗时"
           />
         ) : null}
+        {stat.requestId ? <RequestIdItem requestId={stat.requestId} /> : null}
       </div>
     </div>
   )

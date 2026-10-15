@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Biu Agent OS：让人、Agent、软件和数据在同一个工作现场协作。">
+  <title>Biu Agent OS · 下一代办公入口</title>
+  <style>
+    :root {
+      --bg: #070912;
+      --panel: rgba(255, 255, 255, 0.065);
+      --line: rgba(255, 255, 255, 0.12);
+      --ink: #f4f7ff;
+      --muted: #9ca6be;
+      --mint: #66f4d2;
+      --violet: #8b7cff;
+      --coral: #ff806b;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      overflow: hidden;
+      color: var(--ink);
+      background: var(--bg);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC",
+        "Microsoft YaHei", sans-serif;
+    }
+
+    button { font: inherit; }
+
+    .noise {
+      position: fixed;
+      z-index: 40;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.035;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.8'/%3E%3C/svg%3E");
+    }
+
+    .progress {
+      position: fixed;
+      z-index: 50;
+      top: 0;
+      left: 0;
+      width: 0;
+      height: 2px;
+      background: linear-gradient(90deg, var(--mint), var(--violet), var(--coral));
+      transition: width 0.35s;
+    }
+
+    .topbar {
+      position: fixed;
+      z-index: 30;
+      top: 0;
+      right: 0;
+      left: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 72px;
+      padding: 0 clamp(24px, 5vw, 84px);
+      background: linear-gradient(to bottom, rgba(7, 9, 18, 0.88), transparent);
+      backdrop-filter: blur(8px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+    }
+
+    .mark {
+      display: grid;
+      place-items: center;
+      width: 30px;
+      height: 30px;
+      color: #080a12;
+      font-size: 17px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, var(--mint), var(--violet));
+      box-shadow: 0 0 28px rgba(102, 244, 210, 0.25);
+    }
+
+    .nav {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .nav button {
+      height: 34px;
+      padding: 0 13px;
+      color: var(--muted);
+      cursor: pointer;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(12, 15, 28, 0.6);
+      font-size: 12px;
+    }
+
+    .nav button:hover {
+      color: #fff;
+      border-color: rgba(255, 255, 255, 0.3);
+    }
+
+    .stage {
+      height: 100vh;
+      overflow-y: auto;
+      scroll-snap-type: y mandatory;
+      scrollbar-width: none;
+    }
+
+    .stage::-webkit-scrollbar { display: none; }
+
+    .scene {
+      position: relative;
+      isolation: isolate;
+      display: flex;
+      align-items: center;
+      min-height: 100vh;
+      padding: clamp(80px, 9vw, 140px) clamp(28px, 8vw, 148px);
+      overflow: hidden;
+      scroll-snap-align: start;
+    }
+
+    .scene::before {
+      position: absolute;
+      z-index: -4;
+      inset: 0;
+      content: "";
+      background-image:
+        linear-gradient(rgba(255, 255, 255, 0.026) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.026) 1px, transparent 1px);
+      background-size: 56px 56px;
+      mask-image: linear-gradient(to bottom, transparent, black 24%, black 76%, transparent);
+    }
+
+    .glow {
+      position: absolute;
+      z-index: -3;
+      border-radius: 50%;
+      opacity: 0.65;
+      animation: float 10s ease-in-out infinite;
+    }
+
+    .g1 {
+      top: -16vw;
+      right: -18vw;
+      width: 48vw;
+      height: 48vw;
+      background: radial-gradient(circle, rgba(102, 244, 210, 0.22), transparent 68%);
+    }
+
+    .g2 {
+      bottom: -24vw;
+      left: -22vw;
+      width: 52vw;
+      height: 52vw;
+      background: radial-gradient(circle, rgba(139, 124, 255, 0.24), transparent 68%);
+      animation-delay: -4s;
+    }
+
+    .wrap {
+      width: min(1180px, 100%);
+      margin: auto;
+    }
+
+    .eyebrow {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 24px;
+      color: var(--mint);
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      width: 28px;
+      height: 1px;
+      content: "";
+      background: currentColor;
+    }
+
+    .hero h1 {
+      max-width: 1050px;
+      margin: 0;
+      font-size: clamp(52px, 8.2vw, 126px);
+      font-weight: 900;
+      line-height: 0.92;
+      letter-spacing: -0.065em;
+    }
+
+    .hero h1 em {
+      color: transparent;
+      font-style: normal;
+      background: linear-gradient(95deg, var(--mint), #b9e8ff 42%, var(--violet));
+      background-clip: text;
+    }
+
+    .lead {
+      max-width: 760px;
+      margin: 32px 0 0;
+      color: #c1c8d8;
+      font-size: clamp(18px, 2vw, 27px);
+      line-height: 1.55;
+    }
+
+    .hero-actions {
+      display: flex;
+      align-items: center;
+      gap: 13px;
+      margin-top: 42px;
+    }
+
+    .primary {
+      padding: 15px 24px;
+      color: #080a12;
+      cursor: pointer;
+      border: 0;
+      border-radius: 999px;
+      background: var(--ink);
+      box-shadow: 0 12px 40px rgba(255, 255, 255, 0.12);
+      font-size: 14px;
+      font-weight: 800;
+    }
+
+    .ghost {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .section-title {
+      max-width: 940px;
+      margin: 0 0 20px;
+      font-size: clamp(38px, 5.8vw, 78px);
+      line-height: 1.02;
+      letter-spacing: -0.045em;
+    }
+
+    .section-sub {
+      max-width: 760px;
+      margin: 0;
+      color: var(--muted);
+      font-size: clamp(16px, 1.7vw, 22px);
+      line-height: 1.6;
+    }
+
+    .accent { color: var(--mint); }
+
+    .system-map {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 14px;
+      align-items: stretch;
+      margin-top: 52px;
+    }
+
+    .app {
+      position: relative;
+      min-height: 148px;
+      padding: 18px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel);
+      backdrop-filter: blur(14px);
+    }
+
+    .app b { font-size: 14px; }
+    .app p {
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .app .ico {
+      margin-bottom: 24px;
+      font-size: 24px;
+    }
+
+    .app.human { border-color: rgba(255, 128, 107, 0.38); }
+    .app.human::after {
+      position: absolute;
+      top: 9px;
+      right: 9px;
+      color: var(--coral);
+      content: "人在搬运";
+      font-size: 9px;
+      letter-spacing: 0.1em;
+    }
+
+    .bus-line {
+      position: relative;
+      height: 1px;
+      margin: 23px 0 0;
+      background: linear-gradient(90deg, transparent, var(--coral), transparent);
+    }
+
+    .bus-line::after {
+      position: absolute;
+      top: -9px;
+      left: 50%;
+      padding: 0 12px;
+      color: var(--coral);
+      white-space: nowrap;
+      content: "复制 · 粘贴 · 切换 · 对齐";
+      background: var(--bg);
+      transform: translateX(-50%);
+      font-size: 11px;
+    }
+
+    .paradigm {
+      display: grid;
+      grid-template-columns: 0.9fr 1.1fr;
+      gap: 70px;
+      align-items: center;
+    }
+
+    .orbit {
+      position: relative;
+      width: min(720px, 78vw);
+      margin: 0 auto;
+      aspect-ratio: 1;
+    }
+
+    .orbit::before,
+    .orbit::after {
+      position: absolute;
+      inset: 8%;
+      content: "";
+      border: 1px solid rgba(255, 255, 255, 0.11);
+      border-radius: 50%;
+    }
+
+    .orbit::after {
+      inset: 22%;
+      border-style: dashed;
+      animation: spin 26s linear infinite;
+    }
+
+    .core {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      display: grid;
+      place-items: center;
+      width: 34%;
+      text-align: center;
+      border: 1px solid rgba(140, 242, 220, 0.35);
+      border-radius: 34%;
+      background: linear-gradient(145deg, rgba(102, 244, 210, 0.18), rgba(139, 124, 255, 0.22));
+      box-shadow: 0 0 80px rgba(102, 244, 210, 0.14), inset 0 0 40px rgba(255, 255, 255, 0.05);
+      transform: translate(-50%, -50%);
+      aspect-ratio: 1;
+    }
+
+    .core strong {
+      font-size: clamp(24px, 4vw, 52px);
+      letter-spacing: -0.05em;
+    }
+
+    .core small {
+      display: block;
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: 10px;
+      letter-spacing: 0.12em;
+    }
+
+    .node {
+      position: absolute;
+      min-width: 112px;
+      padding: 12px 15px;
+      text-align: center;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(14, 17, 31, 0.88);
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.24);
+      backdrop-filter: blur(12px);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .node small {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 500;
+    }
+
+    .n1 { top: 17%; left: 4%; }
+    .n2 { top: 20%; right: 2%; }
+    .n3 { bottom: 20%; left: 0; }
+    .n4 { right: 1%; bottom: 16%; }
+
+    .proof-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 12px;
+      margin-top: 48px;
+    }
+
+    .proof {
+      min-height: 185px;
+      padding: 24px 18px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: linear-gradient(160deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.025));
+      transition: transform 0.3s, border-color 0.3s;
+    }
+
+    .proof:hover {
+      border-color: rgba(102, 244, 210, 0.45);
+      transform: translateY(-6px);
+    }
+
+    .proof .num {
+      color: var(--mint);
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+    }
+
+    .proof h3 {
+      margin: 32px 0 9px;
+      font-size: 19px;
+    }
+
+    .proof p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
+    .case-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 14px;
+      margin-top: 44px;
+    }
+
+    .case {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 18px;
+      align-items: start;
+      padding: 25px;
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      background: var(--panel);
+      transition: 0.3s;
+    }
+
+    .case:hover {
+      background: rgba(255, 255, 255, 0.095);
+      transform: translateY(-3px);
+    }
+
+    .case-icon {
+      display: grid;
+      place-items: center;
+      width: 48px;
+      height: 48px;
+      border-radius: 15px;
+      background: rgba(255, 255, 255, 0.07);
+      font-size: 23px;
+    }
+
+    .case h3 {
+      margin: 2px 0 7px;
+      font-size: 18px;
+    }
+
+    .case p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .case span {
+      display: inline-block;
+      margin-top: 13px;
+      color: var(--mint);
+      font-size: 10px;
+      letter-spacing: 0.08em;
+    }
+
+    .final { text-align: center; }
+    .final .section-title {
+      max-width: 1100px;
+      margin-right: auto;
+      margin-left: auto;
+      font-size: clamp(48px, 7.5vw, 112px);
+    }
+
+    .final .section-sub { margin: 28px auto 0; }
+
+    .manifesto {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
+      margin-top: 42px;
+    }
+
+    .pill {
+      padding: 9px 14px;
+      color: #cad1df;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.045);
+      font-size: 12px;
+    }
+
+    .signature {
+      margin-top: 54px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .signature b { color: var(--ink); }
+
+    .dots {
+      position: fixed;
+      z-index: 30;
+      top: 50%;
+      right: 28px;
+      display: grid;
+      gap: 11px;
+      transform: translateY(-50%);
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      padding: 0;
+      cursor: pointer;
+      border: 0;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.28);
+      transition: 0.3s;
+    }
+
+    .dot.on {
+      height: 24px;
+      border-radius: 9px;
+      background: linear-gradient(var(--mint), var(--violet));
+      box-shadow: 0 0 14px rgba(102, 244, 210, 0.4);
+    }
+
+    .fade {
+      opacity: 0;
+      transform: translateY(26px);
+      transition: opacity 0.75s ease, transform 0.75s ease;
+    }
+
+    .scene.active .fade {
+      opacity: 1;
+      transform: none;
+    }
+
+    .scene.active .d2 { transition-delay: 0.12s; }
+    .scene.active .d3 { transition-delay: 0.22s; }
+
+    @keyframes float {
+      50% { transform: translate3d(0, 20px, 0) scale(1.05); }
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    @media (max-width: 900px) {
+      .scene { padding: 90px 26px 62px; }
+      .paradigm { grid-template-columns: 1fr; gap: 20px; }
+      .orbit { width: min(520px, 90vw); }
+      .system-map { grid-template-columns: repeat(2, 1fr); }
+      .app.human { grid-column: 1 / -1; }
+      .proof-grid { grid-template-columns: repeat(2, 1fr); }
+      .proof:last-child { grid-column: 1 / -1; }
+      .case-grid { grid-template-columns: 1fr; }
+      .dots { right: 12px; }
+      .hint { display: none; }
+    }
+
+    @media (max-width: 520px) {
+      .hero h1 { font-size: 50px; }
+      .system-map,
+      .proof-grid { grid-template-columns: 1fr; }
+      .proof:last-child { grid-column: auto; }
+      .topbar { height: 60px; }
+      .dots { display: none; }
+      .orbit { width: 100%; }
+      .node { min-width: 88px; padding: 9px; font-size: 11px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      * { scroll-behavior: auto !important; animation: none !important; }
+      .fade { opacity: 1; transform: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="noise"></div>
+  <div class="progress" id="progress"></div>
+
+  <header class="topbar">
+    <div class="brand"><div class="mark">B</div><span>Biu Agent OS</span></div>
+    <div class="nav">
+      <span class="hint" style="font-size: 11px; color: var(--muted)">滚动 / 方向键切换</span>
+      <button id="autoBtn" type="button">暂停自动播放</button>
+    </div>
+  </header>
+
+  <nav class="dots" id="dots" aria-label="页面导航"></nav>
+
+  <main class="stage" id="stage">
+    <section class="scene hero active">
+      <div class="glow g1"></div><div class="glow g2"></div>
+      <div class="wrap">
+        <div class="eyebrow fade">The next interface of work</div>
+        <h1 class="fade d2">未来工作，<br>只需要打开<br><em>一张 Page</em></h1>
+        <p class="lead fade d3">内容、数据、软件和 Agent，不再散落在不同窗口。让人和 AI 在同一个工作现场，看见同一份状态，操作同一个对象。</p>
+        <div class="hero-actions fade d3">
+          <button class="primary" type="button" onclick="go(1)">看见新的工作范式 ↓</button>
+          <span class="ghost">人 × Agent × 软件 × 数据</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="scene">
+      <div class="glow g2"></div>
+      <div class="wrap">
+        <div class="eyebrow fade">Today</div>
+        <h2 class="section-title fade d2">今天，<span style="color: var(--coral)">人在当系统总线</span></h2>
+        <p class="section-sub fade d3">数据散落在不同软件，能力封装在不同界面，上下文靠人复制粘贴。Agent 可以替人跨平台，但人仍然看不见一个完整、可操作的工作现场。</p>
+        <div class="system-map fade d3">
+          <div class="app"><div class="ico">▦</div><b>数据系统</b><p>结构化记录、指标、权限</p></div>
+          <div class="app"><div class="ico">◫</div><b>专业软件</b><p>固定规则、确定性计算</p></div>
+          <div class="app human"><div class="ico">●</div><b>人</b><p>切窗口、搬上下文、核对结果</p></div>
+          <div class="app"><div class="ico">✦</div><b>Agent</b><p>推理、编排、调用工具</p></div>
+          <div class="app"><div class="ico">▤</div><b>办公产物</b><p>文档、表格、报告、任务</p></div>
+        </div>
+        <div class="bus-line fade d3"></div>
+      </div>
+    </section>
+
+    <section class="scene">
+      <div class="glow g1"></div>
+      <div class="wrap paradigm">
+        <div>
+          <div class="eyebrow fade">The paradigm shift</div>
+          <h2 class="section-title fade d2">不是让 Agent<br>打开更多软件</h2>
+          <p class="section-sub fade d3">而是让软件按任务进入 AI 的工作空间。Page 保存上下文，Agent 编排能力，人负责目标、判断和授权。</p>
+        </div>
+        <div class="orbit fade d2">
+          <div class="core"><div><strong>Page</strong><small>共同工作面</small></div></div>
+          <div class="node n1">人<small>直接操作 · 审批</small></div>
+          <div class="node n2">Agent<small>理解 · 编排</small></div>
+          <div class="node n3">软件<small>确定性执行</small></div>
+          <div class="node n4">数据<small>持久 · 可追溯</small></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="scene">
+      <div class="glow g2"></div>
+      <div class="wrap">
+        <div class="eyebrow fade">One page, five layers</div>
+        <h2 class="section-title fade d2">Page 不是文档，<br>是一个<span class="accent">工作运行时</span></h2>
+        <div class="proof-grid fade d3">
+          <div class="proof"><div class="num">01 / CONTENT</div><h3>所有内容</h3><p>文字、图像、网页、演示和实时结果，在同一上下文中组合。</p></div>
+          <div class="proof"><div class="num">02 / DATA</div><h3>所有数据</h3><p>稳定 ID、字段和关系，不再只是需要反复解析的附件。</p></div>
+          <div class="proof"><div class="num">03 / SOFTWARE</div><h3>所有能力</h3><p>插件把界面与后端逻辑带进 Page，专业系统继续做事实源。</p></div>
+          <div class="proof"><div class="num">04 / AGENT</div><h3>所有 Agent</h3><p>理解目标、调度工具、操作当前界面，并持续推进工作。</p></div>
+          <div class="proof"><div class="num">05 / HUMAN</div><h3>人始终在场</h3><p>看见中间状态，直接纠错、审批、接管，而不是只能写提示词。</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="scene">
+      <div class="glow g1"></div>
+      <div class="wrap">
+        <div class="eyebrow fade">One runtime, every industry</div>
+        <h2 class="section-title fade d2">底座不变，<br><span class="accent">行业软件按需出现</span></h2>
+        <p class="section-sub fade d3">同一个交互模型：Agent 理解目标，软件稳定执行，人核验判断，结果写回持续数据。</p>
+        <div class="case-grid fade d3">
+          <div class="case"><div class="case-icon">⌕</div><div><h3>审计 · 发现即底稿</h3><p>规则真执行，证据可展开，结论带版本、指纹、确认人与时间。</p><span>规则 → 证据 → 人确认 → 可追责对象</span></div></div>
+          <div class="case"><div class="case-icon">＋</div><div><h3>医疗 · 口径可追溯</h3><p>条件受限执行，规则逐版保留，结果自动 diff，指标追到来源病历。</p><span>意图 → 软件校验 → 版本 → 溯源</span></div></div>
+          <div class="case"><div class="case-icon">∑</div><div><h3>造价 · 确定性对账</h3><p>合同、签证、结算三方对齐，固定计算不必每次消耗模型 Token。</p><span>Agent 调度 → 软件计算 → 人处理例外</span></div></div>
+          <div class="case"><div class="case-icon">◎</div><div><h3>教育 · 人就在流程里</h3><p>学生答题、软件判分、老师分组、Agent 继续生成针对性教学。</p><span>同一界面 · 同一数据 · 持续协作</span></div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="scene final">
+      <div class="glow g1"></div><div class="glow g2"></div>
+      <div class="wrap">
+        <div class="eyebrow fade" style="justify-content: center">Biu Agent OS</div>
+        <h2 class="section-title fade d2">让所有软件进入<br><span class="accent">AI 的工作空间</span></h2>
+        <p class="section-sub fade d3">不是重写所有后端，而是让数据库、SaaS 与行业能力按需出现在 Page 上。人和 Agent 共享同一个对象、同一份状态、同一套动作。</p>
+        <div class="manifesto fade d3">
+          <span class="pill">统一地址空间</span>
+          <span class="pill">可插拔软件</span>
+          <span class="pill">语义 UI Actions</span>
+          <span class="pill">人类审批</span>
+          <span class="pill">持久业务对象</span>
+        </div>
+        <div class="signature fade d3">下一代办公入口 · <b>人 × Agent × 软件 × 数据</b></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const stage = document.getElementById("stage");
+    const scenes = [...document.querySelectorAll(".scene")];
+    const dots = document.getElementById("dots");
+    const progress = document.getElementById("progress");
+    const autoBtn = document.getElementById("autoBtn");
+    let index = 0;
+    let auto = true;
+    let timer;
+
+    scenes.forEach((_, i) => {
+      const button = document.createElement("button");
+      button.className = "dot" + (i === 0 ? " on" : "");
+      button.setAttribute("aria-label", "第 " + (i + 1) + " 屏");
+      button.addEventListener("click", () => go(i));
+      dots.appendChild(button);
+    });
+
+    const dotElements = [...dots.children];
+
+    function activate(next) {
+      index = next;
+      scenes.forEach((scene, i) => scene.classList.toggle("active", i === next));
+      dotElements.forEach((dot, i) => dot.classList.toggle("on", i === next));
+      progress.style.width = ((next + 1) / scenes.length * 100) + "%";
+    }
+
+    function restart() {
+      clearInterval(timer);
+      if (auto) timer = setInterval(() => go(index + 1), 8500);
+    }
+
+    function go(next) {
+      index = (next + scenes.length) % scenes.length;
+      scenes[index].scrollIntoView({ behavior: "smooth" });
+      restart();
+    }
+
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting && entry.intersectionRatio > 0.55) {
+          activate(scenes.indexOf(entry.target));
+        }
+      });
+    }, { root: stage, threshold: [0.55] });
+
+    scenes.forEach((scene) => observer.observe(scene));
+    restart();
+
+    autoBtn.addEventListener("click", () => {
+      auto = !auto;
+      autoBtn.textContent = auto ? "暂停自动播放" : "继续自动播放";
+      restart();
+    });
+
+    window.addEventListener("keydown", (event) => {
+      if (["ArrowDown", "ArrowRight", " "].includes(event.key)) {
+        event.preventDefault();
+        go(index + 1);
+      }
+      if (["ArrowUp", "ArrowLeft"].includes(event.key)) {
+        event.preventDefault();
+        go(index - 1);
+      }
+    });
+
+    let touchY = 0;
+    stage.addEventListener("touchstart", (event) => {
+      touchY = event.touches[0].clientY;
+    }, { passive: true });
+    stage.addEventListener("touchend", (event) => {
+      const distance = touchY - event.changedTouches[0].clientY;
+      if (Math.abs(distance) > 55) go(index + (distance > 0 ? 1 : -1));
+    }, { passive: true });
+  </script>
+</body>
+</html>

@@ -18,7 +18,7 @@ import {
 import { asPublicProfile, readWorkspaceProfile, writeWorkspaceProfile } from '@biu/host-workspace'
 import { roleCoversAction, type Action as PermissionAction, type AuthorizationService } from '@biu/host-account/authorization'
 import { isRegisteredBuiltinPlugin } from '@biu/host-account/store'
-import { forwardCloud, publishToCloud } from '@biu/host-account/mirror'
+import { cloudWorkspaceHeaders, forwardCloud, publishToCloud } from '@biu/host-account/mirror'
 import { Service, type Context } from 'cordis'
 import {
   DATABASE_CHANNEL,
@@ -317,6 +317,11 @@ function splitPath(path: string): string[] {
     return ['views', parts.slice(1).join('/')]
   }
   return parts
+}
+
+function isOperationsMetadata(path: string) {
+  const normalized = normalizeCollectionPath(path)
+  return normalized === '/operations' || normalized.startsWith('/ops-')
 }
 
 function coerceList(value: unknown) {
@@ -768,6 +773,7 @@ export class DatabaseService extends Service implements Database {
   publishCollection(item: CollectionSpec): CollectionInfo {
     const info = publicCollection(item)
     if (item.path === '/workspace-members' && !this.membersInSystemData()) return { ...info, view: null }
+    if (item.path === '/plugin-reviews' || normalizeCollectionPath(item.path).startsWith('/ops-')) return { ...info, view: null }
     return info
   }
 
@@ -883,7 +889,7 @@ export class DatabaseService extends Service implements Database {
     const actor = authorization?.currentActor()
     if (authorization && actor) {
       return rows.filter((row) => {
-        if (collection === '/plugin-catalog' || collection === '/plugin-reviews') {
+        if (collection === '/plugin-catalog' || collection === '/plugin-reviews' || isOperationsMetadata(collection)) {
           return action === 'resource:read' || action === 'resource:list'
         }
         if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
@@ -910,7 +916,7 @@ export class DatabaseService extends Service implements Database {
     const workspaceId = store?.activeWorkspaceId() ?? ''
     const grants = new Map<string, Map<string, Set<string>>>()
     return rows.filter((row) => {
-      if (collection === '/plugin-catalog' || collection === '/plugin-reviews') {
+      if (collection === '/plugin-catalog' || collection === '/plugin-reviews' || isOperationsMetadata(collection)) {
         return action === 'resource:read' || action === 'resource:list'
       }
       if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
@@ -1088,7 +1094,7 @@ export class DatabaseService extends Service implements Database {
     action: PermissionAction = 'resource:read',
     record?: { id?: unknown },
   ) {
-    if (spec.path === '/plugin-catalog' || spec.path === '/plugin-reviews') {
+    if (spec.path === '/plugin-catalog' || spec.path === '/plugin-reviews' || isOperationsMetadata(spec.path)) {
       if (
         action === 'resource:read' ||
         action === 'resource:list' ||
@@ -3427,6 +3433,7 @@ export function apply(ctx: Context) {
           method: 'POST',
           headers: {
             'content-type': 'application/json',
+            ...cloudWorkspaceHeaders(ctx),
             ...(token
               ? { authorization: `Bearer ${token}` }
               : { cookie: String(route.req.headers.cookie ?? '') }),

@@ -30,6 +30,7 @@ export {
 } from './session-route.ts'
 export {
   compactSessionEvents,
+  eventRequestId,
   mergeDispatchedUsageIntoNodes,
   projectNodes,
   formatTokens,

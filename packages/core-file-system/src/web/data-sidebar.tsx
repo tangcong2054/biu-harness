@@ -479,7 +479,8 @@ export const DataSidebar = memo(function DataSidebar({
   onCollapse?: () => void
 }) {
   const listedTables = useMemo(() => {
-    const raw = tables.length ? tables : ([{ path: collectionPath, label: title, view: { title } }] as CollectionInfo[])
+    const source = tables.length ? tables.filter((table) => table.view?.route) : tables
+    const raw = source.length ? source : ([{ path: collectionPath, label: title, view: { title } }] as CollectionInfo[])
     const { user, index, system } = sortDataCollections(raw)
     return [...user, ...index, ...system]
   }, [collectionPath, tables, title])

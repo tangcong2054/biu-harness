@@ -14,7 +14,11 @@ function fail(error: unknown) {
   return { status: 400, body: { error: message } }
 }
 
-export function registerRegistryRoutes(ctx: Context, registry: PluginRegistryStore) {
+export function registerRegistryRoutes(
+  ctx: Context,
+  registry: PluginRegistryStore,
+  options: { operations?: boolean } = {},
+) {
   ctx.http.route('GET', '/api/plugin-registry/v1/plugins', async (route) => {
     const rows = await registry.search(route.query.get('q') ?? '', route.query.get('tag') ?? '', bearer(route.req.headers.authorization))
     route.send(200, { ok: true, registryId: registry.registryId, plugins: rows })
@@ -73,37 +77,39 @@ export function registerRegistryRoutes(ctx: Context, registry: PluginRegistrySto
     }
   })
 
-  ctx.http.route('GET', '/api/plugin-registry/v1/reviews', async (route) => {
-    try {
-      const plugins = await registry.listReviews(bearer(route.req.headers.authorization), route.query.get('status') ?? '')
-      route.send(200, { ok: true, registryId: registry.registryId, plugins })
-    } catch (error) {
-      const result = fail(error)
-      route.send(result.status, result.body)
-    }
-  })
+  if (options.operations) {
+    ctx.http.route('GET', '/api/plugin-registry/v1/reviews', async (route) => {
+      try {
+        const plugins = await registry.listReviews(bearer(route.req.headers.authorization), route.query.get('status') ?? '')
+        route.send(200, { ok: true, registryId: registry.registryId, plugins })
+      } catch (error) {
+        const result = fail(error)
+        route.send(result.status, result.body)
+      }
+    })
 
-  ctx.http.route('POST', '/api/plugin-registry/v1/plugins/:id/:version/review', async (route) => {
-    try {
-      const body = await route.json<{ status?: RegistryReviewStatus; reason?: string; reviewer?: string }>()
-      const status =
-        body.status === 'approved' || body.status === 'rejected' || body.status === 'quarantined' || body.status === 'revoked'
-          ? body.status
-          : 'rejected'
-      route.send(200, {
-        ok: true,
-        ...await registry.review(
-          route.params.id,
-          route.params.version,
-          status,
-          String(body.reason ?? ''),
-          bearer(route.req.headers.authorization),
-          String(body.reviewer ?? 'operator'),
-        ),
-      })
-    } catch (error) {
-      const result = fail(error)
-      route.send(result.status, result.body)
-    }
-  })
+    ctx.http.route('POST', '/api/plugin-registry/v1/plugins/:id/:version/review', async (route) => {
+      try {
+        const body = await route.json<{ status?: RegistryReviewStatus; reason?: string; reviewer?: string }>()
+        const status =
+          body.status === 'approved' || body.status === 'rejected' || body.status === 'quarantined' || body.status === 'revoked'
+            ? body.status
+            : 'rejected'
+        route.send(200, {
+          ok: true,
+          ...await registry.review(
+            route.params.id,
+            route.params.version,
+            status,
+            String(body.reason ?? ''),
+            bearer(route.req.headers.authorization),
+            String(body.reviewer ?? 'operator'),
+          ),
+        })
+      } catch (error) {
+        const result = fail(error)
+        route.send(result.status, result.body)
+      }
+    })
+  }
 }

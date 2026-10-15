@@ -1,12 +1,14 @@
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
-import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
+import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime, isOperationsRuntime } from '@biu/host-plugin-loader/data-dir'
 import { AuthorizationService, type ResourcePolicyInput, type ResourceRole, type WorkspaceRole } from './authorization.ts'
 
 export const PRESENCE_STALE_MS = 30_000
 export const DEFAULT_LOCK_MS = 60_000
 export const DEFAULT_SESSION_MS = 30 * 24 * 60 * 60 * 1000
 export const DEFAULT_MCP_CREDENTIAL_MS = 90 * 24 * 60 * 60 * 1000
+export const OPERATIONS_ADMIN_ACCOUNT_ID = 'acc_operations_admin'
+export const OPERATIONS_WORKSPACE_ID = 'ws_operations'
 
 const builtinPluginLookups = new Set<(pluginId: string) => boolean>()
 
@@ -123,6 +125,12 @@ function verifyPassword(password: string, stored: string) {
   return timingSafeEqual(actual, expected)
 }
 
+function operationsLoginName(value: string) {
+  const name = value.trim().toLowerCase()
+  if (/^[a-z][a-z0-9._-]{1,31}$/.test(name) || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(name)) return name
+  throw new CollabError('运营账号格式不对', 400)
+}
+
 export class CollabStore {
   readonly authorization: AuthorizationService
 
@@ -133,6 +141,100 @@ export class CollabStore {
       return this.accountActiveWorkspace(accountId)
     })
     this.ensureBuiltInRoot()
+  }
+
+  bootstrapOperations(input: { email: string; password?: string; name?: string; workspaceName?: string; now?: number }) {
+    if (!isOnlineRuntime() && !isOperationsRuntime()) throw new CollabError('只能在运营运行时初始化运营账号', 400)
+    const now = input.now ?? Date.now()
+    const email = operationsLoginName(input.email)
+    const password = String(input.password ?? '').trim()
+    const fixed = this.db
+      .prepare('SELECT id, email FROM accounts WHERE id = ?')
+      .get(OPERATIONS_ADMIN_ACCOUNT_ID) as { id?: string; email?: string } | undefined
+    const existing = fixed?.id
+      ? fixed
+      : (this.db.prepare('SELECT id, email FROM accounts WHERE email = ?').get(email) as { id?: string; email?: string } | undefined)
+    if (!existing && password.length < 6) {
+      throw new CollabError('首次启动运营端需要 BIU_OPERATIONS_ADMIN_PASSWORD（至少 6 位）', 500)
+    }
+    const accountId = existing?.id || OPERATIONS_ADMIN_ACCOUNT_ID
+    const workspace = this.db
+      .prepare('SELECT owner_id FROM workspaces WHERE id = ?')
+      .get(OPERATIONS_WORKSPACE_ID) as { owner_id?: string } | undefined
+    if (workspace?.owner_id && workspace.owner_id !== accountId) {
+      throw new CollabError('运营 Workspace 已被其他账号占用', 409)
+    }
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      if (!existing) {
+        const idTaken = this.db.prepare('SELECT id FROM accounts WHERE id = ?').get(accountId)
+        if (idTaken) throw new CollabError('运营账号 ID 已被占用', 409)
+        this.db
+          .prepare(
+            `INSERT INTO accounts
+              (id, name, token, password_hash, created_at, email, active_workspace_id, must_change_password, password_recall)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0, '')`,
+          )
+          .run(
+            accountId,
+            input.name?.trim() || '平台管理员',
+            randomBytes(24).toString('hex'),
+            hashPassword(password),
+            now,
+            email,
+            OPERATIONS_WORKSPACE_ID,
+          )
+      } else if (existing.email !== email) {
+        this.db.prepare('UPDATE accounts SET email = ? WHERE id = ?').run(email, accountId)
+      }
+      if (!workspace) {
+        this.db
+          .prepare('INSERT INTO workspaces (id, name, owner_id, created_at) VALUES (?, ?, ?, ?)')
+          .run(OPERATIONS_WORKSPACE_ID, input.workspaceName?.trim() || 'Biu 平台运营', accountId, now)
+      }
+      this.db
+        .prepare(
+          `INSERT INTO workspace_members (workspace_id, account_id, role, created_at)
+           VALUES (?, ?, 'owner', ?)
+           ON CONFLICT(workspace_id, account_id) DO UPDATE SET role = 'owner', member_kind = 'member'`,
+        )
+        .run(OPERATIONS_WORKSPACE_ID, accountId, now)
+      this.db
+        .prepare('UPDATE accounts SET active_workspace_id = ? WHERE id = ?')
+        .run(OPERATIONS_WORKSPACE_ID, accountId)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+    return { accountId, workspaceId: OPERATIONS_WORKSPACE_ID, created: !existing }
+  }
+
+  operationsIdentity() {
+    if (!isOnlineRuntime() && !isOperationsRuntime()) return null
+    const account = this.db
+      .prepare('SELECT id, name, email FROM accounts WHERE id = ?')
+      .get(OPERATIONS_ADMIN_ACCOUNT_ID) as { id?: string; name?: string; email?: string } | undefined
+    const workspace = this.db
+      .prepare('SELECT id, name FROM workspaces WHERE id = ?')
+      .get(OPERATIONS_WORKSPACE_ID) as { id?: string; name?: string } | undefined
+    if (!account?.id || !workspace?.id) return null
+    return {
+      id: account.id,
+      email: account.email ?? '',
+      name: account.name ?? '',
+      workspaceId: workspace.id,
+      workspaceName: workspace.name ?? '',
+    }
+  }
+
+  isOperationsOperator(accountId: string, workspaceId = OPERATIONS_WORKSPACE_ID) {
+    const targetWorkspace = workspaceId || OPERATIONS_WORKSPACE_ID
+    if ((!isOnlineRuntime() && !isOperationsRuntime()) || targetWorkspace !== OPERATIONS_WORKSPACE_ID) return false
+    const row = this.db
+      .prepare('SELECT role FROM workspace_members WHERE workspace_id = ? AND account_id = ?')
+      .get(OPERATIONS_WORKSPACE_ID, accountId) as { role?: string } | undefined
+    return row?.role === 'owner' || row?.role === 'admin'
   }
 
   bootstrapLocal(input: { accountName?: string; workspaceName?: string; now?: number } = {}) {
@@ -205,9 +307,11 @@ export class CollabStore {
 
   login(email: string, password: string, deviceName = '浏览器'): Account & { token: string } {
     const normalized = email.trim().toLowerCase()
-    const row = this.db
-      .prepare('SELECT id, name, email, token, password_hash, created_at, must_change_password FROM accounts WHERE email = ?')
-      .get(normalized) as
+    const selectAccount = this.db.prepare(
+      'SELECT id, name, email, token, password_hash, created_at, must_change_password FROM accounts WHERE email = ?',
+    )
+    const row = (selectAccount.get(normalized) ??
+      (normalized === 'admin@biu.com' ? selectAccount.get('admin') : undefined)) as
       | {
           id: string
           name: string
@@ -222,7 +326,8 @@ export class CollabStore {
       throw new CollabError('邮箱或密码不对', 401)
     }
     const session = this.openSession(row.id, deviceName.slice(0, 120))
-    this.rememberPassword(row.id, password)
+    if (!isOperationsRuntime() && row.id !== OPERATIONS_ADMIN_ACCOUNT_ID) this.rememberPassword(row.id, password)
+    else this.rememberPassword(row.id, '')
     return {
       id: row.id,
       name: row.name,
@@ -255,7 +360,7 @@ export class CollabStore {
     this.assertPassword(accountId, currentPassword)
     this.db
       .prepare('UPDATE accounts SET password_hash = ?, must_change_password = 0, password_recall = ? WHERE id = ?')
-      .run(hashPassword(next), next, accountId)
+      .run(hashPassword(next), isOperationsRuntime() || accountId === OPERATIONS_ADMIN_ACCOUNT_ID ? '' : next, accountId)
     const keepHash = keepToken ? this.digestToken(keepToken) : ''
     this.db
       .prepare('UPDATE auth_sessions SET revoked_at = ? WHERE account_id = ? AND revoked_at IS NULL AND token_hash != ?')
@@ -265,6 +370,11 @@ export class CollabStore {
 
   /** 登录后停在自己的工作区。还没有的话建一个空的。 */
   enter(accountId: string) {
+    if (isOperationsRuntime() || accountId === OPERATIONS_ADMIN_ACCOUNT_ID) {
+      if (!this.isOperationsOperator(accountId)) throw new CollabError('没有平台运营权限', 403)
+      this.rememberActive(accountId, OPERATIONS_WORKSPACE_ID)
+      return OPERATIONS_WORKSPACE_ID
+    }
     const rows = this.listWorkspaces(accountId)
     const current = this.accountActiveWorkspace(accountId)
     const next = current && rows.some((row) => row.id === current) ? current : (rows[0]?.id ?? this.createWorkspace(accountId, '我的工作区').id)
@@ -2744,7 +2854,7 @@ export class CollabStore {
   }
 
   private ensureBuiltInRoot(now = Date.now()) {
-    if (!isOnlineRuntime()) return false
+    if (!isOnlineRuntime() || isOperationsRuntime()) return false
     const existing = this.db
       .prepare(`SELECT id FROM accounts WHERE lower(email) = 'root' LIMIT 1`)
       .get() as { id?: string } | undefined

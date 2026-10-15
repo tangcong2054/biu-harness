@@ -347,7 +347,12 @@ export class AgentLoop implements AgentRunner {
         }
         const detail = String(error)
         const text = `模型调用失败：${detail}`
-        await session.append(this.sessionId, { type: 'assistant/message', text })
+        const failedRequestId = (error as { requestId?: unknown } | null)?.requestId
+        await session.append(this.sessionId, {
+          type: 'assistant/message',
+          text,
+          ...(typeof failedRequestId === 'string' && failedRequestId ? { requestId: failedRequestId } : {}),
+        })
         await session.append(this.sessionId, { type: 'step/end', turn, step })
         await session.append(this.sessionId, { type: 'turn/end', turn, reason: 'llm-error' })
         this.ctx.emit('agent/status', { sessionId: this.sessionId, status: 'idle' })
@@ -361,6 +366,7 @@ export class AgentLoop implements AgentRunner {
           type: 'assistant/message',
           text: final,
           ...(usage ? { usage } : {}),
+          ...replyIds(reply),
         })
         await session.append(this.sessionId, { type: 'step/end', turn, step })
         await session.append(this.sessionId, { type: 'turn/end', turn, reason: 'complete' })
@@ -374,6 +380,7 @@ export class AgentLoop implements AgentRunner {
         text: reply.content ?? '',
         tool_calls: reply.toolCalls,
         ...(usage ? { usage } : {}),
+        ...replyIds(reply),
       })
 
       const prepared = reply.toolCalls.map((call) => {
@@ -503,6 +510,14 @@ export class AgentLoopService extends Service {
 
 function isCancelError(error: unknown) {
   return /cancelled|AbortError|aborted/i.test(String(error))
+}
+
+/** 把供应商 request / response id 挂到 assistant/message；缺省时不落空字段。 */
+function replyIds(reply: AssistantReply): { requestId?: string; responseId?: string } {
+  return {
+    ...(reply.requestId ? { requestId: reply.requestId } : {}),
+    ...(reply.responseId ? { responseId: reply.responseId } : {}),
+  }
 }
 
 function stringify(value: unknown) {

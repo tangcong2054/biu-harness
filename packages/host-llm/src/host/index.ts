@@ -91,8 +91,39 @@ export function resolveModelsListUrl(baseUrl: string | undefined, provider: Chat
 }
 
 export type LlmProbeResult =
-  | { ok: true; latencyMs: number; detail: string }
+  | { ok: true; latencyMs: number; detail: string; models?: string[] }
   | { ok: false; latencyMs: number; detail: string }
+
+const MAX_LISTED_MODELS = 500
+
+/** 从 OpenAI 兼容的 GET /models 响应里取出模型 id。 */
+export function modelIdsFromListBody(body: unknown): string[] {
+  const rows = Array.isArray(body)
+    ? body
+    : body && typeof body === 'object'
+      ? Array.isArray((body as { data?: unknown }).data)
+        ? (body as { data: unknown[] }).data
+        : Array.isArray((body as { models?: unknown }).models)
+          ? (body as { models: unknown[] }).models
+          : []
+      : []
+  const ids: string[] = []
+  const seen = new Set<string>()
+  for (const row of rows) {
+    const raw =
+      typeof row === 'string'
+        ? row
+        : row && typeof row === 'object' && typeof (row as { id?: unknown }).id === 'string'
+          ? (row as { id: string }).id
+          : ''
+    const id = raw.trim()
+    if (!id || id.length > 200 || seen.has(id)) continue
+    seen.add(id)
+    ids.push(id)
+    if (ids.length >= MAX_LISTED_MODELS) break
+  }
+  return ids
+}
 
 export class LlmHttpError extends Error {
   constructor(
@@ -115,10 +146,26 @@ function retryAfterMs(value: string | null) {
   return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined
 }
 
+/** 供应商请求 id 常见的响应头；腾讯云 / OpenAI 兼容网关通常是 x-request-id，Anthropic 是 request-id。 */
+const REQUEST_ID_HEADERS = ['x-request-id', 'x-tc-requestid', 'request-id'] as const
+
+export function requestIdFromHeaders(headers: Headers | undefined | null): string | undefined {
+  if (!headers) return undefined
+  for (const name of REQUEST_ID_HEADERS) {
+    const value = headers.get(name)?.trim()
+    if (value) return value
+  }
+  return undefined
+}
+
+function idString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
 async function responseError(res: Response) {
   let message = `llm http ${res.status}`
   let code: string | number | undefined
-  let requestId: string | undefined
+  let requestId: string | undefined = requestIdFromHeaders(res.headers)
   try {
     const body = (await res.json()) as Record<string, unknown>
     const raw =
@@ -199,16 +246,17 @@ export async function probeLlmConnection(
     })
     if (listRes.ok) {
       const latencyMs = Date.now() - started
-      let count = 0
+      let models: string[] = []
       try {
-        const body = (await listRes.json()) as { data?: unknown[] }
-        if (Array.isArray(body.data)) count = body.data.length
+        models = modelIdsFromListBody(await listRes.json())
       } catch {
         /* ignore */
       }
+      const count = models.length
       return {
         ok: true,
         latencyMs,
+        ...(count > 0 ? { models } : {}),
         detail: count > 0 ? `GET /models · ${count} 个模型 · ${latencyMs}ms` : `GET /models · ${latencyMs}ms`,
       }
     }
@@ -388,6 +436,10 @@ export interface AssistantReply {
   content: string | null
   toolCalls: ToolCall[]
   usage?: LlmUsage
+  /** 供应商请求 id：响应头或流里的 request_id，排查问题时提供给供应商。 */
+  requestId?: string
+  /** 供应商回复 id：OpenAI 兼容 chunk.id / Anthropic message.id；拿不到 requestId 时可作兜底。 */
+  responseId?: string
 }
 
 export interface ChatOptions {
@@ -457,6 +509,8 @@ export async function consumeChatCompletionSse(
     onReasoningDelta?: (text: string) => void | Promise<void>
     onToolDelta?: (call: { id: string; name: string; arguments: string }) => void | Promise<void>
     signal?: AbortSignal
+    /** 响应头里已拿到的请求 id；流里的 request_id 只在它缺失时补上。 */
+    requestId?: string
   } = {},
 ): Promise<AssistantReply> {
   const reader = stream.getReader()
@@ -464,6 +518,8 @@ export async function consumeChatCompletionSse(
   let buffer = ''
   let content = ''
   let usage: LlmUsage | undefined
+  let requestId = options.requestId
+  let responseId: string | undefined
   const tools = new Map<number, StreamToolAcc>()
   let sawDone = false
 
@@ -502,12 +558,16 @@ export async function consumeChatCompletionSse(
           }>
           usage?: unknown
           error?: { message?: string }
+          id?: unknown
+          request_id?: unknown
         }
         try {
           chunk = JSON.parse(payload) as typeof chunk
         } catch {
           continue
         }
+        requestId ??= idString(chunk.request_id)
+        responseId ??= idString(chunk.id)
         if (chunk.error?.message) throw new Error(chunk.error.message)
         const delta = chunk.choices?.[0]?.delta
         const reasoning = delta?.reasoning_content ?? delta?.reasoning
@@ -553,6 +613,8 @@ export async function consumeChatCompletionSse(
     content: content || null,
     toolCalls,
     ...(usage ? { usage } : {}),
+    ...(requestId ? { requestId } : {}),
+    ...(responseId ? { responseId } : {}),
   }
 }
 
@@ -610,7 +672,13 @@ export class OpenAiCompatLlm implements LlmClient {
       throw await responseError(res)
     }
     if (!res.body) throw new Error('llm stream missing body')
-    return consumeChatCompletionSse(res.body, { onDelta: options?.onDelta, onReasoningDelta: options?.onReasoningDelta, onToolDelta: options?.onToolDelta, signal })
+    return consumeChatCompletionSse(res.body, {
+      onDelta: options?.onDelta,
+      onReasoningDelta: options?.onReasoningDelta,
+      onToolDelta: options?.onToolDelta,
+      signal,
+      requestId: requestIdFromHeaders(res.headers),
+    })
   }
 }
 
@@ -690,7 +758,13 @@ export class AnthropicLlm implements LlmClient {
       throw await responseError(res)
     }
     if (!res.body) throw new Error('llm stream missing body')
-    return consumeMessagesSse(res.body, { onDelta: options?.onDelta, onReasoningDelta: options?.onReasoningDelta, onToolDelta: options?.onToolDelta, signal })
+    return consumeMessagesSse(res.body, {
+      onDelta: options?.onDelta,
+      onReasoningDelta: options?.onReasoningDelta,
+      onToolDelta: options?.onToolDelta,
+      signal,
+      requestId: requestIdFromHeaders(res.headers),
+    })
   }
 }
 
@@ -706,13 +780,21 @@ function parseToolJson(text: string): unknown {
 /** 解析 Anthropic Messages SSE：text（text_delta）+ 工具参数（input_json_delta）累积。 */
 async function consumeMessagesSse(
   stream: ReadableStream<Uint8Array>,
-  options: { onDelta?: (text: string) => void | Promise<void>; onReasoningDelta?: (text: string) => void | Promise<void>; onToolDelta?: (call: { id: string; name: string; arguments: string }) => void | Promise<void>; signal?: AbortSignal } = {},
+  options: {
+    onDelta?: (text: string) => void | Promise<void>
+    onReasoningDelta?: (text: string) => void | Promise<void>
+    onToolDelta?: (call: { id: string; name: string; arguments: string }) => void | Promise<void>
+    signal?: AbortSignal
+    requestId?: string
+  } = {},
 ): Promise<AssistantReply> {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
   let content = ''
   let usage: LlmUsage | undefined
+  const requestId = options.requestId
+  let responseId: string | undefined
   const toolBlocks: Array<{ id?: string; name?: string; input: string }> = []
   let sawStop = false
 
@@ -739,7 +821,8 @@ async function consumeMessagesSse(
         }
         switch (evt.type) {
           case 'message_start': {
-            const message = evt.message as { usage?: unknown } | undefined
+            const message = evt.message as { usage?: unknown; id?: unknown } | undefined
+            responseId ??= idString(message?.id)
             const nextUsage = parseProviderUsage(message?.usage)
             if (nextUsage) usage = nextUsage
             break
@@ -803,6 +886,8 @@ async function consumeMessagesSse(
     content: content || null,
     toolCalls,
     ...(usage ? { usage } : {}),
+    ...(requestId ? { requestId } : {}),
+    ...(responseId ? { responseId } : {}),
   }
 }
 

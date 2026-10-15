@@ -4,6 +4,7 @@ dist/
 .cloud-data/
 .local-data/
 .desktop-data/
+.operations-data/
 .cordis/
 # 已安装插件是本地产物，整目录不入库
 .plugin/

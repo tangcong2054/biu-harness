@@ -30,15 +30,33 @@ export type {
 
 const CLIENT_KEY = 'biu.ui-actions.client-id'
 
+function browserRandomId() {
+  const cryptoObj = globalThis.crypto
+  if (typeof cryptoObj?.randomUUID === 'function') {
+    try {
+      return cryptoObj.randomUUID()
+    } catch {
+      /* http:// 局域网地址上这个 API 不可用 */
+    }
+  }
+  const bytes = new Uint8Array(16)
+  if (cryptoObj?.getRandomValues) cryptoObj.getRandomValues(bytes)
+  else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256)
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
 function clientId() {
   try {
     const existing = sessionStorage.getItem(CLIENT_KEY)
     if (existing) return existing
-    const id = crypto.randomUUID()
+    const id = browserRandomId()
     sessionStorage.setItem(CLIENT_KEY, id)
     return id
   } catch {
-    return crypto.randomUUID()
+    return browserRandomId()
   }
 }
 

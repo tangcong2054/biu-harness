@@ -180,6 +180,7 @@ export class PluginRegistryClient {
     readonly registryId: string,
     private readonly defaultTokenPath: string,
     private readonly adminToken = '',
+    private readonly operatorAccess?: () => boolean,
   ) {}
 
   private token() {
@@ -191,6 +192,7 @@ export class PluginRegistryClient {
   }
 
   isOperator() {
+    if (this.operatorAccess) return this.operatorAccess()
     const accountId = currentAccountId()
     let fileOperators: string[] = []
     try {
@@ -277,6 +279,7 @@ export class PluginRegistryClient {
   }
 
   async publish(id: string) {
+    if (id === 'platform-operations') throw new Error('平台运营插件只留在运营端，不上传到插件商店')
     if (existsSync(join(this.store.sandboxPath(id), 'manifest.json'))) await this.store.pack(id)
     const dir = this.store.pluginPath(id)
     if (!existsSync(join(dir, 'manifest.json'))) throw new Error(`plugin is not packed: ${id}`)

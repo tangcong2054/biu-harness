@@ -32,6 +32,7 @@ import {
   runWithRequestWorkspace,
   writeEditorContent,
   isOnlineRuntime,
+  isOperationsRuntime,
 } from '@biu/host-plugin-loader/data-dir'
 
 export type StoreListing = {
@@ -586,6 +587,7 @@ export class PluginStoreService extends Service {
       if (!(await stat(dir)).isDirectory()) continue
       if (!existsSync(join(dir, 'manifest.json'))) continue
       const manifest = await readManifest(dir)
+      if (manifest.id === 'platform-operations' && !isOnlineRuntime() && !isOperationsRuntime()) continue
       const enabled = this.isEnabled(manifest.id)
       const stats = await pluginDirStats(dir)
       const codeVersion = await hashInstalledPluginCode(dir)
@@ -701,6 +703,7 @@ export class PluginStoreService extends Service {
   /** 卸载：有账号上下文时只移除当前 Workspace 安装关系；无租户时沿用本地物理卸载。 */
   async uninstall(id: string) {
     if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
+    if (id === 'platform-operations') throw new Error('不能卸载平台运营插件')
     const accountId = currentAccountId()
     const workspaceId = this.currentWorkspaceId()
     const account = this.accountStore()
@@ -731,6 +734,7 @@ export class PluginStoreService extends Service {
   /** 彻底删除：安装产物和沙箱一起删。回收站清空走这条。 */
   async destroy(id: string) {
     if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
+    if (id === 'platform-operations') throw new Error('不能删除平台运营插件')
     if (this.isBuiltin(id)) throw new Error(`cannot delete built-in plugin: ${id}`)
     await this.uninstall(id)
     const installed = this.pluginPath(id)

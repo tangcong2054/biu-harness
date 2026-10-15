@@ -192,7 +192,7 @@ export function DatabaseInspectorTab({
   const id = paneOf({ paneId })
   const collections = useInspectorCollections()
   const tables = useMemo(
-    () => collections.filter((row) => row.path && row.path !== '/'),
+    () => collections.filter((row) => row.path && row.path !== '/' && row.view?.route),
     [collections],
   )
   const inspectorPath = useBindInspectorDbPath(id, tables, seedCollection)
@@ -278,7 +278,7 @@ export function DatabaseInspectorBrowse(props: SlotProps) {
   const ui = getDatabaseUi()
   const collections = useInspectorCollections()
   const tables = useMemo(
-    () => collections.filter((row) => row.path && row.path !== '/'),
+    () => collections.filter((row) => row.path && row.path !== '/' && row.view?.route),
     [collections],
   )
   const inspectorPath = useBindInspectorDbPath(id, tables, seedOf(extra))

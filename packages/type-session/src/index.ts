@@ -39,6 +39,10 @@ export type SessionEventBody =
         /** 本次 LLM 输入中「历史 turn」占比（0..1）；由 agent-loop 在 derive 时统计挂载。curPct=1-histPct，无需单独存储。 */
         histPct?: number
       }
+      /** 本步模型调用的供应商请求 id（响应头 / 流 / 错误体），用于向供应商排查。 */
+      requestId?: string
+      /** 供应商回复 id（chunk.id / message.id），拿不到 requestId 时的兜底。 */
+      responseId?: string
     }
   | { type: 'assistant/chunk'; text: string; channel?: 'reasoning' }
   | { type: 'tool/call'; id: string; name: string; arguments: string }

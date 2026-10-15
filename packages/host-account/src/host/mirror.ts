@@ -33,6 +33,8 @@ type AccountLike = {
   rememberCopy?: (collection: string, localId: string, cloudId: string) => void
   replica?: { active?: () => { token?: string; accountId?: string } | null }
   linkedCloud?: (localAccountId?: string) => { origin: string; token: string } | null
+  workspaceLocation?: (workspaceId: string) => 'device' | 'cloud'
+  store?: { activeWorkspaceId?: () => string | null }
 }
 
 function sessionsOf(ctx: Context) {
@@ -209,6 +211,23 @@ function cloudLogin(ctx: Context) {
   }
 }
 
+/**
+ * 本机转发到云端的请求要带上当前云端空间。
+ * 不带的话云端会用账号“记住的当前空间”，和本机选中的空间不一致时会报 unknown record。
+ */
+export function cloudWorkspaceHeaders(ctx: Context): Record<string, string> {
+  const account = accountOf(ctx)
+  try {
+    const workspaceId = account?.store?.activeWorkspaceId?.() ?? ''
+    if (workspaceId && account?.workspaceLocation?.(workspaceId) === 'cloud') {
+      return { 'x-biu-workspace-id': workspaceId }
+    }
+  } catch {
+    /* 没有账号服务或空间表时，按不指定空间处理 */
+  }
+  return {}
+}
+
 export async function publishToCloud(ctx: Context, collection: string, ids: string[]) {
   const linked: Record<string, string> = {}
   const login = cloudLogin(ctx)
@@ -258,7 +277,11 @@ export async function publishToCloud(ctx: Context, collection: string, ids: stri
   }
   const res = await fetch(`${login.origin}/api/replica/snapshot`, {
     method: 'POST',
-    headers: { authorization: `Bearer ${login.token}`, 'content-type': 'application/json' },
+    headers: {
+      authorization: `Bearer ${login.token}`,
+      'content-type': 'application/json',
+      ...cloudWorkspaceHeaders(ctx),
+    },
     body: JSON.stringify(snapshot),
   })
   if (!res.ok) {
@@ -295,6 +318,7 @@ export async function forwardCloud(
     method: init.method ?? 'POST',
     headers: {
       authorization: `Bearer ${login.token}`,
+      ...cloudWorkspaceHeaders(ctx),
       ...(init.body === undefined ? {} : { 'content-type': 'application/json' }),
     },
     body: init.body === undefined ? undefined : JSON.stringify(init.body),

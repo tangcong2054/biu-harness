@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, test } from 'vitest'
 import { openAndMigrateBiu, runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
-import { CollabError, CollabStore } from './store.ts'
+import { CollabError, CollabStore, OPERATIONS_ADMIN_ACCOUNT_ID, OPERATIONS_WORKSPACE_ID } from './store.ts'
 
 const dirs: string[] = []
 
@@ -64,6 +64,57 @@ test('online mode denies record reads without an account context', () => {
   } finally {
     if (previous === undefined) delete process.env.BIU_ONLINE
     else process.env.BIU_ONLINE = previous
+  }
+})
+
+test('operations runtime bootstraps one fixed admin workspace without retaining the password', () => {
+  const previousOnline = process.env.BIU_ONLINE
+  const previousOperations = process.env.BIU_OPERATIONS
+  process.env.BIU_ONLINE = '1'
+  process.env.BIU_OPERATIONS = '1'
+  try {
+    const collab = store()
+    assert.throws(
+      () => collab.bootstrapOperations({ email: 'admin' }),
+      /BIU_OPERATIONS_ADMIN_PASSWORD/,
+    )
+    const seeded = collab.bootstrapOperations({
+      email: 'admin',
+      password: '97ortanon',
+    })
+    assert.deepEqual(seeded, {
+      accountId: OPERATIONS_ADMIN_ACCOUNT_ID,
+      workspaceId: OPERATIONS_WORKSPACE_ID,
+      created: true,
+    })
+    const login = collab.login('admin', '97ortanon')
+    assert.equal(login.id, OPERATIONS_ADMIN_ACCOUNT_ID)
+    assert.equal(collab.enter(OPERATIONS_ADMIN_ACCOUNT_ID), OPERATIONS_WORKSPACE_ID)
+    assert.equal(collab.isOperationsOperator(OPERATIONS_ADMIN_ACCOUNT_ID), true)
+    assert.equal(collab.listWorkspaces(OPERATIONS_ADMIN_ACCOUNT_ID)[0]?.id, OPERATIONS_WORKSPACE_ID)
+    assert.equal(
+      collab.bootstrapOperations({ email: 'admin' }).created,
+      false,
+    )
+    const db = (collab as unknown as { db: import('node:sqlite').DatabaseSync }).db
+    const row = db
+      .prepare('SELECT password_recall FROM accounts WHERE id = ?')
+      .get(OPERATIONS_ADMIN_ACCOUNT_ID) as { password_recall: string }
+    assert.equal(row.password_recall, '')
+    collab.changePassword(OPERATIONS_ADMIN_ACCOUNT_ID, '97ortanon', 'new-operations-secret', login.token)
+    assert.equal(
+      (db.prepare('SELECT password_recall FROM accounts WHERE id = ?').get(OPERATIONS_ADMIN_ACCOUNT_ID) as {
+        password_recall: string
+      }).password_recall,
+      '',
+    )
+    assert.equal(collab.login('admin', 'new-operations-secret').id, OPERATIONS_ADMIN_ACCOUNT_ID)
+    assert.throws(() => collab.login('root', '123456'), /邮箱或密码不对/)
+  } finally {
+    if (previousOnline === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previousOnline
+    if (previousOperations === undefined) delete process.env.BIU_OPERATIONS
+    else process.env.BIU_OPERATIONS = previousOperations
   }
 })
 
