@@ -60,7 +60,7 @@ export class AccountService extends Service {
       let snapshotSyncing = false
       const timer = setInterval(() => {
         const device = this.replica?.active()
-        if (!device?.token || snapshotSyncing) return
+        if (!device?.token || !device.workspaceId || snapshotSyncing) return
         snapshotSyncing = true
         void exchangeSnapshot(ctx, origin, device.token, device.accountId, device.workspaceId)
           .catch((error) => {
