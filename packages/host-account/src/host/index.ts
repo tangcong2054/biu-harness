@@ -1375,10 +1375,22 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
     }
   })
 
+  const snapshotInFlight = new Map<string, Promise<MirrorSnapshot>>()
+
   ctx.http.route('GET', '/api/replica/snapshot', async (route) => {
     try {
-      actor(route)
-      route.send(200, await takeSnapshot(ctx))
+      const me = actor(route)
+      const since = Math.max(0, Number(route.query.get('since') ?? 0) || 0)
+      const workspaceId = account.store.activeWorkspaceId() ?? ''
+      const flightKey = `${me.id}\t${workspaceId}\t${since}`
+      let pending = snapshotInFlight.get(flightKey)
+      if (!pending) {
+        pending = takeSnapshot(ctx, since > 0 ? { since } : undefined).finally(() => {
+          snapshotInFlight.delete(flightKey)
+        })
+        snapshotInFlight.set(flightKey, pending)
+      }
+      route.send(200, await pending)
     } catch (error) {
       fail(route, error)
     }

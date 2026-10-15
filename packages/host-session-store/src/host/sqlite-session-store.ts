@@ -110,6 +110,16 @@ export class SqliteSessionStore implements SessionStore {
         ? 'CREATE INDEX IF NOT EXISTS eventsdb.events_session_seq ON events(session_id, seq)'
         : 'CREATE INDEX IF NOT EXISTS events_session_seq ON events(session_id, seq)',
     )
+    this.sessions.exec(
+      this.splitEvents
+        ? 'CREATE INDEX IF NOT EXISTS eventsdb.events_type_session_ts ON events(type, session_id, ts)'
+        : 'CREATE INDEX IF NOT EXISTS events_type_session_ts ON events(type, session_id, ts)',
+    )
+    this.sessions.exec(
+      this.splitEvents
+        ? 'CREATE INDEX IF NOT EXISTS eventsdb.events_session_seq_ts ON events(session_id, seq, ts)'
+        : 'CREATE INDEX IF NOT EXISTS events_session_seq_ts ON events(session_id, seq, ts)',
+    )
     try {
       this.sessions.exec('ALTER TABLE sessions ADD COLUMN mascot_json TEXT')
     } catch {
@@ -266,23 +276,23 @@ export class SqliteSessionStore implements SessionStore {
       )
       .all() as Array<{ session_id: string; last_message_at: number }>
     for (const row of spoken) spokenBySession.set(row.session_id, Number(row.last_message_at) || 0)
-    const firstBySession = new Map<string, number>()
-    const mins = this.sessions
-      .prepare(`SELECT session_id, MIN(ts) AS first_event_at FROM ${this.eventsTable()} GROUP BY session_id`)
-      .all() as Array<{ session_id: string; first_event_at: number }>
-    for (const row of mins) firstBySession.set(row.session_id, Number(row.first_event_at) || 0)
+    const firstEventStmt = this.sessions.prepare(
+      `SELECT ts FROM ${this.eventsTable()} WHERE session_id = ? ORDER BY seq ASC LIMIT 1`,
+    )
     return rows.map((row) => {
       const project = parseProject(row.project_json)
       const mascot = parseMascot(row.mascot_json)
       const config = parseConfig(row.config_json)
       const createdAt = Number(config?.createdAt)
-      const firstEventAt = firstBySession.get(row.id) ?? 0
-      const stamp =
-        Number.isFinite(createdAt) && createdAt > 0
-          ? createdAt
-          : firstEventAt > 0
-            ? firstEventAt
-            : row.updated_at
+      const hasCreatedAt = Number.isFinite(createdAt) && createdAt > 0
+      const firstEventAt = hasCreatedAt
+        ? 0
+        : Number((firstEventStmt.get(row.id) as { ts?: number } | undefined)?.ts) || 0
+      const stamp = hasCreatedAt
+        ? createdAt
+        : firstEventAt > 0
+          ? firstEventAt
+          : row.updated_at
       return {
         id: row.id,
         version: row.version,

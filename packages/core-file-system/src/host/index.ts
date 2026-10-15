@@ -1276,19 +1276,27 @@ export class DatabaseService extends Service implements Database {
   }
 
   /** 当前账号能读到的记录，带上正文，给本机和集中部署对拷。 */
-  async syncedRecords() {
-    const out: Array<{ path: string; records: DbRecord[] }> = []
+  async syncedRecords(options?: { since?: number }) {
+    const since = Math.max(0, Number(options?.since) || 0)
+    const out: Array<{ path: string; records: DbRecord[]; recordIds?: string[] }> = []
     for (const spec of this.collections.values()) {
-      if (!spec.list || !spec.get) continue
+      if (spec.path === '/sessions' || spec.path === '/workspace-members') continue
+      if (!spec.list || !spec.get || !spec.create || !spec.update) continue
       try {
         const listed = await this.list(spec.path)
         if (listed.kind !== 'collection') continue
         const records: DbRecord[] = []
+        const recordIds: string[] = []
         for (const item of listed.items) {
-          const full = await spec.get(String(item.id))
+          const id = String(item.id ?? '')
+          if (!id) continue
+          recordIds.push(id)
+          const updatedAt = Number(item.updatedAt) || 0
+          if (since > 0 && updatedAt > 0 && updatedAt <= since) continue
+          const full = await spec.get(id)
           records.push((full as DbRecord | null) ?? item)
         }
-        out.push({ path: spec.path, records })
+        out.push(since > 0 ? { path: spec.path, records, recordIds } : { path: spec.path, records })
       } catch {
         /* 这张表读不了就跳过，不挡住别的表 */
       }

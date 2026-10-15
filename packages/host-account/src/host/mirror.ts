@@ -5,7 +5,22 @@ import type { SessionRecord } from '@biu/type-session'
 
 export type MirrorSnapshot = {
   sessions: Array<SessionRecord & { updatedAt?: number }>
-  collections: Array<{ path: string; records: Array<Record<string, unknown> & { id: string; updatedAt?: number }> }>
+  sessionIds?: string[]
+  collections: Array<{
+    path: string
+    records: Array<Record<string, unknown> & { id: string; updatedAt?: number }>
+    recordIds?: string[]
+  }>
+}
+
+export type SnapshotOptions = {
+  since?: number
+}
+
+const snapshotWatermarks = new Map<string, number>()
+
+function yieldEventLoop() {
+  return new Promise<void>((resolve) => setImmediate(resolve))
 }
 
 type ApplyMode = 'cache' | 'adopt'
@@ -18,7 +33,7 @@ type SessionStoreLike = {
 }
 
 type DatabaseLike = {
-  syncedRecords: () => Promise<MirrorSnapshot['collections']>
+  syncedRecords: (options?: { since?: number }) => Promise<MirrorSnapshot['collections']>
   applySynced: (path: string, records: MirrorSnapshot['collections'][number]['records']) => Promise<void>
   read?: (path: string) => Promise<{ value?: Record<string, unknown> & { id?: string } }>
   remove?: (path: string, query: { ids: string[] }) => Promise<unknown>
@@ -97,36 +112,74 @@ export function cloudCopyId(collection: string) {
   return collection === '/tasks' ? `task_${hex}` : `c${hex}`
 }
 
-export async function takeSnapshot(ctx: Context): Promise<MirrorSnapshot> {
+export async function takeSnapshot(ctx: Context, options?: SnapshotOptions): Promise<MirrorSnapshot> {
+  const since = Math.max(0, Number(options?.since) || 0)
   const sessions: MirrorSnapshot['sessions'] = []
+  const sessionIds: string[] = []
   const store = sessionsOf(ctx)
   if (store) {
+    let loadedCount = 0
     for (const item of await store.listSummaries()) {
       if (!sessionVisible(ctx, item.id, item)) continue
+      sessionIds.push(item.id)
+      const updatedAt = Number(item.updatedAt) || 0
+      if (since > 0 && updatedAt > 0 && updatedAt <= since) continue
       const full = await store.load(item.id)
       if (!full) continue
-      sessions.push({ ...full, updatedAt: Number(item.updatedAt) || 0 })
+      sessions.push({ ...full, updatedAt })
+      loadedCount += 1
+      if (loadedCount % 5 === 0) await yieldEventLoop()
     }
   }
-  const collections = (await databaseOf(ctx)?.syncedRecords()) ?? []
-  return { sessions, collections }
+  const rawCollections = ((await databaseOf(ctx)?.syncedRecords(since > 0 ? { since } : undefined)) ?? []).filter(
+    (item) => item.path !== '/sessions',
+  )
+  const collections: MirrorSnapshot['collections'] =
+    since > 0
+      ? rawCollections.map((item) => ({
+          path: item.path,
+          recordIds:
+            item.recordIds ?? item.records.map((record) => String(record?.id ?? '')).filter(Boolean),
+          records: item.records.filter((record) => {
+            const updatedAt = Number(record?.updatedAt) || 0
+            return updatedAt <= 0 || updatedAt > since
+          }),
+        }))
+      : rawCollections
+  return {
+    sessions,
+    ...(since > 0 ? { sessionIds } : {}),
+    collections,
+  }
 }
 
 export async function applySnapshot(ctx: Context, snapshot: MirrorSnapshot, mode: ApplyMode = 'cache') {
   const account = accountOf(ctx)
   const store = sessionsOf(ctx)
   if (store) {
-    const current = new Set((await store.listSummaries()).map((item) => item.id))
-    const incoming = new Set<string>()
+    const summaries = await store.listSummaries()
+    const current = new Set(summaries.map((item) => item.id))
+    const currentUpdatedAt = new Map(summaries.map((item) => [item.id, Number(item.updatedAt) || 0]))
+    const incoming = new Set<string>(snapshot.sessionIds ?? [])
+    let savedCount = 0
     for (const record of snapshot.sessions ?? []) {
       if (!record?.id) continue
       incoming.add(record.id)
       const localHome = current.has(record.id) && !account?.isRemote?.('/sessions', record.id)
       if (mode === 'cache' && localHome) continue
+      const incomingAt = Number(record.updatedAt) || 0
+      const existingAt = currentUpdatedAt.get(record.id) ?? 0
+      if (mode === 'cache' && current.has(record.id) && incomingAt > 0 && existingAt >= incomingAt) {
+        claim(ctx, '/sessions', record.id)
+        rememberCloud(ctx, '/sessions', record.id)
+        continue
+      }
       try {
         await store.save(record)
         claim(ctx, '/sessions', record.id)
         if (mode === 'cache') rememberCloud(ctx, '/sessions', record.id)
+        savedCount += 1
+        if (savedCount % 5 === 0) await yieldEventLoop()
       } catch (error) {
         console.warn('[replica] skip session', record.id, error)
       }
@@ -142,7 +195,8 @@ export async function applySnapshot(ctx: Context, snapshot: MirrorSnapshot, mode
   const database = databaseOf(ctx)
   if (!database) return
   for (const collection of snapshot.collections ?? []) {
-    const incoming = new Set<string>()
+    if (collection.path === '/sessions') continue
+    const incoming = new Set<string>(collection.recordIds ?? [])
     const writable = []
     for (const record of collection.records ?? []) {
       const id = String(record?.id ?? '')
@@ -154,11 +208,13 @@ export async function applySnapshot(ctx: Context, snapshot: MirrorSnapshot, mode
       }
       writable.push(record)
     }
-    await database.applySynced(collection.path, writable)
-    for (const record of writable) {
-      if (!record?.id) continue
-      claim(ctx, collection.path, String(record.id))
-      if (mode === 'cache') rememberCloud(ctx, collection.path, String(record.id))
+    if (writable.length) {
+      await database.applySynced(collection.path, writable)
+      for (const record of writable) {
+        if (!record?.id) continue
+        claim(ctx, collection.path, String(record.id))
+        if (mode === 'cache') rememberCloud(ctx, collection.path, String(record.id))
+      }
     }
     if (mode === 'cache') {
       for (const id of account?.remoteIds?.(collection.path) ?? []) {
@@ -180,11 +236,14 @@ export async function exchangeSnapshot(
   workspaceId = '',
 ) {
   const root = origin.replace(/\/$/, '')
+  const watermarkKey = `${root}\t${accountId}\t${workspaceId}`
+  const since = snapshotWatermarks.get(watermarkKey) ?? 0
+  const url = since > 0 ? `${root}/api/replica/snapshot?since=${since}` : `${root}/api/replica/snapshot`
   const headers = {
     authorization: `Bearer ${token}`,
     ...(workspaceId ? { 'x-biu-workspace-id': workspaceId } : {}),
   }
-  const pulled = await fetch(`${root}/api/replica/snapshot`, {
+  const pulled = await fetch(url, {
     headers,
     signal: AbortSignal.timeout(10_000),
   })
@@ -195,6 +254,18 @@ export async function exchangeSnapshot(
       ? runWithRequestWorkspace(workspaceId, () => applySnapshot(ctx, body, 'cache'))
       : applySnapshot(ctx, body, 'cache'),
   )
+  let maxUpdatedAt = since
+  for (const session of body.sessions ?? []) {
+    const ts = Number(session?.updatedAt) || 0
+    if (ts > maxUpdatedAt) maxUpdatedAt = ts
+  }
+  for (const collection of body.collections ?? []) {
+    for (const record of collection.records ?? []) {
+      const ts = Number(record?.updatedAt) || 0
+      if (ts > maxUpdatedAt) maxUpdatedAt = ts
+    }
+  }
+  snapshotWatermarks.set(watermarkKey, maxUpdatedAt > 0 ? maxUpdatedAt : Date.now())
 }
 
 function cloudLogin(ctx: Context) {

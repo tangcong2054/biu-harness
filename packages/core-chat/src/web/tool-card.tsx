@@ -133,10 +133,12 @@ function MetricChart({ detail, tall = false }: { detail: Extract<FormattedDetail
   const axisPts = detail.series[0]?.points ?? []
   const labelCount = Math.min(6, axisPts.length)
   const xLabels: { x: number; label: string }[] = []
+  const seenX = new Set<number>()
   if (labelCount > 1) {
     for (let i = 0; i < labelCount; i += 1) {
       const point = axisPts[Math.floor(((axisPts.length - 1) * i) / (labelCount - 1))]
-      if (!point) continue
+      if (!point || seenX.has(point.x)) continue
+      seenX.add(point.x)
       xLabels.push({
         x: point.x,
         label: new Date(point.x).toLocaleTimeString('zh-CN', { hour12: false }),
@@ -151,10 +153,10 @@ function MetricChart({ detail, tall = false }: { detail: Extract<FormattedDetail
         <span>{detail.series.length} 条曲线</span>
       </div>
       <svg className="tool-chart-svg" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="xMidYMid meet">
-        {ticks.map((tick) => {
+        {ticks.map((tick, i) => {
           const y = padT + yScale(tick)
           return (
-            <g key={tick}>
+            <g key={`tick-${i}-${tick}`}>
               <line x1={padL} y1={y} x2={width - padR} y2={y} className="tool-chart-grid" />
               <text x={padL - 4} y={y + 3} textAnchor="end" className="tool-chart-label">
                 {fmtChartY(tick)}
@@ -162,12 +164,12 @@ function MetricChart({ detail, tall = false }: { detail: Extract<FormattedDetail
             </g>
           )
         })}
-        {xLabels.map((item) => (
-          <text key={`${item.x}-${item.label}`} x={padL + xScale(item.x)} y={height - 6} textAnchor="middle" className="tool-chart-label">
+        {xLabels.map((item, i) => (
+          <text key={`x-${i}-${item.x}-${item.label}`} x={padL + xScale(item.x)} y={height - 6} textAnchor="middle" className="tool-chart-label">
             {item.label}
           </text>
         ))}
-        {detail.series.map((series) => {
+        {detail.series.map((series, seriesIdx) => {
           const valid = series.points.filter((p) => p.y != null && Number.isFinite(p.y)) as { x: number; y: number }[]
           if (valid.length < 2) return null
           const d = valid
@@ -175,14 +177,14 @@ function MetricChart({ detail, tall = false }: { detail: Extract<FormattedDetail
             .join(' ')
           const last = valid[valid.length - 1]!
           return (
-            <g key={series.name}>
+            <g key={`series-${seriesIdx}-${series.name}`}>
               <path d={d} fill="none" stroke={series.color} strokeWidth="1.6" />
               <circle cx={padL + xScale(last.x)} cy={padT + yScale(last.y)} r="2.2" fill={series.color} />
             </g>
           )
         })}
         {detail.series.map((series, i) => (
-          <g key={`legend-${series.name}`}>
+          <g key={`legend-${i}-${series.name}`}>
             <rect x={padL + i * 130} y="3" width="10" height="3" rx="1" fill={series.color} />
             <text x={padL + i * 130 + 14} y="8" className="tool-chart-label">
               {series.name.length > 16 ? `${series.name.slice(0, 16)}…` : series.name}
@@ -192,8 +194,8 @@ function MetricChart({ detail, tall = false }: { detail: Extract<FormattedDetail
       </svg>
       {detail.stats.length ? (
         <div className="tool-chart-stats">
-          {detail.stats.map((stat) => (
-            <span key={stat.name}>
+          {detail.stats.map((stat, i) => (
+            <span key={`stat-${i}-${stat.name}`}>
               <b>{stat.name}</b> min={fmtChartY(stat.min)} max={fmtChartY(stat.max)} avg={fmtChartY(stat.avg)}
             </span>
           ))}

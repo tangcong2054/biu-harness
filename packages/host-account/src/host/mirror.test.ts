@@ -78,6 +78,22 @@ test('cache keeps local sessions and replaces cloud sessions', async () => {
   assert.equal(rows.has('gone'), false)
   const snapshot = await takeSnapshot(ctx)
   assert.equal(snapshot.sessions.find((item) => item.id === 'fresh')?.config?.title, 'new-cloud')
+
+  const incremental = await takeSnapshot(ctx, { since: 25 })
+  assert.deepEqual(incremental.sessions.map((item) => item.id), ['local', 'cloud'])
+  assert.deepEqual(incremental.sessionIds, ['local', 'cloud', 'fresh'])
+
+  saved.length = 0
+  rows.delete('gone')
+  await applySnapshot(ctx, {
+    sessions: [
+      { id: 'cloud', version: 1, updatedAt: 30, events: [], config: { title: 'unchanged-cloud' } },
+    ],
+    sessionIds: ['cloud', 'fresh'],
+    collections: [],
+  }, 'cache')
+  assert.deepEqual(saved.map((item) => item.id), [])
+  assert.equal(rows.has('fresh'), true)
 })
 
 test('cloud copy ids are new and task ids keep the task prefix', () => {
