@@ -56,7 +56,7 @@ test('loop appends multiple assistant/chunk deltas from onDelta', async () => {
   assert.equal(message?.type === 'assistant/message' && message.usage?.inputTokens, 1)
 })
 
-test('loop records provider request ids on every assistant/message step', async () => {
+test('loop does not persist provider request ids for successful calls', async () => {
   const { ctx, sessionId } = await spine()
   ctx.tools.register({
     name: 'noop',
@@ -81,8 +81,8 @@ test('loop records provider request ids on every assistant/message step', async 
       event.type === 'assistant/message' ? [event.requestId ?? null, event.responseId ?? null] : null,
     ),
     [
-      ['req-step-0', 'chatcmpl-0'],
-      ['req-step-1', null],
+      [null, null],
+      [null, null],
     ],
   )
 })
