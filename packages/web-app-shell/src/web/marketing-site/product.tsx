@@ -1,4 +1,4 @@
-import { SiteChrome, SiteFinalCta, type SiteAction } from './site-chrome.tsx'
+import { SiteChrome, type SiteAction } from './site-chrome.tsx'
 import { usePageMeta } from './use-page-meta.ts'
 
 type Block = {
@@ -177,7 +177,6 @@ export function MarketingProduct({ onLogin, onStart }: { onLogin: SiteAction; on
           </div>
         </section>
 
-        <SiteFinalCta title="做你的第一页服务" />
     </SiteChrome>
   )
 }

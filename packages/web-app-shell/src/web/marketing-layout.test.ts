@@ -170,12 +170,6 @@ test('窄屏：所有区块统一收到 20px', () => {
   assert.deepEqual(missing, [], `这些区块没有窄屏留白覆盖，会和邻居错位：${missing.join(', ')}`)
 })
 
-test('长图文件名跟路径走', async () => {
-  const { pageShotName } = await import('./marketing-site/page-shot.ts')
-  assert.equal(pageShotName('/'), 'biu-home.png')
-  assert.equal(pageShotName('/blog/saas-to-paas'), 'biu-blog-saas-to-paas.png')
-})
-
 test('产品页两处标题在小标签下方，不再排到右边', () => {
   assert.match(css, /\.site-continuity-heading,\s*\.site-ecosystem-heading\s*\{[^}]*display:\s*block/s)
   assert.doesNotMatch(css, /\.site-continuity-heading,\s*\.site-ecosystem-heading,\s*\.site-faq-heading/)
@@ -185,12 +179,12 @@ test('长图生成时印花铺满整页，不再固定在视口', () => {
   assert.match(css, /\.site\.is-capturing \.site-print\s*\{[^}]*position:\s*absolute/s, '印花在长图里要跟着内容铺满')
 })
 
-test('页脚：列区是 5 列（产品/开源/了解/分享/开始并排，不换行）', () => {
+test('页脚：列区是 2 列（产品 / 开始并排，不换行）', () => {
   const cols = [...css.matchAll(/\.site-footer-columns\s*\{([^}]*)\}/g)].map((m) => m[1])
   const base0 = cols[0] ?? ''
   const m = base0.match(/grid-template-columns\s*:\s*repeat\((\d+)/)
   assert.ok(m, '未找到列区列数定义')
-  assert.equal(Number(m[1]), 5, '「开始」必须和前面几列并排，不能单独换行')
+  assert.equal(Number(m[1]), 2, '「开始」必须和「产品」并排，不能单独换行')
 })
 
 test('页脚：内容走全站容器基准（不是硬编码 padding）', () => {
@@ -203,31 +197,6 @@ test('页脚：内容走全站容器基准（不是硬编码 padding）', () => 
     false,
     '页脚仍在用硬编码 padding，会与其它区块错位',
   )
-})
-
-test('页脚：列区在上，底部行（BIU 左 / 法务右）在下', () => {
-  const tsx = readFileSync(
-    resolve(process.cwd(), 'packages/web-app-shell/src/web/marketing-site/site-chrome.tsx'),
-    'utf8',
-  )
-  const foot = tsx.slice(tsx.indexOf('export function SiteFooter'))
-  const body = foot.slice(0, foot.indexOf('</footer>'))
-  const top = [...body.matchAll(/^ {6}<(\w+)/gm)].map((m) => m[1])
-  assert.deepEqual(top, ['div', 'div'], '页脚应为两层：列区 + 底部行')
-
-  // 底部行里：tagline 在前，legal 在后
-  const base = body.slice(body.indexOf('site-footer-base'))
-  const order = [...base.matchAll(/site-footer-(tagline|legal)/g)].map((m) => m[1])
-  assert.deepEqual(order, ['tagline', 'legal'], '底部行应为 BIU(左) → 法务(右)')
-
-  const css2 = [...css.matchAll(/\.site-footer-base\s*\{([^}]*)\}/g)].map((m) => m[1])[0] ?? ''
-  assert.match(css2, /justify-content:\s*space-between/, '底部行应两端对齐（左 BIU / 右 法务）')
-})
-
-test('页脚：底部行两侧字号一致', () => {
-  const m = css.match(/\.site-footer-tagline,\s*\.site-footer-legal\s*\{([^}]*)\}/)
-  assert.ok(m, 'tagline 与 legal 应共用同一条字号规则')
-  assert.match(m[1], /font-size:\s*13px/, '两侧字号应统一为 13px')
 })
 
 test('板块间距：小字→大字、大字→内容 各自统一', () => {

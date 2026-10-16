@@ -21,6 +21,14 @@ test('warehouse view imports a standard Skill directory', () => {
   assert.match(source, /new CustomEvent\('fsdb:change'\)/)
 })
 
+test('warehouse cards scroll independently when the skill list grows', () => {
+  assert.match(source, /data-testid="skills-library-view"/)
+  assert.match(source, /height: '100%'/)
+  assert.match(source, /minHeight: 0/)
+  assert.match(source, /overflowY: 'auto'/)
+  assert.match(source, /overscrollBehavior: 'contain'/)
+})
+
 test('skills only keeps the shared content renderer', () => {
   assert.match(source, /export function SkillsContent/)
 })

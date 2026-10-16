@@ -1,5 +1,5 @@
 import { Link, useParams } from 'react-router-dom'
-import { SiteChrome, SiteFinalCta, type SiteAction } from './site-chrome.tsx'
+import { SiteChrome, type SiteAction } from './site-chrome.tsx'
 import { usePageMeta } from './use-page-meta.ts'
 
 export type UseCase = {
@@ -199,7 +199,6 @@ export function MarketingUseCases({ onLogin, onStart }: { onLogin: SiteAction; o
         ))}
       </section>
 
-      <SiteFinalCta title="从你的场景开始" />
     </SiteChrome>
   )
 }
@@ -287,7 +286,6 @@ export function MarketingUseCaseDetail({ onLogin, onStart }: { onLogin: SiteActi
         </div>
       </section>
 
-      <SiteFinalCta title="试试你自己的场景" />
     </SiteChrome>
   )
 }
