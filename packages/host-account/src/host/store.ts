@@ -386,12 +386,25 @@ export class CollabStore {
     const requested = currentRequestWorkspaceId()
     const caller = currentAccountId()
     if (requested) {
-      if (caller && !this.isMember(caller, requested)) return null
+      // 浏览器可能缓存着已被删除或已退出的空间 id。这时若直接返回 null，
+      // 整个界面会卡在无效空间里（切不到别的空间、看不到数据），
+      // 所以回退到账号自己的空间。
+      if (caller && !this.isMember(caller, requested)) return this.resolveActiveWorkspace(caller)
       return requested
     }
-    if (isOnlineRuntime()) return caller ? this.accountActiveWorkspace(caller) : null
-    if (caller) return this.accountActiveWorkspace(caller)
+    if (isOnlineRuntime()) return caller ? this.resolveActiveWorkspace(caller) : null
+    if (caller) return this.resolveActiveWorkspace(caller)
     return this.stateValue('active')
+  }
+
+  /** 账号当前所属空间；已失效（空间被删 / 被移出）时自动切到还剩下的第一个空间。 */
+  private resolveActiveWorkspace(accountId: string): string | null {
+    const current = this.accountActiveWorkspace(accountId)
+    if (current && this.isMember(accountId, current)) return current
+    const next = this.listWorkspaces(accountId)[0]
+    if (!next) return null
+    this.rememberActive(accountId, next.id)
+    return next.id
   }
 
   isMember(accountId: string, workspaceId: string) {
@@ -722,10 +735,23 @@ export class CollabStore {
     return Boolean(row?.must_change_password)
   }
 
+  /** 同一账号下的空间名保持唯一；重名时自动加序号，避免切换菜单里出现多个同名分不清。 */
+  private uniqueWorkspaceName(ownerId: string, name: string): string {
+    const base = name.trim()
+    const taken = new Set(this.listWorkspaces(ownerId).map((item) => item.name))
+    if (!taken.has(base)) return base
+    for (let index = 2; index < 1000; index += 1) {
+      const candidate = `${base} ${index}`
+      if (!taken.has(candidate)) return candidate
+    }
+    return `${base} ${Date.now()}`
+  }
+
   createWorkspace(ownerId: string, name: string, now = Date.now(), ownTransaction = true): Workspace {
     this.requireAccount(ownerId)
-    const trimmed = name.trim()
-    if (!trimmed) throw new CollabError('工作区名字不能为空', 400)
+    const raw = name.trim()
+    if (!raw) throw new CollabError('工作区名字不能为空', 400)
+    const trimmed = this.uniqueWorkspaceName(ownerId, raw)
     const workspace = { id: id('ws'), name: trimmed, ownerId, createdAt: now }
     const write = () => {
       this.db
@@ -778,6 +804,10 @@ export class CollabStore {
     const columnsOf = (table: string) =>
       (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name)
     const sessionIds = records.filter((record) => record.collection === '/sessions').map((record) => record.record_id)
+    // 停在这个空间的账号（不只是删除者）都会失去落脚点，删完要一并安置。
+    const affected = this.db
+      .prepare('SELECT id FROM accounts WHERE active_workspace_id = ?')
+      .all(workspaceId) as Array<{ id: string }>
     this.db.exec('BEGIN IMMEDIATE')
     try {
       for (const table of tables) {
@@ -849,9 +879,15 @@ export class CollabStore {
       this.db.exec('ROLLBACK')
       throw error
     }
-    const next = this.listWorkspaces(actorId)[0]
-    if (next) this.setActive(actorId, next.id)
-    return { id: workspaceId, deleted: true as const, sessionIds, activeWorkspaceId: next?.id ?? '' }
+    // 把每个受影响的账号都迁到它仍所属的空间，否则其他人会卡在空空间里出不去。
+    let activeWorkspaceId = ''
+    for (const row of affected) {
+      const next = this.listWorkspaces(row.id)[0]
+      if (!next) continue
+      this.setActive(row.id, next.id)
+      if (row.id === actorId) activeWorkspaceId = next.id
+    }
+    return { id: workspaceId, deleted: true as const, sessionIds, activeWorkspaceId }
   }
 
   addMember(actorId: string, workspaceId: string, accountId: string, now = Date.now()) {

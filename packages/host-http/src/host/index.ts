@@ -385,6 +385,7 @@ export class HttpService extends Service {
         store?: {
           accountByToken?(token: string): { id: string } | null
           isMember?(accountId: string, workspaceId: string): boolean
+          activeWorkspaceId?(): string | null
         }
       } | undefined
     )?.store
@@ -393,13 +394,16 @@ export class HttpService extends Service {
     } catch {
       accountId = ''
     }
-    if (accountId && workspaceId && store?.isMember && !store.isMember(accountId, workspaceId)) {
-      return { accountId, workspaceId, token, error: 4403 as const }
+    let effectiveWorkspaceId = workspaceId
+    if (accountId && effectiveWorkspaceId && store?.isMember && !store.isMember(accountId, effectiveWorkspaceId)) {
+      // 与 HTTP 一致：浏览器若还带着已删除空间，不要把所有 WS 永久锁死；
+      // 安全地回退到账号自己的活动空间，而不是访问请求中的陌生空间。
+      effectiveWorkspaceId = runWithAccount(accountId, () => String(store.activeWorkspaceId?.() ?? '').trim())
     }
-    if (isOnlineRuntime() && (!accountId || !workspaceId)) {
-      return { accountId, workspaceId, token, error: 4401 as const }
+    if (isOnlineRuntime() && (!accountId || !effectiveWorkspaceId)) {
+      return { accountId, workspaceId: effectiveWorkspaceId, token, error: 4401 as const }
     }
-    return { accountId, workspaceId, token, error: 0 as const }
+    return { accountId, workspaceId: effectiveWorkspaceId, token, error: 0 as const }
   }
 
   listRoutes() {
@@ -513,7 +517,13 @@ export class HttpService extends Service {
           } | undefined
         )?.store
         const requestedWorkspace = await runWithAccount(accountId, async () => {
-          if (headerWorkspace) return headerWorkspace
+          if (headerWorkspace) {
+            // 浏览器可能还缓存着已删除或已退出的 workspaceId。不要让这个陈旧值
+            // 把所有 API 都拦成 403，否则工作区选择器本身也加载不出来，用户无法自救。
+            if (!accountId || !accountStore?.isMember || accountStore.isMember(accountId, headerWorkspace)) {
+              return headerWorkspace
+            }
+          }
           if (!isOnlineRuntime() || !accountId) return ''
           return String(accountStore?.activeWorkspaceId?.() ?? '').trim()
         })

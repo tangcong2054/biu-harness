@@ -239,13 +239,15 @@ test('online HTTP and WebSocket enforce account and workspace boundaries', async
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/db/list`)).status, 401)
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/db/list`, { headers: { Authorization: 'Bearer ada-token' } })).status, 200)
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/db/list`, { headers: { Authorization: 'Bearer bob-token' } })).status, 400)
+    // 浏览器缓存着已删除 / 无权访问的 workspaceId 时，回退到账号活动空间，
+    // 否则工作区列表接口本身也会 403，用户无法切回有效空间。
     assert.equal(
       (
         await fetch(`http://127.0.0.1:${port}/api/db/list`, {
           headers: { Authorization: 'Bearer ada-token', 'X-Biu-Workspace-Id': 'ws-b' },
         })
-      )      .status,
-      403,
+      ).status,
+      200,
     )
     assert.equal(
       (

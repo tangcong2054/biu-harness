@@ -780,3 +780,34 @@ test('session execution leases exclude other devices and can be released', () =>
   const next = collab.acquireExecutionLease(ada.id, 'session-1', 'Ada desktop', 60_000, now + 4)
   assert.notEqual(next.leaseId, first.leaseId)
 })
+
+test('workspace names stay unique per account instead of stacking duplicates', () => {
+  const collab = store()
+  const ada = collab.register('', Date.now(), 'secret1', 'uniq-ada@example.com')
+  const bob = collab.register('', Date.now(), 'secret1', 'uniq-bob@example.com')
+  const first = collab.createWorkspace(ada.id, '我的工作区')
+  const second = collab.createWorkspace(ada.id, '我的工作区')
+  const third = collab.createWorkspace(ada.id, '我的工作区')
+  assert.equal(first.name, '我的工作区')
+  assert.equal(second.name, '我的工作区 2')
+  assert.equal(third.name, '我的工作区 3')
+  // 别的账号不受影响，仍可用同名。
+  assert.equal(collab.createWorkspace(bob.id, '我的工作区').name, '我的工作区')
+  assert.deepEqual(collab.listWorkspaces(ada.id).map((item) => item.name), ['我的工作区', '我的工作区 2', '我的工作区 3'])
+})
+
+test('login falls back to a remaining workspace when the active one is gone', () => {
+  const collab = store()
+  const ada = collab.register('', Date.now(), 'secret1', 'relogin-ada@example.com')
+  const doomed = collab.createWorkspace(ada.id, '临时空间')
+  collab.setActive(ada.id, doomed.id)
+  assert.equal(collab.enter(ada.id), doomed.id)
+  collab.deleteWorkspace(ada.id, doomed.id, '临时空间')
+  // 没有空间时 enter 会自动新建一个（名字同样去重）。
+  const recreated = collab.enter(ada.id)
+  assert.notEqual(recreated, doomed.id)
+  assert.equal(collab.listWorkspaces(ada.id)[0]?.name, '我的工作区')
+  const second = collab.deleteWorkspace(ada.id, recreated, '我的工作区')
+  assert.equal(second.activeWorkspaceId, '')
+  assert.equal(collab.enter(ada.id) !== recreated, true)
+})
