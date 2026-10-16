@@ -141,7 +141,42 @@ function taskRecord(row: TaskRow, lookup: (id: string) => TaskRow | undefined, u
   }
 }
 
+function listedTaskRecord(row: TaskRow, lookup: (id: string) => TaskRow | undefined, usage: Usage, aggregate: boolean): DbRecord {
+  return {
+    id: row.id,
+    title: row.title ?? '',
+    status: row.status ?? 'todo',
+    priority: row.priority ?? 'med',
+    difficulty: row.difficulty ?? 'med',
+    project: row.project ?? '',
+    dueAt: row.dueAt ?? null,
+    creator: row.creator?.name ?? '用户',
+    creatorSessionId: row.creator?.sessionId ?? '',
+    assignee: row.assignee?.name ?? '',
+    assigneeSessionId: row.assignee?.sessionId ?? '',
+    blocked: Boolean(row.blocked),
+    parentChain: parentChain(row, lookup),
+    usage: usage.totalTokens,
+    usageParts: { ...usage, aggregate },
+    ...recordBuiltinValues(row),
+  }
+}
+
+function missingLookup(): TaskRow | undefined {
+  return undefined
+}
+
 function recordsWithUsage(rows: TaskRow[]): DbRecord[] {
+  let tree = false
+  for (const row of rows) {
+    if (row.parentId) {
+      tree = true
+      break
+    }
+  }
+  if (!tree) {
+    return rows.map((row) => listedTaskRecord(row, missingLookup, ownUsage(row), false))
+  }
   const byId = new Map(rows.map((row) => [row.id, row]))
   const kids = new Map<string, string[]>()
   for (const row of rows) {

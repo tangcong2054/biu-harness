@@ -1177,6 +1177,7 @@ export class CollabStore {
       this.db.exec('ROLLBACK')
       throw error
     }
+    this.authorization.invalidateAll()
     return { id: accountId }
   }
 
@@ -2343,6 +2344,7 @@ export class CollabStore {
       .run(workspaceId, collection, recordId, subjectType, subjectId)
     if (!removed.changes) throw new CollabError('协作者不存在', 404)
     if (subjectType === 'account') this.cleanupExternalMembership(workspaceId, subjectId)
+    this.authorization.invalidate(workspaceId, collection)
     this.reconcileRecordScope(workspaceId, collection, recordId)
     return this.accessRows(workspaceId, collection, recordId)
   }
@@ -2414,6 +2416,7 @@ export class CollabStore {
       .run(workspaceId, collection, viewId, subjectType, subjectId)
     if (!removed.changes) throw new CollabError('协作者不存在', 404)
     if (subjectType === 'account') this.cleanupExternalMembership(workspaceId, subjectId)
+    this.authorization.invalidate(workspaceId, collection)
     return this.viewAccessRows(workspaceId, collection, viewId)
   }
 
@@ -2571,6 +2574,7 @@ export class CollabStore {
          DO UPDATE SET role = excluded.role, granted_by = excluded.granted_by, created_at = excluded.created_at`,
       )
       .run(workspaceId, collection, viewId, subjectType, subjectId, role, grantedBy, now)
+    this.authorization.invalidate(workspaceId, collection)
   }
 
   private viewAccessRows(workspaceId: string, collection: string, viewId: string) {
