@@ -4,7 +4,7 @@ import { currentRequestWorkspaceId, openAndMigrateBiu } from '@biu/host-plugin-l
 import type { CollectionInfo, CollectionSpec, DbRecord } from '@biu/type-file-system'
 import { normalizeSchemaValue, recordBuiltinValues, REQUIRED_RECORD_FIELDS } from '@biu/type-file-system'
 import { builtinAllView, isReadOnlyViewId } from '../catalog-views.ts'
-import { normalizeColumnWidths, type SavedView } from '../web/saved-view.ts'
+import { normalizeColumnWidths, normalizePageSize, type SavedView } from '../web/saved-view.ts'
 import { isViewModeId } from '../web/fields.ts'
 import { normalizeCollectionPath } from '../paths.ts'
 import { isIndexCollection } from '../web/database-path.ts'
@@ -196,7 +196,7 @@ export class SavedViewsStore {
       tree: fields.tree !== false,
       wrap: Boolean(fields.wrap),
       truncate: fields.truncate !== false,
-      pageSize: Number(fields.pageSize) || 50,
+      pageSize: normalizePageSize(fields.pageSize),
       columnWidths: normalizeColumnWidths(fields.columnWidths),
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -341,7 +341,7 @@ function asRecord(path: string, tableName: string, view: StoredView): DbRecord {
     tree: view.tree !== false,
     wrap: Boolean(view.wrap),
     truncate: view.truncate !== false,
-    pageSize: Number(view.pageSize) || 50,
+    pageSize: normalizePageSize(view.pageSize),
     columns: Array.isArray(view.columns) ? view.columns.map(String) : [],
     columnWidths: view.columnWidths ?? {},
     filters: JSON.stringify(filters),
@@ -376,7 +376,7 @@ export function clientViewFromDbRow(row: Record<string, unknown> | undefined) {
     tree: row.tree !== false,
     wrap: Boolean(row.wrap),
     truncate: row.truncate !== false,
-    pageSize: Number(row.pageSize) || 50,
+    pageSize: normalizePageSize(row.pageSize),
     columnWidths: row.columnWidths,
     builtin: false,
   }

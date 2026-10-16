@@ -2,7 +2,7 @@ import { builtinAllViewId, stubBuiltinAllView, stubBuiltinBlockKindView, stubBui
 import { isIndexCollection } from './database-path.ts'
 import { listCollection } from './db-client.ts'
 import { looksLikeFilterTree, normalizeFilterGroup, parseSortsInput } from '../query-logic.ts'
-import { normalizeSavedView, type SavedView } from './saved-view.ts'
+import { normalizePageSize, normalizeSavedView, type SavedView } from './saved-view.ts'
 
 export function workspaceViewScope() {
   try {
@@ -234,7 +234,7 @@ export function savedViewFromRecord(row: { viewId?: unknown; title?: unknown; mo
     tree: row.tree !== false,
     wrap: Boolean(row.wrap),
     truncate: row.truncate !== false,
-    pageSize: Number(row.pageSize) || 50,
+    pageSize: normalizePageSize(row.pageSize),
     columnWidths: row.columnWidths,
     builtin: false,
   })
