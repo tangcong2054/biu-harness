@@ -666,7 +666,10 @@ function TerminalSurface({
         socket = new WebSocket(
           `${protocol}//${location.host}/ws/page-terminal` +
             `?cols=${term.cols}&rows=${term.rows}&session=${encodeURIComponent(sessionKey)}` +
-            `&workspaceId=${encodeURIComponent(sessionStorage.getItem('biu.workspaceId') ?? '')}`,
+            // 与宿主 readWorkspaceId() 一致：sessionStorage 为空时回退 localStorage（新标签页 / 新窗口场景）。
+            `&workspaceId=${encodeURIComponent(
+              sessionStorage.getItem('biu.workspaceId') || localStorage.getItem('biu.workspaceId') || '',
+            )}`,
         )
         socket.binaryType = 'arraybuffer'
         socket.addEventListener('open', () => {
