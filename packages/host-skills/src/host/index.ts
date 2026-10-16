@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Service, type Context } from 'cordis'
+import { currentAccountId } from '@biu/host-plugin-loader/data-dir'
 import { skillsCollection } from './collection.ts'
 import { LEGACY_MIGRATED, legacySkillImports, SkillsStore, type SkillImportInput, type SkillRecord } from './store.ts'
 
@@ -34,8 +35,84 @@ export class SkillsService extends Service {
     }
   }
 
+  /**
+   * 把技能认领到当前工作区。
+   * store 只写磁盘，不写 record_owners；云端开启账号鉴权后，
+   * 没有归属记录的 /skills 记录会被 visibleRecords 判为 PRIVATE_RESOURCE 而列表不可见。
+   * 云端导入必须补这一步，否则「导入成功但页面看不到」。
+   */
+  private claimOwnership(id: string) {
+    try {
+      const store = (this.ctx.get('account') as {
+        store?: {
+          activeWorkspaceId?: () => string | null
+          claim?: (actorId: string, workspaceId: string, collection: string, recordId: string) => unknown
+        }
+      } | undefined)?.store
+      if (!store?.claim) return
+      const workspaceId = store.activeWorkspaceId?.() ?? ''
+      const actorId = currentAccountId()
+      // 启动期的 legacy 迁移没有账号上下文，跳过即可（后续由使用者在页面里认领）。
+      if (!workspaceId || !actorId) return
+      store.claim(actorId, workspaceId, '/skills', id)
+    } catch {
+      // 已归属其它空间 / 非成员等情况不影响技能本身已落盘。
+    }
+  }
+
+  /**
+   * 云端：返回当前工作区可见的技能 id；`null` 表示不做过滤（本地 / 桌面模式）。
+   * 技能目录是全局单份，只有这一层把「可见性」约束到工作区，
+   * 否则 Agent 的 promptSection / skill_list / skill_read 会读到别的空间技能。
+   */
+  private visibleIds(): Set<string> | null {
+    try {
+      const account = this.ctx.get('account') as {
+        authorization?: {
+          currentActor?: () => { type: string; accountId: string; workspaceId: string } | null
+          authorize?: (actor: unknown, action: string, resource: unknown) => { allowed?: boolean } | null
+        }
+        store?: { activeWorkspaceId?: () => string | null }
+      } | undefined
+      const authorization = account?.authorization
+      // 没有账号服务（本地 / 桌面）：沿用旧行为，全部可见。
+      if (!authorization?.authorize) return null
+      const workspaceId =
+        account?.store?.activeWorkspaceId?.()?.trim() ||
+        String(process.env.BIU_SKILL_DEFAULT_WORKSPACE ?? '').trim() ||
+        ''
+      const accountId = currentAccountId()
+      // 云端但拿不到工作区/账号：fail-closed，一条都不给。
+      if (!workspaceId || !accountId) return new Set()
+      const actor =
+        authorization.currentActor?.() ?? ({ type: 'account', accountId, workspaceId } as const)
+      if (actor && actor.workspaceId && actor.workspaceId !== workspaceId) return new Set()
+      const ids = new Set<string>()
+      for (const skill of this.store.list()) {
+        const decision = authorization.authorize(actor, 'resource:read', {
+          type: 'record',
+          workspaceId,
+          collection: '/skills',
+          recordId: skill.id,
+        })
+        if (decision?.allowed) ids.add(skill.id)
+      }
+      return ids
+    } catch {
+      // 授权服务异常时宁可不给，也不要把全部技能暴露出去。
+      return new Set()
+    }
+  }
+
+  private allows(id: string) {
+    const ids = this.visibleIds()
+    return !ids || ids.has(id)
+  }
+
   list(): SkillRecord[] {
-    return this.store.list()
+    const ids = this.visibleIds()
+    const all = this.store.list()
+    return ids ? all.filter((item) => ids.has(item.id)) : all
   }
 
   listEnabled() {
@@ -52,11 +129,13 @@ export class SkillsService extends Service {
   }
 
   recordOrNull(id: string) {
+    if (!this.allows(id)) return null
     return this.store.get(id)
   }
 
   /** 只读派生：这条技能目录里已落盘的文件（相对路径，已排序）。 */
   filesOf(id: string): string[] {
+    if (!this.allows(id)) return []
     try {
       return this.store.listFiles(id)
     } catch {
@@ -66,12 +145,13 @@ export class SkillsService extends Service {
 
   /** 读技能目录里一个文件的文本。相对路径已做越界校验。 */
   fileText(id: string, path: string): string {
+    if (!this.allows(id)) throw new Error(`unknown skill: ${id}`)
     return this.store.readFile(id, path).text
   }
 
   record(id: string) {
     const skill = this.store.get(id)
-    if (!skill) throw new Error(`unknown skill: ${id}`)
+    if (!skill || !this.allows(id)) throw new Error(`unknown skill: ${id}`)
     return skill
   }
 
@@ -89,12 +169,14 @@ export class SkillsService extends Service {
 
   create(input: Parameters<SkillsStore['create']>[0]) {
     const created = this.store.create(input)
+    this.claimOwnership(created.id)
     this.changed()
     return created
   }
 
   import(input: SkillImportInput) {
     const created = this.store.import(input)
+    this.claimOwnership(created.id)
     this.changed()
     return created
   }
@@ -106,7 +188,8 @@ export class SkillsService extends Service {
         const id = String(entry.input.id || '')
         if (!(id && this.store.get(id))) {
           try {
-            this.store.import(entry.input)
+            const created = this.store.import(entry.input)
+            this.claimOwnership(created.id)
             migrated += 1
           } catch {
             // 已存在或目录不合法就跳过。
