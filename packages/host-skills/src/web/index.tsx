@@ -91,8 +91,18 @@ function SkillLibraryView({ rows, onOpen }: FsViewProps) {
   }
 
   return (
-    <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '12px 16px 0' }}>
+    <div
+      data-testid="skills-library-view"
+      style={{
+        display: 'flex',
+        flex: 1,
+        flexDirection: 'column',
+        minHeight: 0,
+        height: '100%',
+        overflow: 'hidden',
+      }}
+    >
+      <div style={{ display: 'flex', flexShrink: 0, alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '12px 16px 0' }}>
         <span style={{ color: 'var(--dsw-label-2)', fontSize: 13 }}>
           从包含 SKILL.md 的标准目录导入。
         </span>
@@ -101,9 +111,9 @@ function SkillLibraryView({ rows, onOpen }: FsViewProps) {
         </button>
         <input ref={inputRef} type="file" multiple hidden onChange={importDirectory} />
       </div>
-      {message ? <div style={{ padding: '8px 16px 0', color: 'var(--dsw-label-2)', fontSize: 13 }}>{message}</div> : null}
+      {message ? <div style={{ flexShrink: 0, padding: '8px 16px 0', color: 'var(--dsw-label-2)', fontSize: 13 }}>{message}</div> : null}
       {!rows.length ? (
-        <div style={{ padding: 40, textAlign: 'center', color: 'var(--dsw-label-3)' }}>
+        <div style={{ minHeight: 0, flex: 1, overflowY: 'auto', padding: 40, textAlign: 'center', color: 'var(--dsw-label-3)' }}>
           还没有 Skill，可以导入目录或点击右上角“新建”。
         </div>
       ) : (
@@ -114,6 +124,11 @@ function SkillLibraryView({ rows, onOpen }: FsViewProps) {
             gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))',
             gap: 12,
             padding: 16,
+            minHeight: 0,
+            flex: 1,
+            alignContent: 'start',
+            overflowY: 'auto',
+            overscrollBehavior: 'contain',
           }}
         >
           {rows.map((row) => {
