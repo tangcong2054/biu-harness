@@ -261,8 +261,8 @@ export class SkillsStore {
     return join(this.ensureRoot(), assertSkillId(id))
   }
 
-  listFiles(id: string) {
-    this.require(id)
+  listFiles(id: string, verifyRecord = true) {
+    if (verifyRecord) this.require(id)
     return walkFiles(this.filesDir(id))
   }
 
@@ -302,29 +302,50 @@ export class SkillsStore {
 
   list(): SkillRecord[] {
     if (!existsSync(this.root) || !statSync(this.root).isDirectory()) return []
-    return readdirSync(this.root)
-      .filter((name) => name.endsWith('.md'))
-      .map((name) => this.get(name.slice(0, -3)))
-      .filter((item): item is SkillRecord => Boolean(item))
-      .sort((a, b) => a.name.localeCompare(b.name, 'zh') || a.id.localeCompare(b.id))
+    const names = readdirSync(this.root).filter((name) => name.endsWith('.md'))
+    // 旧实现每条技能都 openAndMigrateBiu() 一次；一次 list 会反复 checkpoint + 跑迁移，
+    // 7 条技能即可阻塞 Node 事件循环数秒，连带插件商店、页面等并发请求一起排队。
+    // 列表只打开一次 SQLite，所有正文共用同一个连接。
+    let db: ReturnType<typeof openAndMigrateBiu> | null = null
+    try {
+      db = openAndMigrateBiu(biuSqlitePath(), { checkpointOnOpen: false })
+    } catch {
+      /* sqlite unavailable；仍可从 markdown 读取元数据和正文 */
+    }
+    try {
+      return names
+        .map((name) => this.load(name.slice(0, -3), db))
+        .filter((item): item is SkillRecord => Boolean(item))
+        .sort((a, b) => a.name.localeCompare(b.name, 'zh') || a.id.localeCompare(b.id))
+    } finally {
+      db?.close()
+    }
   }
 
-  get(id: string) {
+  private load(id: string, db: ReturnType<typeof openAndMigrateBiu> | null = null) {
     try {
       const file = skillFile(this.root, id)
       if (!existsSync(file) || !statSync(file).isFile()) return null
       const loaded = loadSkill(id, readFileSync(file, 'utf8'))
-      try {
-        const db = openAndMigrateBiu(biuSqlitePath())
+      if (db) {
         const body = readEditorContent(db, '/skills', loaded.id)
-        db.close()
         if (body) loaded.notes = body
-      } catch {
-        /* sqlite unavailable */
       }
       return loaded
     } catch {
       return null
+    }
+  }
+
+  get(id: string) {
+    let db: ReturnType<typeof openAndMigrateBiu> | null = null
+    try {
+      db = openAndMigrateBiu(biuSqlitePath(), { checkpointOnOpen: false })
+      return this.load(id, db)
+    } catch {
+      return this.load(id)
+    } finally {
+      db?.close()
     }
   }
 

@@ -65,7 +65,7 @@ export class SkillsService extends Service {
    * 技能目录是全局单份，只有这一层把「可见性」约束到工作区，
    * 否则 Agent 的 promptSection / skill_list / skill_read 会读到别的空间技能。
    */
-  private visibleIds(): Set<string> | null {
+  private visibleIds(skills = this.store.list()): Set<string> | null {
     try {
       const account = this.ctx.get('account') as {
         authorization?: {
@@ -88,7 +88,7 @@ export class SkillsService extends Service {
         authorization.currentActor?.() ?? ({ type: 'account', accountId, workspaceId } as const)
       if (actor && actor.workspaceId && actor.workspaceId !== workspaceId) return new Set()
       const ids = new Set<string>()
-      for (const skill of this.store.list()) {
+      for (const skill of skills) {
         const decision = authorization.authorize(actor, 'resource:read', {
           type: 'record',
           workspaceId,
@@ -110,8 +110,8 @@ export class SkillsService extends Service {
   }
 
   list(): SkillRecord[] {
-    const ids = this.visibleIds()
     const all = this.store.list()
+    const ids = this.visibleIds(all)
     return ids ? all.filter((item) => ids.has(item.id)) : all
   }
 
@@ -133,14 +133,19 @@ export class SkillsService extends Service {
     return this.store.get(id)
   }
 
-  /** 只读派生：这条技能目录里已落盘的文件（相对路径，已排序）。 */
-  filesOf(id: string): string[] {
-    if (!this.allows(id)) return []
+  /** 已通过 list() 授权的记录使用，避免列表中每一行再次扫描全部技能做鉴权。 */
+  filesOfListed(id: string): string[] {
     try {
-      return this.store.listFiles(id)
+      return this.store.listFiles(id, false)
     } catch {
       return []
     }
+  }
+
+  /** 只读派生：这条技能目录里已落盘的文件（相对路径，已排序）。 */
+  filesOf(id: string): string[] {
+    if (!this.allows(id)) return []
+    return this.filesOfListed(id)
   }
 
   /** 读技能目录里一个文件的文本。相对路径已做越界校验。 */
