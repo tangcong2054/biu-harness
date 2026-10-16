@@ -1077,6 +1077,13 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
         previousRevealStartRef.current = revealStart
         return
       }
+      // 锚点可能已被分页、压缩或删除。恢复失败必须回到最新消息，
+      // 并清除坏记忆；否则 scrollTop=0 会再次被记成最早一条，之后每次打开都从头开始。
+      rememberChatScroll(sessionId, { kind: 'bottom' })
+      restoredForRef.current = sessionId
+      stickToBottomRef.current = true
+      pinChatToLatest(parent)
+      prependHeightRef.current = parent.scrollHeight
       previousRevealStartRef.current = revealStart
       return
     }

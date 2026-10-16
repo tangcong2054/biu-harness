@@ -128,8 +128,15 @@ describe('chat scroll memory per session', () => {
   it('mounts from the pinned turn instead of only the tail', () => {
     const nodes = longThread()
     expect(turnIndexContaining(nodes, 'u-3')).toBe(3)
-    expect(revealStartForMemory(nodes, { kind: 'pin', nodeId: 'u-3' }, 10)).toBe(0)
+    expect(revealStartForMemory(nodes, { kind: 'pin', nodeId: 'u-3' }, 10)).toBe(3)
     expect(revealStartForMemory(nodes, { kind: 'bottom' }, 10)).toBe(10 - CHAT_FIRST_PAINT_TURNS)
+  })
+
+  it('falls back to the latest turns when a remembered anchor no longer exists', () => {
+    const nodes = longThread()
+    expect(revealStartForMemory(nodes, { kind: 'pin', nodeId: 'deleted-user' }, 10)).toBe(
+      10 - CHAT_FIRST_PAINT_TURNS,
+    )
   })
 
   it('captures the user message currently stuck to the top', () => {
@@ -243,5 +250,6 @@ describe('thread follows the latest message', () => {
     expect(src).toContain('nextY > lastTouchY + 0.5')
     expect(src).toContain('nextStickToLatest')
     expect(src).toContain('revealedOlder && prependHeightRef.current')
+    expect(src).toContain("rememberChatScroll(sessionId, { kind: 'bottom' })")
   })
 })

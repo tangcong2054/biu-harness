@@ -66,14 +66,18 @@ export function turnIndexContaining(nodes: ChatNode[], nodeId: string): number {
   return groupNodesIntoTurns(nodes).findIndex((turn) => turn.some((node) => node.id === nodeId))
 }
 
-/** 回到中间阅读位置时，从贴顶那一回合挂到最新；贴底则仍只先挂尾巴。 */
+/**
+ * 回到中间阅读位置时，只从贴顶回合挂到最新；贴底仍只先挂尾巴。
+ * 锚点已被分页、压缩或删除时按贴底处理，不能退回到整段历史的开头。
+ */
 export function revealStartForMemory(
   nodes: ChatNode[],
   memory: ChatScrollMemory | undefined,
   totalTurns: number,
 ): number {
   if (!memory || memory.kind === 'bottom') return firstPaintStartIndex(totalTurns)
-  return 0
+  const pinnedTurn = turnIndexContaining(nodes, memory.nodeId)
+  return pinnedTurn >= 0 ? pinnedTurn : firstPaintStartIndex(totalTurns)
 }
 
 function nodeSelector(nodeId: string) {
