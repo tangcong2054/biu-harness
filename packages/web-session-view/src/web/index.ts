@@ -87,6 +87,13 @@ export interface ApprovalItem {
   args: Record<string, unknown>
 }
 
+export type SessionProjectView = {
+  name: string
+  path?: string
+  boundAt: number
+  managed?: boolean
+}
+
 export interface SessionListItem {
   id: string
   title: string
@@ -96,7 +103,7 @@ export interface SessionListItem {
   lastMessageAt?: number
   /** host 列表快照：该 session 的 agent 是否在跑 */
   busy?: boolean
-  project?: { name: string; path?: string; boundAt: number }
+  project?: SessionProjectView
   mascot?: { shape: string; color: string; eye?: number }
   tags?: string[]
   pinned?: boolean
@@ -168,7 +175,7 @@ export interface SessionViewState {
   busySessions: Record<string, true>
   approvalMode: ApprovalMode
   approvals: ApprovalItem[]
-  project?: { name: string; path?: string; boundAt: number }
+  project?: SessionProjectView
   /** Chat 是否还有更早 turn */
   hasMoreOlder: boolean
   loadingOlder: boolean
@@ -220,7 +227,7 @@ type SessionPayload = {
   hasMore?: boolean
   totalTurns?: number
   totalEvents?: number
-  project?: { name: string; path?: string; boundAt: number }
+  project?: SessionProjectView
   config?: { inspector?: SessionInspectorBind; goal?: SessionGoal }
   inspector?: SessionInspectorBind
   dispatchedUsage?: TrajectoryUsage
@@ -238,7 +245,7 @@ type TrajectoryPayload = {
 type SessionCacheEntry = {
   events: SessionEvent[]
   nodes: ChatNode[]
-  project?: { name: string; path?: string; boundAt: number }
+  project?: SessionProjectView
   hasMoreOlder: boolean
   totalTurns: number
   dispatchedUsageByTurn: Record<string, TrajectoryUsage>
@@ -262,6 +269,8 @@ function sessionsEqual(a: SessionListItem[], b: SessionListItem[]): boolean {
       (left.lastMessageAt ?? 0) !== (right.lastMessageAt ?? 0) ||
       left.project?.path !== right.project?.path ||
       left.project?.name !== right.project?.name ||
+      left.project?.boundAt !== right.project?.boundAt ||
+      left.project?.managed !== right.project?.managed ||
       left.mascot?.shape !== right.mascot?.shape ||
       left.mascot?.color !== right.mascot?.color ||
       left.mascot?.eye !== right.mascot?.eye ||
@@ -1205,14 +1214,15 @@ export class SessionViewService extends Service {
     }
   }
 
-  setProjectMeta(project?: { name: string; path?: string; boundAt: number }) {
+  setProjectMeta(project?: SessionProjectView) {
     const current = this.value.project
     const sameProject =
       current === project ||
       (Boolean(current) === Boolean(project) &&
         current?.name === project?.name &&
         current?.path === project?.path &&
-        current?.boundAt === project?.boundAt)
+        current?.boundAt === project?.boundAt &&
+        current?.managed === project?.managed)
     const sessionId = this.value.sessionId
     const sessionsUnchanged =
       !sessionId ||
@@ -1224,7 +1234,8 @@ export class SessionViewService extends Service {
           (Boolean(p) === Boolean(project) &&
             p?.name === project?.name &&
             p?.path === project?.path &&
-            p?.boundAt === project?.boundAt)
+            p?.boundAt === project?.boundAt &&
+            p?.managed === project?.managed)
         )
       })
     if (sameProject && sessionsUnchanged) return

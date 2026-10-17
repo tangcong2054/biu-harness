@@ -1187,6 +1187,7 @@ export async function openSessionHttpPayload(ctx: Context, id: string, limitTurn
     return { status: 404 as const, body: { error: 'unknown session' } }
   }
   const window = sliceTailTurns(record.events, limitTurns)
+  const project = sessionProjectForClient(record)
   const payload: Record<string, unknown> = {
     id: record.id,
     version: record.version,
@@ -1196,7 +1197,7 @@ export async function openSessionHttpPayload(ctx: Context, id: string, limitTurn
     totalEvents: window.totalEvents,
     oldestSeq: window.oldestSeq,
     newestSeq: window.newestSeq,
-    ...(record.project ? { project: record.project } : {}),
+    ...(project ? { project } : {}),
     ...(record.mascot ? { mascot: record.mascot } : {}),
     ...(record.config ? { config: record.config } : {}),
   }
@@ -1213,11 +1214,9 @@ export async function openSessionHttpPayload(ctx: Context, id: string, limitTurn
   for (const item of summaries) {
     titles.set(item.id, item.title)
     if (item.mascot) mascots.set(item.id, item.mascot)
-    if (item.project?.name) {
-      projects.set(item.id, {
-        name: item.project.name,
-        ...(item.project.path ? { path: item.project.path } : {}),
-      })
+    const project = sessionProjectForClient(item)
+    if (project?.name) {
+      projects.set(item.id, project)
     }
     if (item.id === record.id) continue
     try {
@@ -1250,6 +1249,20 @@ export async function openSessionHttpPayload(ctx: Context, id: string, limitTurn
     ]),
   )
   return { status: 200 as const, body: payload }
+}
+
+export function sessionProjectForClient(record: {
+  project?: { name: string; path?: string; boundAt?: number }
+  config?: { createdAt?: number }
+}) {
+  if (isOnlineRuntime()) {
+    return {
+      name: '云端工作区',
+      boundAt: Number(record.config?.createdAt ?? 0),
+      managed: true,
+    }
+  }
+  return record.project
 }
 
 export function apply(ctx: Context) {
@@ -1558,7 +1571,7 @@ export function apply(ctx: Context) {
         updatedAt: item.updatedAt,
         ...(item.lastMessageAt ? { lastMessageAt: item.lastMessageAt } : {}),
         busy: ctx.agents.isBusy(item.id),
-        ...(item.project ? { project: item.project } : {}),
+        ...(sessionProjectForClient(item) ? { project: sessionProjectForClient(item) } : {}),
         ...(item.mascot ? { mascot: item.mascot } : {}),
         tags: item.config?.tags ?? [],
         pinned: Boolean(item.config?.pinned),
@@ -1769,6 +1782,10 @@ export function apply(ctx: Context) {
   })
   ctx.http.route('PUT', '/api/sessions/:id/project', async (route) => {
     if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
+    if (isOnlineRuntime()) {
+      route.send(409, { error: 'Online 会话固定使用云端受控工作区，不能绑定或解绑服务器目录' })
+      return
+    }
     const payload = (await route.json()) as { path?: string | null; name?: string | null }
     try {
       // path 优先；兼容旧客户端误传 name=null 解绑
@@ -1787,6 +1804,11 @@ export function apply(ctx: Context) {
     try {
       const record = await visibleSession(route.params.id)
       if (!record) return route.send(404, { error: 'unknown session' })
+      if (isOnlineRuntime()) {
+        ctx.fs.onlineSessionRoot(record.id)
+        route.send(200, { ok: true, project: sessionProjectForClient(record) })
+        return
+      }
       const { pickHostDirectory } = await import('@biu/host-fs/workspace-pick')
       const current = record.project?.path
       const path = await pickHostDirectory(current)

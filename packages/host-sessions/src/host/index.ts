@@ -30,6 +30,7 @@ import {
 import { rebuildHealedEvents } from './session-heal.ts'
 import { sessionsCollection } from './sessions-collection.ts'
 import type { AuthorizationService } from '@biu/host-account/authorization'
+import { isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
 
 export type { SessionEvent, SessionEventBody, SessionProject, SessionRecord, SessionMascot, SessionConfig }
 export { SESSION_FORMAT_VERSION, normalizeSessionConfig, mergeSessionConfig }
@@ -714,6 +715,10 @@ export class SessionsService extends Service {
 
   async setProject(id: string, project: { path: string } | null) {
     const record = await this.require(id)
+    if (isOnlineRuntime()) {
+      // Online 的 cwd 由 workspaceId/sessionId 派生，不能绑定任意服务器绝对路径。
+      throw new Error('Online 会话使用云端受控工作区，不能绑定服务器目录')
+    }
     if (!project) {
       delete record.project
       await this.persist(record)

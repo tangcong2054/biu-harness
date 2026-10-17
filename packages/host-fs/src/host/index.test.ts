@@ -10,6 +10,7 @@ import * as sessions from '@biu/host-sessions'
 import * as systemPrompt from '@biu/host-system-prompt'
 import * as fs from './index.ts'
 import { runWithSession } from '@biu/host-sessions/scope'
+import { runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 
 test('fs stays inside workspace', async () => {
   const ctx = new Context()
@@ -49,4 +50,57 @@ test('bound session project path becomes tool cwd', async () => {
   })
 
   assert.equal(await (await import('node:fs/promises')).readFile(join(projectRoot, 'app.txt'), 'utf8'), 'edited-by-tool')
+})
+
+test('online sessions use isolated managed roots under BIU_HOME/.biu without migrating .workspace', async () => {
+  const previousOnline = process.env.BIU_ONLINE
+  const previousHome = process.env.BIU_HOME
+  const home = await mkdtemp(join(tmpdir(), 'cordis-online-home-'))
+  const legacyRoot = await mkdtemp(join(tmpdir(), 'cordis-legacy-ws-'))
+  await writeFile(join(legacyRoot, 'legacy.txt'), 'must-not-migrate', 'utf8')
+  process.env.BIU_ONLINE = '1'
+  process.env.BIU_HOME = home
+
+  try {
+    const ctx = new Context()
+    await ctx.plugin(tools)
+    await ctx.plugin(sessionStore, { driver: 'memory' })
+    await ctx.plugin(sessions)
+    await ctx.plugin(systemPrompt)
+    await ctx.plugin(fs, { root: legacyRoot })
+    const first = await ctx.sessions.create()
+    const second = await ctx.sessions.create()
+
+    const firstRoot = await runWithRequestWorkspace('ws_alpha', () =>
+      runWithSession(first.id, async () => {
+        await assert.rejects(() => ctx.fs.read('legacy.txt'), /ENOENT/)
+        await ctx.fs.write('same.txt', 'alpha')
+        return ctx.fs.effectiveRoot()
+      }),
+    )
+    const secondRoot = await runWithRequestWorkspace('ws_beta', () =>
+      runWithSession(second.id, async () => {
+        await assert.rejects(() => ctx.fs.read('same.txt'), /ENOENT/)
+        await ctx.fs.write('same.txt', 'beta')
+        return ctx.fs.effectiveRoot()
+      }),
+    )
+
+    assert.equal(
+      firstRoot,
+      join(home, '.biu', 'workspaces', 'workspace-ws_alpha', 'sessions', `session-${first.id}`),
+    )
+    assert.equal(
+      secondRoot,
+      join(home, '.biu', 'workspaces', 'workspace-ws_beta', 'sessions', `session-${second.id}`),
+    )
+    assert.notEqual(firstRoot, secondRoot)
+    assert.equal(await (await import('node:fs/promises')).readFile(join(firstRoot, 'same.txt'), 'utf8'), 'alpha')
+    assert.equal(await (await import('node:fs/promises')).readFile(join(secondRoot, 'same.txt'), 'utf8'), 'beta')
+  } finally {
+    if (previousOnline === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previousOnline
+    if (previousHome === undefined) delete process.env.BIU_HOME
+    else process.env.BIU_HOME = previousHome
+  }
 })

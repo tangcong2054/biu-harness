@@ -3,8 +3,10 @@ import { Service, type Context } from 'cordis'
 
 export interface SessionProjectMeta {
   name: string
-  path: string
+  path?: string
   boundAt: number
+  /** Online 由服务端管理的隔离目录，不允许用户重新选择或解绑。 */
+  managed?: boolean
 }
 
 export interface ProjectViewState {
@@ -20,12 +22,12 @@ const empty: ProjectViewState = {
 }
 
 function projectMetaEqual(
-  a?: { name: string; path?: string; boundAt: number },
-  b?: { name: string; path?: string; boundAt: number },
+  a?: SessionProjectMeta,
+  b?: SessionProjectMeta,
 ) {
   if (a === b) return true
   if (!a || !b) return !a && !b
-  return a.name === b.name && a.path === b.path && a.boundAt === b.boundAt
+  return a.name === b.name && a.path === b.path && a.boundAt === b.boundAt && a.managed === b.managed
 }
 
 export class ProjectViewService extends Service {
@@ -44,10 +46,15 @@ export class ProjectViewService extends Service {
   get = () => this.value
 
   /** 跟随当前 chat session。 */
-  async attachSession(sessionId: string | null, project?: { name: string; path?: string; boundAt: number }) {
+  async attachSession(sessionId: string | null, project?: SessionProjectMeta) {
     const bound =
-      project?.path
-        ? { name: project.name, path: project.path, boundAt: project.boundAt }
+      project?.path || project?.managed
+        ? {
+            name: project.name,
+            ...(project.path ? { path: project.path } : {}),
+            boundAt: project.boundAt,
+            ...(project.managed ? { managed: true } : {}),
+          }
         : undefined
     if (
       this.value.sessionId === sessionId &&

@@ -1,7 +1,14 @@
+import { mkdirSync } from 'node:fs'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, normalize, relative, resolve } from 'node:path'
 import { Service, type Context } from 'cordis'
 import { currentSessionId } from '@biu/host-sessions/scope'
+import {
+  currentRequestWorkspaceId,
+  dataHome,
+  dataPath,
+  isOnlineRuntime,
+} from '@biu/host-plugin-loader/data-dir'
 import {
   STR_REPLACE_EDITOR_DESCRIPTION,
   STR_REPLACE_EDITOR_PARAMETERS,
@@ -17,13 +24,41 @@ export class FsService extends Service {
     this.defaultRoot = resolve(defaultRoot)
   }
 
-  /** 当前生效工作区：Session 已绑定 host 路径则为该目录，否则默认 `.workspace`。 */
+  /** 当前生效工作区：Online 使用受控云端目录；Offline 可绑定本机目录。 */
   get root() {
     return this.effectiveRoot()
   }
 
   effectiveRoot() {
+    if (isOnlineRuntime()) {
+      const sessionId = currentSessionId()
+      return sessionId ? this.onlineSessionRoot(sessionId) : this.onlineSystemRoot()
+    }
     return this.sessionProjectRoot() ?? this.defaultRoot
+  }
+
+  /** Online 的稳定根目录；不复用或迁移旧 `<repo>/.workspace`。 */
+  onlineWorkspacesRoot() {
+    return dataPath(dataHome(), 'workspaces')
+  }
+
+  onlineSystemRoot() {
+    return this.ensureRoot(join(this.onlineWorkspacesRoot(), '_system'))
+  }
+
+  /**
+   * Online 每个 Workspace/Session 一块独立目录。
+   * workspaceId 优先取当前请求，后台 Agent 则从 Session 归属反查。
+   */
+  onlineSessionRoot(sessionId: string) {
+    const workspaceId = this.workspaceIdForSession(sessionId) || '_unassigned'
+    const root = join(
+      this.onlineWorkspacesRoot(),
+      `workspace-${encodeURIComponent(workspaceId)}`,
+      'sessions',
+      `session-${encodeURIComponent(sessionId)}`,
+    )
+    return this.ensureRoot(root)
   }
 
   sessionProjectRoot() {
@@ -32,6 +67,34 @@ export class FsService extends Service {
     const sessions = this.ctx.get('sessions') as { peek?: (id: string) => { project?: { path?: string } } | undefined } | undefined
     const path = sessions?.peek?.(sessionId)?.project?.path
     return path ? resolve(path) : null
+  }
+
+  private workspaceIdForSession(sessionId: string) {
+    let account:
+      | {
+          store?: {
+            tenantForRecord?(
+              collection: string,
+              recordId: string,
+            ): { workspaceId?: string } | null
+          }
+        }
+      | undefined
+    try {
+      account = this.ctx.get('account') as typeof account
+    } catch {
+      account = undefined
+    }
+    const ownedWorkspaceId = String(
+      account?.store?.tenantForRecord?.('/sessions', sessionId)?.workspaceId ?? '',
+    ).trim()
+    if (ownedWorkspaceId) return ownedWorkspaceId
+    return currentRequestWorkspaceId().trim()
+  }
+
+  private ensureRoot(root: string) {
+    mkdirSync(root, { recursive: true })
+    return root
   }
 
   resolveIn(root: string, rel: string) {
@@ -139,6 +202,9 @@ export function apply(ctx: Context, config: { root?: string } = {}) {
     inner.systemPrompt.register('session.project', () => {
       const sessionId = currentSessionId()
       if (!sessionId) return ''
+      if (isOnlineRuntime()) {
+        return `当前 Session 使用云端受控工作区：${fs.onlineSessionRoot(sessionId)}。bash / 文件工具只能读写该目录。`
+      }
       const project = inner.sessions.peek(sessionId)?.project
       if (!project?.path) return ''
       return `当前 Session 绑定 host 工作区「${project.name}」：${project.path}。bash / 文件工具直接读写该目录（对齐 dsh workspace cwd）。`

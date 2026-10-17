@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, realpath, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'vitest'
@@ -12,6 +12,7 @@ import * as shell from './index.ts'
 import * as jobs from '@biu/host-jobs'
 import { runWithSession } from '@biu/host-sessions/scope'
 import { readArtifactFile } from '@biu/host-sessions/artifacts'
+import { runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 
 async function runtime(root?: string) {
   const ctx = new Context()
@@ -46,6 +47,41 @@ test('shell seam runner can be swapped without changing the bash tool', async ()
   ctx.shell.setRunner(async () => ({ code: 0, stdout: 'swapped\n', stderr: '' }))
   const bash = (await ctx.tools.invoke('bash', { command: 'ignored' })) as { stdout: string }
   assert.match(bash.stdout, /swapped/)
+})
+
+test.skipIf(process.platform === 'win32')('online bash defaults to its managed workspace/session directory', async () => {
+  const previousOnline = process.env.BIU_ONLINE
+  const previousHome = process.env.BIU_HOME
+  const home = await mkdtemp(join(tmpdir(), 'cordis-online-shell-'))
+  process.env.BIU_ONLINE = '1'
+  process.env.BIU_HOME = home
+  try {
+    const { ctx } = await runtime()
+    const result = await runWithRequestWorkspace('ws_shell', () =>
+      runWithSession('sess-shell', () =>
+        ctx.tools.invoke('bash', { command: 'pwd; printf managed > from-shell.txt' }),
+      ),
+    ) as { code: number | null; stdout: string }
+    const expected = join(
+      home,
+      '.biu',
+      'workspaces',
+      'workspace-ws_shell',
+      'sessions',
+      'session-sess-shell',
+    )
+    assert.equal(result.code, 0)
+    assert.equal(await realpath(result.stdout.trim()), await realpath(expected))
+    assert.equal(
+      await (await import('node:fs/promises')).readFile(join(expected, 'from-shell.txt'), 'utf8'),
+      'managed',
+    )
+  } finally {
+    if (previousOnline === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previousOnline
+    if (previousHome === undefined) delete process.env.BIU_HOME
+    else process.env.BIU_HOME = previousHome
+  }
 })
 
 test('bash copies printed image paths into session artifacts', async () => {

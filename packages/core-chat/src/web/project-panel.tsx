@@ -24,15 +24,21 @@ export function SessionProjectPanel(props: SlotProps) {
   }
 
   const bound = Boolean(project)
+  const managed = project?.managed === true
+  const label = managed
+    ? '云端工作区（服务器）'
+    : bound
+      ? `项目文件夹：${project!.name}`
+      : '绑定项目文件夹'
 
   return (
     <div className="project-chip-wrap">
       <button
         type="button"
         className={`project-chip project-chip-icon-only${bound ? '' : ' project-chip-dashed'}${busy ? ' is-busy' : ''}`}
-        disabled={busy}
-        aria-label={bound ? `项目文件夹：${project!.name}` : '绑定项目文件夹'}
-        data-dock-tip={bound ? `项目文件夹：${project!.name}` : '绑定项目文件夹'}
+        disabled={busy || managed}
+        aria-label={label}
+        data-dock-tip={label}
         onClick={() => void projectView.openFolderForSession(sessionId).catch(() => undefined)}
       >
         <FolderGlyph />

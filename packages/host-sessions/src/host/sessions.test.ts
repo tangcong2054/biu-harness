@@ -283,6 +283,26 @@ test('setProject binds host absolute path and clears it', async () => {
   assert.equal((await ctx.sessions.require(record.id)).project, undefined)
 })
 
+test('online sessions reject arbitrary host project paths', async () => {
+  const previous = process.env.BIU_ONLINE
+  process.env.BIU_ONLINE = '1'
+  try {
+    const ctx = new Context()
+    await ctx.plugin(sessionStore, { driver: 'memory' })
+    await ctx.plugin(sessions)
+    const record = await ctx.sessions.create()
+    const dir = await mkdtemp(join(tmpdir(), 'cordis-online-proj-'))
+    await assert.rejects(
+      () => ctx.sessions.setProject(record.id, { path: dir }),
+      /云端受控工作区/,
+    )
+    assert.equal((await ctx.sessions.require(record.id)).project, undefined)
+  } finally {
+    if (previous === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previous
+  }
+})
+
 test('delete removes session from store and cache', async () => {
   const ctx = new Context()
   await ctx.plugin(sessionStore, { driver: 'memory' })
