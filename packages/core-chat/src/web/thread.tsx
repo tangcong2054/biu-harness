@@ -847,6 +847,7 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
   sessionIdRef.current = sessionId
   const restoredForRef = useRef<string | null>(null)
   const holdOlderRef = useRef(false)
+  const restoringAnchorRef = useRef(false)
   const maxScrollRef = useRef(0)
   const prependHeightRef = useRef(0)
   const previousRevealStartRef = useRef(revealStart)
@@ -948,6 +949,7 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
   useEffect(() => {
     const parent = scrollRef.current
     if (!parent) return
+    const scrollSessionId = sessionId
 
     const maybePrefetchOlder = () => {
       if (!hasMoreOlder || loadingOlder || prefetchingRef.current) return
@@ -1008,8 +1010,9 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
       if (holdOlderRef.current && maxScrollRef.current > PREFETCH_OLDER_PX && parent.scrollTop <= PREFETCH_OLDER_PX) {
         holdOlderRef.current = false
       }
-      const id = sessionIdRef.current
-      if (id && restoredForRef.current === id) rememberChatScroll(id, captureChatScroll(parent))
+      if (scrollSessionId && restoredForRef.current === scrollSessionId) {
+        rememberChatScroll(scrollSessionId, captureChatScroll(parent))
+      }
     }
     onScroll()
     parent.addEventListener('scroll', onUserScroll, { passive: true })
@@ -1085,6 +1088,23 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
         previousRevealStartRef.current = revealStart
         return
       }
+      const rememberedTurn = turnIndexContaining(nodes, mem.nodeId)
+      if (rememberedTurn >= 0 && rememberedTurn < revealStart) {
+        setRevealStart(rememberedTurn)
+        previousRevealStartRef.current = revealStart
+        return
+      }
+      // 锚点可能在当前 24-turn 尾窗之前。先逐页补历史，确认服务端也没有后才能判坏。
+      if (hasMoreOlder) {
+        if (!loadingOlder && !restoringAnchorRef.current) {
+          restoringAnchorRef.current = true
+          void sessionView.loadOlder().finally(() => {
+            restoringAnchorRef.current = false
+          })
+        }
+        previousRevealStartRef.current = revealStart
+        return
+      }
       // 锚点可能已被分页、压缩或删除。恢复失败必须回到最新消息，
       // 并清除坏记忆；否则 scrollTop=0 会再次被记成最早一条，之后每次打开都从头开始。
       rememberChatScroll(sessionId, { kind: 'bottom' })
@@ -1110,7 +1130,7 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
     }
     prependHeightRef.current = parent.scrollHeight
     previousRevealStartRef.current = revealStart
-  }, [stickKey, mountedNodes.length, revealStart, sessionId, threadReady])
+  }, [stickKey, mountedNodes.length, revealStart, sessionId, threadReady, hasMoreOlder, loadingOlder, sessionView])
 
   if (nodes.length === 0 && !pending && !error && !switchingSession) {
     return <div className="w-full" data-testid="chat-empty" />

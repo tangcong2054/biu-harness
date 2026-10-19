@@ -242,6 +242,11 @@ describe('thread follows the latest message', () => {
   it('pins a sent user turn to the top and only follows while stuck to the bottom', () => {
     const src = readFileSync(resolve(import.meta.dirname, './thread.tsx'), 'utf8')
     expect(src).toContain('if (!threadReady) return')
+    expect(src).toContain('turnIndexContaining(nodes, mem.nodeId)')
+    expect(src).toContain('void sessionView.loadOlder().finally')
+    expect(src.indexOf('void sessionView.loadOlder().finally')).toBeLessThan(
+      src.indexOf("rememberChatScroll(sessionId, { kind: 'bottom' })"),
+    )
     expect(src).toContain("restoreChatScroll(parent, { kind: 'pin', nodeId: latestUserId })")
     expect(src).toContain('followedUserRef.current === latestUserId')
     expect(src).toContain('ResizeObserver')
