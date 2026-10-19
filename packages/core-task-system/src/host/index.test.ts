@@ -768,7 +768,7 @@ test('task list scans lean columns and skips unused json blobs', () => {
   assert.match(host, /listProjected\(filter: TaskListFilter/)
   assert.match(host, /projected \? LIST_TASK_COLUMNS : 'tasks\.\*'/)
   assert.match(host, /rows\.map\(\(row\) => mapRow\(row, projected\)\)/)
-  assert.match(collection, /tasks\.listProjected \?\? tasks\.list/)
+  assert.match(collection, /tasks\.listProjected \? tasks\.listProjected\(filter\) : tasks\.list\(filter\)/)
   assert.match(host, /function isBlankJson/)
   assert.match(collection, /function missingLookup/)
   assert.match(collection, /if \(!tree\)/)

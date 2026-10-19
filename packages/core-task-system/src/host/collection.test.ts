@@ -98,3 +98,36 @@ test('tasksCollection lets agents write assignee and stamps the creating session
   assert.equal('assigneeSessionId' in (updated[0] ?? {}), false)
   assert.equal(written.assigneeSessionId, 'worker-2')
 })
+
+test('tasksCollection preserves this when calling a projected service method', async () => {
+  class BoundTasks implements TasksLike {
+    private rows = [{ id: 't1', title: '绑定方法', status: 'todo' }]
+
+    list() {
+      return this.rows
+    }
+
+    listProjected() {
+      return this.rows
+    }
+
+    get(id: string) {
+      return this.rows.find((row) => row.id === id)
+    }
+
+    update(id: string, patch: Record<string, unknown>) {
+      return { ...this.rows[0]!, ...patch, id }
+    }
+
+    create(input: Record<string, unknown> & { title: string }) {
+      return { id: 'new', title: input.title, status: 'todo' }
+    }
+
+    delete() {
+      return true
+    }
+  }
+
+  const spec = tasksCollection(new BoundTasks())
+  assert.equal((await spec.list())[0]?.title, '绑定方法')
+})

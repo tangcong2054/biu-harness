@@ -215,7 +215,7 @@ async function resolvedAssignee(
 
 export function tasksCollection(tasks: TasksLike, recordActions?: TaskRecordActions, people?: TaskPeople): CollectionSpec {
   const listProjected = (filter?: { q?: string; status?: string }) =>
-    (tasks.listProjected ?? tasks.list)(filter)
+    tasks.listProjected ? tasks.listProjected(filter) : tasks.list(filter)
   return {
     id: 'tasks',
     path: '/tasks',
