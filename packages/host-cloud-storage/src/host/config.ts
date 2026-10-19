@@ -2,6 +2,7 @@ export type StorageBackend = 'sqlite' | 'dual' | 'mysql'
 
 export type CloudStorageConfig =
   | { backend: 'sqlite'; enabled: false }
+  | { backend: 'dual' | 'mysql'; enabled: false }
   | {
       backend: 'dual' | 'mysql'
       enabled: true
@@ -29,7 +30,8 @@ export function loadCloudStorageConfig(
   const backend = raw as StorageBackend
   if (backend === 'sqlite') return { backend, enabled: false }
   if (env.BIU_ONLINE !== '1') {
-    throw new Error('MySQL storage is only available in the Online runtime')
+    // Offline 永远使用本机 SQLite；允许与 Online 共用同一套 dual/mysql 环境模板。
+    return { backend, enabled: false }
   }
 
   const url = String(env.BIU_MYSQL_URL ?? '').trim()

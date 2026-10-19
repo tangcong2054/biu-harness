@@ -11,6 +11,11 @@
     "./migrations": "./src/host/migrations.ts"
   },
   "dependencies": {
+    "@biu/host-plugin-loader": "0.1.0",
+    "@biu/type-host-context": "0.1.0",
     "mysql2": "^3.24.6"
+  },
+  "peerDependencies": {
+    "cordis": "4.0.0-rc.8"
   }
 }

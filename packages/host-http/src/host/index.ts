@@ -160,6 +160,8 @@ export class HttpService extends Service {
   private routes: Route[] = []
   private sockets = new Set<WebSocket>()
   private socketMeta = new WeakMap<WebSocket, { accountId: string; workspaceId: string; token: string }>()
+  /** 正在看或刚发过消息的账号。归属空间和当前空间不一致时，事件仍要推给这个连接。 */
+  private sessionAudience = new Map<string, { workspaceId: string; accountId: string }>()
   private server: Server | null = null
   /** 同一 HTTP server 上只能有一条 upgrade 路由；多挂几个 `ws.Server({ server })` 会互相 abort 握手。 */
   private wsServers = new Map<string, WebSocketServer>()
@@ -173,8 +175,8 @@ export class HttpService extends Service {
       this.server = server
       const hub = new WebSocketServer({ noServer: true })
       this.wsServers.set('/ws', hub)
-      hub.on('connection', (socket, request: IncomingMessage) => {
-        const auth = this.authenticateSocket(request)
+      hub.on('connection', async (socket, request: IncomingMessage) => {
+        const auth = await this.authenticateSocket(request)
         if (auth.error) {
           socket.close(auth.error, auth.error === 4403 ? 'workspace' : 'tenant')
           return
@@ -260,19 +262,25 @@ export class HttpService extends Service {
     const pluginId = currentPluginId()
     return this.ctx.effect(() => {
       const wss = new WebSocketServer({ noServer: true })
-      wss.on('connection', (socket, request) => {
+      wss.on('connection', async (socket, request) => {
         if (isOnlineRuntime()) {
-          const auth = this.authenticateSocket(request)
+          const auth = await this.authenticateSocket(request)
           if (auth.error) {
             socket.close(auth.error, auth.error === 4403 ? 'workspace' : 'tenant')
             return
           }
-          const store = (
+          const account = (
             this.ctx.get('account') as {
+              canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): Promise<boolean>
               store?: { canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): boolean }
             } | undefined
-          )?.store
-          if (pluginId && !store?.canAccessPlugin?.(auth.accountId, auth.workspaceId, pluginId)) {
+          )
+          const allowed = pluginId
+            ? account?.canAccessPlugin
+              ? await account.canAccessPlugin(auth.accountId, auth.workspaceId, pluginId)
+              : account?.store?.canAccessPlugin?.(auth.accountId, auth.workspaceId, pluginId)
+            : true
+          if (!allowed) {
             socket.close(4403, 'plugin access')
             return
           }
@@ -293,8 +301,19 @@ export class HttpService extends Service {
       workspaceId ||= typeof scoped.workspaceId === 'string' ? scoped.workspaceId : ''
       accountId ||= typeof scoped.accountId === 'string' ? scoped.accountId : ''
       if ((!workspaceId || !accountId) && typeof scoped.sessionId === 'string') {
-        const tenant = (
+        const sessionId = scoped.sessionId
+        const requestWorkspaceId = currentRequestWorkspaceId()
+        const requestAccountId = currentAccountId()
+        if (requestWorkspaceId && requestAccountId) {
+          this.sessionAudience.set(sessionId, { workspaceId: requestWorkspaceId, accountId: requestAccountId })
+        }
+        const audience = this.sessionAudience.get(sessionId)
+        const account = (
           this.ctx.get('account') as {
+            tenantForRecord?(collection: string, recordId: string): Promise<{
+              workspaceId: string
+              accountId: string
+            } | null>
             store?: {
               tenantForRecord?(collection: string, recordId: string): {
                 workspaceId: string
@@ -302,7 +321,26 @@ export class HttpService extends Service {
               } | null
             }
           } | undefined
-        )?.store?.tenantForRecord?.('/sessions', scoped.sessionId)
+        )
+        const fanout = (tenant: { workspaceId: string; accountId: string } | null | undefined) => {
+          const targets = new Map<string, { workspaceId: string; accountId: string }>()
+          for (const target of [tenant, audience]) {
+            if (!target?.workspaceId || !target.accountId) continue
+            targets.set(`${target.workspaceId}\0${target.accountId}`, target)
+          }
+          for (const target of targets.values()) {
+            this.broadcast(type, { ...scoped, ...target }, target.workspaceId, target.accountId)
+          }
+        }
+        if (account?.tenantForRecord) {
+          void account.tenantForRecord('/sessions', sessionId).then((tenant) => fanout(tenant))
+          return
+        }
+        const tenant = account?.store?.tenantForRecord?.('/sessions', sessionId)
+        if (tenant || audience) {
+          fanout(tenant)
+          return
+        }
         workspaceId ||= tenant?.workspaceId ?? ''
         accountId ||= tenant?.accountId ?? ''
       }
@@ -313,20 +351,34 @@ export class HttpService extends Service {
     for (const socket of this.sockets) {
       const meta = this.socketMeta.get(socket)
       if (meta?.accountId && meta.workspaceId) {
-        const store = (
+        const account = (
           this.ctx.get('account') as {
+            accountByToken?(token: string): Promise<{ id: string } | null>
+            isMemberAsync?(accountId: string, workspaceId: string): Promise<boolean>
             store?: {
               accountByToken?(token: string): { id: string } | null
               isMember?(accountId: string, workspaceId: string): boolean
             }
           } | undefined
-        )?.store
-        if (
-          (store?.accountByToken && store.accountByToken(meta.token)?.id !== meta.accountId) ||
-          (store?.isMember && !store.isMember(meta.accountId, meta.workspaceId))
-        ) {
-          socket.close(4403, 'membership revoked')
-          continue
+        )
+        if (account?.accountByToken || account?.isMemberAsync) {
+          void Promise.all([
+            account.accountByToken?.(meta.token),
+            account.isMemberAsync?.(meta.accountId, meta.workspaceId),
+          ]).then(([identity, member]) => {
+            if ((account.accountByToken && identity?.id !== meta.accountId) || member === false) {
+              socket.close(4403, 'membership revoked')
+            }
+          })
+        } else {
+          const store = account?.store
+          if (
+            (store?.accountByToken && store.accountByToken(meta.token)?.id !== meta.accountId) ||
+            (store?.isMember && !store.isMember(meta.accountId, meta.workspaceId))
+          ) {
+            socket.close(4403, 'membership revoked')
+            continue
+          }
         }
       }
       if (!deliverTenantEvent(meta ?? {}, type, { workspaceId, accountId })) continue
@@ -357,18 +409,24 @@ export class HttpService extends Service {
   }
 
   disconnectRevokedSessions(accountId: string) {
-    const store = (
-      this.ctx.get('account') as { store?: { accountByToken?(token: string): { id: string } | null } } | undefined
-    )?.store
+    const account = this.ctx.get('account') as {
+      accountByToken?(token: string): Promise<{ id: string } | null>
+      store?: { accountByToken?(token: string): { id: string } | null }
+    } | undefined
     for (const socket of this.sockets) {
       const meta = this.socketMeta.get(socket)
-      if (meta?.accountId === accountId && store?.accountByToken?.(meta.token)?.id !== accountId) {
+      if (meta?.accountId !== accountId) continue
+      if (account?.accountByToken) {
+        void account.accountByToken(meta.token).then((identity) => {
+          if (identity?.id !== accountId) socket.close(4401, 'session revoked')
+        })
+      } else if (account?.store?.accountByToken?.(meta.token)?.id !== accountId) {
         socket.close(4401, 'session revoked')
       }
     }
   }
 
-  private authenticateSocket(request: IncomingMessage) {
+  private async authenticateSocket(request: IncomingMessage) {
     const url = new URL(request.url ?? '/', 'http://localhost')
     const cookie = String(request.headers.cookie ?? '')
     const encoded = cookie
@@ -380,25 +438,42 @@ export class HttpService extends Service {
     const token = preview ? '' : (url.searchParams.get('token') ?? cookieToken)
     const workspaceId = preview ? '' : (url.searchParams.get('workspaceId') ?? '')
     let accountId = ''
-    const store = (
+    const account = (
       this.ctx.get('account') as {
+        accountByToken?(token: string): Promise<{ id: string } | null>
+        activeWorkspaceFor?(accountId: string): Promise<string>
+        isMemberAsync?(accountId: string, workspaceId: string): Promise<boolean>
         store?: {
           accountByToken?(token: string): { id: string } | null
           isMember?(accountId: string, workspaceId: string): boolean
           activeWorkspaceId?(): string | null
         }
       } | undefined
-    )?.store
+    )
+    const store = account?.store
     try {
-      accountId = token ? store?.accountByToken?.(token)?.id ?? '' : ''
+      accountId = token
+        ? account?.accountByToken
+          ? (await account.accountByToken(token))?.id ?? ''
+          : store?.accountByToken?.(token)?.id ?? ''
+        : ''
     } catch {
       accountId = ''
     }
     let effectiveWorkspaceId = workspaceId
-    if (accountId && effectiveWorkspaceId && store?.isMember && !store.isMember(accountId, effectiveWorkspaceId)) {
+    const member = accountId && effectiveWorkspaceId
+      ? account?.isMemberAsync
+        ? await account.isMemberAsync(accountId, effectiveWorkspaceId)
+        : store?.isMember?.(accountId, effectiveWorkspaceId)
+      : false
+    if (accountId && effectiveWorkspaceId && !member) {
       // 与 HTTP 一致：浏览器若还带着已删除空间，不要把所有 WS 永久锁死；
       // 安全地回退到账号自己的活动空间，而不是访问请求中的陌生空间。
-      effectiveWorkspaceId = runWithAccount(accountId, () => String(store.activeWorkspaceId?.() ?? '').trim())
+      effectiveWorkspaceId = await runWithAccount(accountId, async () => String(
+        account?.activeWorkspaceFor
+          ? await account.activeWorkspaceFor(accountId)
+          : store?.activeWorkspaceId?.() ?? '',
+      ).trim())
     }
     if (isOnlineRuntime() && (!accountId || !effectiveWorkspaceId)) {
       return { accountId, workspaceId: effectiveWorkspaceId, token, error: 4401 as const }
@@ -479,10 +554,23 @@ export class HttpService extends Service {
         const legacyToken = legacyEncoded ? decodeURIComponent(legacyEncoded.slice('biu_legacy_account='.length)) : ''
         const token = bearerToken || accountToken || legacyToken
         let accountId = ''
+        const accountService = this.ctx.get('account') as {
+          accountByToken?(token: string): Promise<{ id: string } | null>
+          activeWorkspaceFor?(accountId: string): Promise<string>
+          isMemberAsync?(accountId: string, workspaceId: string): Promise<boolean>
+          canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): Promise<boolean>
+          store?: {
+            accountByToken?(token: string): { id: string } | null
+            isMember?(accountId: string, workspaceId: string): boolean
+            activeWorkspaceId?(): string | null
+            canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): boolean
+          }
+        } | undefined
         if (token) {
           try {
-            const store = (this.ctx.get('account') as { store?: { accountByToken(token: string): { id: string } | null } } | undefined)?.store
-            accountId = store?.accountByToken(token)?.id ?? ''
+            accountId = accountService?.accountByToken
+              ? (await accountService.accountByToken(token))?.id ?? ''
+              : accountService?.store?.accountByToken?.(token)?.id ?? ''
           } catch {
             accountId = ''
           }
@@ -494,7 +582,7 @@ export class HttpService extends Service {
           ])
         }
         const hasAccountSystem = Boolean(
-          (this.ctx.get('account') as { store?: { accountByToken?: unknown } } | undefined)?.store?.accountByToken,
+          accountService?.accountByToken || accountService?.store?.accountByToken,
         )
         const publicApi =
           url.pathname.startsWith('/api/account/') ||
@@ -507,25 +595,24 @@ export class HttpService extends Service {
           return
         }
         const headerWorkspace = String(req.headers['x-biu-workspace-id'] ?? '').trim()
-        const accountStore = (
-          this.ctx.get('account') as {
-            store?: {
-              isMember?(accountId: string, workspaceId: string): boolean
-              activeWorkspaceId?(): string | null
-              canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): boolean
-            }
-          } | undefined
-        )?.store
+        const accountStore = accountService?.store
         const requestedWorkspace = await runWithAccount(accountId, async () => {
           if (headerWorkspace) {
             // 浏览器可能还缓存着已删除或已退出的 workspaceId。不要让这个陈旧值
             // 把所有 API 都拦成 403，否则工作区选择器本身也加载不出来，用户无法自救。
-            if (!accountId || !accountStore?.isMember || accountStore.isMember(accountId, headerWorkspace)) {
+            const member = accountService?.isMemberAsync
+              ? await accountService.isMemberAsync(accountId, headerWorkspace)
+              : accountStore?.isMember?.(accountId, headerWorkspace)
+            if (!accountId || member) {
               return headerWorkspace
             }
           }
           if (!isOnlineRuntime() || !accountId) return ''
-          return String(accountStore?.activeWorkspaceId?.() ?? '').trim()
+          return String(
+            accountService?.activeWorkspaceFor
+              ? await accountService.activeWorkspaceFor(accountId)
+              : accountStore?.activeWorkspaceId?.() ?? '',
+          ).trim()
         })
         if (
           isOnlineRuntime() &&
@@ -544,14 +631,17 @@ export class HttpService extends Service {
           !identityRoute &&
           accountId &&
           requestedWorkspace &&
-          accountStore?.isMember &&
-          !accountStore.isMember(accountId, requestedWorkspace)
+          !(accountService?.isMemberAsync
+            ? await accountService.isMemberAsync(accountId, requestedWorkspace)
+            : accountStore?.isMember?.(accountId, requestedWorkspace))
         ) {
           context.send(403, { error: '不在这个空间' })
           return
         }
         if (isOnlineRuntime() && match.pluginId) {
-          const allowed = accountStore?.canAccessPlugin?.(accountId, requestedWorkspace, match.pluginId)
+          const allowed = accountService?.canAccessPlugin
+            ? await accountService.canAccessPlugin(accountId, requestedWorkspace, match.pluginId)
+            : accountStore?.canAccessPlugin?.(accountId, requestedWorkspace, match.pluginId)
           if (!allowed) {
             context.send(404, { error: 'not found' })
             return

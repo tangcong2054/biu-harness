@@ -194,12 +194,13 @@ function decorateTask(
 
 /** 从 task 体系取出本 live（作为 creator）派发的任务，作为派工统计数据源（替代旧的 wake/inject 扫描）。 */
 export async function loadLiveDispatchTasks(
-  ctx: Context & { tasks?: { list(filter: { creatorSessionId?: string }): Array<{ id: string; title: string; status: 'todo' | 'doing' | 'done'; createdAt: number; assignee?: { sessionId?: string } | null }> } },
+  ctx: Context & { tasks?: { list(filter: { creatorSessionId?: string }): Array<{ id: string; title: string; status: 'todo' | 'doing' | 'done' | 'failed'; createdAt: number; assignee?: { sessionId?: string } | null }> | Promise<Array<{ id: string; title: string; status: 'todo' | 'doing' | 'done' | 'failed'; createdAt: number; assignee?: { sessionId?: string } | null }>> } },
   liveId: string,
 ): Promise<TaskDispatchSource[]> {
   if (!ctx.tasks) return []
-  const rows = ctx.tasks.list({ creatorSessionId: liveId })
+  const rows = await ctx.tasks.list({ creatorSessionId: liveId })
   return rows
+    .filter((row): row is typeof row & { status: 'todo' | 'doing' | 'done' } => row.status !== 'failed')
     .map((row) => ({
       id: row.id,
       title: row.title,

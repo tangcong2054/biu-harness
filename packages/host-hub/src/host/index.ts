@@ -113,21 +113,24 @@ export class HubService extends Service {
     }
   }
 
-  snapshotFor(accountId: string, workspaceId: string) {
+  async snapshotFor(accountId: string, workspaceId: string) {
     const snapshot = this.snapshot()
-    const store = (
+    const account = (
       this.ctx.get('account') as {
+        canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): Promise<boolean>
         store?: { canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): boolean }
       } | undefined
-    )?.store
+    )
+    const checks = await Promise.all(snapshot.plugins.map(async (plugin) => ({
+      id: plugin.id,
+      allowed: !isStorePackage(plugin.packageName) || Boolean(
+        account?.canAccessPlugin
+          ? await account.canAccessPlugin(accountId, workspaceId, plugin.id)
+          : account?.store?.canAccessPlugin?.(accountId, workspaceId, plugin.id),
+      ),
+    })))
     const allowed = new Set(
-      snapshot.plugins
-        .filter(
-          (plugin) =>
-            !isStorePackage(plugin.packageName) ||
-            Boolean(store?.canAccessPlugin?.(accountId, workspaceId, plugin.id)),
-        )
-        .map((plugin) => plugin.id),
+      checks.filter((item) => item.allowed).map((item) => item.id),
     )
     const plugins = snapshot.plugins
       .filter((plugin) => allowed.has(plugin.id))
@@ -261,10 +264,10 @@ export async function apply(ctx: Context) {
   const catalog = await resolveCatalog()
   const hub = new HubService(ctx, catalog)
   await hub.mountEnabled()
-  ctx.http.route('GET', '/api/snapshot', (route) => {
+  ctx.http.route('GET', '/api/snapshot', async (route) => {
     route.res.setHeader('cache-control', 'private, no-store')
     route.res.setHeader('vary', 'Authorization, Cookie, X-Biu-Workspace-Id')
-    route.send(200, ctx.hub.snapshotFor(currentAccountId(), currentRequestWorkspaceId()))
+    route.send(200, await ctx.hub.snapshotFor(currentAccountId(), currentRequestWorkspaceId()))
   })
   ctx.http.broadcast('plugins/changed', { ts: Date.now() })
   ctx.http.route('POST', '/api/plugins/:id', async (route) => {

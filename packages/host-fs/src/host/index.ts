@@ -61,6 +61,30 @@ export class FsService extends Service {
     return this.ensureRoot(root)
   }
 
+  async onlineSessionRootAsync(sessionId: string) {
+    const requested = currentRequestWorkspaceId().trim()
+    let workspaceId = requested
+    if (!workspaceId) {
+      const account = this.ctx.get('account') as {
+        tenantForRecord?(collection: string, recordId: string): Promise<{ workspaceId?: string } | null>
+      } | undefined
+      workspaceId = String((await account?.tenantForRecord?.('/sessions', sessionId))?.workspaceId ?? '').trim()
+    }
+    const root = join(
+      this.onlineWorkspacesRoot(),
+      `workspace-${encodeURIComponent(workspaceId || '_unassigned')}`,
+      'sessions',
+      `session-${encodeURIComponent(sessionId)}`,
+    )
+    return this.ensureRoot(root)
+  }
+
+  async effectiveRootAsync() {
+    if (!isOnlineRuntime()) return this.sessionProjectRoot() ?? this.defaultRoot
+    const sessionId = currentSessionId()
+    return sessionId ? this.onlineSessionRootAsync(sessionId) : this.onlineSystemRoot()
+  }
+
   sessionProjectRoot() {
     const sessionId = currentSessionId()
     if (!sessionId) return null
@@ -72,6 +96,10 @@ export class FsService extends Service {
   private workspaceIdForSession(sessionId: string) {
     let account:
       | {
+          tenantForRecord?(
+            collection: string,
+            recordId: string,
+          ): Promise<{ workspaceId?: string } | null>
           store?: {
             tenantForRecord?(
               collection: string,
@@ -85,11 +113,16 @@ export class FsService extends Service {
     } catch {
       account = undefined
     }
+    const requested = currentRequestWorkspaceId().trim()
+    if (requested) return requested
+    // MySQL tenant lookup is asynchronous. Never fall through to the SQLite
+    // store in that mode; background callers must establish workspace scope.
+    if (account?.tenantForRecord) return ''
     const ownedWorkspaceId = String(
       account?.store?.tenantForRecord?.('/sessions', sessionId)?.workspaceId ?? '',
     ).trim()
     if (ownedWorkspaceId) return ownedWorkspaceId
-    return currentRequestWorkspaceId().trim()
+    return ''
   }
 
   private ensureRoot(root: string) {
@@ -132,15 +165,15 @@ export class FsService extends Service {
   }
 
   async read(rel: string) {
-    return this.readIn(this.effectiveRoot(), rel)
+    return this.readIn(await this.effectiveRootAsync(), rel)
   }
 
   async write(rel: string, content: string) {
-    return this.writeIn(this.effectiveRoot(), rel, content)
+    return this.writeIn(await this.effectiveRootAsync(), rel, content)
   }
 
   async list(rel = '.') {
-    return this.listIn(this.effectiveRoot(), rel)
+    return this.listIn(await this.effectiveRootAsync(), rel)
   }
 
   /** 稳定工作区（defaultRoot，不随 Session 绑定漂移）：供 DB 集合等需要固定落盘的场景使用。 */

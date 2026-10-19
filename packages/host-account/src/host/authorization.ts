@@ -105,6 +105,38 @@ export function roleCoversAction(role: ResourceRole, action: Action) {
   return ROLE_RANK[role] >= ROLE_RANK[requiredRole(action)]
 }
 
+/** 集合级权限只看空间角色，不读单条记录策略。MySQL 模式复用同一规则。 */
+export function authorizeCollection(
+  membership: WorkspaceRole | null,
+  memberKind: 'member' | 'external' | 'guest',
+  action: Action,
+  collection: string,
+): Decision {
+  if (!membership) return { allowed: false, reason: 'NOT_A_MEMBER' }
+  if (collection === '/workspace-members') {
+    const effectiveRole: ResourceRole =
+      membership === 'owner' ? 'owner' : membership === 'admin' ? 'manager' : 'viewer'
+    return ROLE_RANK[effectiveRole] >= ROLE_RANK[requiredRole(action)]
+      ? { allowed: true, effectiveRole, source: 'workspace-default' }
+      : { allowed: false, reason: 'INSUFFICIENT_PERMISSION' }
+  }
+  const managing =
+    action === 'resource:share' ||
+    action === 'resource:manage-permissions' ||
+    action === 'resource:delete'
+  if (managing && membership !== 'owner' && membership !== 'admin') {
+    return { allowed: false, reason: 'INSUFFICIENT_PERMISSION' }
+  }
+  const effectiveRole: ResourceRole = membership === 'owner' || membership === 'admin'
+    ? 'manager'
+    : membership === 'viewer' || memberKind === 'external' || memberKind === 'guest'
+      ? 'viewer'
+      : 'editor'
+  return ROLE_RANK[effectiveRole] >= ROLE_RANK[requiredRole(action)]
+    ? { allowed: true, effectiveRole, source: 'workspace-default' }
+    : { allowed: false, reason: 'INSUFFICIENT_PERMISSION' }
+}
+
 function memberAccessRole(policy: PolicyRow, membership: string): ResourceRole {
   if (membership === 'owner' || membership === 'admin') return 'manager'
   if (membership === 'viewer') return 'viewer'
@@ -260,28 +292,7 @@ export class AuthorizationService {
     }
 
     if (resource.type === 'collection') {
-      if (resource.collection === '/workspace-members') {
-        const effectiveRole: ResourceRole =
-          membership === 'owner' ? 'owner' : membership === 'admin' ? 'manager' : 'viewer'
-        return ROLE_RANK[effectiveRole] >= ROLE_RANK[requiredRole(action)]
-          ? { allowed: true, effectiveRole, source: 'workspace-default' }
-          : { allowed: false, reason: 'INSUFFICIENT_PERMISSION' }
-      }
-      const managing =
-        action === 'resource:share' ||
-        action === 'resource:manage-permissions' ||
-        action === 'resource:delete'
-      if (managing && membership !== 'owner' && membership !== 'admin') {
-        return { allowed: false, reason: 'INSUFFICIENT_PERMISSION' }
-      }
-      const effectiveRole: ResourceRole = membership === 'owner' || membership === 'admin'
-        ? 'manager'
-        : membership === 'viewer' || memberKind === 'external' || memberKind === 'guest'
-          ? 'viewer'
-          : 'editor'
-      return ROLE_RANK[effectiveRole] >= ROLE_RANK[requiredRole(action)]
-        ? { allowed: true, effectiveRole, source: 'workspace-default' }
-        : { allowed: false, reason: 'INSUFFICIENT_PERMISSION' }
+      return authorizeCollection(membership, memberKind, action, resource.collection)
     }
 
     if (resource.collection === '/workspace-members') {

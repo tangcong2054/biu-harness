@@ -35,12 +35,12 @@ type TaskRow = DbRecord & {
 }
 
 export type TasksLike = {
-  list: (filter?: { q?: string; status?: string }) => TaskRow[]
-  listProjected?: (filter?: { q?: string; status?: string }) => TaskRow[]
-  get: (id: string) => TaskRow | undefined
-  update: (id: string, patch: Record<string, unknown>) => DbRecord
-  create: (input: Record<string, unknown> & { title: string; creator: Actor }) => TaskRow
-  delete: (id: string) => boolean
+  list: (filter?: { q?: string; status?: 'todo' | 'doing' | 'done' | 'failed'; creatorSessionId?: string }) => TaskRow[] | Promise<TaskRow[]>
+  listProjected?: (filter?: { q?: string; status?: 'todo' | 'doing' | 'done' | 'failed' }) => TaskRow[] | Promise<TaskRow[]>
+  get: (id: string) => TaskRow | undefined | Promise<TaskRow | undefined>
+  update: (id: string, patch: Record<string, unknown>) => DbRecord | Promise<DbRecord>
+  create: (input: Record<string, unknown> & { title: string; creator: Actor }) => TaskRow | Promise<TaskRow>
+  delete: (id: string) => boolean | Promise<boolean>
 }
 
 export type TaskRecordActions = {
@@ -214,7 +214,7 @@ async function resolvedAssignee(
 }
 
 export function tasksCollection(tasks: TasksLike, recordActions?: TaskRecordActions, people?: TaskPeople): CollectionSpec {
-  const listProjected = (filter?: { q?: string; status?: string }) =>
+  const listProjected = (filter?: { q?: string; status?: 'todo' | 'doing' | 'done' | 'failed' }) =>
     tasks.listProjected ? tasks.listProjected(filter) : tasks.list(filter)
   return {
     id: 'tasks',
@@ -253,14 +253,15 @@ export function tasksCollection(tasks: TasksLike, recordActions?: TaskRecordActi
       },
     },
     records: { update: true, create: true, delete: true },
-    list: (query) => {
+    list: async (query) => {
       if (query?.ids?.length) {
-        const rows = query.ids.map((id) => tasks.get(id)).filter((row): row is TaskRow => Boolean(row))
+        const rows = (await Promise.all(query.ids.map((id) => tasks.get(id))))
+          .filter((row): row is TaskRow => Boolean(row))
         return recordsWithUsage(rows)
       }
-      return recordsWithUsage(listProjected(query?.q ? { q: query.q } : {}))
+      return recordsWithUsage(await listProjected(query?.q ? { q: query.q } : {}))
     },
-    get: (id) => recordsWithUsage(listProjected()).find((row) => row.id === id) ?? null,
+    get: async (id) => recordsWithUsage(await listProjected()).find((row) => row.id === id) ?? null,
     update: async (id, patch) => {
       const nextPatch = { ...patch }
       const assignee = await resolvedAssignee(people, patch)
@@ -276,9 +277,11 @@ export function tasksCollection(tasks: TasksLike, recordActions?: TaskRecordActi
         nextPatch.creator = creator ?? { kind: 'user', name: '用户' }
         delete nextPatch.creatorSessionId
       }
-      const next = tasks.update(id, nextPatch) as TaskRow
-      const rows = listProjected().map((row) => (row.id === id ? { ...row, ...next, id } : row))
-      return recordsWithUsage(rows).find((row) => row.id === id) ?? taskRecord(next, (pid) => tasks.get(pid), ZERO_USAGE, false)
+      const next = await tasks.update(id, nextPatch) as TaskRow
+      const listed = await listProjected()
+      const rows = listed.map((row) => (row.id === id ? { ...row, ...next, id } : row))
+      const lookup = new Map(rows.map((row) => [row.id, row]))
+      return recordsWithUsage(rows).find((row) => row.id === id) ?? taskRecord(next, (pid) => lookup.get(pid), ZERO_USAGE, false)
     },
     create: async (rows) =>
       Promise.all(
@@ -286,19 +289,21 @@ export function tasksCollection(tasks: TasksLike, recordActions?: TaskRecordActi
           const title = typeof fields.title === 'string' && fields.title.trim() ? fields.title.trim() : '未命名任务'
           const creator = people?.resolveCreator ? await people.resolveCreator() : { kind: 'user', name: '用户' }
           const assignee = await resolvedAssignee(people, fields)
-          const row = tasks.create({
+          const row = await tasks.create({
             ...fields,
             title,
             creator,
             ...(assignee !== undefined ? { assignee } : {}),
           })
-          return recordsWithUsage(listProjected()).find((item) => item.id === row.id) ?? taskRecord(row, (pid) => tasks.get(pid), ZERO_USAGE, false)
+          const listed = await listProjected()
+          const lookup = new Map(listed.map((item) => [item.id, item]))
+          return recordsWithUsage(listed).find((item) => item.id === row.id) ?? taskRecord(row, (pid) => lookup.get(pid), ZERO_USAGE, false)
         }),
       ),
-    remove: (query) => {
+    remove: async (query) => {
       const ids = query.ids ?? []
       for (const id of ids) {
-        if (!tasks.delete(id)) throw new Error(`unknown task: ${id}`)
+        if (!(await tasks.delete(id))) throw new Error(`unknown task: ${id}`)
       }
       return ids
     },

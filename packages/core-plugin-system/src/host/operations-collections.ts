@@ -4,7 +4,7 @@ import type { Context } from 'cordis'
 import type { CollectionSpec, DbRecord } from '@biu/type-file-system'
 import { REQUIRED_RECORD_FIELDS } from '@biu/type-file-system'
 import { currentAccountId, currentRequestWorkspaceId, openSqlite } from '@biu/host-plugin-loader/data-dir'
-import { OperationsStore, type OperationsKind } from './operations-store.ts'
+import type { OperationsKind, OperationsRepository } from './operations-repository.ts'
 
 const OPERATIONS_ADMIN_ACCOUNT_ID = 'acc_operations_admin'
 const OPERATIONS_WORKSPACE_ID = 'ws_operations'
@@ -26,11 +26,11 @@ function schema(label: string, columns: string[], fields: Record<string, { type:
   }
 }
 
-function collection(store: OperationsStore, spec: (typeof KINDS)[number], canAccess?: () => boolean): CollectionSpec {
+function collection(store: OperationsRepository, spec: (typeof KINDS)[number], canAccess?: () => boolean): CollectionSpec {
   const list = async (query?: { q?: string }) => {
     if (canAccess && !canAccess()) return []
-    syncOperationsFromPlatform(store)
-    return store.list(spec.kind, query?.q) as DbRecord[]
+    await syncOperationsFromPlatform(store)
+    return await store.list(spec.kind, query?.q) as DbRecord[]
   }
   return {
     id: spec.path.slice(1).replaceAll('/', '-'),
@@ -69,7 +69,7 @@ function collection(store: OperationsStore, spec: (typeof KINDS)[number], canAcc
   }
 }
 
-export function operationsCollections(store: OperationsStore, canAccess?: () => boolean): CollectionSpec[] {
+export function operationsCollections(store: OperationsRepository, canAccess?: () => boolean): CollectionSpec[] {
   return [
     ...KINDS.map((spec) => collection(store, spec, canAccess)),
     {
@@ -84,13 +84,13 @@ export function operationsCollections(store: OperationsStore, canAccess?: () => 
       }),
       list: async (query?: { q?: string }) => {
         if (canAccess && !canAccess()) return []
-        syncOperationsFromPlatform(store)
-        return store.audits(query?.q)
+        await syncOperationsFromPlatform(store)
+        return await store.audits(query?.q)
       },
       get: async (id) => {
         if (canAccess && !canAccess()) return null
-        syncOperationsFromPlatform(store)
-        return store.audits().find((row) => row.id === id) ?? null
+        await syncOperationsFromPlatform(store)
+        return (await store.audits()).find((row) => row.id === id) ?? null
       },
     },
   ]
@@ -101,7 +101,7 @@ function checkOperator(ctx: Context) {
   return account?.store?.isOperationsOperator?.(currentAccountId(), currentRequestWorkspaceId() || undefined) === true
 }
 
-export function registerOperationsIngest(ctx: Context, store: OperationsStore) {
+export function registerOperationsIngest(ctx: Context, store: OperationsRepository) {
   ctx.http.route('POST', '/api/operations/v1/events', async (route) => {
     try {
       if (!checkOperator(ctx)) {
@@ -114,30 +114,30 @@ export function registerOperationsIngest(ctx: Context, store: OperationsStore) {
         route.send(400, { error: '运营事件类型不正确' })
         return
       }
-      route.send(200, { ok: true, record: store.upsert(type, body.record) })
+      route.send(200, { ok: true, record: await store.upsert(type, body.record) })
     } catch (error) {
       route.send(400, { error: error instanceof Error ? error.message : String(error) })
     }
   })
-  ctx.http.route('GET', '/api/operations/v1/summary', (route) => {
+  ctx.http.route('GET', '/api/operations/v1/summary', async (route) => {
     if (!checkOperator(ctx)) {
       route.send(403, { error: '没有平台运营权限' })
       return
     }
-    syncOperationsFromPlatform(store)
+    await syncOperationsFromPlatform(store)
     route.send(200, {
-      counts: store.counts(),
-      accounts: store.list('account').slice(0, 10),
-      workspaces: store.list('workspace').slice(0, 10),
+      counts: await store.counts(),
+      accounts: (await store.list('account')).slice(0, 10),
+      workspaces: (await store.list('workspace')).slice(0, 10),
     })
   })
-  ctx.http.route('POST', '/api/operations/v1/sync', (route) => {
+  ctx.http.route('POST', '/api/operations/v1/sync', async (route) => {
     if (!checkOperator(ctx)) {
       route.send(403, { error: '没有平台运营权限' })
       return
     }
-    syncOperationsFromPlatform(store, process.cwd(), true)
-    route.send(200, { ok: true, counts: store.counts() })
+    await syncOperationsFromPlatform(store, process.cwd(), true)
+    route.send(200, { ok: true, counts: await store.counts() })
   })
 }
 
@@ -175,7 +175,7 @@ function tableExists(db: import('node:sqlite').DatabaseSync, name: string) {
   return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name))
 }
 
-export function syncOperationsFromPlatform(store: OperationsStore, rootDir = process.cwd(), force = false) {
+export async function syncOperationsFromPlatform(store: OperationsRepository, rootDir = process.cwd(), force = false) {
   const now = Date.now()
   if (!force && now - lastPlatformSyncAt < 3000) return false
   const cloudBiu = join(rootDir, '.cloud-data', '.biu', 'biu.sqlite')
@@ -187,7 +187,7 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
   if (!hasCloud && !hasLocal) return false
   lastPlatformSyncAt = now
 
-  store.removePlaceholderIdentity()
+  await store.removePlaceholderIdentity()
 
   const cloudDb = hasCloud ? openSqlite(cloudBiu) : null
   const localDb = hasLocal ? openSqlite(localBiu) : null
@@ -311,7 +311,7 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
         workspaceNames.set(ws.id, ws.name)
         const canonicalOwner = localToCanonical.get(ws.owner_id) || ws.owner_id
         accounts.get(canonicalOwner)?.workspaces.add(ws.id)
-        store.upsert(
+        await store.upsert(
           'workspace',
           {
             id: ws.id,
@@ -359,7 +359,7 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
         const canonicalOwner = localToCanonical.get(ws.owner_id) || ws.owner_id
         accounts.get(canonicalOwner)?.workspaces.add(ws.id)
         if (cloudWorkspaceIds.has(ws.id) || cloudMirrored.has(ws.id)) continue
-        store.upsert(
+        await store.upsert(
           'workspace',
           {
             id: ws.id,
@@ -379,7 +379,7 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
       string,
       { id: string; installationId: string; accountId: string; version: string; os: string; status: string; lastSeenAt: number }
     >()
-    const collectSessions = (db: import('node:sqlite').DatabaseSync | null, envLabel: 'Online' | 'Offline') => {
+    const collectSessions = async (db: import('node:sqlite').DatabaseSync | null, envLabel: 'Online' | 'Offline') => {
       if (!db || !tableExists(db, 'auth_sessions')) return
       const sessions = db
         .prepare('SELECT id, account_id, device_name, created_at, last_seen_at, revoked_at FROM auth_sessions')
@@ -400,7 +400,7 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
         const parsed = parseUserAgent(String(s.device_name || ''))
         const accountLabel = resolveAccountLabel(s.account_id)
         if (s.revoked_at) {
-          store.upsert(
+          await store.upsert(
             'security',
             {
               id: `sec_revoke_${s.id}`,
@@ -428,8 +428,8 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
         }
       }
     }
-    collectSessions(cloudDb, 'Online')
-    collectSessions(localDb, 'Offline')
+    await collectSessions(cloudDb, 'Online')
+    await collectSessions(localDb, 'Offline')
 
     if (cloudDb && tableExists(cloudDb, 'presence')) {
       const presences = cloudDb.prepare('SELECT account_id, seen_at FROM presence').all() as Array<{
@@ -452,7 +452,7 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
             : acc.inCloud
               ? 'Online'
               : 'Offline'
-      store.upsert(
+      await store.upsert(
         'account',
         {
           id: acc.id,
@@ -468,7 +468,7 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
     }
 
     for (const dev of deviceGroups.values()) {
-      store.upsert('device', dev, dev.lastSeenAt || now)
+      await store.upsert('device', dev, dev.lastSeenAt || now)
     }
 
     if (localDb) {
@@ -486,7 +486,7 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
           active: number
         }>
         for (const conn of conns) {
-          store.upsert(
+          await store.upsert(
             'sync',
             {
               id: `sync_conn_${conn.local_account_id}`,
@@ -507,7 +507,7 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
         }>
         for (const p of places) {
           const wsName = workspaceNames.get(p.workspace_id) || p.workspace_id
-          store.upsert(
+          await store.upsert(
             'sync',
             {
               id: `sync_ws_${p.workspace_id}`,
@@ -523,7 +523,7 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
       }
     }
 
-    const collectShares = (db: import('node:sqlite').DatabaseSync | null, envLabel: string) => {
+    const collectShares = async (db: import('node:sqlite').DatabaseSync | null, envLabel: string) => {
       if (!db || !tableExists(db, 'shares')) return
       const shares = db
         .prepare('SELECT token, kind, collection, record_id, allow_copy, created_at FROM shares')
@@ -536,7 +536,7 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
         created_at: number
       }>
       for (const sh of shares) {
-        store.upsert(
+        await store.upsert(
           'security',
           {
             id: `sec_share_${sh.token.slice(0, 12)}`,
@@ -549,8 +549,8 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
         )
       }
     }
-    collectShares(cloudDb, 'Online')
-    collectShares(localDb, 'Offline')
+    await collectShares(cloudDb, 'Online')
+    await collectShares(localDb, 'Offline')
 
     if (cloudDb && tableExists(cloudDb, 'plugin_audit_log')) {
       const audits = cloudDb
@@ -572,7 +572,7 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
       for (const a of audits) {
         if (a.workspace_id === OPERATIONS_WORKSPACE_ID || a.plugin_id === 'platform-operations') continue
         const wsName = workspaceNames.get(a.workspace_id) || a.workspace_id
-        store.upsertAudit(
+        await store.upsertAudit(
           `audit_cloud_${a.id}`,
           resolveAccountLabel(a.account_id),
           a.action,
@@ -663,7 +663,7 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
     const sortedDays = [...byDay.entries()].sort((a, b) => b[0].localeCompare(a[0])).slice(0, 15)
     for (const [day, info] of sortedDays) {
       const ownerSummary = [...info.owners].slice(0, 2).join('、') || 'tanon@biu.com、tangcong@biu.com'
-      store.upsert(
+      await store.upsert(
         'usage',
         {
           id: `usage_${day}`,
@@ -686,10 +686,10 @@ export function syncOperationsFromPlatform(store: OperationsStore, rootDir = pro
 
 export { checkOperator }
 
-export function seedOperationsIdentity(ctx: Context, store: OperationsStore) {
-  if (syncOperationsFromPlatform(store, process.cwd(), true)) {
-    if (!store.audits().some((row) => row.action === 'bootstrap')) {
-      store.audit('admin', 'bootstrap', OPERATIONS_WORKSPACE_ID, '初始化平台运营中心并同步 Online / Offline 元数据', Date.now())
+export async function seedOperationsIdentity(ctx: Context, store: OperationsRepository) {
+  if (await syncOperationsFromPlatform(store, process.cwd(), true)) {
+    if (!(await store.audits()).some((row) => row.action === 'bootstrap')) {
+      await store.audit('admin', 'bootstrap', OPERATIONS_WORKSPACE_ID, '初始化平台运营中心并同步 Online / Offline 元数据', Date.now())
     }
     return
   }
@@ -700,9 +700,9 @@ export function seedOperationsIdentity(ctx: Context, store: OperationsStore) {
   const now = Date.now()
   const accountId = identity?.id || OPERATIONS_ADMIN_ACCOUNT_ID
   const workspaceId = identity?.workspaceId || OPERATIONS_WORKSPACE_ID
-  const currentAccount = store.list('account').find((row) => row.id === accountId)
+  const currentAccount = (await store.list('account')).find((row) => row.id === accountId)
   if (!currentAccount) {
-    store.upsert('account', {
+    await store.upsert('account', {
       id: accountId,
       email: identity?.email || 'admin',
       name: identity?.name || '平台管理员',
@@ -710,7 +710,7 @@ export function seedOperationsIdentity(ctx: Context, store: OperationsStore) {
       workspaceCount: 1,
     }, now)
   } else if (!Number(currentAccount.workspaceCount)) {
-    store.upsert('account', {
+    await store.upsert('account', {
       id: accountId,
       email: currentAccount.email,
       name: currentAccount.name,
@@ -721,8 +721,8 @@ export function seedOperationsIdentity(ctx: Context, store: OperationsStore) {
       workspaceCount: 1,
     }, now)
   }
-  if (!store.list('workspace').some((row) => row.id === workspaceId)) {
-    store.upsert('workspace', {
+  if (!(await store.list('workspace')).some((row) => row.id === workspaceId)) {
+    await store.upsert('workspace', {
       id: workspaceId,
       name: identity?.workspaceName || 'Biu 平台运营',
       ownerId: accountId,
@@ -731,7 +731,7 @@ export function seedOperationsIdentity(ctx: Context, store: OperationsStore) {
       status: 'active',
     }, now)
   }
-  if (!store.audits().some((row) => row.action === 'bootstrap')) {
-    store.audit(identity?.id || OPERATIONS_ADMIN_ACCOUNT_ID, 'bootstrap', OPERATIONS_WORKSPACE_ID, '初始化平台运营中心', now)
+  if (!(await store.audits()).some((row) => row.action === 'bootstrap')) {
+    await store.audit(identity?.id || OPERATIONS_ADMIN_ACCOUNT_ID, 'bootstrap', OPERATIONS_WORKSPACE_ID, '初始化平台运营中心', now)
   }
 }

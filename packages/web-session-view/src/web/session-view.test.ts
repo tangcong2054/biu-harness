@@ -171,6 +171,44 @@ test('turn/end clears current busy promptly (no stale breathing state)', async (
   assert.equal(view.get().pending, false)
 })
 
+test('user message lifts the session in the sidebar before the list catches up', async () => {
+  mockFetch({
+    '/api/sessions': () => ({
+      sessions: [
+        { id: 'older', title: '旧', eventCount: 1, updatedAt: 50, lastMessageAt: 50 },
+        { id: 's1', title: '当前', eventCount: 1, updatedAt: 10, lastMessageAt: 10 },
+      ],
+    }),
+    '/api/approvals': () => ({ mode: 'auto', pending: [] }),
+  })
+  const ctx = new Context()
+  await ctx.plugin(sessionView)
+  const view = ctx.sessionView as SessionViewService
+  await view.refreshSessions()
+  view.ingest('s1', { type: 'user/message', text: '现在', seq: 1, ts: 80 })
+  assert.equal(view.get().sessions.find((item) => item.id === 's1')?.lastMessageAt, 80)
+  const ordered = [...view.get().sessions].sort(
+    (a, b) => (b.lastMessageAt ?? b.updatedAt) - (a.lastMessageAt ?? a.updatedAt),
+  )
+  assert.equal(ordered[0]?.id, 's1')
+})
+
+test('stale list busy does not restart breathing after the turn ended', async () => {
+  mockFetch({
+    '/api/sessions': () => ({ sessions: [{ id: 's1', title: 'a', busy: true, eventCount: 2, updatedAt: 1 }] }),
+    '/api/approvals': () => ({ mode: 'auto', pending: [] }),
+  })
+  const ctx = new Context()
+  await ctx.plugin(sessionView)
+  const view = ctx.sessionView as SessionViewService
+  view.ingest('s1', { type: 'session/open', version: 1, seq: 0, ts: 1 })
+  view.setAgentStatus('running', 1)
+  view.ingest('s1', { type: 'turn/end', turn: 1, reason: 'complete', seq: 2, ts: 2 })
+  await view.refreshSessions()
+  assert.equal(view.get().busySessions.s1, undefined)
+  assert.equal(view.get().pending, false)
+})
+
 test('stale agent/status running after turn/end does not restart breathing', async () => {
   mockFetch({
     '/api/sessions': () => ({ sessions: [{ id: 's1', title: 'a', busy: false, eventCount: 2, updatedAt: 1 }] }),

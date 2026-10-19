@@ -156,12 +156,16 @@ export class ToolsService extends Service {
   private visible(name: string) {
     const pluginId = this.pluginIds.get(this.resolveName(name))
     if (pluginId && currentAccountId()) {
-      const store = (
+      const account = (
         this.ctx.get('account') as {
+          canAccessPluginCached?(accountId: string, workspaceId: string, pluginId: string): boolean
           store?: { canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): boolean }
         } | undefined
-      )?.store
-      if (!store?.canAccessPlugin?.(currentAccountId(), currentRequestWorkspaceId(), pluginId)) return false
+      )
+      const allowed = account?.canAccessPluginCached
+        ? account.canAccessPluginCached(currentAccountId(), currentRequestWorkspaceId(), pluginId)
+        : account?.store?.canAccessPlugin?.(currentAccountId(), currentRequestWorkspaceId(), pluginId)
+      if (!allowed) return false
     }
     const policy = toolPolicyStorage.getStore()
     const mode = policy?.mode ?? this.mode

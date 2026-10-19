@@ -75,13 +75,13 @@ async function boot(opts: AccountOpts = {}) {
 }
 
 function seed(ctx: Context) {
-  return runWithAccount('acc_test', () => {
-    const mine = ctx.skills.import({
+  return runWithAccount('acc_test', async () => {
+    const mine = await ctx.skills.import({
       name: 'mine',
       description: '本工作区的技能',
       files: [{ path: 'SKILL.md', content: '---\nname: mine\n---\n正文' }],
     })
-    const other = ctx.skills.import({
+    const other = await ctx.skills.import({
       name: 'other',
       description: '别的工作区的技能',
       files: [{ path: 'SKILL.md', content: '---\nname: other\n---\n正文' }],
@@ -92,7 +92,7 @@ function seed(ctx: Context) {
 
 test('云端只列出当前工作区可见的技能', async () => {
   const ctx = await boot({ visible: new Set(['mine']) })
-  const { mine, other } = seed(ctx)
+  const { mine, other } = await seed(ctx)
   const listed = runWithAccount('acc_test', () => ctx.skills.list())
   assert.deepEqual(listed.map((item) => item.id), [mine.id])
   assert.equal(runWithAccount('acc_test', () => ctx.skills.summaries().length), 1)
@@ -106,7 +106,7 @@ test('云端只列出当前工作区可见的技能', async () => {
 
 test('promptSection 不泄露别的工作区的技能', async () => {
   const ctx = await boot({ visible: new Set(['mine']) })
-  seed(ctx)
+  await seed(ctx)
   const prompt = runWithAccount('acc_test', () => ctx.skills.promptSection())
   assert.match(prompt, /mine/)
   assert.doesNotMatch(prompt, /other/)
@@ -114,14 +114,14 @@ test('promptSection 不泄露别的工作区的技能', async () => {
 
 test('没有账号服务时（本地 / 桌面）保持全部可见', async () => {
   const ctx = await boot({ withAccount: false })
-  const { mine, other } = seed(ctx)
+  const { mine, other } = await seed(ctx)
   const listed = runWithAccount('acc_test', () => ctx.skills.list())
   assert.deepEqual(listed.map((item) => item.id).sort(), [mine.id, other.id].sort())
 })
 
 test('云端但拿不到工作区时 fail-closed', async () => {
   const ctx = await boot({ workspaceId: '', visible: new Set(['mine']) })
-  const { mine, other } = seed(ctx)
+  const { mine, other } = await seed(ctx)
   assert.deepEqual(runWithAccount('acc_test', () => ctx.skills.list()), [])
   assert.deepEqual(runWithAccount('acc_test', () => ctx.skills.list()), [])
   assert.notEqual(mine.id, other.id)
@@ -130,7 +130,7 @@ test('云端但拿不到工作区时 fail-closed', async () => {
 test('BIU_SKILL_DEFAULT_WORKSPACE 可兜底', async () => {
   process.env.BIU_SKILL_DEFAULT_WORKSPACE = 'ws_fallback'
   const ctx = await boot({ workspaceId: '', visible: new Set(['mine']) })
-  seed(ctx)
+  await seed(ctx)
   const listed = runWithAccount('acc_test', () => ctx.skills.list())
   assert.deepEqual(listed.map((item) => item.id), ['mine'])
 })

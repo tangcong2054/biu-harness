@@ -589,6 +589,7 @@ export class SessionViewService extends Service {
       error: undefined,
     })
     this.stashCurrent()
+    if (event.type === 'user/message') this.noteSessionActivity(sessionId, event.ts)
     if (event.type === 'turn/end' || event.type === 'turn/start') this.syncDispatchedPoll()
     // 检查器打开后 trajectoryLive=true：即使 URL 仍是 chat 也要刷新右侧轨迹
     if (this.wantsTrajectory()) void this.refreshTrajectoryIndex()
@@ -732,19 +733,40 @@ export class SessionViewService extends Service {
     })
   }
 
+  /** 用户消息先抬到侧栏顶部，不必等下一次列表请求。 */
+  private noteSessionActivity(sessionId: string, at: number) {
+    const stamp = Number(at) || Date.now()
+    const index = this.value.sessions.findIndex((item) => item.id === sessionId)
+    if (index < 0) return
+    const item = this.value.sessions[index]!
+    const lastMessageAt = Math.max(item.lastMessageAt ?? 0, stamp)
+    const updatedAt = Math.max(item.updatedAt, stamp)
+    if (lastMessageAt === (item.lastMessageAt ?? 0) && updatedAt === item.updatedAt) return
+    const sessions = this.value.sessions.slice()
+    sessions[index] = { ...item, lastMessageAt, updatedAt }
+    this.replace({ sessions })
+  }
+
+  /** 当前会话的回合已经结束时，列表里过期的 busy:true 不能把吉祥物再点亮。 */
+  private localTurnSettled(sessionId: string) {
+    if (sessionId !== this.value.sessionId) return false
+    return !turnInProgress(this.value.events) && this.value.events.some((item) => item.type === 'turn/end')
+  }
+
   private syncBusyFromSessions(sessions: SessionListItem[]) {
     const busySessions = { ...this.value.busySessions }
     let changed = false
     const currentId = this.value.sessionId
     const holdOpen = Date.now() < this.busyHoldUntil
     for (const item of sessions) {
-      if (item.busy) {
+      const settled = this.localTurnSettled(item.id)
+      if (item.busy && !settled) {
         if (!busySessions[item.id]) {
           busySessions[item.id] = true
           changed = true
         }
       } else if (busySessions[item.id]) {
-        if (item.id === currentId && holdOpen) continue
+        if (item.id === currentId && holdOpen && !settled) continue
         delete busySessions[item.id]
         changed = true
       }
@@ -765,14 +787,23 @@ export class SessionViewService extends Service {
     if (this.sessionsRefreshTimer != null) return
     this.sessionsRefreshTimer = setTimeout(() => {
       this.sessionsRefreshTimer = null
-      void this.refreshSessions()
+      void this.refreshSessions({ refresh: true })
     }, 200)
   }
 
   async refreshSessions(opts?: { refresh?: boolean }) {
     try {
-      const next = await getSessionsList<SessionListItem>(opts)
-      if (!next) return
+      const listed = await getSessionsList<SessionListItem>(opts)
+      if (!listed) return
+      const previous = new Map(this.value.sessions.map((item) => [item.id, item]))
+      const next = listed.map((item) => {
+        const prior = previous.get(item.id)
+        if (!prior) return item
+        const updatedAt = Math.max(item.updatedAt, prior.updatedAt)
+        const lastMessageAt = Math.max(item.lastMessageAt ?? 0, prior.lastMessageAt ?? 0)
+        if (updatedAt === item.updatedAt && lastMessageAt === (item.lastMessageAt ?? 0)) return item
+        return { ...item, updatedAt, ...(lastMessageAt > 0 ? { lastMessageAt } : {}) }
+      })
       const busySessions = this.syncBusyFromSessions(next)
       const sessionsChanged = !sessionsEqual(this.value.sessions, next)
       if (!sessionsChanged && !busySessions) return

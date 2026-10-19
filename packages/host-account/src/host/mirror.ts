@@ -1,6 +1,8 @@
+import { createHash } from 'node:crypto'
 import type { Context } from 'cordis'
 import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime, runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import type { SessionRecord } from '@biu/type-session'
+import { SnapshotWatermarkStore } from './snapshot-watermarks.ts'
 
 export type MirrorSnapshot = {
   sessions: Array<SessionRecord & { updatedAt?: number }>
@@ -10,13 +12,34 @@ export type MirrorSnapshot = {
     records: Array<Record<string, unknown> & { id: string; updatedAt?: number }>
     recordIds?: string[]
   }>
+  assets?: SnapshotAsset[]
 }
 
 export type SnapshotOptions = {
   since?: number
+  includeAssets?: boolean
 }
 
-const snapshotWatermarks = new Map<string, number>()
+export type SnapshotConflict = {
+  collection: string
+  id: string
+  reason?: string
+}
+
+export type SnapshotAsset = {
+  name: string
+  etag: string
+  mime: string
+  storage: 'hash' | 'name'
+  size: number
+  contentHash: string
+  bytesBase64: string
+}
+
+export type ExchangeSnapshotOptions = {
+  watermarkPath?: string
+  watermarkCache?: Map<string, number>
+}
 
 function yieldEventLoop() {
   return new Promise<void>((resolve) => setImmediate(resolve))
@@ -37,6 +60,9 @@ type DatabaseLike = {
   batchChanges?: <T>(run: () => Promise<T> | T) => Promise<T>
   read?: (path: string) => Promise<{ value?: Record<string, unknown> & { id?: string } }>
   remove?: (path: string, query: { ids: string[] }) => Promise<unknown>
+  exportSnapshotAssets?: (records: unknown[]) => Promise<SnapshotAsset[]>
+  preflightSnapshotAssets?: (assets: SnapshotAsset[]) => Promise<SnapshotConflict[]>
+  restoreSnapshotAssets?: (assets: Array<Omit<SnapshotAsset, 'bytesBase64' | 'size'> & { bytes: Uint8Array }>) => Promise<void>
 }
 
 type AccountLike = {
@@ -105,7 +131,7 @@ function desktopCloudWorkspace(ctx: Context) {
   const origin = process.env.BIU_REMOTE_ORIGIN?.replace(/\/$/, '')
   if (!origin) return null
   const account = accountOf(ctx)
-  const workspaceId = currentRequestWorkspaceId() || account?.store?.activeWorkspaceId() || ''
+  const workspaceId = currentRequestWorkspaceId() || account?.store?.activeWorkspaceId?.() || ''
   if (!workspaceId || account?.workspaceLocation?.(workspaceId) !== 'cloud') return null
   const linked = account?.linkedCloud?.(currentAccountId() || undefined)
   if (!linked?.token) return null
@@ -146,10 +172,17 @@ export async function takeSnapshot(ctx: Context, options?: SnapshotOptions): Pro
           }),
         }))
       : rawCollections
+  const assets = options?.includeAssets
+    ? await databaseOf(ctx)?.exportSnapshotAssets?.([
+        ...sessions,
+        ...collections.flatMap((collection) => collection.records),
+      ])
+    : undefined
   return {
     sessions,
     ...(since > 0 ? { sessionIds } : {}),
     collections,
+    ...(assets ? { assets } : {}),
   }
 }
 
@@ -236,17 +269,97 @@ export async function applySnapshot(ctx: Context, snapshot: MirrorSnapshot, mode
   return applySnapshotNow(ctx, snapshot, mode)
 }
 
+/**
+ * Restores a private backup as new local data. Conflict detection completes
+ * before the first write so an existing local record is never overwritten.
+ */
+export async function restoreSnapshotSafely(ctx: Context, snapshot: MirrorSnapshot) {
+  const conflicts: SnapshotConflict[] = []
+  const decodedAssets: Array<Omit<SnapshotAsset, 'bytesBase64' | 'size'> & { bytes: Uint8Array }> = []
+  const assetNames = new Set<string>()
+  let decodedBytes = 0
+  for (const asset of snapshot.assets ?? []) {
+    const name = String(asset?.name ?? '')
+    let bytes: Buffer
+    try {
+      bytes = Buffer.from(String(asset?.bytesBase64 ?? ''), 'base64')
+    } catch {
+      bytes = Buffer.alloc(0)
+    }
+    const hash = createHash('sha256').update(bytes).digest('hex')
+    const hashName = /^([a-f0-9]{64})(?:\.[A-Za-z0-9]{1,12})?$/.exec(name)
+    const invalid =
+      !name ||
+      assetNames.has(name) ||
+      bytes.toString('base64') !== asset.bytesBase64 ||
+      bytes.length !== Number(asset.size) ||
+      hash !== asset.contentHash ||
+      !['hash', 'name'].includes(asset.storage) ||
+      (asset.storage === 'hash' && hashName?.[1] !== hash) ||
+      (asset.storage === 'name' && asset.etag !== hash)
+    if (invalid) {
+      conflicts.push({ collection: '/assets', id: name, reason: 'invalid-or-tampered' })
+      continue
+    }
+    assetNames.add(name)
+    decodedBytes += bytes.length
+    decodedAssets.push({
+      name,
+      etag: asset.etag,
+      mime: asset.mime,
+      storage: asset.storage,
+      contentHash: asset.contentHash,
+      bytes,
+    })
+  }
+  const itemCount =
+    (snapshot.sessions?.length ?? 0) +
+    (snapshot.collections ?? []).reduce((sum, collection) => sum + (collection.records?.length ?? 0), 0) +
+    decodedAssets.length
+  if (decodedBytes > 10 * 1024 * 1024 || itemCount > 20_000) {
+    conflicts.push({ collection: '/assets', id: '', reason: 'backup-limit-exceeded' })
+  }
+  const store = sessionsOf(ctx)
+  const currentSessions = new Set((await store?.listSummaries())?.map((item) => item.id) ?? [])
+  for (const record of snapshot.sessions ?? []) {
+    if (record?.id && currentSessions.has(record.id)) {
+      conflicts.push({ collection: '/sessions', id: record.id })
+    }
+  }
+  const database = databaseOf(ctx)
+  if ((snapshot.assets?.length ?? 0) > 0 && !database?.preflightSnapshotAssets) {
+    conflicts.push({ collection: '/assets', id: '', reason: 'asset-service-unavailable' })
+  } else if (decodedAssets.length && conflicts.length === 0) {
+    conflicts.push(...((await database?.preflightSnapshotAssets?.(snapshot.assets ?? [])) ?? []))
+  }
+  for (const collection of snapshot.collections ?? []) {
+    if (collection.path === '/sessions') continue
+    for (const record of collection.records ?? []) {
+      const id = String(record?.id ?? '')
+      if (!id) continue
+      const existing = await database?.read?.(`${collection.path}/${id}`).catch(() => null)
+      if (existing?.value?.id) conflicts.push({ collection: collection.path, id })
+    }
+  }
+  if (conflicts.length) return { restored: false as const, conflicts }
+  if (decodedAssets.length) await database?.restoreSnapshotAssets?.(decodedAssets)
+  await applySnapshot(ctx, snapshot, 'adopt')
+  return { restored: true as const, conflicts: [] as SnapshotConflict[] }
+}
+
 export async function exchangeSnapshot(
   ctx: Context,
   origin: string,
   token: string,
   accountId: string,
   workspaceId = '',
+  options?: ExchangeSnapshotOptions,
 ) {
   if (!workspaceId) return
   const root = origin.replace(/\/$/, '')
-  const watermarkKey = `${root}\t${accountId}\t${workspaceId}`
-  const since = snapshotWatermarks.get(watermarkKey) ?? 0
+  const watermarkKey = { origin: root, accountId, workspaceId }
+  const watermarks = new SnapshotWatermarkStore(options?.watermarkPath, options?.watermarkCache)
+  const since = watermarks.get(watermarkKey)
   const url = since > 0 ? `${root}/api/replica/snapshot?since=${since}` : `${root}/api/replica/snapshot`
   const headers = {
     authorization: `Bearer ${token}`,
@@ -274,7 +387,7 @@ export async function exchangeSnapshot(
       if (ts > maxUpdatedAt) maxUpdatedAt = ts
     }
   }
-  snapshotWatermarks.set(watermarkKey, maxUpdatedAt > 0 ? maxUpdatedAt : Date.now())
+  watermarks.set(watermarkKey, maxUpdatedAt > 0 ? maxUpdatedAt : Date.now())
 }
 
 export async function forwardCloud(
@@ -297,4 +410,31 @@ export async function forwardCloud(
   })
   const body = await res.json().catch(() => ({}))
   return { status: res.status, body }
+}
+
+export async function forwardCloudBytes(
+  ctx: Context,
+  path: string,
+  init: {
+    method?: string
+    body?: Uint8Array
+    headers?: Record<string, string>
+  } = {},
+): Promise<{ status: number; body: Buffer; headers: Headers } | null> {
+  const cloud = desktopCloudWorkspace(ctx)
+  if (!cloud) return null
+  const res = await fetch(`${cloud.origin}${path}`, {
+    method: init.method ?? 'GET',
+    headers: {
+      ...init.headers,
+      authorization: `Bearer ${cloud.token}`,
+      'x-biu-workspace-id': cloud.workspaceId,
+    },
+    body: init.body === undefined ? undefined : Buffer.from(init.body),
+  })
+  return {
+    status: res.status,
+    body: Buffer.from(await res.arrayBuffer()),
+    headers: res.headers,
+  }
 }

@@ -6,14 +6,12 @@ describe('cloud storage config', () => {
     expect(loadCloudStorageConfig({})).toEqual({ backend: 'sqlite', enabled: false })
   })
 
-  test('refuses MySQL from Offline', () => {
-    expect(() =>
-      loadCloudStorageConfig({
-        BIU_ONLINE: '0',
-        BIU_STORAGE_BACKEND: 'mysql',
-        BIU_MYSQL_URL: 'mysql://biu:secret@db.example.test',
-      }),
-    ).toThrow(/only available in the Online runtime/)
+  test('keeps MySQL disabled in Offline', () => {
+    expect(loadCloudStorageConfig({
+      BIU_ONLINE: '0',
+      BIU_STORAGE_BACKEND: 'dual',
+      BIU_MYSQL_URL: 'mysql://biu:secret@db.example.test',
+    })).toEqual({ backend: 'dual', enabled: false })
   })
 
   test('loads explicitly enabled, separate Online databases', () => {

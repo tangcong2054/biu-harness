@@ -98,25 +98,25 @@ export type PresenceRow = {
   seenAt: number
 }
 
-function id(prefix: string) {
+export function controlPlaneId(prefix: string) {
   return `${prefix}_${randomBytes(8).toString('hex')}`
 }
 
-function tokenHash(token: string) {
+export function controlPlaneTokenHash(token: string) {
   return createHash('sha256').update(token).digest('hex')
 }
 
-function inviteToken() {
+export function controlPlaneInviteToken() {
   return randomBytes(24).toString('base64url')
 }
 
-function hashPassword(password: string) {
+export function controlPlaneHashPassword(password: string) {
   const salt = randomBytes(16)
   const hash = scryptSync(password, salt, 32)
   return `scrypt:${salt.toString('hex')}:${hash.toString('hex')}`
 }
 
-function verifyPassword(password: string, stored: string) {
+export function controlPlaneVerifyPassword(password: string, stored: string) {
   const [kind, saltHex, hashHex] = stored.split(':')
   if (kind !== 'scrypt' || !saltHex || !hashHex) return false
   const actual = scryptSync(password, Buffer.from(saltHex, 'hex'), 32)
@@ -124,6 +124,12 @@ function verifyPassword(password: string, stored: string) {
   if (actual.length !== expected.length) return false
   return timingSafeEqual(actual, expected)
 }
+
+const id = controlPlaneId
+const tokenHash = controlPlaneTokenHash
+const inviteToken = controlPlaneInviteToken
+const hashPassword = controlPlaneHashPassword
+const verifyPassword = controlPlaneVerifyPassword
 
 function operationsLoginName(value: string) {
   const name = value.trim().toLowerCase()
@@ -2102,6 +2108,13 @@ export class CollabStore {
       .prepare('SELECT record_id FROM record_owners WHERE workspace_id = ? AND collection = ?')
       .all(workspaceId, collection) as Array<{ record_id: string }>
     return new Set(rows.map((row) => row.record_id))
+  }
+
+  recordWorkspace(collection: string, recordId: string) {
+    const row = this.db
+      .prepare('SELECT workspace_id FROM record_owners WHERE collection = ? AND record_id = ?')
+      .get(collection, recordId) as { workspace_id?: string } | undefined
+    return row?.workspace_id ?? null
   }
 
   attach(

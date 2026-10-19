@@ -13,10 +13,12 @@ import {
   isChatPinnedToBottom,
   nextStickToLatest,
   pinChatToLatest,
+  readingMemory,
   recalledChatScroll,
   rememberChatScroll,
   resetChatScrollMemoryForTests,
   restoreChatScroll,
+  revealStartAfterPrepend,
   revealStartForMemory,
   shouldRevealFast,
   sliceTurnsFrom,
@@ -99,6 +101,12 @@ describe('thread reveal (visible first, then older)', () => {
     expect(didRevealOlderTurns(4, 4)).toBe(false)
     expect(didRevealOlderTurns(4, 5)).toBe(false)
   })
+
+  it('keeps the tail window when older turns are prepended', () => {
+    expect(revealStartAfterPrepend(98, 100)).toBe(198)
+    expect(revealStartAfterPrepend(0, 100)).toBe(0)
+    expect(revealStartAfterPrepend(8, 0)).toBe(8)
+  })
 })
 
 function box(top: number, height: number): DOMRect {
@@ -159,6 +167,21 @@ describe('chat scroll memory per session', () => {
     later.getBoundingClientRect = () => box(200, 40)
     parent.append(passed, sticky, later)
     expect(captureChatScroll(parent)).toEqual({ kind: 'pin', nodeId: 'u-3' })
+  })
+
+  it('does not pin the earliest user message when nothing is stuck to the top', () => {
+    const parent = document.createElement('div')
+    Object.defineProperty(parent, 'scrollHeight', { value: 4000, configurable: true })
+    Object.defineProperty(parent, 'scrollTop', { value: 0, writable: true, configurable: true })
+    Object.defineProperty(parent, 'clientHeight', { value: 800, configurable: true })
+    parent.getBoundingClientRect = () => box(0, 800)
+    const first = document.createElement('div')
+    first.dataset.nodeId = 'u-0'
+    first.dataset.chatKind = 'user'
+    first.getBoundingClientRect = () => box(24, 40)
+    parent.append(first)
+    expect(captureChatScroll(parent)).toEqual({ kind: 'bottom' })
+    expect(readingMemory(parent, true)).toEqual({ kind: 'bottom' })
   })
 
   it('captures bottom when close to the latest messages', () => {
@@ -244,9 +267,14 @@ describe('thread follows the latest message', () => {
     expect(src).toContain('if (!threadReady) return')
     expect(src).toContain('turnIndexContaining(nodes, mem.nodeId)')
     expect(src).toContain('void sessionView.loadOlder().finally')
-    expect(src.indexOf('void sessionView.loadOlder().finally')).toBeLessThan(
-      src.indexOf("rememberChatScroll(sessionId, { kind: 'bottom' })"),
-    )
+    expect(src).toContain('revealStartAfterPrepend')
+    const olderAt = src.indexOf('锚点可能在当前尾窗之前')
+    const pinWhileLoadingAt = src.indexOf('pinChatToLatest(parent)', olderAt)
+    const bottomAt = src.indexOf("rememberChatScroll(sessionId, { kind: 'bottom' })")
+    expect(olderAt).toBeGreaterThan(-1)
+    expect(olderAt).toBeLessThan(pinWhileLoadingAt)
+    expect(pinWhileLoadingAt).toBeLessThan(bottomAt)
+    expect(src).toContain('readingMemory(parent, stickToBottomRef.current)')
     expect(src).toContain("restoreChatScroll(parent, { kind: 'pin', nodeId: latestUserId })")
     expect(src).toContain('followedUserRef.current === latestUserId')
     expect(src).toContain('ResizeObserver')

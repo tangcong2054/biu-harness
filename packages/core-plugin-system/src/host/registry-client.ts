@@ -238,7 +238,7 @@ export class PluginRegistryClient {
       const owned = Boolean(origin && origin.registryId === registryId && origin.ownerId === row.ownerId)
       const localCodeVersion = local?.codeVersion ?? ''
       const present = Boolean(local) || sandboxIds.has(row.id)
-      const installedForWorkspace = this.store.isInstalledForCurrentWorkspace(row.id)
+      const installedForWorkspace = await this.store.isInstalledForCurrentWorkspace(row.id)
       flags[row.id] = {
         remoteCodeVersion: row.codeVersion,
         localCodeVersion,

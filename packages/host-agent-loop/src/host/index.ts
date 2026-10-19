@@ -187,6 +187,12 @@ export class AgentLoop implements AgentRunner {
     }
     // 分段 prompt 只在 turn 开头写入一次，避免每 step 污染权威日志；derive 取最后一条 system/prompt。
     const live = [...claimed].reverse().find((item) => item.liveContext)?.liveContext
+    try {
+      const skills = this.ctx.get('skills') as { ensureOwned?: () => Promise<void> } | undefined
+      await skills?.ensureOwned?.()
+    } catch {
+      /* 没有技能服务时提示词里就不列技能 */
+    }
     await session.append(this.sessionId, { type: 'system/prompt', text: this.ctx.systemPrompt.assemble(live) })
 
     const steps: AgentTurn['steps'] = []

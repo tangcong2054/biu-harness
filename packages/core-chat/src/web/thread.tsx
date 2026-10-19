@@ -40,7 +40,6 @@ import { ContentEditsTable } from './content-edits-table.tsx'
 import { UsageInline } from './usage-inline.tsx'
 import {
   bumpRevealStart,
-  captureChatScroll,
   didRevealOlderTurns,
   firstPaintStartIndex,
   groupNodesIntoTurns,
@@ -48,9 +47,11 @@ import {
   nextStickToLatest,
   pinChatToLatest,
   PIN_TOP_SLACK_PX,
+  readingMemory,
   recalledChatScroll,
   rememberChatScroll,
   restoreChatScroll,
+  revealStartAfterPrepend,
   revealStartForMemory,
   shouldRevealFast,
   sliceTurnsFrom,
@@ -811,25 +812,54 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
   const [revealStart, setRevealStart] = useState(() => firstPaintStartIndex(totalTurns))
   const sessionKeyRef = useRef(sessionId)
   const prevTotalRef = useRef(totalTurns)
+  const firstNodeIdRef = useRef(nodes[0]?.id ?? '')
   const revealPendingRef = useRef(false)
   if (sessionId !== sessionKeyRef.current) {
     sessionKeyRef.current = sessionId
     // 切会话时先留着上一段画面，回合数还是旧的，这时重算会把新会话切成空白。
     revealPendingRef.current = true
   }
-  const revealStale = totalTurns > 0 && revealStart >= totalTurns
-  if (
+  const previousTotal = prevTotalRef.current
+  const previousFirstId = firstNodeIdRef.current
+  const firstNodeId = nodes[0]?.id ?? ''
+  let visibleStart = revealStart
+  const revealStale = totalTurns > 0 && visibleStart >= totalTurns
+  const pendingMemory = recalledChatScroll(sessionId)
+  const pinMissing =
+    pendingMemory?.kind === 'pin' && turnIndexContaining(nodes, pendingMemory.nodeId) < 0
+  const prependedTurns =
     !switchingSession &&
-    (revealPendingRef.current || (prevTotalRef.current === 0 && totalTurns > 0) || revealStale)
+    !revealPendingRef.current &&
+    pinMissing &&
+    previousFirstId !== '' &&
+    firstNodeId !== '' &&
+    firstNodeId !== previousFirstId &&
+    totalTurns > previousTotal
+      ? totalTurns - previousTotal
+      : 0
+  if (!switchingSession && prependedTurns > 0 && visibleStart > 0) {
+    // 补进更早回合后，旧起点会指到新历史的开头。先把窗口平移回原来的尾巴。
+    visibleStart = revealStartAfterPrepend(visibleStart, prependedTurns)
+    prevTotalRef.current = totalTurns
+    firstNodeIdRef.current = firstNodeId
+    if (visibleStart !== revealStart) setRevealStart(visibleStart)
+  } else if (
+    !switchingSession &&
+    (revealPendingRef.current || (previousTotal === 0 && totalTurns > 0) || revealStale)
   ) {
     revealPendingRef.current = false
     prevTotalRef.current = totalTurns
+    firstNodeIdRef.current = firstNodeId
     const next = revealStartForMemory(nodes, recalledChatScroll(sessionId), totalTurns)
+    visibleStart = next
     if (next !== revealStart) setRevealStart(next)
   } else if (!switchingSession) {
     prevTotalRef.current = totalTurns
+    firstNodeIdRef.current = firstNodeId
   }
-  const mountedNodes = useMemo(() => sliceTurnsFrom(nodes, revealStart), [nodes, revealStart])
+  const visibleStartRef = useRef(visibleStart)
+  visibleStartRef.current = visibleStart
+  const mountedNodes = useMemo(() => sliceTurnsFrom(nodes, visibleStart), [nodes, visibleStart])
   const pending = useSessionView((state) => state.pending)
   const sessions = useSessionView((state) => state.sessions)
   const error = useSessionView((state) => state.error)
@@ -916,6 +946,7 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
     prependHeightRef.current = 0
     previousRevealStartRef.current = revealStart
     holdOlderRef.current = mem?.kind === 'pin'
+    restoringAnchorRef.current = false
     maxScrollRef.current = 0
     followedUserRef.current = ''
     ignoreNextScrollRef.current = false
@@ -927,7 +958,10 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
     return () => {
       const parent = scrollRef.current
       const id = sessionIdRef.current
-      if (id && parent) rememberChatScroll(id, captureChatScroll(parent))
+      // 恢复还没完成时滚动条停在 0，这时记下来会把最早一条写成新锚点。
+      if (id && parent && restoredForRef.current === id) {
+        rememberChatScroll(id, readingMemory(parent, stickToBottomRef.current))
+      }
     }
   }, [])
 
@@ -987,6 +1021,11 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
         maybePrefetchOlder()
         return
       }
+      // 锚点还在恢复时，顶部位置不是用户的阅读位置，不能拿来取消贴底。
+      if (restoredForRef.current !== scrollSessionId) {
+        lastTop = parent.scrollTop
+        return
+      }
       applyStick(parent.scrollTop < lastTop - 0.5)
       lastTop = parent.scrollTop
       maybePrefetchOlder()
@@ -1011,10 +1050,11 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
         holdOlderRef.current = false
       }
       if (scrollSessionId && restoredForRef.current === scrollSessionId) {
-        rememberChatScroll(scrollSessionId, captureChatScroll(parent))
+        rememberChatScroll(scrollSessionId, readingMemory(parent, stickToBottomRef.current))
       }
     }
-    onScroll()
+    // 挂上监听时滚动条常在 0。这时立刻算贴底会把 stick 清掉，首帧就停在最早消息。
+    if (restoredForRef.current === scrollSessionId) maybePrefetchOlder()
     parent.addEventListener('scroll', onUserScroll, { passive: true })
     parent.addEventListener('wheel', onWheel, { passive: true })
     parent.addEventListener('touchstart', onTouchStart, { passive: true })
@@ -1089,18 +1129,25 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
         return
       }
       const rememberedTurn = turnIndexContaining(nodes, mem.nodeId)
-      if (rememberedTurn >= 0 && rememberedTurn < revealStart) {
+      const start = visibleStartRef.current
+      if (rememberedTurn >= 0 && rememberedTurn < start) {
+        stickToBottomRef.current = false
         setRevealStart(rememberedTurn)
-        previousRevealStartRef.current = revealStart
+        previousRevealStartRef.current = start
         return
       }
-      // 锚点可能在当前 24-turn 尾窗之前。先逐页补历史，确认服务端也没有后才能判坏。
-      if (hasMoreOlder) {
+      // 锚点可能在当前尾窗之前。逐页补历史，但视口先钉在已加载的最新消息，不能停在开头。
+      if (rememberedTurn < 0 && hasMoreOlder) {
         if (!loadingOlder && !restoringAnchorRef.current) {
           restoringAnchorRef.current = true
           void sessionView.loadOlder().finally(() => {
             restoringAnchorRef.current = false
           })
+        }
+        if (parent.scrollTop <= PIN_TOP_SLACK_PX) {
+          stickToBottomRef.current = true
+          ignoreNextScrollRef.current = true
+          pinChatToLatest(parent)
         }
         previousRevealStartRef.current = revealStart
         return
@@ -1110,6 +1157,8 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
       rememberChatScroll(sessionId, { kind: 'bottom' })
       restoredForRef.current = sessionId
       stickToBottomRef.current = true
+      holdOlderRef.current = false
+      ignoreNextScrollRef.current = true
       pinChatToLatest(parent)
       prependHeightRef.current = parent.scrollHeight
       previousRevealStartRef.current = revealStart

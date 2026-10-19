@@ -110,12 +110,14 @@ export function createBiuMcpServer(ctx: Context) {
     const tenant = currentMcpTenant()
     const audit = (success: boolean) => {
       if (!tenant) return
-      const store = (
+      const account = (
         ctx.get('account') as {
+          auditMcp?(tenant: McpTenant, toolName: string, success: boolean): Promise<void> | void
           store?: { auditMcp?(tenant: McpTenant, toolName: string, success: boolean): void }
         } | undefined
-      )?.store
-      store?.auditMcp?.(tenant, name, success)
+      )
+      if (account?.auditMcp) void account.auditMcp(tenant, name, success)
+      else account?.store?.auditMcp?.(tenant, name, success)
     }
     try {
       if (tenant && !tenant.allowedTools.includes(name)) {
@@ -192,10 +194,17 @@ export function applyHostServer(ctx: Context) {
     }
   }
 
-  function mcpTenant(route: RouteContext) {
+  async function mcpTenant(route: RouteContext) {
     const got = bearerToken(route.req.headers.authorization)
-    const store = (
+    const account = (
       ctx.get('account') as {
+        resolveMcpCredential?(token: string): Promise<{
+          credentialId: string
+          accountId: string
+          workspaceId: string
+          role: string
+          allowedTools: string[]
+        } | null>
         store?: {
           resolveMcpCredential?(token: string): {
             credentialId: string
@@ -206,15 +215,19 @@ export function applyHostServer(ctx: Context) {
           } | null
         }
       } | undefined
-    )?.store
-    const credential = got ? store?.resolveMcpCredential?.(got) : null
+    )
+    const credential = got
+      ? account?.resolveMcpCredential
+        ? await account.resolveMcpCredential(got)
+        : account?.store?.resolveMcpCredential?.(got)
+      : null
     if (credential) return credential
     if (tokensMatch(got, token) && !isOnlineRuntime()) return null
     route.send(401, { error: 'mcp token required — 使用绑定空间的凭证' })
     return false as const
   }
 
-  ctx.http.route('GET', '/api/mcp/info', (route) => {
+  ctx.http.route('GET', '/api/mcp/info', async (route) => {
     applyCors(route)
     if (isOnlineRuntime()) {
       const accountId = currentAccountId()
@@ -228,24 +241,24 @@ export function applyHostServer(ctx: Context) {
       const { token: _token, clients: _clients, ...safe } = payload()
       return route.send(200, { ...safe, token: '', online: true, workspaceId })
     }
-    if (!isLoopbackAddress(route.req.socket.remoteAddress) && mcpTenant(route) === false) return
+    if (!isLoopbackAddress(route.req.socket.remoteAddress) && await mcpTenant(route) === false) return
     route.send(200, payload())
   })
 
-  ctx.http.route('POST', '/api/mcp/rotate', (route) => {
+  ctx.http.route('POST', '/api/mcp/rotate', async (route) => {
     applyCors(route)
     if (isOnlineRuntime()) {
       route.send(410, { error: '在线模式请使用空间 MCP 凭证' })
       return
     }
-    if (mcpTenant(route) === false) return
+    if (await mcpTenant(route) === false) return
     token = rotateMcpToken(path)
     route.send(200, payload())
   })
 
   const handle = async (route: RouteContext) => {
     applyCors(route)
-    const tenant = mcpTenant(route)
+    const tenant = await mcpTenant(route)
     if (tenant === false) return
     const server = createBiuMcpServer(ctx)
     const transport = new StreamableHTTPServerTransport({

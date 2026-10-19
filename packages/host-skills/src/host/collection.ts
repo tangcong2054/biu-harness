@@ -79,9 +79,9 @@ export function skillsCollection(skills: SkillsService): CollectionSpec {
         },
       },
     },
-    list: () => skills.list().map((item) => asRecord(item, false, skills.filesOfListed(item.id))),
-    get: (id) => {
-      const skill = skills.recordOrNull(id)
+    list: async () => (await skills.listInWorkspace()).map((item) => asRecord(item, false, skills.filesOfListed(item.id))),
+    get: async (id) => {
+      const skill = await skills.recordInWorkspace(id)
       return skill ? asRecord(skill, true, skills.filesOf(skill.id)) : null
     },
     create: async (rows) => {
@@ -89,7 +89,7 @@ export function skillsCollection(skills: SkillsService): CollectionSpec {
       for (const fields of rows) {
         const pack = asCreateFiles(fields.files)
         const created = pack?.length
-          ? skills.import({
+          ? await skills.import({
               id: String(fields.id ?? '').trim() || undefined,
               name: String(fields.title ?? fields.name ?? ''),
               description: String(fields.description ?? ''),
@@ -100,7 +100,7 @@ export function skillsCollection(skills: SkillsService): CollectionSpec {
               files: pack,
               // 不传 draft：由 store 按“记录字段 + SKILL.md frontmatter”综合判定。
             })
-          : skills.create({
+          : await skills.create({
               id: String(fields.id ?? '').trim() || undefined,
               name: String(fields.title ?? fields.name ?? ''),
               description: String(fields.description ?? ''),

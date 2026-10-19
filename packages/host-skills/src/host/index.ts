@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Service, type Context } from 'cordis'
-import { currentAccountId } from '@biu/host-plugin-loader/data-dir'
+import { currentAccountId, currentRequestWorkspaceId } from '@biu/host-plugin-loader/data-dir'
 import { skillsCollection } from './collection.ts'
 import { LEGACY_MIGRATED, legacySkillImports, SkillsStore, type SkillImportInput, type SkillRecord } from './store.ts'
 
@@ -12,8 +12,34 @@ export type SkillSummary = {
   source: string
 }
 
+type SkillAccount = {
+  usesMysqlAccounts?: () => boolean
+  mysql?: {
+    claimRecord(input: {
+      actorId: string
+      workspaceId: string
+      collection: string
+      recordId: string
+      now: number
+    }): Promise<void>
+    membership(accountId: string, workspaceId: string): Promise<{ role: string } | null>
+    ownedRecordIds(workspaceId: string, collection: string): Promise<string[]>
+    ownerWorkspaceIds(collection: string, recordId: string): Promise<string[]>
+  }
+  store?: {
+    activeWorkspaceId?: () => string | null
+    claim?: (actorId: string, workspaceId: string, collection: string, recordId: string) => unknown
+  }
+  authorization?: {
+    currentActor?: () => { type: string; accountId: string; workspaceId: string } | null
+    authorize?: (actor: unknown, action: string, resource: unknown) => { allowed?: boolean } | null
+  }
+}
+
 export class SkillsService extends Service {
   private store: SkillsStore
+  /** MySQL 模式下当前进程已知的「工作区 → 技能 id」。列表请求会先刷新。 */
+  private ownedByWorkspace = new Map<string, Set<string>>()
 
   constructor(ctx: Context) {
     super(ctx, 'skills')
@@ -35,28 +61,78 @@ export class SkillsService extends Service {
     }
   }
 
+  private account(): SkillAccount | undefined {
+    try {
+      return this.ctx.get('account') as SkillAccount | undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  private workspaceId() {
+    return (
+      currentRequestWorkspaceId().trim() ||
+      this.account()?.store?.activeWorkspaceId?.()?.trim() ||
+      String(process.env.BIU_SKILL_DEFAULT_WORKSPACE ?? '').trim()
+    )
+  }
+
+  private rememberOwned(workspaceId: string, id: string) {
+    const ids = this.ownedByWorkspace.get(workspaceId) ?? new Set<string>()
+    ids.add(id)
+    this.ownedByWorkspace.set(workspaceId, ids)
+  }
+
+  /** 把 MySQL 里这个工作区的技能 id 读进内存，供同步的列表和提示词使用。 */
+  async ensureOwned() {
+    const account = this.account()
+    const mysql = account?.usesMysqlAccounts?.() ? account.mysql : undefined
+    if (!mysql?.ownedRecordIds) return
+    const workspaceId = this.workspaceId()
+    const accountId = currentAccountId()
+    if (!workspaceId || !accountId) {
+      if (workspaceId) this.ownedByWorkspace.set(workspaceId, new Set())
+      return
+    }
+    const member = await mysql.membership(accountId, workspaceId)
+    if (!member) {
+      this.ownedByWorkspace.set(workspaceId, new Set())
+      return
+    }
+    this.ownedByWorkspace.set(workspaceId, new Set(await mysql.ownedRecordIds(workspaceId, '/skills')))
+  }
+
   /**
    * 把技能认领到当前工作区。
-   * store 只写磁盘，不写 record_owners；云端开启账号鉴权后，
-   * 没有归属记录的 /skills 记录会被 visibleRecords 判为 PRIVATE_RESOURCE 而列表不可见。
-   * 云端导入必须补这一步，否则「导入成功但页面看不到」。
+   * 文件只落在运行目录的磁盘上；Online 没有 record_owners 时，列表会把它当成私有记录藏起来。
    */
-  private claimOwnership(id: string) {
+  private async claimOwnership(id: string) {
+    const account = this.account()
+    const workspaceId = this.workspaceId()
+    const actorId = currentAccountId()
+    if (!workspaceId || !actorId || !account) return
+    const mysql = account.usesMysqlAccounts?.() ? account.mysql : undefined
+    if (mysql?.claimRecord) {
+      const owners = await mysql.ownerWorkspaceIds('/skills', id)
+      if (owners.some((owner) => owner !== workspaceId)) {
+        throw new Error('这条技能已经属于另一个空间')
+      }
+      if (!owners.includes(workspaceId)) {
+        await mysql.claimRecord({
+          actorId,
+          workspaceId,
+          collection: '/skills',
+          recordId: id,
+          now: Date.now(),
+        })
+      }
+      this.rememberOwned(workspaceId, id)
+      return
+    }
     try {
-      const store = (this.ctx.get('account') as {
-        store?: {
-          activeWorkspaceId?: () => string | null
-          claim?: (actorId: string, workspaceId: string, collection: string, recordId: string) => unknown
-        }
-      } | undefined)?.store
-      if (!store?.claim) return
-      const workspaceId = store.activeWorkspaceId?.() ?? ''
-      const actorId = currentAccountId()
-      // 启动期的 legacy 迁移没有账号上下文，跳过即可（后续由使用者在页面里认领）。
-      if (!workspaceId || !actorId) return
-      store.claim(actorId, workspaceId, '/skills', id)
+      account.store?.claim?.(actorId, workspaceId, '/skills', id)
     } catch {
-      // 已归属其它空间 / 非成员等情况不影响技能本身已落盘。
+      // 已归属其它空间 / 非成员时保留已落盘的文件。
     }
   }
 
@@ -67,21 +143,16 @@ export class SkillsService extends Service {
    */
   private visibleIds(skills = this.store.list()): Set<string> | null {
     try {
-      const account = this.ctx.get('account') as {
-        authorization?: {
-          currentActor?: () => { type: string; accountId: string; workspaceId: string } | null
-          authorize?: (actor: unknown, action: string, resource: unknown) => { allowed?: boolean } | null
-        }
-        store?: { activeWorkspaceId?: () => string | null }
-      } | undefined
+      const account = this.account()
       const authorization = account?.authorization
+      const workspaceId = this.workspaceId()
+      const accountId = currentAccountId()
+      if (account?.usesMysqlAccounts?.()) {
+        if (!workspaceId || !accountId) return new Set()
+        return this.ownedByWorkspace.get(workspaceId) ?? new Set()
+      }
       // 没有账号服务（本地 / 桌面）：沿用旧行为，全部可见。
       if (!authorization?.authorize) return null
-      const workspaceId =
-        account?.store?.activeWorkspaceId?.()?.trim() ||
-        String(process.env.BIU_SKILL_DEFAULT_WORKSPACE ?? '').trim() ||
-        ''
-      const accountId = currentAccountId()
       // 云端但拿不到工作区/账号：fail-closed，一条都不给。
       if (!workspaceId || !accountId) return new Set()
       const actor =
@@ -113,6 +184,17 @@ export class SkillsService extends Service {
     const all = this.store.list()
     const ids = this.visibleIds(all)
     return ids ? all.filter((item) => ids.has(item.id)) : all
+  }
+
+  /** 先对齐 MySQL 归属，再按当前工作区过滤。页面列表走这里。 */
+  async listInWorkspace() {
+    await this.ensureOwned()
+    return this.list()
+  }
+
+  async recordInWorkspace(id: string) {
+    await this.ensureOwned()
+    return this.recordOrNull(id)
   }
 
   listEnabled() {
@@ -172,16 +254,16 @@ export class SkillsService extends Service {
     }
   }
 
-  create(input: Parameters<SkillsStore['create']>[0]) {
+  async create(input: Parameters<SkillsStore['create']>[0]) {
     const created = this.store.create(input)
-    this.claimOwnership(created.id)
+    await this.claimOwnership(created.id)
     this.changed()
     return created
   }
 
-  import(input: SkillImportInput) {
+  async import(input: SkillImportInput) {
     const created = this.store.import(input)
-    this.claimOwnership(created.id)
+    await this.claimOwnership(created.id)
     this.changed()
     return created
   }
@@ -194,7 +276,7 @@ export class SkillsService extends Service {
         if (!(id && this.store.get(id))) {
           try {
             const created = this.store.import(entry.input)
-            this.claimOwnership(created.id)
+            void this.claimOwnership(created.id)
             migrated += 1
           } catch {
             // 已存在或目录不合法就跳过。
@@ -262,8 +344,8 @@ export function apply(ctx: Context) {
       properties: { all: { type: 'boolean' } },
     },
     execution: 'parallel',
-    execute: (args) =>
-      (args.all === true ? skills.list() : skills.summaries()).map((skill) => ({
+    execute: async (args) =>
+      (await skills.listInWorkspace()).filter((skill) => args.all === true || (skill.enabled && skill.description.trim())).map((skill) => ({
         id: skill.id,
         name: skill.name,
         description: skill.description,
@@ -281,7 +363,10 @@ export function apply(ctx: Context) {
       required: ['id'],
     },
     execution: 'parallel',
-    execute: (args) => skills.read(String(args.id)),
+    execute: async (args) => {
+      await skills.ensureOwned()
+      return skills.read(String(args.id))
+    },
   })
 
   ctx.http.route('POST', '/api/skills/import', async (route) => {
@@ -291,7 +376,7 @@ export function apply(ctx: Context) {
         route.send(400, { error: 'files are required' })
         return
       }
-      const created = skills.import({
+      const created = await skills.import({
         id: body.id,
         name: body.name,
         description: body.description,
@@ -317,6 +402,7 @@ export function apply(ctx: Context) {
         route.send(400, { error: 'id and path are required' })
         return
       }
+      await skills.ensureOwned()
       const file = skills.fileText(id, path)
       const name = path.split('/').pop() ?? path
       route.res.writeHead(200, {

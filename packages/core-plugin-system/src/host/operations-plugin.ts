@@ -3,7 +3,9 @@ import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { Context } from 'cordis'
 import { isOnlineRuntime, isOperationsRuntime, runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
+import { MysqlOperationsStore, type CloudStorageService } from '@biu/host-cloud-storage'
 import { checkOperator, operationsCollections, registerOperationsIngest, seedOperationsIdentity } from './operations-collections.ts'
+import type { OperationsRepository } from './operations-repository.ts'
 import { OperationsStore } from './operations-store.ts'
 import { defaultPluginDir, defaultStatePath } from './store.ts'
 
@@ -12,7 +14,7 @@ export const PLATFORM_OPERATIONS_PLUGIN_ID = 'platform-operations'
 const MANIFEST = {
   id: PLATFORM_OPERATIONS_PLUGIN_ID,
   name: '平台运营',
-  blurb: '平台运营私有页面块插件。在页面里插入 :::pageBlock {kind=platform-operations plugin=platform-operations}，查看用户、Workspace、用量、设备、同步、安全和插件审核。只给运营账号使用，不进入插件商店。',
+  blurb: '平台运营私有页面块插件。在页面里插入 :::pageBlock {kind=platform-operations plugin=platform-operations}，查看用户、Workspace、用量、设备、同步、安全和插件审核，并配置在线主机的模型和 API Key。只给运营账号使用，不进入插件商店。',
   tags: ['page', 'editor', 'operations'],
   author: 'BIU官方',
   authorUrl: 'https://github.com/helloooooooooooooo97/biu',
@@ -24,7 +26,7 @@ const HOST_JS = `import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 export const name = 'platform-operations'
-export const inject = ['http']
+export const inject = ['http', 'cloudStorage']
 
 export async function apply(ctx) {
   const href = pathToFileURL(join(process.cwd(), 'packages/core-plugin-system/src/host/operations-plugin.ts')).href
@@ -77,6 +79,19 @@ const CSS = \`
 .ops-actions{display:flex;gap:5px;justify-content:flex-end;flex-wrap:wrap}
 .ops-empty{padding:22px 12px;border:1px dashed var(--dsw-border);border-radius:8px;color:var(--dsw-label-3);font-size:12.5px;text-align:center;line-height:1.7}
 .ops-error{margin:0 0 10px;padding:7px 10px;border-radius:7px;border:1px solid color-mix(in srgb,var(--dsw-danger,#d9534f) 45%,var(--dsw-border));background:color-mix(in srgb,var(--dsw-danger,#d9534f) 8%,transparent);color:var(--dsw-danger,#d9534f);font-size:12.5px}
+.ops-note{margin:0 0 10px;color:var(--dsw-label-3);font-size:12px;line-height:1.6}
+.ops-models{display:grid;grid-template-columns:minmax(180px,240px) minmax(0,1fr);gap:12px}
+.ops-picks{display:flex;flex-direction:column;gap:4px;max-height:420px;overflow:auto}
+.ops-pick{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;padding:6px 8px;border:1px solid var(--dsw-border);border-radius:6px;background:transparent;color:inherit;text-align:left;cursor:pointer;font:inherit}
+.ops-pick.is-active{border-color:var(--dsw-pick,#4a6cf7);background:color-mix(in srgb,var(--dsw-pick,#4a6cf7) 8%,var(--dsw-bg))}
+.ops-row{display:flex;gap:6px;align-items:center}
+.ops-row .ops-pick{flex:1}
+.ops-form{display:flex;flex-direction:column;gap:8px}
+.ops-field{display:flex;flex-direction:column;gap:4px}
+.ops-field span{font-size:11.5px;color:var(--dsw-label-3);font-weight:650}
+.ops-input{height:30px;padding:0 8px;border:1px solid var(--dsw-border);border-radius:6px;background:var(--dsw-bg);color:var(--dsw-label);font:inherit;font-size:12.5px}
+.ops-status{font-size:12px;color:var(--dsw-ok,#3fb950)}
+@media (max-width:720px){.ops-models{grid-template-columns:1fr}}
 \`
 
 function useOpsStyle() {
@@ -91,6 +106,7 @@ function useOpsStyle() {
 
 const TABS = [
   ['overview', '概览', ''],
+  ['models', '模型', ''],
   ['accounts', '用户', 'accounts'],
   ['workspaces', 'Workspace', 'workspaces'],
   ['usage', '用量', 'usage'],
@@ -144,7 +160,7 @@ function toneForStatus(status) {
 async function readJson(url, options) {
   const res = await fetch(url, options)
   const body = await res.json()
-  if (!res.ok) throw new Error(body.error || '读取运营数据失败')
+  if (!res.ok) throw new Error(body.error || body.detail || '读取运营数据失败')
   return body
 }
 
@@ -504,6 +520,378 @@ function renderDetailTable(tab, items, busy, run) {
   )
 }
 
+function ModelsPanel() {
+  const [data, setData] = useState(null)
+  const [activeId, setActiveId] = useState('deepseek')
+  const [keyDraft, setKeyDraft] = useState('')
+  const [urlDraft, setUrlDraft] = useState('')
+  const [modelDraft, setModelDraft] = useState('')
+  const [addLabel, setAddLabel] = useState('')
+  const [addUrl, setAddUrl] = useState('')
+  const [addKey, setAddKey] = useState('')
+  const [addProtocol, setAddProtocol] = useState('openai-compat')
+  const [status, setStatus] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState('')
+
+  function applyData(next, prefer) {
+    setData(next)
+    const id = prefer || (next && next.endpointId) || 'deepseek'
+    setActiveId(id)
+    const found = ((next && next.endpoints) || []).find((item) => item.id === id)
+    setUrlDraft(found && found.baseUrl ? found.baseUrl : '')
+    setKeyDraft('')
+    setAddKey('')
+  }
+
+  useEffect(() => {
+    let live = true
+    readJson('/api/operations/v1/llm')
+      .then((body) => {
+        if (live) applyData(body)
+      })
+      .catch((err) => {
+        if (live) setError(err instanceof Error ? err.message : '读取模型配置失败')
+      })
+    return () => {
+      live = false
+    }
+  }, [])
+
+  const endpoints = (data && data.endpoints) || []
+  const officialIds = { deepseek: 1, openai: 1, anthropic: 1 }
+  const official = ['deepseek', 'anthropic', 'openai']
+    .map((id) => endpoints.find((item) => item.id === id))
+    .filter(Boolean)
+  const extra = endpoints.filter(
+    (item) => !officialIds[item.id] && (item.configured || item.group === 'custom' || item.id === (data && data.endpointId) || item.id === activeId),
+  )
+  const visible = official.concat(extra)
+  const active = endpoints.find((item) => item.id === activeId) || null
+  const models = ((data && data.modelCatalog) || []).filter((item) => item.endpointId === activeId)
+  const envLocked = ((data && data.envLocked) || []).find((item) => item.endpointId === activeId)
+  const isOfficial = Boolean(officialIds[activeId])
+
+  function selectEndpoint(id) {
+    setActiveId(id)
+    setError('')
+    setStatus('')
+    setKeyDraft('')
+    setModelDraft('')
+    const found = endpoints.find((item) => item.id === id)
+    setUrlDraft(found && found.baseUrl ? found.baseUrl : '')
+  }
+
+  async function postConfig(body, prefer) {
+    const next = await readJson('/api/operations/v1/llm', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    applyData(next, prefer || next.endpointId)
+    if (next.envLockedRejected && next.envLockedRejected.length) {
+      setError('该入口的 Key 由环境变量锁定，没有覆盖')
+      return next
+    }
+    setStatus('已保存')
+    return next
+  }
+
+  async function saveCurrent() {
+    if (!active || busy) return
+    const body = {}
+    if (!envLocked && keyDraft.trim()) {
+      body.setApiKey = {}
+      body.setApiKey[activeId] = keyDraft.trim()
+    }
+    if (!isOfficial) {
+      const base = urlDraft.trim()
+      if (base && base !== (active.defaultBaseUrl || '')) {
+        body.setBaseUrl = {}
+        body.setBaseUrl[activeId] = base
+      }
+    }
+    if (!body.setApiKey && !body.setBaseUrl) {
+      setStatus('没有需要保存的更改')
+      return
+    }
+    setBusy('save')
+    setError('')
+    setStatus('')
+    try {
+      await postConfig(body, activeId)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '保存失败')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function clearKey() {
+    if (!active || envLocked || busy) return
+    setBusy('clear')
+    setError('')
+    setStatus('')
+    try {
+      const setApiKey = {}
+      setApiKey[activeId] = null
+      await postConfig({ setApiKey }, activeId)
+      setStatus('已清除 Key')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '清除失败')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function testCurrent() {
+    if (!active || busy) return
+    setBusy('test')
+    setError('')
+    setStatus('')
+    try {
+      const payload = { endpointId: activeId }
+      if (keyDraft.trim()) payload.apiKey = keyDraft.trim()
+      if (!isOfficial && urlDraft.trim()) payload.baseUrl = urlDraft.trim()
+      const currentModel = models[0] && models[0].model
+      if (data && data.endpointId === activeId && data.model) payload.model = data.model
+      else if (currentModel) payload.model = currentModel
+      const next = await readJson('/api/operations/v1/llm/test', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      if (next.config) applyData(next.config, activeId)
+      setStatus(next.detail || '连接成功')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '连接失败')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function makeDefault(model) {
+    if (!model || busy) return
+    setBusy('model')
+    setError('')
+    setStatus('')
+    try {
+      await postConfig({ endpointId: activeId, model: model.model }, activeId)
+      setStatus('默认模型：' + model.label)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '设置默认模型失败')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function addModel() {
+    const name = modelDraft.trim()
+    if (!name || busy) {
+      if (!name) setError('请填写模型 ID')
+      return
+    }
+    setBusy('add-model')
+    setError('')
+    setStatus('')
+    try {
+      await postConfig({ addModel: { endpointId: activeId, model: name, label: name } }, activeId)
+      setModelDraft('')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '添加模型失败')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function removeModel(id) {
+    if (!id || busy) return
+    setBusy('remove-model')
+    setError('')
+    try {
+      await postConfig({ removeCustomModel: id }, activeId)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '删除模型失败')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function addEndpoint() {
+    const label = addLabel.trim()
+    const baseUrl = addUrl.trim()
+    if (!label || !baseUrl) {
+      setError('请填写名称和 Base URL')
+      return
+    }
+    setBusy('add-endpoint')
+    setError('')
+    setStatus('')
+    try {
+      const created = await postConfig({ addEndpoint: { label, baseUrl, protocol: addProtocol } })
+      const newId = created && created.endpointId
+      if (addKey.trim() && newId) {
+        const setApiKey = {}
+        setApiKey[newId] = addKey.trim()
+        await postConfig({ setApiKey, endpointId: newId }, newId)
+      }
+      setAddLabel('')
+      setAddUrl('')
+      setAddKey('')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '添加入口失败')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  return h(
+    'div',
+    { 'data-testid': 'ops-models' },
+    h(
+      'p',
+      { className: 'ops-note' },
+      '这里配置的是在线主机正在使用的模型和 Key，与对话设置共用同一份存储。Key 只写进主机密钥文件，页面只显示掩码。',
+    ),
+    error ? h('p', { className: 'ops-error' }, error) : null,
+    status ? h('p', { className: 'ops-status' }, status) : null,
+    h(
+      'div',
+      { className: 'ops-models' },
+      h(
+        'div',
+        { className: 'ops-picks', 'aria-label': '模型入口' },
+        visible.map((item) =>
+          h(
+            'button',
+            {
+              key: item.id,
+              type: 'button',
+              className: 'ops-pick' + (item.id === activeId ? ' is-active' : ''),
+              onClick: () => selectEndpoint(item.id),
+            },
+            h('span', null, item.label || item.id),
+            h(
+              'span',
+              { className: 'ops-badge ' + (item.configured ? 'ok' : '') },
+              item.configured ? item.hint || '已配置' : '未配置',
+            ),
+          ),
+        ),
+      ),
+      active
+        ? h(
+            'div',
+            { className: 'ops-form' },
+            h('div', { className: 'ops-sec' }, (active.label || active.id) + (data && data.endpointId === activeId ? ' · 当前默认' : '')),
+            envLocked
+              ? h('p', { className: 'ops-note' }, '这个入口的 Key 由环境变量 ' + envLocked.env + ' 锁定，运营页面不能覆盖。')
+              : h(
+                  'label',
+                  { className: 'ops-field' },
+                  h('span', null, 'API Key'),
+                  h('input', {
+                    className: 'ops-input',
+                    type: 'password',
+                    autoComplete: 'off',
+                    'data-testid': 'ops-model-key',
+                    placeholder: active.configured ? '已配置 · 输入新 Key 后保存' : active.placeholder || 'sk-…',
+                    value: keyDraft,
+                    onChange: (event) => setKeyDraft(event.target.value),
+                  }),
+                ),
+            isOfficial
+              ? h('p', { className: 'ops-note' }, '官方地址：' + (active.defaultBaseUrl || active.baseUrl || ''))
+              : h(
+                  'label',
+                  { className: 'ops-field' },
+                  h('span', null, 'Base URL'),
+                  h('input', {
+                    className: 'ops-input',
+                    type: 'url',
+                    'data-testid': 'ops-model-url',
+                    value: urlDraft,
+                    placeholder: active.defaultBaseUrl || '',
+                    onChange: (event) => setUrlDraft(event.target.value),
+                  }),
+                ),
+            h(
+              'div',
+              { className: 'ops-actions', style: { justifyContent: 'flex-start' } },
+              h('button', { className: 'ops-btn pri', type: 'button', disabled: Boolean(busy), onClick: saveCurrent }, busy === 'save' ? '保存中…' : '保存'),
+              h('button', { className: 'ops-btn', type: 'button', disabled: Boolean(busy), onClick: testCurrent }, busy === 'test' ? '测试中…' : '测试连接'),
+              envLocked ? null : h('button', { className: 'ops-btn', type: 'button', disabled: Boolean(busy) || !active.configured, onClick: clearKey }, '清除 Key'),
+            ),
+            h('div', { className: 'ops-sec' }, '模型 · 点击设为默认'),
+            models.length
+              ? h(
+                  'div',
+                  { className: 'ops-picks' },
+                  models.map((model) =>
+                    h(
+                      'div',
+                      { key: model.id, className: 'ops-row' },
+                      h(
+                        'button',
+                        { type: 'button', className: 'ops-pick' + (data && data.model === model.model && data.endpointId === activeId ? ' is-active' : ''), onClick: () => makeDefault(model) },
+                        h('span', null, model.label || model.model),
+                        data && data.model === model.model && data.endpointId === activeId ? h('span', { className: 'ops-badge ok' }, '默认') : null,
+                      ),
+                      model.builtin === false
+                        ? h('button', { type: 'button', className: 'ops-btn sm', disabled: Boolean(busy), onClick: () => removeModel(model.id) }, '删除')
+                        : null,
+                    ),
+                  ),
+                )
+              : h('p', { className: 'ops-note' }, '这个入口还没有模型。'),
+            h(
+              'div',
+              { className: 'ops-actions', style: { justifyContent: 'flex-start' } },
+              h('input', {
+                className: 'ops-input',
+                'data-testid': 'ops-model-name',
+                placeholder: '添加模型 ID',
+                value: modelDraft,
+                onChange: (event) => setModelDraft(event.target.value),
+              }),
+              h('button', { className: 'ops-btn', type: 'button', disabled: Boolean(busy), onClick: addModel }, '添加模型'),
+            ),
+          )
+        : h('p', { className: 'ops-empty' }, '还没有可配置的入口。'),
+    ),
+    h('div', { className: 'ops-sec' }, '添加自定义入口'),
+    h(
+      'div',
+      { className: 'ops-form' },
+      h('input', { className: 'ops-input', placeholder: '名称', value: addLabel, onChange: (event) => setAddLabel(event.target.value) }),
+      h('input', { className: 'ops-input', placeholder: 'https://api.example.com/v1', value: addUrl, onChange: (event) => setAddUrl(event.target.value) }),
+      h('input', {
+        className: 'ops-input',
+        type: 'password',
+        autoComplete: 'off',
+        placeholder: 'API Key（可选）',
+        value: addKey,
+        onChange: (event) => setAddKey(event.target.value),
+      }),
+      h(
+        'div',
+        { className: 'ops-actions', style: { justifyContent: 'flex-start' } },
+        h(
+          'button',
+          { type: 'button', className: 'ops-btn' + (addProtocol === 'openai-compat' ? ' pri' : ''), onClick: () => setAddProtocol('openai-compat') },
+          'OpenAI 兼容',
+        ),
+        h(
+          'button',
+          { type: 'button', className: 'ops-btn' + (addProtocol === 'anthropic' ? ' pri' : ''), onClick: () => setAddProtocol('anthropic') },
+          'Anthropic',
+        ),
+        h('button', { className: 'ops-btn pri', type: 'button', disabled: Boolean(busy), onClick: addEndpoint }, '接入'),
+      ),
+    ),
+  )
+}
+
 function OperationsBlock(props) {
   useOpsStyle()
   const initialTab = props && props.data && typeof props.data.tab === 'string' ? props.data.tab : 'overview'
@@ -544,7 +932,7 @@ function OperationsBlock(props) {
   }, [tab, busy, refreshTick])
 
   useEffect(() => {
-    if (tab === 'overview') return
+    if (tab === 'overview' || tab === 'models') return
     let live = true
     setError('')
     const params = new URLSearchParams({ path: SOURCES[tab], limit: '100', offset: '0', q: '', sort: 'updatedAt', dir: 'desc', filter: '{}' })
@@ -606,7 +994,7 @@ function OperationsBlock(props) {
       'header',
       { className: 'ops-hd' },
       h('span', { className: 'ops-title' }, 'Biu 平台运营中心'),
-      h('span', { className: 'ops-meta' }, 'Online + Offline 元数据 · 不含用户正文与密钥'),
+      h('span', { className: 'ops-meta' }, 'Online + Offline 元数据 · 不含用户正文'),
       h('div', { className: 'ops-grow' }),
       h(
         'button',
@@ -636,8 +1024,10 @@ function OperationsBlock(props) {
     h(
       'div',
       { className: 'ops-body' },
-      error ? h('p', { className: 'ops-error' }, error) : null,
-      tab === 'overview'
+      error && tab !== 'models' ? h('p', { className: 'ops-error' }, error) : null,
+      tab === 'models'
+        ? h(ModelsPanel)
+        : tab === 'overview'
         ? h(
             'div',
             null,
@@ -737,11 +1127,189 @@ export function ensurePlatformOperationsPlugin() {
   }
 }
 
+type OperatorLlmChat = {
+  activateAccount(): void
+  patch(next: Record<string, unknown>, opts?: { persist?: boolean }): unknown
+  applyAdminApiKeys(updates: Record<string, string | null>): { locked: string[]; view: Record<string, unknown> }
+  operatorPublicView(): Record<string, unknown>
+  testConnection(opts: { endpointId?: string; apiKey?: string; baseUrl?: string; model?: string }): Promise<{
+    ok: boolean
+    endpointId: string
+    detail?: string
+  }>
+  markEndpointReachable(endpointId: string, opts?: { persist?: boolean; baseUrl?: string }): unknown
+  invalidateEndpoint(endpointId: string): unknown
+}
+
+function adminKeyUpdates(value: unknown): Record<string, string | null> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const out: Record<string, string | null> = {}
+  for (const [id, key] of Object.entries(value as Record<string, unknown>)) {
+    if (!id.trim()) continue
+    if (key === null || key === '') out[id] = null
+    else if (typeof key === 'string') out[id] = key
+  }
+  return out
+}
+
+function redactDetail(detail: unknown, secret?: string) {
+  const text = typeof detail === 'string' ? detail : ''
+  const hidden = secret?.trim()
+  if (!hidden || hidden.length < 4 || !text.includes(hidden)) return text
+  return text.split(hidden).join('***')
+}
+
+function operatorChat(ctx: Context): OperatorLlmChat | null {
+  try {
+    const chat = ctx.get('chat') as OperatorLlmChat | undefined
+    if (!chat || typeof chat.applyAdminApiKeys !== 'function' || typeof chat.operatorPublicView !== 'function') return null
+    return chat
+  } catch {
+    return null
+  }
+}
+
+export function readOperatorLlm(ctx: Context, chat: OperatorLlmChat) {
+  if (!checkOperator(ctx)) return { status: 403 as const, body: { error: '没有平台运营权限' } }
+  chat.activateAccount()
+  return { status: 200 as const, body: chat.operatorPublicView() }
+}
+
+export function writeOperatorLlm(ctx: Context, chat: OperatorLlmChat, payload: Record<string, unknown> | null) {
+  if (!checkOperator(ctx)) return { status: 403 as const, body: { error: '没有平台运营权限' } }
+  chat.activateAccount()
+  const body = payload && typeof payload === 'object' ? payload : {}
+  const updates = adminKeyUpdates(body.setApiKey)
+  const rest: Record<string, unknown> = { ...body }
+  delete rest.setApiKey
+  delete rest.apiKey
+  if (Object.keys(rest).length) chat.patch(rest)
+  if (typeof body.apiKey === 'string' && body.apiKey.trim()) {
+    const view = chat.operatorPublicView() as { endpointId?: string }
+    const endpointId =
+      typeof rest.endpointId === 'string' && rest.endpointId.trim()
+        ? rest.endpointId.trim()
+        : String(view.endpointId ?? '')
+    if (endpointId) updates[endpointId] = body.apiKey.trim()
+  }
+  if (!Object.keys(updates).length) return { status: 200 as const, body: chat.operatorPublicView() }
+  const applied = chat.applyAdminApiKeys(updates)
+  return {
+    status: 200 as const,
+    body: {
+      ...applied.view,
+      ...(applied.locked.length ? { envLockedRejected: applied.locked } : {}),
+    },
+  }
+}
+
+export async function testOperatorLlm(
+  ctx: Context,
+  chat: OperatorLlmChat,
+  payload: { endpointId?: string; apiKey?: string; baseUrl?: string; model?: string },
+) {
+  if (!checkOperator(ctx)) return { status: 403 as const, body: { ok: false, error: '没有平台运营权限' } }
+  chat.activateAccount()
+  const draft = typeof payload.apiKey === 'string' ? payload.apiKey : ''
+  try {
+    const result = await chat.testConnection({
+      endpointId: payload.endpointId,
+      apiKey: draft,
+      baseUrl: payload.baseUrl,
+      model: payload.model,
+    })
+    const detail = redactDetail(result.detail, draft)
+    if (!result.ok) {
+      chat.invalidateEndpoint(result.endpointId)
+      return {
+        status: 400 as const,
+        body: { ok: false, endpointId: result.endpointId, error: detail || '连接失败', config: chat.operatorPublicView() },
+      }
+    }
+    let locked: string[] = []
+    if (draft.trim()) {
+      locked = chat.applyAdminApiKeys({ [result.endpointId]: draft.trim() }).locked
+    }
+    if (locked.length) {
+      return {
+        status: 409 as const,
+        body: {
+          ok: false,
+          endpointId: result.endpointId,
+          error: '该入口的 Key 由环境变量锁定，不会覆盖',
+          envLockedRejected: locked,
+          config: chat.operatorPublicView(),
+        },
+      }
+    }
+    if (typeof payload.baseUrl === 'string' && payload.baseUrl.trim()) {
+      chat.patch({ setBaseUrl: { [result.endpointId]: payload.baseUrl.trim() } })
+    }
+    chat.markEndpointReachable(result.endpointId, {
+      persist: true,
+      ...(typeof payload.baseUrl === 'string' && payload.baseUrl.trim() ? { baseUrl: payload.baseUrl.trim() } : {}),
+    })
+    return {
+      status: 200 as const,
+      body: { ok: true, endpointId: result.endpointId, detail: detail || '连接成功', config: chat.operatorPublicView() },
+    }
+  } catch {
+    return { status: 500 as const, body: { ok: false, error: '连接测试失败' } }
+  }
+}
+
+export function registerOperatorLlmRoutes(ctx: Context) {
+  ctx.http.route('GET', '/api/operations/v1/llm', (route) => {
+    const chat = operatorChat(ctx)
+    if (!chat) {
+      route.send(503, { error: '模型服务还没就绪' })
+      return
+    }
+    const result = readOperatorLlm(ctx, chat)
+    route.send(result.status, result.body)
+  })
+  ctx.http.route('POST', '/api/operations/v1/llm', async (route) => {
+    const chat = operatorChat(ctx)
+    if (!chat) {
+      route.send(503, { error: '模型服务还没就绪' })
+      return
+    }
+    try {
+      const payload = (await route.json().catch(() => null)) as Record<string, unknown> | null
+      const result = writeOperatorLlm(ctx, chat, payload)
+      route.send(result.status, result.body)
+    } catch {
+      route.send(400, { error: '保存模型配置失败' })
+    }
+  })
+  ctx.http.route('POST', '/api/operations/v1/llm/test', async (route) => {
+    const chat = operatorChat(ctx)
+    if (!chat) {
+      route.send(503, { error: '模型服务还没就绪' })
+      return
+    }
+    const payload = ((await route.json().catch(() => null)) ?? {}) as {
+      endpointId?: string
+      apiKey?: string
+      baseUrl?: string
+      model?: string
+    }
+    const result = await testOperatorLlm(ctx, chat, payload)
+    route.send(result.status, result.body)
+  })
+}
+
 export async function applyPlatformOperations(ctx: Context) {
   if (!isOnlineRuntime() && !isOperationsRuntime()) return
-  ctx.inject(['database'], (inner) => {
-    const store = OperationsStore.open()
-    seedOperationsIdentity(ctx, store)
+  registerOperatorLlmRoutes(ctx)
+  ctx.inject(['database'], async (inner) => {
+    const cloudStorage = ctx.get('cloudStorage') as CloudStorageService | undefined
+    const cloudConfig = cloudStorage?.config
+    const store: OperationsRepository =
+      cloudStorage?.pool && cloudConfig?.enabled
+        ? new MysqlOperationsStore(cloudStorage.pool, cloudConfig.operationsDatabase)
+        : OperationsStore.open()
+    await seedOperationsIdentity(ctx, store)
     registerOperationsIngest(ctx, store)
     for (const spec of operationsCollections(store, () => checkOperator(ctx))) inner.database.register(spec)
     void seedPlatformOperationsPage(inner)

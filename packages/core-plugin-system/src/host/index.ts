@@ -65,7 +65,7 @@ export async function apply(ctx: Context) {
     if (operations) {
       inner.systemPrompt.register(
         'plugin.operations',
-        '平台运营是私有页面块插件 platform-operations，仅在运营 Workspace（ws_operations）内供运营账号使用，不发布到插件商店。用户、Workspace、用量、设备、同步、安全和审计分别使用 /ops-accounts、/ops-workspaces、/ops-usage、/ops-devices、/ops-sync-health、/ops-security-events、/ops-audit。插件审核使用 /plugin-reviews 的 approve/reject/quarantine/revoke。这些是平台元数据，不读取用户正文、密码或 Token。',
+        '平台运营是私有页面块插件 platform-operations，仅在运营 Workspace（ws_operations）内供运营账号使用，不发布到插件商店。用户、Workspace、用量、设备、同步、安全和审计分别使用 /ops-accounts、/ops-workspaces、/ops-usage、/ops-devices、/ops-sync-health、/ops-security-events、/ops-audit。插件审核使用 /plugin-reviews 的 approve/reject/quarantine/revoke。在线模型和 API Key 使用 /api/operations/v1/llm，写入主机已有的模型配置，不另建密钥库。这些是平台元数据，不读取用户正文、密码或 Token。',
       )
     }
   })

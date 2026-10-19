@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { afterEach, test } from 'vitest'
 import { openAndMigrateBiu, runWithAccount } from '@biu/host-plugin-loader/data-dir'
 import { CollabStore } from './store.ts'
-import type { Actor, ResourceRef } from './authorization.ts'
+import { authorizeCollection, type Actor, type ResourceRef } from './authorization.ts'
 
 const dirs: string[] = []
 
@@ -270,4 +270,15 @@ test('an agent has exactly the delegating account permissions', () => {
   }
   assert.equal(auth.authorize(agent, 'resource:update', page('agent-page')).allowed, true)
   assert.equal(auth.authorize(agent, 'resource:manage-permissions', page('agent-page')).allowed, false)
+})
+
+test('collection checks use workspace role without a per-record policy', () => {
+  const missing = authorizeCollection(null, 'member', 'resource:read', '/facets')
+  assert.equal(missing.allowed, false)
+  if (!missing.allowed) assert.equal(missing.reason, 'NOT_A_MEMBER')
+  assert.equal(authorizeCollection('owner', 'member', 'resource:read', '/facets').allowed, true)
+  assert.equal(authorizeCollection('member', 'member', 'resource:update', '/pages').allowed, true)
+  assert.equal(authorizeCollection('member', 'member', 'resource:delete', '/pages').allowed, false)
+  assert.equal(authorizeCollection('viewer', 'member', 'resource:update', '/pages').allowed, false)
+  assert.equal(authorizeCollection('owner', 'member', 'resource:share', '/pages').allowed, true)
 })

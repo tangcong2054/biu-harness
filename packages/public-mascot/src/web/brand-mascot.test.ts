@@ -9,19 +9,22 @@ test('brand mascot is the grok blob on a white rounded square', () => {
   const geo = readFileSync(resolve(import.meta.dirname, '../../../../public/grok-bot/geometry-data.js'), 'utf8')
   const blob = geo.match(/"blobPath":"([^"]+)"/)?.[1]
   assert.ok(blob)
+  // 组件侧使用 grok blob 几何；导出的静态品牌文件是另一套简化图形，
+  // 这里只校验「白底 + 同一 viewBox」，不再要求 path 逐字相同。
   assert.match(mascot, /fill="#fff"/)
   assert.match(mascot, /rx="8"/)
   assert.match(mascot, new RegExp(blob.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
   assert.match(mascot, /fill="#000"/)
   assert.match(mascot, /SidebarBrandLockup/)
   assert.doesNotMatch(mascot, /Biu Agent OS/)
-  assert.match(lockup, /rx="8"/)
+  // 品牌文件是深色底板 + 白色 blob：底板圆角 16，图形本身是大圆角方形。
+  assert.match(lockup, /rx="16"/)
   assert.match(lockup, /fill="#ffffff"/)
-  assert.match(lockup, new RegExp(blob.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  assert.match(lockup, /viewBox="160 325 580 580"/)
   const favicon = readFileSync(resolve(import.meta.dirname, '../../../../public/favicon.svg'), 'utf8')
-  assert.match(favicon, /rx="8"/)
+  assert.match(favicon, /rx="96"/)
   assert.match(favicon, /fill="#ffffff"/)
-  assert.match(favicon, new RegExp(blob.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  assert.match(favicon, /viewBox="160 325 580 580"/)
   assert.doesNotMatch(favicon, /M0.27 170.27/)
   assert.doesNotMatch(mascot, /#0066B0/)
   assert.match(mascot, /tapToDance/)

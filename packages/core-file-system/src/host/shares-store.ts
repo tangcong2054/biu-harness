@@ -4,6 +4,11 @@ import { openAndMigrateBiu } from '@biu/host-plugin-loader/data-dir'
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
 import { normalizeCollectionPath } from '../paths.ts'
 import type { ShareKind, ShareRecord } from '../share-snapshot.ts'
+import {
+  SqliteMetadataRuntime,
+  type MetadataRepository,
+  type MetadataRuntimeMode,
+} from '@biu/host-plugin-loader/metadata-runtime'
 
 export type { ShareKind, ShareRecord } from '../share-snapshot.ts'
 
@@ -52,6 +57,37 @@ function publicShare(row: ShareRow): ShareRecord {
 
 export class SharesStore {
   private db: DatabaseSync | null = null
+  private runtime: SqliteMetadataRuntime | null = null
+
+  configureRuntime(
+    mode: MetadataRuntimeMode,
+    repository: MetadataRepository | null,
+    onShadowError?: (error: unknown) => void,
+  ) {
+    this.runtime = new SqliteMetadataRuntime(
+      mode,
+      repository,
+      () => this.conn(),
+      ['shares'],
+      onShadowError,
+    )
+  }
+
+  prepare() {
+    return this.runtime?.prepare() ?? Promise.resolve()
+  }
+
+  prepareToken(token: string) {
+    return this.runtime?.prepareShareToken(token) ?? Promise.resolve()
+  }
+
+  withTokenWorkspace<T>(token: string, run: () => Promise<T>) {
+    return this.runtime?.withShareWorkspace(token, run) ?? run()
+  }
+
+  flush() {
+    return this.runtime?.flush() ?? Promise.resolve()
+  }
 
   open(path = ':memory:') {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
@@ -167,17 +203,20 @@ export class SharesStore {
       existing?.createdAt ?? now,
       now,
     )
+    this.runtime?.changed('shares')
     return this.get(token)!
   }
 
   revoke(token: string) {
     this.conn().prepare('DELETE FROM shares WHERE token = ?').run(token)
+    this.runtime?.deleteShareToken(token)
   }
 
   revokeTarget(kind: ShareKind, collection: string, viewId = '', recordId = '') {
     this.conn().prepare(
       'DELETE FROM shares WHERE kind = ? AND collection = ? AND view_id = ? AND record_id = ?',
     ).run(kind, normalizeCollectionPath(collection), viewId, recordId)
+    this.runtime?.changed('shares')
   }
 
   revokeRecord(collection: string, recordId: string) {
@@ -188,6 +227,7 @@ export class SharesStore {
       normalizeCollectionPath(collection),
       id,
     )
+    this.runtime?.changed('shares')
   }
 
   revokeView(collection: string, viewId: string) {
@@ -198,6 +238,7 @@ export class SharesStore {
       normalizeCollectionPath(collection),
       id,
     )
+    this.runtime?.changed('shares')
   }
 
   list(): ShareRecord[] {

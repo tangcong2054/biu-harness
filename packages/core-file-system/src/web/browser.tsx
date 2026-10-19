@@ -2229,6 +2229,7 @@ export function CollectionBrowser({
       setTotal((count) => count + 1)
       quietUntil.current = 0
       void reload()
+      onOpenRecord?.(id, activeViewId, dataPath)
       window.setTimeout(() => showRecordInInspector(collectionPath, id), 0)
     } catch (err) {
       setError(String(err))

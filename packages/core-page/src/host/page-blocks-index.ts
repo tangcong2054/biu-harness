@@ -2,7 +2,19 @@ import type { DbRecord } from '@biu/type-file-system'
 import { recordBuiltinValues } from '@biu/type-file-system'
 import { listPageBlockFences, pageBlockData, pageBlockRecordId, parsePageBlockRecordId, uniquifyPageBlockMarkdown, defaultPageBlockTitle } from '@biu/core-editor/host'
 import { assetNamesFromBlock, assetNamesFromHtml } from '@biu/type-file-system'
-import { readEditorContent, replacePageBlockRefs, writeEditorContent } from '@biu/host-plugin-loader/data-dir'
+import {
+  currentRequestWorkspaceId,
+  openAndMigrateBiu,
+  readEditorContent,
+  replacePageBlockRefs,
+  runWithRequestWorkspace,
+  writeEditorContent,
+} from '@biu/host-plugin-loader/data-dir'
+import {
+  SqliteMetadataRuntime,
+  type MetadataRepository,
+  type MetadataRuntimeMode,
+} from '@biu/host-plugin-loader/metadata-runtime'
 import type { PagesStore, PageRow } from './store.ts'
 
 export const PAGE_BLOCK_HOT_WINDOW_MS = 5 * 60 * 1000
@@ -112,10 +124,52 @@ export type PageBlocksIndexOptions = {
 
 /** 倒排只扫脏记录：先最近窗口，再少量补旧的；每拍有上限。 */
 export class PageBlocksIndex {
+  private runtime: SqliteMetadataRuntime | null = null
+  private runtimeDb: import('node:sqlite').DatabaseSync | null = null
+  private editorRepository: {
+    read(collection: string, recordId: string): Promise<{ body: string; version: number }>
+    list(collection: string): Promise<Array<{ record_id: string; body: string; updated_at: number; version: number }>>
+    workspaceIds(): Promise<string[]>
+    write(collection: string, recordId: string, body: string): Promise<unknown>
+  } | null = null
+
   constructor(
     private store: PagesStore,
     private opts: PageBlocksIndexOptions = {},
   ) {}
+
+  configureRuntime(
+    mode: MetadataRuntimeMode,
+    repository: MetadataRepository | null,
+    editorRepository: PageBlocksIndex['editorRepository'],
+    onShadowError?: (error: unknown) => void,
+    sqliteDb?: import('node:sqlite').DatabaseSync,
+  ) {
+    if (mode !== 'sqlite') {
+      this.runtimeDb = mode === 'mysql'
+        ? openAndMigrateBiu(':memory:', { foreignKeys: false })
+        : sqliteDb ?? null
+    }
+    this.editorRepository = editorRepository
+    this.runtime = new SqliteMetadataRuntime(
+      mode,
+      repository,
+      () => {
+        if (!this.runtimeDb) throw new Error('page block metadata database is not ready')
+        return this.runtimeDb
+      },
+      ['page_block_index', 'page_block_cover', 'page_block_index_meta', 'block_refs'],
+      onShadowError,
+    )
+  }
+
+  private async prepare() {
+    await this.runtime?.prepare()
+  }
+
+  private async flush() {
+    await this.runtime?.flush()
+  }
 
   private hotWindowMs() {
     return this.opts.hotWindowMs ?? PAGE_BLOCK_HOT_WINDOW_MS
@@ -130,7 +184,7 @@ export class PageBlocksIndex {
   }
 
   private async db() {
-    return this.store.sqlite()
+    return this.runtimeDb ?? this.store.sqlite()
   }
 
   lastRunAt() {
@@ -138,14 +192,18 @@ export class PageBlocksIndex {
   }
 
   private async readMeta(key: string) {
+    await this.prepare()
     const db = await this.db()
     const row = db.prepare('SELECT value FROM page_block_index_meta WHERE key = ?').get(key) as { value: string } | undefined
     return row?.value ?? ''
   }
 
   private async writeMeta(key: string, value: string) {
+    await this.prepare()
     const db = await this.db()
     db.prepare('INSERT INTO page_block_index_meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value)
+    this.runtime?.changed('page_block_index_meta')
+    await this.flush()
   }
 
   async reindexPage(page: PageRow) {
@@ -161,12 +219,19 @@ export class PageBlocksIndex {
     recordId: string,
     meta?: { body?: string; title?: string; createdAt?: number; updatedAt?: number },
   ) {
+    await this.prepare()
     const db = await this.db()
-    let body = meta?.body ?? readEditorContent(db, collection, recordId)
+    let body = meta?.body
+      ?? (this.runtime?.mode === 'mysql' && this.editorRepository
+        ? (await this.editorRepository.read(collection, recordId)).body
+        : readEditorContent(db, collection, recordId))
     const unique = uniquifyPageBlockMarkdown(body)
     if (unique.changed) {
       body = unique.markdown
       writeEditorContent(db, collection, recordId, body, { transaction: false })
+      if (this.runtime?.mode === 'mysql' && this.editorRepository) {
+        await this.editorRepository.write(collection, recordId, body)
+      }
     }
     const stamp = db
       .prepare('SELECT updated_at FROM editor_content WHERE collection = ? AND record_id = ?')
@@ -213,6 +278,8 @@ export class PageBlocksIndex {
       ).run(collection, recordId, updatedAt)
       replacePageBlockRefs(db, collection, recordId, blockRefs)
       db.exec('COMMIT')
+      this.runtime?.changed('page_block_index', 'page_block_cover', 'block_refs')
+      await this.flush()
     } catch (error) {
       db.exec('ROLLBACK')
       throw error
@@ -224,6 +291,7 @@ export class PageBlocksIndex {
   }
 
   async dropRecord(collection: string, recordId: string) {
+    await this.prepare()
     const db = await this.db()
     db.prepare('DELETE FROM page_block_index WHERE collection = ? AND page_id = ?').run(collection, recordId)
     db.prepare('DELETE FROM page_block_cover WHERE collection = ? AND page_id = ?').run(collection, recordId)
@@ -232,10 +300,35 @@ export class PageBlocksIndex {
     } catch {
       /* table may not exist yet */
     }
+    this.runtime?.changed('page_block_index', 'page_block_cover', 'block_refs')
+    await this.flush()
   }
 
   async sync(now = Date.now()) {
+    if (this.runtime?.mode === 'mysql' && !currentRequestWorkspaceId() && this.editorRepository) {
+      let scanned = 0
+      let dirty = 0
+      for (const workspaceId of await this.editorRepository.workspaceIds()) {
+        const result = await runWithRequestWorkspace(workspaceId, () => this.sync(now))
+        scanned += result.scanned
+        dirty += result.dirty
+      }
+      return { scanned, dirty, lastRunAt: now }
+    }
+    await this.prepare()
     const db = await this.db()
+    if (this.runtime?.mode === 'mysql' && this.editorRepository) {
+      db.prepare(`DELETE FROM editor_content WHERE collection IN (${EDITOR_BLOCK_COLLECTIONS.map(() => '?').join(',')})`)
+        .run(...EDITOR_BLOCK_COLLECTIONS)
+      const insert = db.prepare(
+        `INSERT INTO editor_content(collection, record_id, body, updated_at, version) VALUES(?, ?, ?, ?, ?)`,
+      )
+      for (const collection of EDITOR_BLOCK_COLLECTIONS) {
+        for (const row of await this.editorRepository.list(collection)) {
+          insert.run(collection, row.record_id, row.body, row.updated_at, row.version)
+        }
+      }
+    }
     const liveRows = db
       .prepare(
         `SELECT collection, record_id AS page_id, updated_at AS page_updated_at FROM editor_content
@@ -273,12 +366,14 @@ export class PageBlocksIndex {
   }
 
   async list() {
+    await this.prepare()
     const db = await this.db()
     const rows = db.prepare('SELECT * FROM page_block_index ORDER BY collection, page_id, block_id').all() as IndexRow[]
     return rows.map(toRecord)
   }
 
   async get(id: string) {
+    await this.prepare()
     const parsed = parsePageBlockRecordId(id)
     if (!parsed) return null
     const db = await this.db()

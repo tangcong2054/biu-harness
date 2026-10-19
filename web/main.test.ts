@@ -12,7 +12,8 @@ test('web entry boots without top-level await', () => {
   assert.match(src, /export const webBoot = \(async \(\) =>/)
   assert.doesNotMatch(src, /^for \(const item of webRuntimeLoaders\) \{\n  const mod = await item.load\(\)/m)
   assert.doesNotMatch(src, /const ctx = new Context\(\)\n\s*const ctx = new Context\(\)/)
-  assert.match(css, /\.site\s*\{[^}]*height:\s*100%;[^}]*overflow-y:\s*auto;/s)
+  // .site 用视口高度而非 height:100%：父级可能是无高度裸 div，百分比会让整页滚不动。
+  assert.match(css, /\.site\s*\{[^}]*height:\s*100dvh;[^}]*overflow-y:\s*auto;/s)
   assert.match(css, /\.site \[data-reveal\]\s*\{[^}]*opacity:\s*0;[^}]*translate3d\(0,\s*42px,\s*0\)/s)
   assert.match(css, /@media \(prefers-reduced-motion: reduce\)/)
 })
@@ -31,6 +32,7 @@ test('boots the authentication boundary into #app', async () => {
     const { webBoot } = await import('./main.tsx')
     await webBoot
   })
-  assert.match(document.body.innerHTML, /data-testid="auth-gate"/)
-  assert.match(document.body.innerHTML, /登录/)
+  // 未登录：先落在官网/登录页，绝不直接渲染工作台内容。
+  assert.match(document.body.innerHTML, /class="site"|auth-gate/)
+  assert.doesNotMatch(document.body.innerHTML, /data-testid="header-config-toggle"/)
 })

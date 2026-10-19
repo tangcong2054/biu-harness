@@ -63,6 +63,18 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
       res.end(JSON.stringify({ kind: 'content', path: '/pages/p1', value: 'from-cloud', version: 2 }))
       return
     }
+    if (url.startsWith('/api/db/list')) {
+      res.end(JSON.stringify({ items: [{ id: 'p018', title: '云端页' }], total: 1 }))
+      return
+    }
+    if (url.startsWith('/api/db/read')) {
+      res.end(JSON.stringify({ kind: 'record', path: '/pages/p018', value: { id: 'p018', title: '云端页' } }))
+      return
+    }
+    if (url.startsWith('/api/db/stat')) {
+      res.end(JSON.stringify({ kind: 'collection', path: '/pages' }))
+      return
+    }
     if (url === '/api/db/delete' || url === '/api/db/restore' || url === '/api/db/shares' || url.startsWith('/api/db/shares?')) {
       res.end(JSON.stringify({ ok: true, share: url.includes('shares') ? { token: 's1', url: '/share/s1' } : undefined }))
       return
@@ -145,6 +157,23 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
     assert.equal(captured.some((item) => item.url === '/api/db/content' && item.workspaceId === 'cloud-ws'), true)
 
     captured.length = 0
+    const listedPages = await fetch(`${origin}/api/db/list?path=${encodeURIComponent('/pages')}&limit=20`, { headers })
+    assert.equal(listedPages.status, 200)
+    assert.equal((await listedPages.json() as { total?: number }).total, 1)
+    assert.equal(captured.some((item) => item.url.startsWith('/api/db/list') && item.method === 'GET' && item.workspaceId === 'cloud-ws'), true)
+
+    captured.length = 0
+    const opened = await fetch(`${origin}/api/db/read?path=${encodeURIComponent('/pages/p018')}`, { headers })
+    assert.equal(opened.status, 200)
+    assert.equal((await opened.json() as { value?: { id?: string } }).value?.id, 'p018')
+    assert.equal(captured.some((item) => item.url.includes('/api/db/read') && item.method === 'GET' && item.workspaceId === 'cloud-ws'), true)
+
+    captured.length = 0
+    const stat = await fetch(`${origin}/api/db/stat?path=${encodeURIComponent('/pages')}`, { headers })
+    assert.equal(stat.status, 200)
+    assert.equal(captured.some((item) => item.url.startsWith('/api/db/stat') && item.method === 'GET' && item.workspaceId === 'cloud-ws'), true)
+
+    captured.length = 0
     const read = await fetch(`${origin}/api/db/content?path=${encodeURIComponent('/pages/p1')}`, { headers })
     assert.equal(read.status, 200)
     assert.equal(captured.some((item) => item.url.includes('/api/db/content') && item.method === 'GET' && item.workspaceId === 'cloud-ws'), true)
@@ -197,6 +226,14 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
     // 本测试没有挂 core-page，因而本地 handler 可返回 unknown collection；
     // 关键边界是切回 device Workspace 后请求绝不能再到远端。
     await localCreated.json()
+    const localListed = await fetch(`${origin}/api/db/list?path=${encodeURIComponent('/pages')}`, {
+      headers: { ...auth, 'x-biu-workspace-id': registered.workspaceId },
+    })
+    await localListed.json()
+    const localRead = await fetch(`${origin}/api/db/read?path=${encodeURIComponent('/pages/p018')}`, {
+      headers: { ...auth, 'x-biu-workspace-id': registered.workspaceId },
+    })
+    await localRead.json()
     assert.equal(captured.length, 0)
   } finally {
     await accountFiber.dispose()

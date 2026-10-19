@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { test } from 'vitest'
 import { Context } from 'cordis'
 import { Service } from 'cordis'
 import type { SessionRecord } from '@biu/type-session'
-import { applySnapshot, exchangeSnapshot, forwardCloud, takeSnapshot } from './mirror.ts'
+import { applySnapshot, exchangeSnapshot, forwardCloud, restoreSnapshotSafely, takeSnapshot } from './mirror.ts'
 
 test('cache keeps local sessions and replaces cloud sessions', async () => {
   const ctx = new Context()
@@ -133,6 +136,162 @@ test('snapshot application uses one database change batch', async () => {
   assert.equal(batches, 1)
 })
 
+test('safe restore reports every conflict and writes nothing', async () => {
+  const ctx = new Context()
+  let sessionWrites = 0
+  let recordWrites = 0
+  class Store extends Service {
+    constructor(ctx: Context) {
+      super(ctx, 'sessionStore')
+    }
+    listSummaries() {
+      return Promise.resolve([{ id: 'session-existing' }])
+    }
+    load() {
+      return Promise.resolve(null)
+    }
+    save() {
+      sessionWrites += 1
+      return Promise.resolve()
+    }
+  }
+  class Database extends Service {
+    constructor(ctx: Context) {
+      super(ctx, 'database')
+    }
+    read(path: string) {
+      return Promise.resolve(path === '/pages/page-existing' ? { value: { id: 'page-existing' } } : {})
+    }
+    applySynced() {
+      recordWrites += 1
+      return Promise.resolve()
+    }
+    syncedRecords() {
+      return Promise.resolve([])
+    }
+  }
+  await ctx.plugin(Store)
+  await ctx.plugin(Database)
+
+  const result = await restoreSnapshotSafely(ctx, {
+    sessions: [{ id: 'session-existing', version: 1, events: [], config: {} }],
+    collections: [{ path: '/pages', records: [{ id: 'page-existing' }, { id: 'page-new' }] }],
+  })
+  assert.deepEqual(result, {
+    restored: false,
+    conflicts: [
+      { collection: '/sessions', id: 'session-existing' },
+      { collection: '/pages', id: 'page-existing' },
+    ],
+  })
+  assert.equal(sessionWrites, 0)
+  assert.equal(recordWrites, 0)
+})
+
+test('safe restore validates and restores a referenced CAS asset before records', async () => {
+  const ctx = new Context()
+  const bytes = Buffer.from('asset bytes')
+  const hash = createHash('sha256').update(bytes).digest('hex')
+  const restoredAssets: Uint8Array[] = []
+  let recordWrites = 0
+  class Database extends Service {
+    constructor(ctx: Context) {
+      super(ctx, 'database')
+    }
+    read() {
+      return Promise.resolve({})
+    }
+    preflightSnapshotAssets() {
+      return Promise.resolve([])
+    }
+    restoreSnapshotAssets(assets: Array<{ bytes: Uint8Array }>) {
+      restoredAssets.push(...assets.map((asset) => asset.bytes))
+      return Promise.resolve()
+    }
+    applySynced() {
+      recordWrites += 1
+      return Promise.resolve()
+    }
+    syncedRecords() {
+      return Promise.resolve([])
+    }
+  }
+  await ctx.plugin(Database)
+
+  const result = await restoreSnapshotSafely(ctx, {
+    sessions: [],
+    collections: [{ path: '/pages', records: [{ id: 'page-new', notes: `![x](/api/db/file/${hash}.png)` }] }],
+    assets: [{
+      name: `${hash}.png`,
+      etag: `${hash}.png`,
+      mime: 'image/png',
+      storage: 'hash',
+      size: bytes.length,
+      contentHash: hash,
+      bytesBase64: bytes.toString('base64'),
+    }],
+  })
+  assert.equal(result.restored, true)
+  assert.equal(Buffer.from(restoredAssets[0]!).toString(), 'asset bytes')
+  assert.equal(recordWrites, 1)
+})
+
+test('tampered asset hash and document conflicts produce zero writes', async () => {
+  const bytes = Buffer.from('document')
+  const hash = createHash('sha256').update(bytes).digest('hex')
+  for (const scenario of ['tampered', 'conflict'] as const) {
+    const ctx = new Context()
+    let assetWrites = 0
+    let recordWrites = 0
+    let preflights = 0
+    class Database extends Service {
+      constructor(ctx: Context) {
+        super(ctx, 'database')
+      }
+      read() {
+        return Promise.resolve({})
+      }
+      preflightSnapshotAssets() {
+        preflights += 1
+        return Promise.resolve(
+          scenario === 'conflict'
+            ? [{ collection: '/assets' as const, id: 'board.json', reason: 'content-conflict' }]
+            : [],
+        )
+      }
+      restoreSnapshotAssets() {
+        assetWrites += 1
+        return Promise.resolve()
+      }
+      applySynced() {
+        recordWrites += 1
+        return Promise.resolve()
+      }
+      syncedRecords() {
+        return Promise.resolve([])
+      }
+    }
+    await ctx.plugin(Database)
+    const result = await restoreSnapshotSafely(ctx, {
+      sessions: [],
+      collections: [{ path: '/pages', records: [{ id: 'page-new', notes: 'assets/board.json' }] }],
+      assets: [{
+        name: 'board.json',
+        etag: hash,
+        mime: 'application/json',
+        storage: 'name',
+        size: bytes.length,
+        contentHash: scenario === 'tampered' ? '0'.repeat(64) : hash,
+        bytesBase64: bytes.toString('base64'),
+      }],
+    })
+    assert.equal(result.restored, false)
+    assert.equal(assetWrites, 0)
+    assert.equal(recordWrites, 0)
+    assert.equal(preflights, scenario === 'tampered' ? 0 : 1)
+  }
+})
+
 test('forwardCloud sends the workspace header to the cloud', async () => {
   const previous = process.env.BIU_REMOTE_ORIGIN
   const realFetch = globalThis.fetch
@@ -181,6 +340,118 @@ test('replica snapshot exchange does not run without a cloud workspace', async (
   try {
     await exchangeSnapshot(new Context(), 'http://127.0.0.1:9', 'token', 'ada', '')
     assert.equal(called, 0)
+  } finally {
+    globalThis.fetch = previous
+  }
+})
+
+test('snapshot watermark survives a new process cache', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'biu-snapshot-watermark-')), 'cloud-sync.sqlite')
+  const previous = globalThis.fetch
+  const urls: string[] = []
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    urls.push(String(input))
+    if (urls.length > 1) return new Response('{}', { status: 503 })
+    return Response.json({
+      sessions: [{ id: 'remote', version: 1, updatedAt: 123, events: [], config: {} }],
+      collections: [],
+    })
+  }) as typeof fetch
+  try {
+    const options = { watermarkPath: path, watermarkCache: new Map<string, number>() }
+    await exchangeSnapshot(new Context(), 'http://cloud.test/', 'token', 'ada', 'ws-one', options)
+    await exchangeSnapshot(new Context(), 'http://cloud.test', 'token', 'ada', 'ws-one', {
+      watermarkPath: path,
+      watermarkCache: new Map<string, number>(),
+    })
+
+    assert.equal(urls[0], 'http://cloud.test/api/replica/snapshot')
+    assert.equal(urls[1], 'http://cloud.test/api/replica/snapshot?since=123')
+    const db = new DatabaseSync(path, { readOnly: true })
+    const row = db.prepare('SELECT watermark, updated_at FROM snapshot_watermarks').get() as {
+      watermark: number
+      updated_at: number
+    }
+    db.close()
+    assert.equal(row.watermark, 123)
+    assert.ok(row.updated_at > 0)
+  } finally {
+    globalThis.fetch = previous
+  }
+})
+
+test('snapshot watermarks are isolated by workspace', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'biu-snapshot-workspaces-')), 'cloud-sync.sqlite')
+  const previous = globalThis.fetch
+  const urls: string[] = []
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    urls.push(String(input))
+    if (urls.length > 1) return new Response('{}', { status: 503 })
+    return Response.json({
+      sessions: [],
+      collections: [{ path: '/pages', records: [{ id: 'p1', updatedAt: 200 }] }],
+    })
+  }) as typeof fetch
+  try {
+    await exchangeSnapshot(new Context(), 'http://cloud.test', 'token', 'ada', 'ws-a', {
+      watermarkPath: path,
+      watermarkCache: new Map<string, number>(),
+    })
+    await exchangeSnapshot(new Context(), 'http://cloud.test', 'token', 'ada', 'ws-b', {
+      watermarkPath: path,
+      watermarkCache: new Map<string, number>(),
+    })
+    await exchangeSnapshot(new Context(), 'http://cloud.test', 'token', 'ada', 'ws-a', {
+      watermarkPath: path,
+      watermarkCache: new Map<string, number>(),
+    })
+
+    assert.equal(urls[1], 'http://cloud.test/api/replica/snapshot')
+    assert.equal(urls[2], 'http://cloud.test/api/replica/snapshot?since=200')
+  } finally {
+    globalThis.fetch = previous
+  }
+})
+
+test('failed snapshot apply does not advance the persisted watermark', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'biu-snapshot-failure-')), 'cloud-sync.sqlite')
+  const previous = globalThis.fetch
+  const urls: string[] = []
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    urls.push(String(input))
+    if (urls.length > 1) return new Response('{}', { status: 503 })
+    return Response.json({
+      sessions: [],
+      collections: [{ path: '/pages', records: [{ id: 'p1', updatedAt: 300 }] }],
+    })
+  }) as typeof fetch
+  try {
+    const ctx = new Context()
+    class FailingDatabase extends Service {
+      constructor(ctx: Context) {
+        super(ctx, 'database')
+      }
+      syncedRecords() {
+        return Promise.resolve([])
+      }
+      applySynced() {
+        return Promise.reject(new Error('apply failed'))
+      }
+    }
+    await ctx.plugin(FailingDatabase)
+
+    await assert.rejects(
+      exchangeSnapshot(ctx, 'http://cloud.test', 'token', 'ada', 'ws-fail', {
+        watermarkPath: path,
+        watermarkCache: new Map<string, number>(),
+      }),
+      /apply failed/,
+    )
+    await exchangeSnapshot(new Context(), 'http://cloud.test', 'token', 'ada', 'ws-fail', {
+      watermarkPath: path,
+      watermarkCache: new Map<string, number>(),
+    })
+    assert.equal(urls[1], 'http://cloud.test/api/replica/snapshot')
   } finally {
     globalThis.fetch = previous
   }

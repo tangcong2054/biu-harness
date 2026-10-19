@@ -19,6 +19,11 @@ import {
 } from '@biu/type-file-system'
 import { parsePageBanner, type PageBanner, type PageBannerKind } from '../page-banner.ts'
 import { bannerGalleryId, isBannerPreset } from '../banner-presets.ts'
+import {
+  SqliteMetadataRuntime,
+  type MetadataRepository,
+  type MetadataRuntimeMode,
+} from '@biu/host-plugin-loader/metadata-runtime'
 
 type DatabaseSync = import('node:sqlite').DatabaseSync
 
@@ -94,6 +99,75 @@ const FACET_ROW_SQL = 'id, label, fields_json, created_at, updated_at'
 /** 分面目录由 File System 用 SQLite 管：目录 + 跨表倒排，查询不扫全表。 */
 export class FacetStore {
   private db: DatabaseSync | null = null
+  private runtime: SqliteMetadataRuntime | null = null
+  private editorRepository: {
+    list(collection: string): Promise<Array<{ record_id: string; body: string; updated_at: number; version: number }>>
+    write(collection: string, recordId: string, body: string): Promise<unknown>
+    delete(collection: string, recordId: string): Promise<unknown>
+  } | null = null
+  private editorPending: Promise<unknown> = Promise.resolve()
+  private onShadowError: (error: unknown) => void = () => {}
+
+  configureRuntime(
+    mode: MetadataRuntimeMode,
+    repository: MetadataRepository | null,
+    editorRepository: FacetStore['editorRepository'],
+    onShadowError?: (error: unknown) => void,
+  ) {
+    this.runtime = new SqliteMetadataRuntime(
+      mode,
+      repository,
+      () => this.ensure(),
+      [
+        'facets', 'facet_stamps', 'facet_record_values', 'record_meta',
+        'record_banners', 'banner_gallery', 'attachments', 'content_refs', 'block_refs',
+      ],
+      onShadowError,
+    )
+    this.editorRepository = editorRepository
+    this.onShadowError = onShadowError ?? (() => {})
+  }
+
+  async prepare() {
+    await this.runtime?.prepare()
+    if (this.runtime?.mode !== 'mysql' || !this.editorRepository) return
+    const rows = await this.editorRepository.list('/facets')
+    const db = this.ensure()
+    db.prepare(`DELETE FROM editor_content WHERE collection = '/facets'`).run()
+    const insert = db.prepare(
+      `INSERT INTO editor_content(collection, record_id, body, updated_at, version) VALUES('/facets', ?, ?, ?, ?)`,
+    )
+    for (const row of rows) insert.run(row.record_id, row.body, row.updated_at, row.version)
+  }
+
+  async flush() {
+    await this.runtime?.flush()
+    await this.editorPending
+  }
+
+  private changed(...tables: string[]) {
+    this.runtime?.changed(...tables)
+  }
+
+  private changedFacetNotes(id: string, notes: string) {
+    if (!this.editorRepository || this.runtime?.mode === 'sqlite') return
+    const write = () => this.editorRepository!.write('/facets', id, notes)
+    if (this.runtime?.mode === 'shadow') {
+      this.editorPending = this.editorPending.then(write).catch((error) => this.onShadowError(error))
+    } else {
+      this.editorPending = this.editorPending.then(write)
+    }
+  }
+
+  private deletedFacetNotes(id: string) {
+    if (!this.editorRepository || this.runtime?.mode === 'sqlite') return
+    const write = () => this.editorRepository!.delete('/facets', id)
+    if (this.runtime?.mode === 'shadow') {
+      this.editorPending = this.editorPending.then(write).catch((error) => this.onShadowError(error))
+    } else {
+      this.editorPending = this.editorPending.then(write)
+    }
+  }
 
   open(path = ':memory:') {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
@@ -175,6 +249,8 @@ export class FacetStore {
       )
       .run(pack.id, pack.label, JSON.stringify(pack.fields), now, now)
     writeEditorContent(db, '/facets', pack.id, notes, { transaction: false })
+    this.changed('facets')
+    this.changedFacetNotes(pack.id, notes)
   }
 
   ensure() {
@@ -230,8 +306,10 @@ export class FacetStore {
         if (keep.has(row.id)) continue
         db.prepare('DELETE FROM facet_stamps WHERE facet_id = ?').run(row.id)
         db.prepare('DELETE FROM facets WHERE id = ?').run(row.id)
+        this.deletedFacetNotes(row.id)
       }
       db.exec('COMMIT')
+      this.changed('facets', 'facet_stamps')
     } catch (error) {
       db.exec('ROLLBACK')
       throw error
@@ -255,7 +333,9 @@ export class FacetStore {
     try {
       db.prepare('DELETE FROM facet_stamps WHERE facet_id = ?').run(want)
       const result = db.prepare('DELETE FROM facets WHERE id = ?').run(want)
+      this.deletedFacetNotes(want)
       db.exec('COMMIT')
+      this.changed('facets', 'facet_stamps')
       return Number(result.changes) > 0
     } catch (error) {
       db.exec('ROLLBACK')
@@ -283,6 +363,7 @@ export class FacetStore {
       )
       for (const tagId of ids) insert.run(tagId, collection, recordId, title)
       db.exec('COMMIT')
+      this.changed('facet_stamps')
     } catch (error) {
       db.exec('ROLLBACK')
       throw error
@@ -303,6 +384,7 @@ export class FacetStore {
     if (isEmptySchemaValue(value)) {
       db.prepare('DELETE FROM facet_record_values WHERE collection = ? AND record_id = ?').run(collection, recordId)
       this.indexRecord(collection, recordId, title, [])
+      this.changed('facet_record_values')
       return value
     }
     db.prepare(
@@ -311,6 +393,7 @@ export class FacetStore {
        ON CONFLICT(collection, record_id) DO UPDATE SET facet_json = excluded.facet_json`,
     ).run(collection, recordId, JSON.stringify(value))
     this.indexRecord(collection, recordId, title, value.tags)
+    this.changed('facet_record_values')
     return value
   }
 
@@ -379,6 +462,7 @@ export class FacetStore {
     const db = this.ensure()
     if (!banner) {
       db.prepare('DELETE FROM record_banners WHERE collection = ? AND record_id = ?').run(collection, recordId)
+      this.changed('record_banners')
       return null
     }
     db.prepare(
@@ -387,6 +471,7 @@ export class FacetStore {
        ON CONFLICT(collection, record_id) DO UPDATE SET kind = excluded.kind, html = excluded.html`,
     ).run(collection, recordId, banner.kind, banner.html)
     if (!isBannerPreset(banner)) this.rememberBannerGallery(banner)
+    this.changed('record_banners')
     return this.recordBanner(collection, recordId)
   }
 
@@ -402,6 +487,7 @@ export class FacetStore {
          ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, html = excluded.html`,
       )
       .run(id, banner.kind, title, html, Date.now())
+    this.changed('banner_gallery')
   }
 
   listBannerGallery(): Array<{ id: string; kind: PageBannerKind; style: string; title: string; html: string }> {
@@ -419,6 +505,7 @@ export class FacetStore {
     const key = id.trim()
     if (!key) return false
     const result = this.ensure().prepare('DELETE FROM banner_gallery WHERE id = ?').run(key)
+    this.changed('banner_gallery')
     return Number(result.changes) > 0
   }
 
@@ -452,6 +539,7 @@ export class FacetStore {
         patch.createdBy !== undefined ? JSON.stringify(patch.createdBy) : null,
         patch.updatedBy !== undefined ? JSON.stringify(asPersonList(patch.updatedBy)) : null,
       )
+    this.changed('record_meta')
     return this.recordMeta(collection, recordId) ?? { emoji: null, tags: null, createdBy: null, updatedBy: [], deletedAt: null }
   }
 
@@ -477,12 +565,14 @@ export class FacetStore {
          ON CONFLICT(collection, record_id) DO UPDATE SET deleted_at = excluded.deleted_at`,
       )
       .run(collection, recordId, at)
+    this.changed('record_meta')
   }
 
   restoreDeleted(collection: string, recordId: string) {
     this.ensure()
       .prepare('UPDATE record_meta SET deleted_at = NULL WHERE collection = ? AND record_id = ?')
       .run(collection, recordId)
+    this.changed('record_meta')
   }
 
   listDeleted() {
@@ -503,10 +593,12 @@ export class FacetStore {
     db.prepare('DELETE FROM record_banners WHERE collection = ? AND record_id = ?').run(collection, recordId)
     db.prepare('DELETE FROM content_refs WHERE collection = ? AND record_id = ?').run(collection, recordId)
     db.prepare('DELETE FROM block_refs WHERE collection = ? AND record_id = ?').run(collection, recordId)
+    this.changed('facet_stamps', 'facet_record_values', 'record_meta', 'record_banners', 'content_refs', 'block_refs')
   }
 
   putAttachment(row: { name: string; etag: string; mime: string; bytes: number; kind?: string; storage?: string }) {
     upsertAttachmentRow(this.ensure(), row)
+    this.changed('attachments')
   }
 
   replaceContentRefs(collection: string, recordId: string, content: Iterable<string>, banner: Iterable<string> = []) {
@@ -515,6 +607,7 @@ export class FacetStore {
     try {
       replaceContentRefsRows(db, collection, recordId, content, banner)
       db.exec('COMMIT')
+      this.changed('content_refs')
     } catch (error) {
       db.exec('ROLLBACK')
       throw error
@@ -529,6 +622,7 @@ export class FacetStore {
          ON CONFLICT(collection, record_id, block_id, name, source) DO NOTHING`,
       )
       .run(collection, recordId, blockId, name, source)
+    this.changed('block_refs')
   }
 
   replaceBlockRefs(
@@ -550,6 +644,7 @@ export class FacetStore {
       )
       for (const ref of refs) insert.run(collection, recordId, blockId, ref.name, ref.source)
       db.exec('COMMIT')
+      this.changed('block_refs')
     } catch (error) {
       db.exec('ROLLBACK')
       throw error
@@ -561,9 +656,11 @@ export class FacetStore {
       this.ensure()
         .prepare('DELETE FROM block_refs WHERE collection = ? AND record_id = ? AND block_id = ?')
         .run(collection, recordId, blockId)
+      this.changed('block_refs')
       return
     }
     this.ensure().prepare('DELETE FROM block_refs WHERE collection = ? AND record_id = ?').run(collection, recordId)
+    this.changed('block_refs')
   }
 
   listedAttachmentNames(collection: string, recordId: string): string[] {

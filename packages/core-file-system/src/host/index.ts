@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import type { IncomingMessage } from 'node:http'
 import { isAbsolute, resolve } from 'node:path'
 import {
@@ -16,9 +17,10 @@ import {
   isOnlineRuntime,
 } from '@biu/host-plugin-loader/data-dir'
 import { asPublicProfile, readWorkspaceProfile, writeWorkspaceProfile } from '@biu/host-workspace'
-import { roleCoversAction, type Action as PermissionAction, type AuthorizationService } from '@biu/host-account/authorization'
+import { authorizeCollection, roleCoversAction, type Action as PermissionAction, type AuthorizationService } from '@biu/host-account/authorization'
+import { mysqlRecordVisible, resolveRecordScope, type DataScope, type ScopeSource } from './record-scope.ts'
 import { isRegisteredBuiltinPlugin } from '@biu/host-account/store'
-import { forwardCloud } from '@biu/host-account/mirror'
+import { forwardCloud, forwardCloudBytes } from '@biu/host-account/mirror'
 import { Service, type Context } from 'cordis'
 import {
   DATABASE_CHANNEL,
@@ -741,6 +743,7 @@ type WorkspaceFiles = {
     granted_by?: string
   }>
   collectionRecordOwners?(workspaceId: string, collection: string): Map<string, string>
+  isMember?(accountId: string, workspaceId: string): boolean
 }
 
 export function clampPage(limit?: number, offset?: number) {
@@ -768,6 +771,10 @@ export class DatabaseService extends Service implements Database {
   private inflightVisible = new Map<string, Promise<VisibleSortedPack>>()
   private visibleCache = new Map<string, VisibleSortedPack>()
   private visibleGen = 0
+  /** MySQL 模式下按工作区读到的私人/空间/共享。键含 visibleGen，数据变更后失效。 */
+  private mysqlScopes = new Map<string, DataScope | null>()
+  /** 同一条键上，MySQL 策略是否允许当前账号看见。没有键表示这条记录还没在 MySQL 落归属。 */
+  private mysqlVisible = new Map<string, boolean>()
   private boundAuth?: AuthorizationService
   private unbindAuth?: () => void
   recycleAssets?: () => void
@@ -778,6 +785,74 @@ export class DatabaseService extends Service implements Database {
 
   constructor(ctx: Context) {
     super(ctx, 'database')
+  }
+
+  private async prepareMetadata() {
+    await Promise.all([
+      this.facets.prepare(),
+      this.shares.prepare(),
+      (this.viewCatalog as { prepare?: () => Promise<void> } | undefined)?.prepare?.(),
+    ])
+  }
+
+  private async finishMetadata<T>(value: T): Promise<T> {
+    await Promise.all([
+      this.facets.flush(),
+      this.shares.flush(),
+      (this.viewCatalog as { flush?: () => Promise<void> } | undefined)?.flush?.(),
+    ])
+    return value
+  }
+
+  private cloudContent() {
+    try {
+      return this.ctx.get('cloudStorage') as {
+        editorContentMode?: 'sqlite' | 'mysql' | 'shadow'
+        ensureProductMigrations?: () => Promise<void>
+        editorContentRepository?: {
+          read(collection: string, recordId: string): Promise<{ body: string; version: number }>
+          write(collection: string, recordId: string, body: string, expectedVersion?: number): Promise<{ body: string; version: number }>
+        } | null
+      } | undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  private async readContentRecord(collection: string, recordId: string) {
+    const cloud = this.cloudContent()
+    if (cloud?.editorContentMode === 'mysql' && cloud.editorContentRepository) {
+      await cloud.ensureProductMigrations?.()
+      return cloud.editorContentRepository.read(collection, recordId)
+    }
+    return readEditorContentRecord(this.facets.ensure(), collection, recordId)
+  }
+
+  private async writeContentRecord(collection: string, recordId: string, body: string, expectedVersion?: number) {
+    const cloud = this.cloudContent()
+    if (cloud?.editorContentMode === 'mysql' && cloud.editorContentRepository) {
+      await cloud.ensureProductMigrations?.()
+      try {
+        return await cloud.editorContentRepository.write(collection, recordId, body, expectedVersion)
+      } catch (error) {
+        const conflict = error as { code?: string; expectedVersion?: number; actualVersion?: number }
+        if (conflict?.code === 'EDITOR_CONTENT_CONFLICT') {
+          throw new EditorContentConflictError(
+            Number(conflict.expectedVersion ?? expectedVersion ?? 0),
+            Number(conflict.actualVersion ?? 0),
+          )
+        }
+        throw error
+      }
+    }
+    const written = writeEditorContent(this.facets.ensure(), collection, recordId, body, { expectedVersion })
+    if (cloud?.editorContentMode === 'shadow' && cloud.editorContentRepository) {
+      await cloud.ensureProductMigrations?.()
+      cloud.editorContentRepository.write(collection, recordId, body).catch((error) => {
+        this.ctx.logger('database').warn(`MySQL editor_content shadow write failed: ${String(error)}`)
+      })
+    }
+    return written
   }
 
   private async serializeContentWrite<T>(path: string, run: () => Promise<T>): Promise<T> {
@@ -977,8 +1052,13 @@ export class DatabaseService extends Service implements Database {
   ) {
     const authorization = this.authorization()
     const actor = authorization?.currentActor()
+    const keep = <R extends T>(row: R, sqliteAllows: () => boolean) => {
+      const mysql = this.mysqlVisibility(collection, row)
+      if (mysql != null) return mysql
+      return sqliteAllows()
+    }
     if (authorization && actor) {
-      return rows.filter((row) => {
+      return rows.filter((row) => keep(row, () => {
         if (collection === '/plugin-catalog' || collection === '/plugin-reviews' || isOperationsMetadata(collection)) {
           return action === 'resource:read' || action === 'resource:list'
         }
@@ -998,14 +1078,14 @@ export class DatabaseService extends Service implements Database {
         if (authorization.authorize(actor, action, resource).allowed) return true
         const viaView = this.viewGrantRole(actor.workspaceId, collection, row, actor.accountId)
         return Boolean(viaView && roleCoversAction(viaView, action))
-      })
+      }))
     }
     const membership = this.workspaceMembership()
-    if (!membership) return rows
+    if (!membership) return rows.filter((row) => this.mysqlVisibility(collection, row) !== false)
     const store = this.collabStore()
     const workspaceId = store?.activeWorkspaceId() ?? ''
     const grants = new Map<string, Map<string, Set<string>>>()
-    return rows.filter((row) => {
+    return rows.filter((row) => keep(row, () => {
       if (collection === '/plugin-catalog' || collection === '/plugin-reviews' || isOperationsMetadata(collection)) {
         return action === 'resource:read' || action === 'resource:list'
       }
@@ -1023,7 +1103,7 @@ export class DatabaseService extends Service implements Database {
       const people = map.get(target.id)
       if (!people || people.size === 0) return true
       return people.has(currentAccountId())
-    })
+    }))
   }
 
   /** 合集目录只留下当前用户能读到的源记录上贴过的合集；还没贴到公开数据上的，只留给创建人。 */
@@ -1116,12 +1196,59 @@ export class DatabaseService extends Service implements Database {
       parentRecordId?: string
     },
   ) {
+    const mysqlAttached = this.attachMysqlWorkspaceRecord(collection, recordId, policy)
     const store = this.collabStore()
-    const workspaceId = store?.activeWorkspaceId()
-    if (!store || !workspaceId) return
-    store.attach(workspaceId, collection, recordId, Date.now(), policy)
+    const requested = currentRequestWorkspaceId()
+    const actorId = currentAccountId()
+    const active = store?.activeWorkspaceId()
+    // 离线正打开云端空间时，本机 active 仍可能是本机空间。归属必须跟着这次请求的空间，否则新页面会挂到本机空间，云端列表和打开都看不到。
+    const workspaceId = requested && actorId && store?.isMember?.(actorId, requested) ? requested : active
+    if (store && workspaceId) {
+      try {
+        store.attach(workspaceId, collection, recordId, Date.now(), policy)
+        this.ownerCache = null
+        this.ownershipCache = null
+      } catch (error) {
+        return mysqlAttached.then((attached) => {
+          if (!attached) throw error
+        })
+      }
+    }
+    return mysqlAttached.then(() => undefined)
+  }
+
+  /** 在线账号的工作区只在 MySQL。新建记录必须把归属写到云端，否则三个分享组都看不到。 */
+  private async attachMysqlWorkspaceRecord(
+    collection: string,
+    recordId: string,
+    policy?: {
+      ownership?: 'personal' | 'workspace' | 'shared'
+      accessMode?: 'inherit' | 'private' | 'members' | 'restricted'
+      memberDefaultRole?: 'viewer' | 'editor'
+      parentCollection?: string
+      parentRecordId?: string
+    },
+  ) {
+    const mysql = this.mysqlAccount()?.usesMysqlAccounts?.() ? this.mysqlAccount()?.mysql : undefined
+    const actorId = currentAccountId()
+    const workspaceId = currentRequestWorkspaceId()
+    if (!mysql?.attachPolicy || !actorId || !workspaceId) return false
+    await mysql.attachPolicy({
+      actorId,
+      workspaceId,
+      collection,
+      recordId,
+      ownership: policy?.ownership ?? 'personal',
+      accessMode: policy?.accessMode ?? 'private',
+      memberDefaultRole: policy?.memberDefaultRole,
+      parentCollection: policy?.parentCollection,
+      parentRecordId: policy?.parentRecordId,
+      now: Date.now(),
+    })
     this.ownerCache = null
     this.ownershipCache = null
+    this.invalidateCaches()
+    return true
   }
 
   /** 分享里的「按成员视图批量授权」：全部成员可编辑。 */
@@ -1147,21 +1274,19 @@ export class DatabaseService extends Service implements Database {
   }
 
   rememberScope(collection: string, recordId: string, scope: 'personal' | 'workspace' | 'shared') {
-    if (scope === 'shared') {
-      this.markPublicView(collection, recordId)
-      return
-    }
-    this.attachWorkspaceRecord(collection, recordId, {
+    if (scope === 'shared') return this.markPublicView(collection, recordId)
+    const attached = this.attachWorkspaceRecord(collection, recordId, {
       ownership: scope === 'workspace' ? 'workspace' : 'personal',
       accessMode: scope === 'workspace' ? 'members' : 'private',
       ...(scope === 'workspace' ? { memberDefaultRole: 'editor' as const } : {}),
     })
     if (scope === 'workspace') this.grantAllMembersEditable(collection, recordId)
+    return attached
   }
 
   /** 公开链接：无密码，所有人只读查看。 */
   markPublicView(collection: string, recordId: string) {
-    this.attachWorkspaceRecord(collection, recordId, {
+    const attached = this.attachWorkspaceRecord(collection, recordId, {
       ownership: 'shared',
       accessMode: 'members',
       memberDefaultRole: 'viewer',
@@ -1171,6 +1296,7 @@ export class DatabaseService extends Service implements Database {
     } catch {
       /* 分享库还没打开时，记录仍然按共享归属 */
     }
+    return attached
   }
 
   private builtinPlugin(spec: CollectionSpec, id: string, record?: { builtin?: unknown }) {
@@ -1189,14 +1315,25 @@ export class DatabaseService extends Service implements Database {
         action === 'resource:read' ||
         action === 'resource:list' ||
         action === 'resource:update'
-      ) return
-      throw new Error('permission denied: INSUFFICIENT_PERMISSION')
+      ) return Promise.resolve()
+      return Promise.reject(new Error('permission denied: INSUFFICIENT_PERMISSION'))
     }
     if (this.builtinPlugin(spec, id, record)) {
-      if (action === 'resource:read' || action === 'resource:list') return
-      throw new Error('permission denied: INSUFFICIENT_PERMISSION')
+      if (action === 'resource:read' || action === 'resource:list') return Promise.resolve()
+      return Promise.reject(new Error('permission denied: INSUFFICIENT_PERMISSION'))
     }
-    if (this.facets.isDeleted(spec.path, id)) throw new Error(`unknown record: ${spec.path}/${id}`)
+    if (this.facets.isDeleted(spec.path, id)) return Promise.reject(new Error(`unknown record: ${spec.path}/${id}`))
+    return this.finishAssertLiveRecord(spec, id, action, record)
+  }
+
+  /** MySQL 已经记下归属时以云端为准；否则仍走本机 SQLite。 */
+  private async finishAssertLiveRecord(
+    spec: CollectionSpec,
+    id: string,
+    action: PermissionAction,
+    record?: { id?: unknown },
+  ) {
+    if (await this.mysqlAllowsRecord(spec.path, id, record)) return
     const authorization = this.authorization()
     const actor = authorization?.currentActor()
     if (authorization && actor) {
@@ -1225,11 +1362,105 @@ export class DatabaseService extends Service implements Database {
     }
   }
 
+  /** @returns true 表示 MySQL 已允许，调用方不要再用 SQLite 否决。没有云端归属时返回 false。 */
+  private async mysqlAllowsRecord(collection: string, id: string, record?: { id?: unknown }) {
+    const account = this.mysqlAccount()
+    const mysql = account?.usesMysqlAccounts?.() ? account.mysql : undefined
+    const workspaceId = currentRequestWorkspaceId()
+    const accountId = currentAccountId()
+    if (!mysql?.membership || !mysql.collectionScopeSources || !workspaceId || !accountId) return false
+    const member = await mysql.membership(accountId, workspaceId)
+    if (!member) return false
+    const target = this.scopeTarget(collection, id, record)
+    const sources = new Map<string, ScopeSource>()
+    const load = async (name: string) => {
+      if (sources.has(name)) return
+      const loaded = await mysql.collectionScopeSources!(workspaceId, name)
+      sources.set(name, { policies: loaded.policies, owners: new Set(loaded.owners) })
+    }
+    await load(target.collection)
+    const direct = sources.get(target.collection)?.policies[target.id]
+    if (direct?.accessMode === 'inherit' && direct.parentCollection) await load(direct.parentCollection)
+    const known = Boolean(direct) || Boolean(sources.get(target.collection)?.owners.has(target.id))
+    if (!known) return false
+    if (!mysqlRecordVisible(target.collection, target.id, sources, accountId)) {
+      throw new Error(`unknown record: ${collection}/${id}`)
+    }
+    return true
+  }
+
+  /** 列表已经装载过 MySQL 归属时，true/false 覆盖 SQLite；null 表示这条记录还没有云端归属。 */
+  private mysqlVisibility(collection: string, row: { id?: unknown }) {
+    if (!this.mysqlAccount()?.usesMysqlAccounts?.()) return null
+    const workspaceId = currentRequestWorkspaceId()
+    if (!workspaceId) return null
+    const target = this.scopeTarget(collection, String(row.id ?? ''), row)
+    const key = this.mysqlScopeKey(workspaceId, target.collection, target.id)
+    if (!this.mysqlVisible.has(key)) return null
+    return this.mysqlVisible.get(key) === true
+  }
+
+  private mysqlAccount() {
+    try {
+      return this.ctx.get('account') as {
+        usesMysqlAccounts?: () => boolean
+        mysql?: {
+          membership: (
+            accountId: string,
+            workspaceId: string,
+          ) => Promise<{
+            role: 'owner' | 'admin' | 'member' | 'viewer'
+            memberKind: 'member' | 'external' | 'guest'
+          } | null>
+          externallySharedRecords?: (
+            accountId: string,
+            workspaceId: string,
+          ) => Promise<Array<{ collection: string; record_id: string }>>
+          collectionScopeSources?: (
+            workspaceId: string,
+            collection: string,
+          ) => Promise<{ policies: ScopeSource['policies']; owners: string[] }>
+          attachPolicy?: (input: {
+            actorId: string
+            workspaceId: string
+            collection: string
+            recordId: string
+            ownership: 'personal' | 'workspace' | 'shared'
+            accessMode: 'inherit' | 'private' | 'members' | 'restricted'
+            memberDefaultRole?: 'viewer' | 'editor'
+            parentCollection?: string
+            parentRecordId?: string
+            now: number
+          }) => Promise<void>
+        } | null
+      } | undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** MySQL 账号的成员关系不在本机 SQLite。集合级检查直接读云端角色。 */
+  private async mysqlCollectionDecision(collection: string, action: PermissionAction) {
+    const account = this.mysqlAccount()
+    if (!account?.usesMysqlAccounts?.() || !account.mysql) return null
+    const accountId = currentAccountId()
+    const workspaceId = currentRequestWorkspaceId()
+    if (!accountId || !workspaceId) return { allowed: false as const, reason: 'UNAUTHENTICATED' as const }
+    const membership = await account.mysql.membership(accountId, workspaceId)
+    return authorizeCollection(membership?.role ?? null, membership?.memberKind ?? 'member', action, collection)
+  }
+
   async requirePath(path: string, action: PermissionAction) {
+    await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length === 1) {
       const spec = this.collection(`/${parts[0]}`)
       if (!spec) throw new Error(`unknown collection: /${parts[0]}`)
+      const mysqlDecision = await this.mysqlCollectionDecision(spec.path, action)
+      if (mysqlDecision) {
+        if (!mysqlDecision.allowed) throw new Error(`permission denied: ${mysqlDecision.reason}`)
+        return
+      }
       const authorization = this.authorization()
       const actor = authorization?.currentActor()
       if (authorization && !actor) throw new Error('permission denied: UNAUTHENTICATED')
@@ -1247,7 +1478,7 @@ export class DatabaseService extends Service implements Database {
     if (!spec) throw new Error(`unknown collection: /${parts[0]}`)
     const record = await spec.get(parts[1]!)
     if (!record) throw new Error(`unknown record: ${spec.path}/${parts[1]}`)
-    this.assertLiveRecord(spec, record.id, action, record)
+    await this.assertLiveRecord(spec, record.id, action, record)
   }
 
   requireAsset(name: string, action: 'resource:read' | 'resource:update') {
@@ -1276,6 +1507,10 @@ export class DatabaseService extends Service implements Database {
       return
     }
     throw new Error('permission denied: INSUFFICIENT_PERMISSION')
+  }
+
+  prepareAssetAccess() {
+    return this.prepareMetadata()
   }
 
   private async matchCollectionRows(
@@ -1361,8 +1596,9 @@ export class DatabaseService extends Service implements Database {
     const actor = auth?.currentActor()
     const extraScans = auth && actor ? this.preloadRelatedCollections(spec.path, rows, auth, actor) : []
     try {
+      const mysql = await this.loadMysqlScopes(spec.path, rows)
       const visible = sortRecords(this.visibleRecords(spec.path, rows), sortField, sortDir, sorts)
-      return this.partitionVisibleRows(spec.path, visible)
+      return this.partitionVisibleRows(spec.path, visible, mysql)
     } finally {
       if (auth && actor) {
         for (const collection of extraScans) {
@@ -1372,11 +1608,70 @@ export class DatabaseService extends Service implements Database {
     }
   }
 
-  private partitionVisibleRows(collection: string, rows: DbRecord[]): VisibleSortedPack {
+  private async loadMysqlScopes(collection: string, rows: DbRecord[]) {
+    const account = this.mysqlAccount()
+    const mysql = account?.usesMysqlAccounts?.() ? account.mysql : undefined
+    if (!mysql?.collectionScopeSources) return false
+    const workspaceId = currentRequestWorkspaceId()
+    const accountId = currentAccountId()
+    const names = new Set<string>([collection])
+    for (const row of rows) {
+      names.add(this.scopeTarget(collection, String(row.id ?? ''), row).collection)
+    }
+    const sources = new Map<string, ScopeSource>()
+    const member = workspaceId && accountId
+      ? await mysql.membership(accountId, workspaceId)
+      : null
+    if (workspaceId && member) {
+      for (const name of names) {
+        const loaded = await mysql.collectionScopeSources(workspaceId, name)
+        sources.set(name, { policies: loaded.policies, owners: new Set(loaded.owners) })
+      }
+    }
+    for (const row of rows) {
+      const target = this.scopeTarget(collection, String(row.id ?? ''), row)
+      const source = sources.get(target.collection)
+      const known = Boolean(source?.policies[target.id] || source?.owners.has(target.id))
+      if (!known || !workspaceId || !member || !accountId) continue
+      const key = this.mysqlScopeKey(workspaceId, target.collection, target.id)
+      this.mysqlScopes.set(key, resolveRecordScope(target.collection, target.id, sources))
+      this.mysqlVisible.set(key, mysqlRecordVisible(target.collection, target.id, sources, accountId))
+    }
+    return true
+  }
+
+  private mysqlScopeKey(workspaceId: string, collection: string, id: string) {
+    return `${this.visibleGen}\t${workspaceId}\t${collection}\t${id}`
+  }
+
+  /** `undefined` 表示这条列表不是 MySQL 拆分；`null` 表示已拆分但没有归属。 */
+  private mysqlScopeOf(collection: string, id: string): DataScope | null | undefined {
+    if (!this.mysqlAccount()?.usesMysqlAccounts?.()) return undefined
+    const workspaceId = currentRequestWorkspaceId()
+    if (!workspaceId) return null
+    return this.mysqlScopes.get(this.mysqlScopeKey(workspaceId, collection, id))
+  }
+
+  private partitionVisibleRows(collection: string, rows: DbRecord[], mysql: boolean): VisibleSortedPack {
     const authorization = this.authorization()
     const actor = authorization?.currentActor()
-    if (!authorization || !actor) {
-      return { rows, personal: rows, workspace: rows, shared: rows }
+    if (mysql || !authorization || !actor) {
+      if (!mysql) return { rows, personal: rows, workspace: rows, shared: rows }
+      const personal: DbRecord[] = []
+      const workspace: DbRecord[] = []
+      const shared: DbRecord[] = []
+      for (const row of rows) {
+        if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
+          shared.push(row)
+          continue
+        }
+        const target = this.scopeTarget(collection, String(row.id ?? ''), row)
+        const scope = this.mysqlScopeOf(target.collection, target.id)
+        if (scope === 'personal') personal.push(row)
+        else if (scope === 'workspace') workspace.push(row)
+        else if (scope === 'shared') shared.push(row)
+      }
+      return { rows, personal, workspace, shared }
     }
     const personal: DbRecord[] = []
     const workspace: DbRecord[] = []
@@ -1462,6 +1757,8 @@ export class DatabaseService extends Service implements Database {
     this.inflightScans.clear()
     this.inflightVisible.clear()
     this.visibleCache.clear()
+    this.mysqlScopes.clear()
+    this.mysqlVisible.clear()
   }
 
   private notifyChange() {
@@ -1499,6 +1796,7 @@ export class DatabaseService extends Service implements Database {
   }
 
   async stat(path: string) {
+    await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length === 0) {
       return {
@@ -1516,7 +1814,7 @@ export class DatabaseService extends Service implements Database {
     if (parts.length === 2) {
       const record = await spec.get(parts[1]!)
       if (!record) throw new Error(`unknown record: ${spec.path}/${parts[1]}`)
-      this.assertLiveRecord(spec, record.id, 'resource:read', record)
+      await this.assertLiveRecord(spec, record.id, 'resource:read', record)
       return {
         kind: 'record' as const,
         path: `${spec.path}/${record.id}`,
@@ -1532,6 +1830,7 @@ export class DatabaseService extends Service implements Database {
 
   /** 当前账号能读到的记录，带上正文，给本机和集中部署对拷。 */
   async syncedRecords(options?: { since?: number }) {
+    await this.prepareMetadata()
     const since = Math.max(0, Number(options?.since) || 0)
     const out: Array<{ path: string; records: DbRecord[]; recordIds?: string[] }> = []
     for (const spec of this.collections.values()) {
@@ -1559,8 +1858,104 @@ export class DatabaseService extends Service implements Database {
     return out
   }
 
+  /** Narrow Context-service API used by private backups; keeps host-account decoupled. */
+  async exportSnapshotAssets(records: unknown[]) {
+    const names = [...collectAssetNames(...records)].sort()
+    const exported = []
+    for (const name of names) {
+      const asset = await this.assets.readAny(name)
+      exported.push({
+        name,
+        etag: asset.etag,
+        mime: asset.type,
+        storage: asset.storage,
+        size: asset.bytes.length,
+        contentHash: createHash('sha256').update(asset.bytes).digest('hex'),
+        bytesBase64: asset.bytes.toString('base64'),
+      })
+    }
+    return exported
+  }
+
+  async preflightSnapshotAssets(
+    incoming: Array<{
+      name: string
+      etag: string
+      storage: 'hash' | 'name'
+      contentHash: string
+    }>,
+  ) {
+    const conflicts: Array<{ collection: '/assets'; id: string; reason: string }> = []
+    for (const asset of incoming) {
+      if (!isAssetFileName(asset.name)) {
+        conflicts.push({ collection: '/assets', id: asset.name, reason: 'invalid-name' })
+        continue
+      }
+      try {
+        const existing =
+          asset.storage === 'hash'
+            ? await this.assets.read(asset.name)
+            : await this.assets.readDoc(asset.name)
+        const existingHash = createHash('sha256').update(existing.bytes).digest('hex')
+        const same =
+          existing.storage === asset.storage &&
+          existingHash === asset.contentHash &&
+          (asset.storage === 'hash' || existing.etag === asset.etag)
+        if (!same) conflicts.push({ collection: '/assets', id: asset.name, reason: 'content-conflict' })
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+          conflicts.push({ collection: '/assets', id: asset.name, reason: 'read-failed' })
+        }
+      }
+    }
+    return conflicts
+  }
+
+  async restoreSnapshotAssets(
+    incoming: Array<{
+      name: string
+      etag: string
+      mime: string
+      storage: 'hash' | 'name'
+      bytes: Uint8Array
+    }>,
+  ) {
+    await this.prepareMetadata()
+    for (const asset of incoming) {
+      let existing:
+        | { bytes: Buffer; type: string; etag: string; storage: 'hash' | 'name' }
+        | undefined
+      try {
+        existing =
+          asset.storage === 'hash'
+            ? await this.assets.read(asset.name)
+            : await this.assets.readDoc(asset.name)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+      }
+      if (!existing) {
+        if (asset.storage === 'hash') {
+          const written = await this.assets.write(asset.name, asset.bytes)
+          if (written.name !== asset.name) throw new Error(`asset hash mismatch: ${asset.name}`)
+        } else {
+          await this.assets.writeDoc(asset.name, asset.bytes)
+        }
+      }
+      this.facets.putAttachment({
+        name: asset.name,
+        etag: asset.etag,
+        mime: asset.mime,
+        bytes: asset.bytes.length,
+        kind: 'asset',
+        storage: asset.storage,
+      })
+    }
+    await this.finishMetadata(undefined)
+  }
+
   /** 按 id 写入。对方更新时间不比本地新就跳过。 */
   async applySynced(path: string, records: DbRecord[]) {
+    await this.prepareMetadata()
     const spec = this.collection(path)
     if (!spec?.get || !spec.create || !spec.update) return
     for (const record of records) {
@@ -1577,9 +1972,11 @@ export class DatabaseService extends Service implements Database {
         console.warn('[replica] skip', path, id, error)
       }
     }
+    await this.finishMetadata(undefined)
   }
 
   async list(path: string, filter?: Record<string, unknown>, page?: ListPage) {
+    await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length === 0) {
       return {
@@ -1666,6 +2063,7 @@ export class DatabaseService extends Service implements Database {
   }
 
   async collectFacet(id: string) {
+    await this.prepareMetadata()
     const found = this.facets.collect(id)
     const labels = new Map(this.collectionsList().map((spec) => [spec.path, spec.label ?? spec.id]))
     return {
@@ -1695,6 +2093,13 @@ export class DatabaseService extends Service implements Database {
   }
 
   private shareScopeLabel(collection: string, id: string, record: DbRecord, stored: 'personal' | 'workspace' | 'shared') {
+    const target = this.scopeTarget(collection, id, record)
+    const mysqlScope = this.mysqlScopeOf(target.collection, target.id)
+    if (mysqlScope === 'personal' || mysqlScope === 'workspace' || mysqlScope === 'shared') {
+      if (this.hasPublicShare(collection, id) || mysqlScope === 'shared') return '共享'
+      if (mysqlScope === 'workspace') return '空间'
+      return '私人'
+    }
     if (this.hasPublicShare(collection, id) || stored === 'shared') return '共享'
     const scope = this.effectiveScope(collection, record, stored)
     if (scope === 'workspace') return '空间'
@@ -1799,9 +2204,14 @@ export class DatabaseService extends Service implements Database {
     return next
   }
 
-  private refreshContentRefs(spec: CollectionSpec, record: DbRecord) {
+  private async refreshContentRefs(spec: CollectionSpec, record: DbRecord) {
     const banner = this.facets.recordBanner(spec.path, record.id)
-    const body = readEditorContent(this.facets.ensure(), spec.path, record.id)
+    const field = contentKey(spec)
+    const body = typeof record[field] === 'string'
+      ? String(record[field])
+      : isEditorContentSpec(spec)
+        ? (await this.readContentRecord(spec.path, record.id)).body
+        : readEditorContent(this.facets.ensure(), spec.path, record.id)
     this.facets.replaceContentRefs(
       spec.path,
       record.id,
@@ -1852,8 +2262,12 @@ export class DatabaseService extends Service implements Database {
 
   /** 侧栏「添加聊天」走 sessions.create，不经过表格的 create，这里补创建人和本地归属。 */
   async touchActor(collection: string, recordId: string) {
+    await this.prepareMetadata()
     await this.stampActor(collection, recordId)
-    if (isOnlineRuntime()) return
+    if (isOnlineRuntime()) {
+      await this.finishMetadata(undefined)
+      return
+    }
     try {
       const account = this.ctx.get('account') as {
         markLocal?: (collection: string, id: string) => void
@@ -1867,6 +2281,7 @@ export class DatabaseService extends Service implements Database {
     } catch {
       /* 没有账号服务时只记录创建人 */
     }
+    await this.finishMetadata(undefined)
   }
 
   private async stampActor(collection: string, recordId: string) {
@@ -1986,6 +2401,7 @@ export class DatabaseService extends Service implements Database {
   }
 
   async read(path: string) {
+    await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length === 0) return this.stat('/')
     if (parts.length === 1) return this.list(`/${parts[0]}`)
@@ -1994,11 +2410,12 @@ export class DatabaseService extends Service implements Database {
     if (!spec) throw new Error(`unknown collection: /${parts[0]}`)
     const record = await spec.get(parts[1]!)
     if (!record) throw new Error(`unknown record: ${spec.path}/${parts[1]}`)
-    this.assertLiveRecord(spec, record.id, 'resource:read', record)
+    await this.assertLiveRecord(spec, record.id, 'resource:read', record)
     return { kind: 'record' as const, path: `${spec.path}/${record.id}`, schema: this.schemaForCurrent(spec), value: withoutContent(spec, this.withBanner(spec, this.decorateRecord(spec, record))) }
   }
 
   async update(path: string, content: unknown) {
+    await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length !== 2) throw new Error(`cannot update: ${normalizeCollectionPath(path)}`)
     const spec = this.collection(`/${parts[0]}`)
@@ -2007,7 +2424,7 @@ export class DatabaseService extends Service implements Database {
     const raw = parseContent(content)
     const current = await spec.get(parts[1]!)
     if (!current) throw new Error(`unknown record: ${spec.path}/${parts[1]}`)
-    this.assertLiveRecord(spec, current.id, 'resource:update', current)
+    await this.assertLiveRecord(spec, current.id, 'resource:update', current)
     const bannerPatch = takeBannerPatch(raw)
     if ('facet' in raw && schema.fields.facet) {
       if (!schema.fields.facet.writable || schema.fields.facet.computed) throw new Error(`field not writable: facet`)
@@ -2047,7 +2464,7 @@ export class DatabaseService extends Service implements Database {
         this.facets.writeRecordBanner(spec.path, current.id, bannerPatch.value)
         next = this.withBanner(spec, next)
       }
-      this.refreshContentRefs(spec, next)
+      await this.refreshContentRefs(spec, next)
       await this.stampActor(spec.path, current.id)
       this.bump()
       const beforeRow = this.decorateRecord(spec, current)
@@ -2061,11 +2478,11 @@ export class DatabaseService extends Service implements Database {
       if (Object.keys(beforeSnap).length) {
         await this.ctx.get('contentTurns')?.recordUpdate(`${spec.path}/${current.id}`, title, beforeSnap, afterSnap)
       }
-      return {
+      return this.finishMetadata({
         kind: 'record' as const,
         path: `${spec.path}/${current.id}`,
         value: withoutContent(spec, this.withBanner(spec, next)),
-      }
+      })
     }
     const patch = pickWritablePatch(schema, raw)
     await assertSameTableLinks(spec, patch, parts[1])
@@ -2102,7 +2519,7 @@ export class DatabaseService extends Service implements Database {
       this.facets.writeRecordBanner(spec.path, record.id, bannerPatch.value)
     }
     this.indexFacetRecord(spec, this.decorateRecord(spec, record))
-    this.refreshContentRefs(spec, this.withBanner(spec, record))
+    await this.refreshContentRefs(spec, this.withBanner(spec, record))
     this.bump()
     const beforeSnap: Record<string, unknown> = {}
     const afterSnap: Record<string, unknown> = {}
@@ -2114,10 +2531,11 @@ export class DatabaseService extends Service implements Database {
     if (Object.keys(patch).length) {
       await this.ctx.get('contentTurns')?.recordUpdate(`${spec.path}/${record.id}`, title, beforeSnap, afterSnap)
     }
-    return { kind: 'record' as const, path: `${spec.path}/${record.id}`, value: withoutContent(spec, this.withBanner(spec, this.decorateRecord(spec, record))) }
+    return this.finishMetadata({ kind: 'record' as const, path: `${spec.path}/${record.id}`, value: withoutContent(spec, this.withBanner(spec, this.decorateRecord(spec, record))) })
   }
 
   async create(path: string, content?: unknown, options: { scope?: 'personal' | 'workspace' | 'shared' | 'local' } = {}) {
+    await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length !== 1) throw new Error(`cannot create: ${normalizeCollectionPath(path)}`)
     const spec = this.collection(`/${parts[0]}`)
@@ -2163,21 +2581,21 @@ export class DatabaseService extends Service implements Database {
         this.persistRecordFacet(spec, record.id, input.facet ?? record.facet, record)
       }
       this.indexFacetRecord(spec, this.decorateRecord(spec, record))
-      this.refreshContentRefs(spec, this.withBanner(spec, record))
+      await this.refreshContentRefs(spec, this.withBanner(spec, record))
       const parentField = spec.schema.parentField
       const parentRecordId = parentField ? String(record[parentField] ?? '').trim() : ''
       if (spec.path !== '/workspace-members') {
         const workspaceOwned = options.scope === 'workspace'
         const shared = options.scope === 'shared' && !parentRecordId
         const local = options.scope === 'local' && !parentRecordId
-        this.attachWorkspaceRecord(spec.path, record.id, {
+        await this.attachWorkspaceRecord(spec.path, record.id, {
           ownership: parentRecordId || workspaceOwned ? 'workspace' : shared ? 'shared' : 'personal',
           accessMode: parentRecordId ? 'inherit' : workspaceOwned || shared ? 'members' : 'private',
           ...(workspaceOwned ? { memberDefaultRole: 'editor' as const } : {}),
           ...(shared ? { memberDefaultRole: 'viewer' as const } : {}),
           ...(parentRecordId ? { parentCollection: spec.path, parentRecordId } : {}),
         })
-        if (shared) this.markPublicView(spec.path, record.id)
+        if (shared) await this.markPublicView(spec.path, record.id)
         if (workspaceOwned && !parentRecordId) this.grantAllMembersEditable(spec.path, record.id)
         if (local || this.deviceWorkspace()) this.markDeviceRecord(spec.path, record.id)
       }
@@ -2192,14 +2610,15 @@ export class DatabaseService extends Service implements Database {
       const title = String(item.value.title ?? item.value.name ?? '').trim() || item.path
       await this.ctx.get('contentTurns')?.recordCreate(item.path, title, item.value)
     }
-    return {
+    return this.finishMetadata({
       kind: 'created' as const,
       path: spec.path,
       items,
-    }
+    })
   }
 
   async remove(path: string, query: CollectionListQuery = {}) {
+    await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length !== 1) throw new Error(`cannot delete: ${normalizeCollectionPath(path)}`)
     const spec = this.collection(`/${parts[0]}`)
@@ -2218,11 +2637,9 @@ export class DatabaseService extends Service implements Database {
     }
     const matchedTrash = await this.matchCollectionRows(spec, { ...listQuery, trash: true }, filter, q)
     const matchedLive = await this.matchCollectionRows(spec, { ...listQuery, trash: false }, filter, q)
-    const matched = this.visibleRecords(
-      spec.path,
-      query.purge ? (matchedTrash.length ? matchedTrash : matchedLive) : matchedLive,
-      'resource:delete',
-    )
+    const candidates = query.purge ? (matchedTrash.length ? matchedTrash : matchedLive) : matchedLive
+    await this.loadMysqlScopes(spec.path, candidates)
+    const matched = this.visibleRecords(spec.path, candidates, 'resource:delete')
     const ids = [...new Set(matched.map((row) => row.id))]
     if (!ids.length) return { kind: 'deleted' as const, path: spec.path, ids }
     const hard = Boolean(query.purge) || HARD_DELETE_PATHS.has(spec.path)
@@ -2246,7 +2663,7 @@ export class DatabaseService extends Service implements Database {
         }
       }
       this.bump()
-      return { kind: 'deleted' as const, path: spec.path, ids, trash: true }
+      return this.finishMetadata({ kind: 'deleted' as const, path: spec.path, ids, trash: true })
     }
     await spec.remove({ ids })
     for (const id of ids) {
@@ -2262,32 +2679,32 @@ export class DatabaseService extends Service implements Database {
     }
     this.bump()
     this.recycleAssets?.()
-    return { kind: 'deleted' as const, path: spec.path, ids }
+    return this.finishMetadata({ kind: 'deleted' as const, path: spec.path, ids })
   }
 
   async restore(path: string, query: CollectionListQuery = {}) {
+    await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length !== 1) throw new Error(`cannot restore: ${normalizeCollectionPath(path)}`)
     const spec = this.collection(`/${parts[0]}`)
     if (!spec) throw new Error(`unknown collection: /${parts[0]}`)
     if (!hasCollectionDeleteQuery(query)) throw new Error('restore requires ids, q, or filter')
-    const matched = this.visibleRecords(
-      spec.path,
-      await this.matchCollectionRows(
-        spec,
-        { q: query.q ?? '', filter: query.filter, ids: query.ids, trash: true },
-        query.filter,
-        query.q ?? '',
-      ),
-      'resource:restore',
+    const trashed = await this.matchCollectionRows(
+      spec,
+      { q: query.q ?? '', filter: query.filter, ids: query.ids, trash: true },
+      query.filter,
+      query.q ?? '',
     )
+    await this.loadMysqlScopes(spec.path, trashed)
+    const matched = this.visibleRecords(spec.path, trashed, 'resource:restore')
     const ids = [...new Set(matched.map((row) => row.id))]
     for (const id of ids) this.facets.restoreDeleted(spec.path, id)
     this.bump()
-    return { kind: 'restored' as const, path: spec.path, ids }
+    return this.finishMetadata({ kind: 'restored' as const, path: spec.path, ids })
   }
 
   async listTrash() {
+    await this.prepareMetadata()
     const items = []
     for (const row of this.facets.listDeleted()) {
       const spec = this.collection(row.collection)
@@ -2325,6 +2742,7 @@ export class DatabaseService extends Service implements Database {
   }
 
   async action(path: string, actionId: string, args?: Record<string, unknown>) {
+    await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length !== 2) throw new Error(`cannot action: ${normalizeCollectionPath(path)}`)
     const spec = this.collection(`/${parts[0]}`)
@@ -2340,18 +2758,18 @@ export class DatabaseService extends Service implements Database {
       await this.requirePath(spec.path, 'resource:read')
       if (loaded) {
         const owner = this.recordOwner(spec.path, record.id)
-        if (!owner) this.attachWorkspaceRecord(spec.path, record.id, { ownership: 'personal', accessMode: 'private' })
-        else this.assertLiveRecord(spec, record.id, 'resource:read', record)
+        if (!owner) await this.attachWorkspaceRecord(spec.path, record.id, { ownership: 'personal', accessMode: 'private' })
+        else await this.assertLiveRecord(spec, record.id, 'resource:read', record)
       }
     } else if (!personalLoad && (loaded || !action.allowMissing)) {
-      this.assertLiveRecord(spec, record.id, (action.requiredAction ?? 'resource:update') as PermissionAction, record)
+      await this.assertLiveRecord(spec, record.id, (action.requiredAction ?? 'resource:update') as PermissionAction, record)
     } else {
       await this.requirePath(spec.path, (action.requiredAction ?? 'resource:update') as PermissionAction)
     }
     if (!matchActionWhen(record, action.when)) throw new Error(`action not available: ${actionId}`)
     const result = await action.run(parts[1]!, record, args)
     if (spec.path === '/plugins' && actionId === 'sandbox' && !this.recordOwner(spec.path, parts[1]!)) {
-      this.attachWorkspaceRecord(spec.path, parts[1]!, { ownership: 'personal', accessMode: 'private' })
+      await this.attachWorkspaceRecord(spec.path, parts[1]!, { ownership: 'personal', accessMode: 'private' })
     }
     if (spec.path === '/plugins' && (actionId === 'sandbox' || actionId === 'pack')) {
       await this.stampActor(spec.path, parts[1]!)
@@ -2359,15 +2777,16 @@ export class DatabaseService extends Service implements Database {
     const next = (await spec.get(parts[1]!)) ?? record
     this.indexFacetRecord(spec, next)
     this.bump()
-    return {
+    return this.finishMetadata({
       kind: 'record' as const,
       path: `${spec.path}/${next.id}`,
       value: withoutContent(spec, next),
       ...(result !== undefined ? { result } : {}),
-    }
+    })
   }
 
   async content(path: string) {
+    await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length !== 2) throw new Error(`cannot content: ${normalizeCollectionPath(path)}`)
     const spec = this.collection(`/${parts[0]}`)
@@ -2376,10 +2795,10 @@ export class DatabaseService extends Service implements Database {
     const field = schema.contentField ?? 'content'
     const record = await spec.get(parts[1]!)
     if (!record) throw new Error(`unknown record: ${spec.path}/${parts[1]}`)
-    this.assertLiveRecord(spec, record.id, 'resource:read', record)
+    await this.assertLiveRecord(spec, record.id, 'resource:read', record)
     if (!schema.fields[field]) throw new Error(`no content field: ${field}`)
     const editorContent = isEditorContentSpec(spec)
-      ? readEditorContentRecord(this.facets.ensure(), spec.path, record.id)
+      ? await this.readContentRecord(spec.path, record.id)
       : null
     const value = editorContent ? editorContent.body : (record[field] ?? null)
     return {
@@ -2397,6 +2816,7 @@ export class DatabaseService extends Service implements Database {
   }
 
   private async writeContentNow(path: string, value: unknown, expectedVersion?: number) {
+    await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length !== 2) throw new Error(`cannot write content: ${normalizeCollectionPath(path)}`)
     const spec = this.collection(`/${parts[0]}`)
@@ -2406,28 +2826,28 @@ export class DatabaseService extends Service implements Database {
     const field = schema.contentField ?? 'content'
     const existing = await spec.get(parts[1]!)
     if (!existing) throw new Error(`unknown record: ${spec.path}/${parts[1]}`)
-    this.assertLiveRecord(spec, existing.id, 'resource:update', existing)
+    await this.assertLiveRecord(spec, existing.id, 'resource:update', existing)
     if (!schema.fields[field]) throw new Error(`no content field: ${field}`)
     if (isEditorContentSpec(spec)) {
-      writeEditorContent(this.facets.ensure(), spec.path, parts[1]!, String(value ?? ''), { expectedVersion })
+      await this.writeContentRecord(spec.path, parts[1]!, String(value ?? ''), expectedVersion)
     }
     const patch = this.collectionCanUpdate(spec)
       ? pickWritablePatch(schema, { [field]: value })
       : { [field]: value }
     const record = await spec.update(parts[1]!, patch)
     await this.stampActor(spec.path, record.id)
-    this.refreshContentRefs(spec, this.withBanner(spec, record))
+    await this.refreshContentRefs(spec, this.withBanner(spec, record))
     this.bump()
     const editorContent = isEditorContentSpec(spec)
-      ? readEditorContentRecord(this.facets.ensure(), spec.path, record.id)
+      ? await this.readContentRecord(spec.path, record.id)
       : null
-    return {
+    return this.finishMetadata({
       kind: 'content' as const,
       path: `${spec.path}/${record.id}`,
       field,
       value: editorContent ? editorContent.body : (record[field] ?? null),
       ...(editorContent ? { version: editorContent.version } : {}),
-    }
+    })
   }
 
   async contentTitle(path: string) {
@@ -2492,6 +2912,7 @@ export class DatabaseService extends Service implements Database {
   }
 
   async editAsset(path: string, args: Record<string, unknown> = {}) {
+    await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length !== 2) throw new Error(`cannot asset: ${normalizeCollectionPath(path)}`)
     const spec = this.collection(`/${parts[0]}`)
@@ -2500,7 +2921,7 @@ export class DatabaseService extends Service implements Database {
     if (!record) throw new Error(`unknown record: ${spec.path}/${parts[1]}`)
     const from = String(args.from ?? '').trim()
     const command = String(args.command ?? (args.value != null || from ? 'write' : 'view'))
-    this.assertLiveRecord(spec, record.id, command === 'view' ? 'resource:read' : 'resource:update', record)
+    await this.assertLiveRecord(spec, record.id, command === 'view' ? 'resource:read' : 'resource:update', record)
     const names = new Set([
       ...collectAssetNames(record, this.facets.recordBanner(spec.path, record.id)?.html),
       ...this.facets.listedAttachmentNames(spec.path, record.id),
@@ -2514,7 +2935,7 @@ export class DatabaseService extends Service implements Database {
       const assets = []
       for (const name of [...names].sort()) {
         try {
-          const read = await this.assets.readAny(name)
+          const read = await readAssetWithCloudFallback(this.ctx, this.assets, name)
           assets.push({ name, etag: read.etag, type: read.type })
         } catch {
           assets.push({ name, missing: true })
@@ -2526,7 +2947,7 @@ export class DatabaseService extends Service implements Database {
     if (command === 'view') {
       if (!names.has(file)) throw new Error(`asset not referenced: ${file}`)
       try {
-        const read = await this.assets.readAny(file)
+        const read = await readAssetWithCloudFallback(this.ctx, this.assets, file)
         const text =
           read.type.startsWith('text/') || read.type.includes('json') ? read.bytes.toString('utf8') : undefined
         return {
@@ -2552,7 +2973,7 @@ export class DatabaseService extends Service implements Database {
     if (command !== 'write') throw new Error(`unknown asset command: ${command}`)
     const body = from ? await readLocalWriteFile(from) : String(args.value ?? '')
     if (!from && args.value == null) throw new Error('write needs value or from')
-    const written = await this.assets.write(file, body)
+    const written = await writeHashedAssetWithCloud(this.ctx, this.assets, file, body, recPath)
     const kind = String(args.kind ?? '') === 'core' ? 'core' : 'asset'
     const blockId = String(args.block_id ?? args.blockId ?? '').trim()
     const source = String(args.source ?? (blockId ? `block:${blockId}` : 'asset')).trim() || 'asset'
@@ -2577,10 +2998,11 @@ export class DatabaseService extends Service implements Database {
       this.facets.upsertBlockRef(spec.path, record.id, blockId, written.name, source)
     }
     this.broadcastAsset(recPath, written.name, written.etag)
-    return { kind: 'asset' as const, ok: true as const, path: recPath, name: written.name, etag: written.etag, storage: 'hash' as const }
+    return this.finishMetadata({ kind: 'asset' as const, ok: true as const, path: recPath, name: written.name, etag: written.etag, storage: 'hash' as const })
   }
 
   async editDoc(path: string, args: Record<string, unknown> = {}) {
+    await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length !== 2) throw new Error(`cannot doc: ${normalizeCollectionPath(path)}`)
     const spec = this.collection(`/${parts[0]}`)
@@ -2589,7 +3011,7 @@ export class DatabaseService extends Service implements Database {
     if (!record) throw new Error(`unknown record: ${spec.path}/${parts[1]}`)
     const from = String(args.from ?? '').trim()
     const command = String(args.command ?? (args.value != null || from ? 'write' : 'view'))
-    this.assertLiveRecord(spec, record.id, command === 'view' ? 'resource:read' : 'resource:update', record)
+    await this.assertLiveRecord(spec, record.id, command === 'view' ? 'resource:read' : 'resource:update', record)
     const names = new Set([
       ...collectAssetNames(record, this.facets.recordBanner(spec.path, record.id)?.html),
       ...this.facets.listedAttachmentNames(spec.path, record.id),
@@ -2603,7 +3025,7 @@ export class DatabaseService extends Service implements Database {
       const assets = []
       for (const name of [...names].sort()) {
         try {
-          const read = await this.assets.readAny(name)
+          const read = await readAssetWithCloudFallback(this.ctx, this.assets, name)
           assets.push({ name, etag: read.etag, type: read.type, storage: read.storage })
         } catch {
           assets.push({ name, missing: true })
@@ -2655,7 +3077,7 @@ export class DatabaseService extends Service implements Database {
     })
     if (blockId) this.facets.upsertBlockRef(spec.path, record.id, blockId, written.name, source)
     this.broadcastAsset(recPath, written.name, written.etag)
-    return { kind: 'doc' as const, ok: true as const, path: recPath, name: written.name, etag: written.etag, storage: 'name' as const }
+    return this.finishMetadata({ kind: 'doc' as const, ok: true as const, path: recPath, name: written.name, etag: written.etag, storage: 'name' as const })
   }
 
   private broadcastAsset(path: string, name: string, etag: string) {
@@ -2671,6 +3093,72 @@ async function readLocalWriteFile(raw: string) {
   } catch {
     throw new Error(`cannot read from: ${raw}`)
   }
+}
+
+class CloudAssetError extends Error {
+  constructor(
+    readonly status: number,
+    readonly body: unknown,
+  ) {
+    super(
+      typeof body === 'object' && body && 'error' in body
+        ? String((body as { error?: unknown }).error)
+        : `cloud asset request failed: ${status}`,
+    )
+  }
+}
+
+function cloudBodyJson(bytes: Buffer): unknown {
+  try {
+    return JSON.parse(bytes.toString('utf8')) as unknown
+  } catch {
+    return { error: bytes.toString('utf8') || 'cloud asset request failed' }
+  }
+}
+
+async function readAssetWithCloudFallback(ctx: Context, assets: FileSystemAssets, name: string) {
+  try {
+    return await assets.readAny(name)
+  } catch (localError) {
+    const forwarded = await forwardCloudBytes(ctx, `/api/db/file/${encodeURIComponent(name)}`)
+    if (!forwarded || forwarded.status >= 300) throw localError
+    if (isHashedAssetName(name)) {
+      const cached = await assets.write(name, forwarded.body)
+      if (cached.name !== name) throw new Error('cloud asset hash mismatch')
+    } else {
+      await assets.writeDoc(name, forwarded.body)
+    }
+    return assets.readAny(name)
+  }
+}
+
+async function writeHashedAssetWithCloud(
+  ctx: Context,
+  assets: FileSystemAssets,
+  name: string,
+  bytes: string | Buffer | Uint8Array,
+  resourcePath: string,
+) {
+  const raw = typeof bytes === 'string' ? Buffer.from(bytes) : Buffer.from(bytes)
+  const forwarded = await forwardCloudBytes(ctx, `/api/db/file/hash/${encodeURIComponent(name)}`, {
+    method: 'PUT',
+    body: raw,
+    headers: {
+      'content-type': mimeOfAsset(name),
+      'x-biu-resource-path': resourcePath,
+    },
+  })
+  if (forwarded && forwarded.status >= 300) {
+    throw new CloudAssetError(forwarded.status, cloudBodyJson(forwarded.body))
+  }
+  const written = await assets.write(name, raw)
+  if (forwarded) {
+    const remote = cloudBodyJson(forwarded.body) as { name?: unknown }
+    if (typeof remote.name === 'string' && remote.name !== written.name) {
+      throw new Error('cloud asset hash mismatch')
+    }
+  }
+  return written
 }
 
 /**
@@ -2866,12 +3354,47 @@ export function databaseHttpFailure(error: unknown) {
 
 export function apply(ctx: Context) {
   const db = new DatabaseService(ctx)
-  db.facets.open(biuSqlitePath())
+  let cloudMetadata: {
+    metadataMode?: 'sqlite' | 'mysql' | 'shadow'
+    editorContentMode?: 'sqlite' | 'mysql' | 'shadow'
+    fileSystemMetadataRepository?: import('@biu/host-plugin-loader/metadata-runtime').MetadataRepository | null
+    editorContentRepository?: {
+      list(collection: string): Promise<Array<{ record_id: string; body: string; updated_at: number; version: number }>>
+      write(collection: string, recordId: string, body: string): Promise<unknown>
+      delete(collection: string, recordId: string): Promise<unknown>
+    } | null
+  } | undefined
+  try {
+    cloudMetadata = ctx.get('cloudStorage') as typeof cloudMetadata
+  } catch {
+    cloudMetadata = undefined
+  }
+  const metadataMode = cloudMetadata?.metadataMode ?? 'sqlite'
+  const metadataPath = metadataMode === 'mysql' || process.env.VITEST ? ':memory:' : biuSqlitePath()
+  const metadataRepository = cloudMetadata?.fileSystemMetadataRepository ?? null
+  const shadowWarning = (error: unknown) => ctx.logger('database').warn(`MySQL metadata shadow write failed: ${String(error)}`)
+  db.facets.open(metadataPath)
+  db.facets.configureRuntime(
+    metadataMode,
+    metadataRepository,
+    metadataMode === 'mysql' || cloudMetadata?.editorContentMode !== 'sqlite'
+      ? cloudMetadata?.editorContentRepository ?? null
+      : null,
+    shadowWarning,
+  )
   const assets = db.assets
   const savedViews = new SavedViewsStore()
-  savedViews.open(process.env.VITEST ? ':memory:' : biuSqlitePath())
+  savedViews.open(metadataPath)
+  savedViews.configureRuntime(metadataMode, metadataRepository, shadowWarning)
   const account = ctx.get('account') as {
     authorization?: AuthorizationService
+    usesMysqlAccounts?: () => boolean
+    mysql?: {
+      externallySharedRecords?: (
+        accountId: string,
+        workspaceId: string,
+      ) => Promise<Array<{ collection: string; record_id: string }>>
+    } | null
     workspaceLocation?: (workspaceId: string) => 'device' | 'cloud'
     store?: {
       activeWorkspaceId?: () => string | null
@@ -2931,7 +3454,8 @@ export function apply(ctx: Context) {
     )
   })
   const shares = db.shares
-  shares.open(process.env.VITEST ? ':memory:' : biuSqlitePath())
+  shares.open(metadataPath)
+  shares.configureRuntime(metadataMode, metadataRepository, shadowWarning)
   const facets = db.facets
   db.register(viewsCollection(savedViews, () => db.collectionsList().map((item) => db.publishCollection(item)), () => currentAccountId()))
   db.register(facetsCollection(facets, () => db.collectionsList().map((item) => ({
@@ -2956,13 +3480,13 @@ export function apply(ctx: Context) {
   }
   db.register(trashCollection(db, gcHooks))
   db.recycleAssets = () => {
-    if (process.env.VITEST) return
+    if (process.env.VITEST || metadataMode === 'mysql') return
     void runWorkspaceAssetGc(gcHooks())
   }
   ctx.effect(() => {
-    if (!process.env.VITEST) void runWorkspaceAssetGc(gcHooks())
+    if (!process.env.VITEST && metadataMode !== 'mysql') void runWorkspaceAssetGc(gcHooks())
     const tick = setInterval(() => {
-      if (process.env.VITEST) return
+      if (process.env.VITEST || metadataMode === 'mysql') return
       void runWorkspaceAssetGc(gcHooks())
     }, ASSET_GC_INTERVAL_MS)
     tick.unref()
@@ -3312,8 +3836,48 @@ export function apply(ctx: Context) {
       route.send(400, { error: String(error) })
     }
   })
-  ctx.http.route('GET', '/api/db/list', (route) =>
-    send(route, () => {
+  const forwardCloudRead = async (
+    route: { query: URLSearchParams; send: (status: number, body: unknown) => void },
+    apiPath: string,
+  ) => {
+    const search = route.query.toString()
+    try {
+      const forwarded = await forwardCloud(ctx, '', '', search ? `${apiPath}?${search}` : apiPath, { method: 'GET' })
+      if (!forwarded) return false
+      route.send(forwarded.status, forwarded.body)
+      return true
+    } catch {
+      return false
+    }
+  }
+  const cacheCloudRecords = async (collection: string, records: Array<{ id?: string }>) => {
+    const account = ctx.get('account') as {
+      markRemote?: (collection: string, id: string) => void
+      store?: { recordWorkspace?: (collection: string, recordId: string) => string | null }
+    }
+    const requested = currentRequestWorkspaceId()
+    const safe = records.filter((record) => {
+      const id = String(record?.id ?? '')
+      if (!id) return false
+      const owner = account.store?.recordWorkspace?.(collection, id) ?? ''
+      // 云端分配的页面号可能和本机旧页面相同。本机这条还属于别的空间时不能覆盖。
+      return !owner || !requested || owner === requested
+    })
+    if (safe.length) await db.applySynced(collection, safe as DbRecord[])
+    for (const record of safe) {
+      const id = String(record.id ?? '')
+      if (!id) continue
+      try {
+        account.markRemote?.(collection, id)
+      } catch {
+        /* 没有账号库时仍返回云端结果 */
+      }
+    }
+    return safe
+  }
+  ctx.http.route('GET', '/api/db/list', async (route) => {
+    if (await forwardCloudRead(route, '/api/db/list')) return
+    await send(route, () => {
       let filter: Record<string, unknown> | undefined
       const raw = route.query.get('filter')
       if (raw) {
@@ -3333,9 +3897,12 @@ export function apply(ctx: Context) {
         offset: route.query.get('offset') ? Number(route.query.get('offset')) : undefined,
         columns: parseListColumnsParam(route.query.get('columns')),
       })
-    }),
-  )
-  ctx.http.route('GET', '/api/db/read', (route) => send(route, () => db.read(route.query.get('path') || '/')))
+    })
+  })
+  ctx.http.route('GET', '/api/db/read', async (route) => {
+    if (await forwardCloudRead(route, '/api/db/read')) return
+    await send(route, () => db.read(route.query.get('path') || '/'))
+  })
   ctx.http.route('GET', '/api/db/banner-gallery', (route) =>
     send(route, async () => {
       await db.requirePath('/pages', 'resource:read')
@@ -3356,7 +3923,10 @@ export function apply(ctx: Context) {
       route.send(400, { error: String(error) })
     }
   })
-  ctx.http.route('GET', '/api/db/stat', (route) => send(route, () => db.stat(route.query.get('path') || '/')))
+  ctx.http.route('GET', '/api/db/stat', async (route) => {
+    if (await forwardCloudRead(route, '/api/db/stat')) return
+    await send(route, () => db.stat(route.query.get('path') || '/'))
+  })
   ctx.http.route('GET', '/api/db/content', async (route) => {
     const path = route.query.get('path') || '/'
     const parts = path.split('/').filter(Boolean)
@@ -3419,7 +3989,7 @@ export function apply(ctx: Context) {
         const forwarded = await forwardCloud(ctx, `/${parts[0]}`, parts[1]!, '/api/db/update', { body })
         if (forwarded) {
           const value = (forwarded.body as { value?: { id?: string } } | null)?.value
-          if (forwarded.status < 300 && value?.id) await db.applySynced(`/${parts[0]}`, [value as { id: string }])
+          if (forwarded.status < 300 && value?.id) await cacheCloudRecords(`/${parts[0]}`, [value])
           route.send(forwarded.status, forwarded.body)
           return
         }
@@ -3472,16 +4042,12 @@ export function apply(ctx: Context) {
         if (forwarded.status < 300) {
           const values = (payload.items ?? []).map((item) => item.value).filter((value): value is { id: string } => Boolean(value?.id))
           try {
-            await db.applySynced(collection, values as DbRecord[])
-            for (const value of values) {
-              try {
-                const account = ctx.get('account') as { markRemote?: (collection: string, id: string) => void }
-                account.markRemote?.(collection, value.id)
-              } catch {
-                /* 没有账号库时仍返回云端结果 */
-              }
-              if (scope === 'shared') db.markPublicView(collection, value.id)
-              else db.rememberScope(collection, value.id, scope === 'workspace' ? 'workspace' : 'personal')
+            const cached = await cacheCloudRecords(collection, values)
+            for (const value of cached) {
+              const id = String(value.id ?? '')
+              if (!id) continue
+              if (scope === 'shared') await db.markPublicView(collection, id)
+              else await db.rememberScope(collection, id, scope === 'workspace' ? 'workspace' : 'personal')
             }
           } catch {
             /* 云端已创建，本地缓存稍后对齐 */
@@ -3555,6 +4121,7 @@ export function apply(ctx: Context) {
         dropSharesForRemovedViews(shares, path, savedViews.viewsFor(path), next)
         savedViews.replace(path, next)
       }
+      await Promise.all([savedViews.flush(), shares.flush()])
       ctx.emit('database/change')
       route.send(200, { ok: true })
     } catch (error) {
@@ -3588,6 +4155,7 @@ export function apply(ctx: Context) {
     }
   }
   ctx.http.route('GET', '/api/db/shares', async (route) => {
+    await shares.prepare()
     if (activeDataLocation() === 'cloud' && !isOnlineRuntime()) {
       const search = route.query.toString()
       const forwarded = await forwardCloud(
@@ -3626,12 +4194,14 @@ export function apply(ctx: Context) {
             title = String(got.value?.title ?? got.value?.name ?? share.recordId)
           } catch {
             shares.revoke(share.token)
+            await shares.flush()
             continue
           }
         } else {
           const named = savedViews.viewsFor(share.collection).find((item) => item.id === share.viewId)
           if (!named && share.viewId && !isReadOnlyViewId(share.viewId)) {
             shares.revoke(share.token)
+            await shares.flush()
             continue
           }
           let collectionLabel = share.collection.replace(/^\//, '')
@@ -3654,8 +4224,11 @@ export function apply(ctx: Context) {
       }
       const accountId = currentAccountId()
       const workspaceId = currentRequestWorkspaceId()
-      if (activeDataLocation() === 'cloud' && accountId && workspaceId && account?.store?.externallySharedRecords) {
-        for (const record of account.store.externallySharedRecords(accountId, workspaceId)) {
+      if (activeDataLocation() === 'cloud' && accountId && workspaceId) {
+        const externalRecords = account?.usesMysqlAccounts?.() && account.mysql?.externallySharedRecords
+          ? await account.mysql.externallySharedRecords(accountId, workspaceId)
+          : account?.store?.externallySharedRecords?.(accountId, workspaceId) ?? []
+        for (const record of externalRecords) {
           const key = `${record.collection}\t${record.record_id}`
           if (listedRecords.has(key)) continue
           try {
@@ -3724,6 +4297,7 @@ export function apply(ctx: Context) {
       if (body.enabled === false) {
         if (kind === 'record') shares.revokeRecord(collection, recordId)
         else shares.revokeTarget(kind, collection, body.viewId ?? '', body.recordId ?? '')
+        await shares.flush()
         route.send(200, { share: null })
         return
       }
@@ -3736,13 +4310,15 @@ export function apply(ctx: Context) {
         sharePlugins: body.sharePlugins,
         allowCopy: body.allowCopy,
       })
+      await shares.flush()
       route.send(200, { share: { ...share, url: publicShareUrl(route.req, share.token) } })
     } catch (error) {
       route.send(400, { error: String(error) })
     }
   })
-  ctx.http.route('GET', '/api/share/:token', async (route) => {
+  ctx.http.route('GET', '/api/share/:token', async (route) => shares.withTokenWorkspace(route.params.token ?? '', async () => {
     const token = route.params.token ?? ''
+    await shares.prepareToken(token)
     const share = shares.get(token)
     if (!share) {
       route.send(404, { error: 'not found' })
@@ -3759,14 +4335,16 @@ export function apply(ctx: Context) {
       const msg = String(error)
       if (share.kind === 'record' && /unknown record/.test(msg)) {
         shares.revoke(token)
+        await shares.flush()
         route.send(404, { error: 'not found' })
         return
       }
       route.send(400, { error: msg })
     }
-  })
-  ctx.http.route('POST', '/api/share/:token', async (route) => {
+  }))
+  ctx.http.route('POST', '/api/share/:token', async (route) => shares.withTokenWorkspace(route.params.token ?? '', async () => {
     const token = route.params.token ?? ''
+    await shares.prepareToken(token)
     const share = shares.get(token)
     if (!share) {
       route.send(404, { error: 'not found' })
@@ -3784,14 +4362,16 @@ export function apply(ctx: Context) {
       const msg = String(error)
       if (share.kind === 'record' && /unknown record/.test(msg)) {
         shares.revoke(token)
+        await shares.flush()
         route.send(404, { error: 'not found' })
         return
       }
       route.send(400, { error: msg })
     }
-  })
-  ctx.http.route('GET', '/api/share/:token/file/:name', async (route) => {
+  }))
+  ctx.http.route('GET', '/api/share/:token/file/:name', async (route) => shares.withTokenWorkspace(route.params.token ?? '', async () => {
     const token = route.params.token ?? ''
+    await shares.prepareToken(token)
     const share = shares.get(token)
     if (!share) {
       route.send(404, { error: 'not found' })
@@ -3818,9 +4398,10 @@ export function apply(ctx: Context) {
     } catch {
       route.send(404, { error: 'not found' })
     }
-  })
-  ctx.http.route('GET', '/api/share/:token/plugin/:id/web.js', async (route) => {
+  }))
+  ctx.http.route('GET', '/api/share/:token/plugin/:id/web.js', async (route) => shares.withTokenWorkspace(route.params.token ?? '', async () => {
     const token = route.params.token ?? ''
+    await shares.prepareToken(token)
     const share = shares.get(token)
     if (!share) {
       route.send(404, { error: 'not found' })
@@ -3851,9 +4432,10 @@ export function apply(ctx: Context) {
     } catch {
       route.send(404, { error: 'not found' })
     }
-  })
-  ctx.http.route('GET', '/api/share/:token/plugin/:id', async (route) => {
+  }))
+  ctx.http.route('GET', '/api/share/:token/plugin/:id', async (route) => shares.withTokenWorkspace(route.params.token ?? '', async () => {
     const token = route.params.token ?? ''
+    await shares.prepareToken(token)
     const share = shares.get(token)
     if (!share) {
       route.send(404, { error: 'not found' })
@@ -3888,7 +4470,7 @@ export function apply(ctx: Context) {
     } catch {
       route.send(404, { error: 'not found' })
     }
-  })
+  }))
   ctx.http.route('GET', '/api/db/facets', async (route) => {
     try {
       await db.requirePath('/facets', 'resource:read')
@@ -3908,6 +4490,7 @@ export function apply(ctx: Context) {
       await db.requirePath('/facets', 'resource:update')
       const body = (await route.json()) as { facets?: unknown[] }
       facets.replace(Array.isArray(body.facets) ? body.facets : [])
+      await facets.flush()
       ctx.emit('database/change')
       route.send(200, { ok: true, facets: facets.list() })
     } catch (error) {
@@ -3917,8 +4500,9 @@ export function apply(ctx: Context) {
   const serveDbFile: Parameters<typeof ctx.http.route>[2] = async (route) => {
     try {
       const name = route.params.name ?? ''
+      await db.prepareAssetAccess()
       db.requireAsset(name, 'resource:read')
-      const { bytes, type, etag } = await assets.readAny(name)
+      const { bytes, type, etag } = await readAssetWithCloudFallback(ctx, assets, name)
       route.res.writeHead(200, {
         'content-type': type,
         'cache-control': isHashedAssetName(name) ? 'public, max-age=31536000, immutable' : 'no-store',
@@ -3939,9 +4523,24 @@ export function apply(ctx: Context) {
       }
       await db.requirePath(path, 'resource:update')
       const bytes = await route.bytes()
-      const written = isHashedAssetName(name)
-        ? await assets.write(name, bytes)
-        : await assets.writeDoc(name, bytes, { etag: parseIfMatch(route.req.headers['if-match']) })
+      let written
+      if (isHashedAssetName(name)) {
+        written = await writeHashedAssetWithCloud(ctx, assets, name, bytes, path)
+      } else {
+        const forwarded = await forwardCloudBytes(ctx, `/api/db/file/${encodeURIComponent(name)}`, {
+          method: 'PUT',
+          body: bytes,
+          headers: {
+            'content-type': String(route.req.headers['content-type'] ?? mimeOfAsset(name)),
+            'x-biu-resource-path': path,
+            ...(route.req.headers['if-match'] ? { 'if-match': String(route.req.headers['if-match']) } : {}),
+          },
+        })
+        if (forwarded && forwarded.status >= 300) {
+          throw new CloudAssetError(forwarded.status, cloudBodyJson(forwarded.body))
+        }
+        written = await assets.writeDoc(name, bytes, { etag: parseIfMatch(route.req.headers['if-match']) })
+      }
       db.facets.putAttachment({
         name: written.name,
         etag: written.etag,
@@ -3953,6 +4552,10 @@ export function apply(ctx: Context) {
       ctx.http.broadcast?.(DATABASE_CHANNEL, { ts: Date.now(), asset: { name: written.name, etag: written.etag } })
       route.send(200, { ok: true, ...written })
     } catch (error) {
+      if (error instanceof CloudAssetError) {
+        route.send(error.status, error.body)
+        return
+      }
       if (error instanceof AssetConflictError) {
         route.send(409, { error: 'etag conflict', etag: error.etag })
         return
@@ -3970,7 +4573,7 @@ export function apply(ctx: Context) {
       }
       await db.requirePath(path, 'resource:update')
       const bytes = await route.bytes()
-      const written = await assets.write(name, bytes)
+      const written = await writeHashedAssetWithCloud(ctx, assets, name, bytes, path)
       db.facets.putAttachment({
         name: written.name,
         etag: written.etag,
@@ -3982,6 +4585,10 @@ export function apply(ctx: Context) {
       ctx.http.broadcast?.(DATABASE_CHANNEL, { ts: Date.now(), asset: { name: written.name, etag: written.etag } })
       route.send(200, { ok: true, ...written })
     } catch (error) {
+      if (error instanceof CloudAssetError) {
+        route.send(error.status, error.body)
+        return
+      }
       route.send(400, { error: String(error) })
     }
   }

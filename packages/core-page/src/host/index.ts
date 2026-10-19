@@ -72,6 +72,7 @@ function servePageFile(ctx: Context, store: PagesStore) {
     inner.http.route('GET', '/api/page/file/:name', async (route) => {
       try {
         const name = route.params.name ?? ''
+        await (inner.database as unknown as { prepareAssetAccess?: () => Promise<void> }).prepareAssetAccess?.()
         inner.database.requireAsset(name, 'resource:read')
         const { bytes, type, etag } = await store.readAsset(name)
         route.res.writeHead(200, {
@@ -89,7 +90,10 @@ function servePageFile(ctx: Context, store: PagesStore) {
         const name = route.params.name ?? ''
         const path = route.query.get('path') || String(route.req.headers['x-biu-resource-path'] ?? '')
         if (path) await inner.database.requirePath(path, 'resource:update')
-        else inner.database.requireAsset(name, 'resource:update')
+        else {
+          await (inner.database as unknown as { prepareAssetAccess?: () => Promise<void> }).prepareAssetAccess?.()
+          inner.database.requireAsset(name, 'resource:update')
+        }
         const ifMatch = String(route.req.headers['if-match'] ?? '').trim().replace(/^W\//, '').replaceAll('"', '')
         const written = await store.writeAsset(name, await route.bytes(), {
           etag: ifMatch && ifMatch !== '*' ? ifMatch : '',
@@ -110,7 +114,7 @@ function servePageFile(ctx: Context, store: PagesStore) {
 export const name = 'page'
 export const inject = ['database', 'fs']
 
-export function apply(ctx: Context) {
+export async function apply(ctx: Context) {
   // 页面落到工作区 `.biu`（与 file-system / sessions 同一数据目录的父目录）。
   // 用 defaultRoot，不随 Session 绑定项目路径漂移。
   const workspaceRoot = ctx.fs.workspace.resolve('.')
@@ -122,13 +126,53 @@ export function apply(ctx: Context) {
     write: (rel, content) => ctx.fs.writeIn(root, rel, content),
     list: (rel) => ctx.fs.listIn(root, rel ?? '.'),
   }
-  const store = new PagesStore(fs, assetsRootPath(root))
+  let cloud: {
+    pageMode?: 'sqlite' | 'mysql' | 'shadow'
+    editorContentMode?: 'sqlite' | 'mysql' | 'shadow'
+    ensureProductMigrations?: () => Promise<void>
+    pageRepository?: import('./store.ts').PageRepository | null
+    editorContentRepository?: import('./store.ts').PageContentRepository | null
+    metadataMode?: 'sqlite' | 'mysql' | 'shadow'
+    fileSystemMetadataRepository?: import('@biu/host-plugin-loader/metadata-runtime').MetadataRepository | null
+  } | undefined
+  try {
+    cloud = ctx.get('cloudStorage') as typeof cloud
+  } catch {
+    cloud = undefined
+  }
+  const mode = cloud?.pageMode ?? 'sqlite'
+  const metadataMode = cloud?.metadataMode ?? 'sqlite'
+  if (mode !== 'sqlite' || cloud?.editorContentMode !== 'sqlite' || metadataMode !== 'sqlite') {
+    await cloud?.ensureProductMigrations?.()
+  }
+  const store = new PagesStore(
+    fs,
+    assetsRootPath(root),
+    cloud?.pageRepository ?? undefined,
+    mode,
+    cloud?.editorContentRepository ?? undefined,
+    cloud?.editorContentMode ?? 'sqlite',
+    (error) => ctx.logger('page').warn(`MySQL page shadow write failed: ${String(error)}`),
+    cloud?.fileSystemMetadataRepository ?? null,
+    metadataMode,
+  )
   const index = new PageBlocksIndex(store)
+  index.configureRuntime(
+    metadataMode,
+    cloud?.fileSystemMetadataRepository ?? null,
+    cloud?.editorContentRepository && 'list' in cloud.editorContentRepository
+      ? cloud.editorContentRepository as never
+      : null,
+    (error) => ctx.logger('page').warn(`MySQL page-block shadow write failed: ${String(error)}`),
+    metadataMode === 'shadow' ? await store.sqlite() : undefined,
+  )
   ctx.database.register(pagesCollection(store, index))
   ctx.database.register(pageBlocksCollection(store, index))
   servePageFile(ctx, store)
   const tick = setInterval(() => {
-    void index.sync()
+    void index.sync().catch((error) => {
+      if (mode !== 'mysql') ctx.logger('page').warn(`page index sync failed: ${String(error)}`)
+    })
   }, PAGE_BLOCK_TICK_MS)
   tick.unref()
   ctx.effect(() => () => clearInterval(tick))

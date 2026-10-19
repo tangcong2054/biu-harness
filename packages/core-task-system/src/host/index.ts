@@ -1,11 +1,17 @@
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { biuSqlitePath, openAndMigrateBiu, readEditorContent, writeEditorContent } from '@biu/host-plugin-loader/data-dir'
+import {
+  biuSqlitePath,
+  currentRequestWorkspaceId,
+  openAndMigrateBiu,
+  readEditorContent,
+  writeEditorContent,
+} from '@biu/host-plugin-loader/data-dir'
 import { Service, type Context } from 'cordis'
 import { currentSessionId } from '@biu/host-sessions/scope'
 import { emptySchemaValue, normalizeSchemaValue, type SchemaFieldValue } from '@biu/type-file-system'
 import { startTaskClock } from './clock.ts'
-import { tasksCollection } from './collection.ts'
+import { tasksCollection, type TasksLike } from './collection.ts'
 
 type DatabaseSync = import('node:sqlite').DatabaseSync
 type SQLInputValue = import('node:sqlite').SQLInputValue
@@ -478,22 +484,22 @@ export function computeNextTriggerAt(row: { trigger?: TaskTrigger; status?: Task
   return null
 }
 
-function asStatus(value: unknown, fallback: TaskStatus = 'todo'): TaskStatus {
+export function asStatus(value: unknown, fallback: TaskStatus = 'todo'): TaskStatus {
   const raw = String(value ?? fallback)
   return STATUSES.has(raw as TaskStatus) ? (raw as TaskStatus) : fallback
 }
 
-function asPriority(value: unknown, fallback: TaskPriority = 'med'): TaskPriority {
+export function asPriority(value: unknown, fallback: TaskPriority = 'med'): TaskPriority {
   const raw = String(value ?? fallback)
   return PRIORITIES.has(raw as TaskPriority) ? (raw as TaskPriority) : fallback
 }
 
-function asDifficulty(value: unknown, fallback: TaskDifficulty = 'med'): TaskDifficulty {
+export function asDifficulty(value: unknown, fallback: TaskDifficulty = 'med'): TaskDifficulty {
   const raw = String(value ?? fallback)
   return DIFFICULTIES.has(raw as TaskDifficulty) ? (raw as TaskDifficulty) : fallback
 }
 
-function normalizeActor(value: unknown, fallbackName = '用户'): TaskActor | null {
+export function normalizeActor(value: unknown, fallbackName = '用户'): TaskActor | null {
   if (value == null) return null
   if (typeof value === 'string') {
     const name = value.trim()
@@ -731,7 +737,7 @@ const LIST_TASK_COLUMNS = `tasks.id, tasks.title, tasks.status, tasks.priority, 
          tasks.sort, tasks.created_at, tasks.updated_at, tasks.creator_json, tasks.assignee_json, tasks.assigned_at,
          tasks.project, tasks.tags_json, tasks.parent_id, tasks.depends_on, tasks.depth, tasks.emoji, tasks.reports_json`
 
-function mapRow(row: Record<string, unknown>, listed = false): TaskRow {
+export function mapRow(row: Record<string, unknown>, listed = false): TaskRow {
   let creator: TaskActor = { kind: 'user', name: '用户' }
   if (typeof row.creator_json === 'string' && row.creator_json) {
     try {
@@ -1395,25 +1401,100 @@ export const name = 'core-task-system'
 export const inject = ['http', 'hub', 'tools', 'sessions']
 export { tasksCollection } from './collection.ts'
 
-export function apply(ctx: Context) {
+export async function apply(ctx: Context) {
   startTaskClock(ctx)
   const host = ctx as HostCtx
   const dbPath = biuSqlitePath()
-  const tasks = new TasksService(ctx, dbPath).open()
+  let cloud: {
+    taskMode?: 'sqlite' | 'mysql' | 'shadow'
+    editorContentMode?: 'sqlite' | 'mysql' | 'shadow'
+    ensureProductMigrations?: () => Promise<void>
+    taskRepository?: import('./mysql-service.ts').MysqlTaskRawRepository | null
+    editorContentRepository?: import('./mysql-service.ts').TaskContentRepository | null
+  } | undefined
+  try {
+    cloud = ctx.get('cloudStorage') as typeof cloud
+  } catch {
+    cloud = undefined
+  }
+  const taskMode = cloud?.taskMode ?? 'sqlite'
+  let tasks:
+    | TasksService
+    | import('./mysql-service.ts').MysqlTasksService
+    | import('./mysql-service.ts').ShadowTasksService
+    | import('./mysql-service.ts').ContentRoutedTasksService
+  if (taskMode === 'sqlite') {
+    const sqlite = new TasksService(ctx, dbPath).open()
+    if (cloud?.editorContentMode !== 'sqlite' && cloud?.editorContentRepository) {
+      await cloud.ensureProductMigrations?.()
+      const { ContentRoutedTasksService } = await import('./mysql-service.ts')
+      tasks = new ContentRoutedTasksService(
+        sqlite,
+        cloud.editorContentRepository,
+        cloud.editorContentMode === 'mysql',
+        (error) => ctx.logger('tasks').warn(`MySQL task content write failed: ${String(error)}`),
+      )
+    } else {
+      tasks = sqlite
+    }
+  } else {
+    if (!cloud?.taskRepository || !cloud.editorContentRepository) {
+      throw new Error('MySQL Task repository requires CloudStorageService repositories')
+    }
+    await cloud.ensureProductMigrations?.()
+    const {
+      MysqlTasksService,
+      ShadowTaskContentRepository,
+      ShadowTasksService,
+      SqliteTaskContentRepository,
+    } = await import('./mysql-service.ts')
+    const noopContent = {
+      async read() { return { body: '', version: 0 } },
+    }
+    if (taskMode === 'shadow') {
+      const sqlite = new TasksService(ctx, dbPath).open()
+      const directContent = cloud.editorContentMode !== 'sqlite'
+      const mysql = new MysqlTasksService(
+        ctx,
+        cloud.taskRepository,
+        directContent ? cloud.editorContentRepository : noopContent,
+        directContent,
+        'tasksMysqlShadow',
+      )
+      tasks = new ShadowTasksService(sqlite, mysql, (error) => {
+        ctx.logger('tasks').warn(`MySQL task shadow write failed: ${String(error)}`)
+      }, cloud.editorContentMode === 'mysql' ? cloud.editorContentRepository : undefined)
+    } else {
+      if (cloud.editorContentMode === 'mysql') {
+        tasks = new MysqlTasksService(ctx, cloud.taskRepository, cloud.editorContentRepository, true)
+      } else {
+        const sqliteContent = new SqliteTaskContentRepository(dbPath)
+        const content = cloud.editorContentMode === 'shadow'
+          ? new ShadowTaskContentRepository(
+              sqliteContent,
+              cloud.editorContentRepository,
+              (error) => ctx.logger('tasks').warn(`MySQL task content shadow write failed: ${String(error)}`),
+            )
+          : sqliteContent
+        tasks = new MysqlTasksService(ctx, cloud.taskRepository, content, false)
+      }
+    }
+  }
 
-  async function present(row: TaskRow): Promise<TaskRow> {
+  async function present(row: TaskRow, lookup?: Map<string, TaskRow>): Promise<TaskRow> {
     // 完成状态（todo/doing/done）尊重已存储的 row.status：它由 task_report 上报 或 人/AI 手动 update 维护（last-write-wins）。
     // 无任何信号时默认 todo。
     const counts = (row.reports ?? []).filter((r) => r.status === 'done').length
     const base = { ...row, status: row.status || 'todo' }
     // 持久化消耗：聚合本任务各 report 固化的 usage（同名 session+turn 去重），删 session 也不丢。
     const usage = sumReportUsage(row.reports)
+    const byId = lookup ?? new Map((await tasks.list()).map((item) => [item.id, item]))
     return {
       ...base,
       doneCount: counts,
       // 阻塞始终派生：待办 + 存在未完成依赖；并给出阻塞来源链
-      blocked: computeBlocked({ ...row, status: base.status }, (id) => tasks.get(id)),
-      blockedBy: computeBlockedBy({ ...row, status: base.status }, (id) => tasks.get(id)),
+      blocked: computeBlocked({ ...row, status: base.status }, (id) => byId.get(id)),
+      blockedBy: computeBlockedBy({ ...row, status: base.status }, (id) => byId.get(id)),
       execution: (row.reports ?? []).length
         ? deriveExecutionFromReports(row.reports)
         : { status: 'idle', turn: null, assistantText: '', updatedAt: 0 },
@@ -1426,7 +1507,8 @@ export function apply(ctx: Context) {
   }
 
   async function presentMany(rows: TaskRow[]): Promise<TaskRow[]> {
-    return Promise.all(rows.map((row) => present(row)))
+    const lookup = new Map(rows.map((row) => [row.id, row]))
+    return Promise.all(rows.map((row) => present(row, lookup)))
   }
 
   host.hub.register({
@@ -1439,7 +1521,7 @@ export function apply(ctx: Context) {
 
 
   async function runTaskReport(id: string, args: Record<string, unknown> = {}) {
-    const row = tasks.get(id)
+    const row = await tasks.get(id)
     if (!row) throw new Error('unknown task')
     const status = args.status === 'done' ? 'done' : 'doing'
     const sessionId = currentSessionId()
@@ -1470,14 +1552,14 @@ export function apply(ctx: Context) {
       ...(usage ? { usage } : {}),
       ts: now(),
     }
-    tasks.report(id, report)
-    tasks.update(id, { status })
+    await tasks.report(id, report)
+    await tasks.update(id, { status })
     const delivered = await reportBackToCreator(host, row, report)
-    return { ...(await present(tasks.get(id)!)), delivered }
+    return { ...(await present((await tasks.get(id))!)), delivered }
   }
 
   async function runTaskDeliver(id: string, args: Record<string, unknown> = {}) {
-    const row = tasks.get(id)
+    const row = await tasks.get(id)
     if (!row) throw new Error('unknown task')
     const targetSessionId = row.assignee?.sessionId
     if (!targetSessionId) {
@@ -1526,7 +1608,7 @@ export function apply(ctx: Context) {
     }
     if (!host.sessions?.sendMessage) return false
     // 置 pending 防重入（原子守卫：先写库再派工）
-    tasks.update(row.id, {
+    await tasks.update(row.id, {
       trigger: { state: 'pending', lastRun: now() },
     })
     const text = buildDeliverText({ ...row, ...(row.trigger ? { trigger: row.trigger } : {}) })
@@ -1535,11 +1617,11 @@ export function apply(ctx: Context) {
         wait: false,
         sender: { type: 'session', sessionId: currentSessionId() ?? 'unknown' },
       })
-      tasks.update(row.id, { trigger: { state: 'delivered' } })
+      await tasks.update(row.id, { trigger: { state: 'delivered' } })
       return true
     } catch {
       // 派工失败：回退 idle，允许下次重试
-      tasks.update(row.id, { trigger: { state: 'idle' } })
+      await tasks.update(row.id, { trigger: { state: 'idle' } })
       return false
     }
   }
@@ -1562,15 +1644,15 @@ export function apply(ctx: Context) {
   }
 
   /** 周期任务下轮重置：任务已完成且 trigger 仍 enabled（周期语义）→ 回到 idle 进入下轮。 */
-  function resetPeriodic(row: TaskRow): void {
+  async function resetPeriodic(row: TaskRow): Promise<void> {
     const tr = row.trigger
     if (!tr?.enabled) return
     if (row.status === 'done' && tr.state === 'delivered') {
-      tasks.update(row.id, {
+      await tasks.update(row.id, {
         trigger: { state: 'idle' },
       })
       // 周期 cron：更新 lastRun，使下轮定时不重叠
-      if (tr.cron) tasks.update(row.id, { trigger: { state: 'idle' } })
+      if (tr.cron) await tasks.update(row.id, { trigger: { state: 'idle' } })
     }
   }
 
@@ -1581,13 +1663,13 @@ export function apply(ctx: Context) {
    * lastReportPromptAt 不足 reportIntervalSec)内时，应触发一次进程追问。
    * 返回 null 表示不应追问；否则返回是否追问 + 已超时秒数 + 冷却/间隔毫秒。
    */
-  function promptForProgress(row: TaskRow): void {
+  async function promptForProgress(row: TaskRow): Promise<void> {
     try {
       const nowTs = now()
       const verdict = shouldPromptProgress(row, nowTs)
       if (verdict.shouldFail) {
         if (row.status === 'failed') return
-        tasks.update(row.id, { status: 'failed' })
+        await tasks.update(row.id, { status: 'failed' })
         const assigneeSessionId = row.assignee?.sessionId
         const creatorSessionId = row.creator?.kind === 'agent' ? row.creator.sessionId : undefined
         if (assigneeSessionId && host.sessions?.sendMessage) {
@@ -1609,27 +1691,38 @@ export function apply(ctx: Context) {
       host.sessions.sendMessage(assigneeSessionId, text, { wait: false, sender }).catch(() => {
         /* 发送失败：保留 lastReportPromptAt 未更新，下轮可重试 */
       })
-      tasks.update(row.id, { lastReportPromptAt: nowTs, reportPromptCount: nextCount })
+      await tasks.update(row.id, { lastReportPromptAt: nowTs, reportPromptCount: nextCount })
     } catch {
       /* 单测/无完整 host 时容忍 */
     }
   }
 
   /** 统一驱动一轮：定时触发检查 + 周期重置。返回本轮派工的任务数。 */
-  async function driveTimers(): Promise<number> {
+  async function driveTimers(scoped = false): Promise<number> {
+    const multi = tasks as typeof tasks & {
+      workspaceIds?(): Promise<string[]>
+      inWorkspace?<T>(workspaceId: string, run: () => T): T
+    }
+    if (!scoped && !currentRequestWorkspaceId() && multi.workspaceIds && multi.inWorkspace) {
+      let total = 0
+      for (const workspaceId of await multi.workspaceIds()) {
+        total += await multi.inWorkspace(workspaceId, () => driveTimers(true))
+      }
+      return total
+    }
     const nowTs = now()
     let fired = 0
-    const rows = tasks.list()
+    const rows = await tasks.list()
     // 进度超时监测（周期汇报提醒）：只针对已派发且有执行 session 的未完成任务
     for (const row of rows) {
-      promptForProgress(row)
+      await promptForProgress(row)
     }
     for (const row of rows) {
       const tr = row.trigger
       if (!tr?.enabled) continue
       // 周期重置：已完成的任务回到下轮
-      resetPeriodic(row)
-      const fresh = tasks.get(row.id)!
+      await resetPeriodic(row)
+      const fresh = (await tasks.get(row.id))!
       const freshTr = fresh.trigger
       if (!freshTr?.enabled) continue
       // 秒级周期 cron（*/N 等）已派工未 done：时间维度按周期重置回 idle 再触发，
@@ -1637,8 +1730,8 @@ export function apply(ctx: Context) {
       if (freshTr.state !== 'idle' && freshTr.cron) {
         const match = parseCron(freshTr.cron)
         if (match?.hasSeconds && freshTr.lastRun != null && nowTs - freshTr.lastRun >= 1000) {
-          tasks.update(fresh.id, { trigger: { state: 'idle' } })
-          const resetRow = tasks.get(fresh.id)!
+          await tasks.update(fresh.id, { trigger: { state: 'idle' } })
+          const resetRow = (await tasks.get(fresh.id))!
           const resetTr = resetRow.trigger
           if (resetTr?.enabled && timingHit(resetTr, nowTs)) {
             const ok = await fireTrigger(resetRow)
@@ -1657,22 +1750,20 @@ export function apply(ctx: Context) {
 
   // 定时触发：订阅同包 clock/tick（每秒心跳）——事件驱动，不另起调度器。
   ctx.on('clock/tick', () => {
-    try {
-      void driveTimers()
-    } catch {
+    void driveTimers().catch(() => {
       /* 单测等无完整 host 时容忍 */
-    }
+    })
   })
 
   // on 自动触发：
   //  - turn:end：某 session 回合结束时，检查所有监听 turn:end 且已到达条件的事件触发
   //  - dep:done：依赖任务完成 → 触发依赖它的任务（通过监听 task_report done / 状态变化）
-  ctx.on('session/event', (payload) => {
+  ctx.on('session/event', async (payload) => {
     try {
       const ev = payload.event
       if (ev?.type !== 'turn/end') return
       const sessionId = payload.sessionId
-      const rows = tasks.list()
+      const rows = await tasks.list()
       for (const row of rows) {
         const tr = row.trigger
         if (!tr?.enabled || !tr.on.includes('turn:end')) continue
@@ -1690,17 +1781,18 @@ export function apply(ctx: Context) {
   // dep:done：依赖某任务的"完成"作为触发源。通过 tools/post-execute 捕获 task_report done，
   // 或监听任务状态变化。这里统一：当某任务的 assignee 回合结束且该任务已 done 时，通知依赖方。
   // 简化为：监听 task_report（tools/post-execute 中 name==='task_report'），若报告 done 则触发其下游。
-  ctx.on('tools/post-execute', (payload) => {
+  ctx.on('tools/post-execute', async (payload) => {
     try {
       if (payload?.name !== 'db_action') return
-      const rows = tasks.list()
+      const rows = await tasks.list()
+      const byId = new Map(rows.map((row) => [row.id, row]))
       // 找所有已完成的任务 id 集合（作为 dep:done 的候选依赖源）
       for (const row of rows) {
         const tr = row.trigger
         if (!tr?.enabled || !tr.on.includes('dep:done')) continue
         if (tr.state !== 'idle') continue
         // 依赖全部完成（满足 depsSatisfied）即触发
-        if (depsSatisfied(row, (id) => tasks.get(id))) {
+        if (depsSatisfied(row, (id) => byId.get(id))) {
           void fireTrigger(row)
         }
       }
@@ -1712,7 +1804,7 @@ export function apply(ctx: Context) {
   ctx.inject(['database'], (inner) => {
     inner.database.register(
       tasksCollection(
-        tasks,
+        tasks as unknown as TasksLike,
         {
           report: (id, _record, args) => runTaskReport(id, args),
           deliver: (id, _record, args) => runTaskDeliver(id, args),

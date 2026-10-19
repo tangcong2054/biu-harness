@@ -36,6 +36,15 @@ export function bumpRevealStart(startIndex: number, batch = CHAT_REVEAL_BATCH): 
   return Math.max(0, startIndex - Math.max(1, batch))
 }
 
+/**
+ * 向前补进更早回合后，把挂载起点平移同样的回合数。
+ * 起点为 0 时整段已挂上，交给滚动补偿；否则阅读窗口继续停在原来的尾巴上。
+ */
+export function revealStartAfterPrepend(revealStart: number, addedTurns: number): number {
+  if (addedTurns <= 0 || revealStart <= 0) return Math.max(0, revealStart)
+  return revealStart + addedTurns
+}
+
 /** 输入栏垫了 pb-72 / 18rem，离真正 scroll 底还有一大截也算在看最新（记忆用）。 */
 export const CHAT_NEAR_BOTTOM_PX = 360
 /** 只有贴着滚动条底边才跟着新内容钉住；宽阈值会把上滑拽回去、抖死。 */
@@ -106,9 +115,18 @@ export function captureChatScroll(parent: HTMLElement): ChatScrollMemory {
   for (const el of Array.from(users)) {
     if (el.getBoundingClientRect().top <= parentTop + PIN_TOP_SLACK_PX) pin = el
   }
-  const id = pin?.dataset.nodeId ?? users[0]?.dataset.nodeId
+  const id = pin?.dataset.nodeId
   if (!id) return { kind: 'bottom' }
   return { kind: 'pin', nodeId: id }
+}
+
+/**
+ * 仍打算贴底、但滚动条还停在顶部时，不能把最早一条用户消息记成锚点。
+ * 那种顶部位置会在下次打开时自我强化，每次都从最早处开始。
+ */
+export function readingMemory(parent: HTMLElement, stickToBottom: boolean): ChatScrollMemory {
+  if (stickToBottom && parent.scrollTop <= PIN_TOP_SLACK_PX) return { kind: 'bottom' }
+  return captureChatScroll(parent)
 }
 
 export function distanceFromChatBottom(parent: HTMLElement): number {

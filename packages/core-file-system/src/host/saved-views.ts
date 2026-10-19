@@ -9,6 +9,11 @@ import { isViewModeId } from '../web/fields.ts'
 import { normalizeCollectionPath } from '../paths.ts'
 import { isIndexCollection } from '../web/database-path.ts'
 import {
+  SqliteMetadataRuntime,
+  type MetadataRepository,
+  type MetadataRuntimeMode,
+} from '@biu/host-plugin-loader/metadata-runtime'
+import {
   countFilterRules,
   flatFiltersToTree,
   looksLikeFilterTree,
@@ -30,6 +35,33 @@ type ViewRow = { workspace_id: string; collection: string; payload_json: string 
 export class SavedViewsStore {
   private byPath = new Map<string, StoredView[]>()
   private db: DatabaseSync | null = null
+  private runtime: SqliteMetadataRuntime | null = null
+
+  configureRuntime(
+    mode: MetadataRuntimeMode,
+    repository: MetadataRepository | null,
+    onShadowError?: (error: unknown) => void,
+  ) {
+    this.runtime = new SqliteMetadataRuntime(
+      mode,
+      repository,
+      () => {
+        if (!this.db) this.open(':memory:')
+        return this.db!
+      },
+      ['saved_views'],
+      onShadowError,
+    )
+  }
+
+  async prepare() {
+    await this.runtime?.prepare()
+    this.hydrate()
+  }
+
+  async flush() {
+    await this.runtime?.flush()
+  }
 
   open(path = ':memory:') {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
@@ -97,6 +129,7 @@ export class SavedViewsStore {
         upsert.run(workspaceId, path, String(view.id), JSON.stringify(view), Date.now())
       }
       this.db.exec('COMMIT')
+      this.runtime?.changed('saved_views')
     } catch (error) {
       this.db.exec('ROLLBACK')
       throw error

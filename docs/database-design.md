@@ -178,14 +178,14 @@ MySQL 第一版建议：
 - `cloud_connections`
 - `workspace_place`
 - `record_place`
-- `record_cloud_copy`
 - `/api/replica/snapshot`
 - `takeSnapshot()` / `applySnapshot(cache|adopt)`
-- `publishToCloud()`（目前主要由分享路径触发）
+- 桌面端在 Cloud Workspace 中按 Workspace 转发 create/update/delete/content/share
+- 本地 Workspace 与 Cloud Workspace 已成为互斥的数据边界
 
 仍缺：
 
-1. 用户可选择的批量上传入口。
+1. 用户把本地 Workspace 发布为 Cloud Workspace 的显式入口。
 2. 新设备恢复向导。
 3. 附件 CAS manifest 与二进制传输。
 4. 持久化 snapshot watermark（当前为进程内 Map）。
@@ -196,13 +196,14 @@ MySQL 第一版建议：
 ```text
 本地只读导出
 → 生成 manifest
-→ 为云副本生成新 ID
+→ 在云端创建目标 Workspace
+→ 保持记录 ID，按 Workspace 导入
 → 缺失附件按 hash 上传对象存储
-→ 写入 private_backup / workspace
-→ 成功后记录 local_id ↔ cloud_id
+→ 写入 private_backup 或正式 Cloud Workspace
+→ 成功后把新 Workspace 标记为 cloud
 ```
 
-本地原记录不改主键、不自动转云端、不因失败删除。
+本地原 Workspace 不自动删除或原地变云端。上传成功后可以保留一个本地副本，避免失败或冲突造成数据丢失；不再恢复已删除的逐记录 `publishToCloud()` 复制语义。
 
 ### 下载
 
@@ -215,7 +216,7 @@ MySQL 第一版建议：
 → 附件按需下载
 ```
 
-遇到本地同 ID 私有记录时保留本地，云端内容使用新 ID 或进入冲突处理，不能静默覆盖。
+Cloud Workspace 以云端为权威并按原 ID 缓存；本地 Workspace 与 Cloud Workspace 物理分区，不能把同 ID 本地记录静默覆盖。
 
 ### 本地同步状态
 
@@ -229,7 +230,7 @@ MySQL 第一版建议：
 
 - 上传/下载 job
 - manifest 与水位
-- local/cloud ID 映射
+- local workspace / cloud workspace 映射
 - 重试和冲突状态
 
 老 `biu.sqlite` 继续服务本地业务，减少新旧分支互相影响。
@@ -362,7 +363,7 @@ ID 对比：
 - `.local-data` 不是第二个需要 union 的服务端数据库。
 - Offline 独有的 4 个 Task、3 个 Session 等仍是本地私有数据，只有用户选择上传时才进入 `private_backup` 或 Workspace。
 - 重合 Page/Task/Session 也不能按“更新时间大者”直接覆盖；必须沿用 local/cloud 映射、版本与冲突规则。
-- Offline 的 `record_place`、`record_cloud_copy`、`replica_*`、`cloud_connections` 属于设备侧状态，不进入产品 MySQL 权威表。
+- Offline 的 `record_place`、`replica_*`、`cloud_connections` 属于设备侧状态，不进入产品 MySQL 权威表；旧 `record_cloud_copy` 只作兼容清理，不进入新同步协议。
 
 ### 两份 `ops.sqlite` 需要合并去重
 
@@ -416,4 +417,10 @@ ID 对比：
 - 两份运营快照已按上述规则导入 `biu_ops_dev`。
 - 导入结果：accounts 4、workspaces 5、usage 19、devices 6、sync health 3、security events 16、audit logs 14。
 - 重复执行导入后行数不变，已验证幂等。
-- 尚未把 Online 产品主库导入 `biu_dev`；当前只建立设备、备份和授权 revision 基础表，避免在查询/授权适配完成前误切主数据。
+- Online 产品快照已完整导入并审计；按产品决定，缺失 Workspace 归属的历史业务记录不再使用，只从 MySQL 导入结果剔除，源 SQLite 保持不变。
+- 清理后的 `biu_dev`：pages 6、tasks 0、editor_content 38、sessions 11、events 49,254；其余有明确租户或全局语义的持久化表保留。
+- `cloud_connections`、`workspace_place`、`record_place`、`replica_*` 等设备状态，以及 locks/presence/leases/GC 候选未导入。
+- Online 的账号/Workspace/权限、Page/Task/正文、Session/Events、Facet/View/Share/Record Meta/PageBlock、插件元数据和 Operations 已接入异步 MySQL Repository；`BIU_STORAGE_BACKEND=mysql` 可作为主读写路径。
+- 租户审计发现的 204 条历史记录（pages 78、tasks 25、sessions 82、facets 7、skills 12）已在 `migration_tenancy_exceptions` 标记为 `discarded`。
+- MySQL-only 已在隔离 `BIU_HOME` 启动验证：账号登录、Workspace 鉴权、Page 列表、Session 列表以及 Page 正文创建/删除均成功；测试 Host 已关闭。
+- Offline 永远继续使用 SQLite；`dual` 用于回滚期影子同步，`mysql` 用于 Online 主读写。

@@ -150,6 +150,20 @@ function emptyKeys(): Record<string, string> {
   return { deepseek: '', openai: '', anthropic: '' }
 }
 
+const ADMIN_KEY_ENV: Record<string, string> = {
+  deepseek: 'DEEPSEEK_API_KEY',
+  openai: 'OPENAI_API_KEY',
+  anthropic: 'ANTHROPIC_API_KEY',
+}
+
+/** 环境变量始终压过密钥文件。返回变量名表示这个入口不能被运营配置覆盖。 */
+export function adminKeyEnvLock(endpointId: string): string | null {
+  const name = ADMIN_KEY_ENV[endpointId.trim()]
+  if (!name) return null
+  const value = process.env[name]
+  return typeof value === 'string' && value.trim() ? name : null
+}
+
 export function readAdminApiKeys(path = dataPath(dataHome(), 'chat-secrets.json')) {
   try {
     const raw = JSON.parse(readFileSync(path, 'utf8')) as { apiKeys?: unknown }
@@ -163,6 +177,38 @@ export function readAdminApiKeys(path = dataPath(dataHome(), 'chat-secrets.json'
   } catch {
     return {}
   }
+}
+
+/** 合并写入在线主机已有的 chat-secrets.json。空串删除。被环境变量锁定的入口不写。 */
+export function writeAdminApiKeys(
+  updates: Record<string, string | null | undefined>,
+  path = dataPath(dataHome(), 'chat-secrets.json'),
+): { apiKeys: Record<string, string>; locked: string[] } {
+  const current = readAdminApiKeys(path)
+  const locked: string[] = []
+  for (const [rawId, value] of Object.entries(updates)) {
+    const id = rawId.trim()
+    if (!id) continue
+    if (adminKeyEnvLock(id)) {
+      locked.push(id)
+      continue
+    }
+    if (value == null || value === '') delete current[id]
+    else if (typeof value === 'string' && value.trim()) current[id] = value.trim()
+  }
+  let envelope: Record<string, unknown> = {}
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      envelope = { ...(parsed as Record<string, unknown>) }
+    }
+  } catch {
+    envelope = {}
+  }
+  envelope.apiKeys = current
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, `${JSON.stringify(envelope, null, 2)}\n`, { mode: 0o600 })
+  return { apiKeys: current, locked }
 }
 
 function defaults(): ChatConfig {
@@ -1087,6 +1133,36 @@ export class ChatService extends Service {
   private syncToolsMode() {
     this.ctx.tools.setMode(this.config.agentMode)
     this.ctx.tools.setPinnedExtras(this.config.extraTools)
+  }
+
+  /**
+   * 运营配置写入现有 chat-secrets.json，并更新本进程内存。
+   * 在线模式下 patch 落盘会剥掉 apiKeys，因此密钥不会进 chat-config.json。
+   */
+  applyAdminApiKeys(updates: Record<string, string | null | undefined>) {
+    const saved = writeAdminApiKeys(updates)
+    const writable: Record<string, string | null> = {}
+    for (const [rawId, value] of Object.entries(updates)) {
+      const id = rawId.trim()
+      if (!id || saved.locked.includes(id)) continue
+      if (value == null || value === '') writable[id] = null
+      else if (typeof value === 'string' && value.trim()) writable[id] = value.trim()
+    }
+    if (Object.keys(writable).length) this.patch({ setApiKey: writable })
+    return { locked: saved.locked, view: this.operatorPublicView() }
+  }
+
+  /** 给运营插件的视图：仍只有掩码，但允许提交 Key 到本机密钥文件。 */
+  operatorPublicView() {
+    const envLocked = (['deepseek', 'openai', 'anthropic'] as const).flatMap((id) => {
+      const env = adminKeyEnvLock(id)
+      return env ? [{ endpointId: id, env }] : []
+    })
+    return {
+      ...this.publicView(),
+      acceptsApiKeys: true,
+      envLocked,
+    }
   }
 }
 

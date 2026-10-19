@@ -22,6 +22,7 @@ test('paints the authentication boundary into el', async () => {
     await ctx.plugin(reactHost, { el })
     await ctx.plugin(shell)
   })
-  assert.match(el.innerHTML, /data-testid="auth-gate"/)
-  assert.match(el.innerHTML, /登录/)
+  // 未登录：落在官网/登录边界，不渲染工作台。
+  assert.match(el.innerHTML, /class="site"|auth-gate/)
+  assert.doesNotMatch(el.innerHTML, /data-testid="header-config-toggle"/)
 })

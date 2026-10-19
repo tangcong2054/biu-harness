@@ -1,10 +1,26 @@
 import { existsSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { Service, type Context } from 'cordis'
-import { biuSqlitePath, currentAccountId, eventsSqlitePath, isOnlineRuntime, isOperationsRuntime, openAndMigrateBiu, openSqlite } from '@biu/host-plugin-loader/data-dir'
+import { biuSqlitePath, currentAccountId, currentRequestWorkspaceId, eventsSqlitePath, isOnlineRuntime, isOperationsRuntime, openAndMigrateBiu, openSqlite, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
+import {
+  MAX_PRIVATE_BACKUP_BYTES,
+  type CloudStorageService,
+  type MysqlAccountRepository,
+  type RuntimeRepositoryMode,
+} from '@biu/host-cloud-storage'
 import type { RouteContext } from '@biu/type-http'
-import { CollabError, CollabStore } from './store.ts'
+import {
+  CollabError,
+  CollabStore,
+  DEFAULT_SESSION_MS,
+  controlPlaneHashPassword,
+  controlPlaneId,
+  controlPlaneInviteToken,
+  controlPlaneTokenHash,
+  controlPlaneVerifyPassword,
+} from './store.ts'
 import { httpRemote, RecordReplica } from './replica.ts'
-import { applySnapshot, exchangeSnapshot, takeSnapshot, type MirrorSnapshot } from './mirror.ts'
+import { applySnapshot, exchangeSnapshot, restoreSnapshotSafely, takeSnapshot, type MirrorSnapshot } from './mirror.ts'
 import type { AuthorizationService, ResourceRole } from './authorization.ts'
 import { workspaceMembersCollection } from './workspace-members-collection.ts'
 
@@ -14,6 +30,7 @@ export const name = 'account'
 export const inject = ['http']
 
 type AccountConfig = { sqlitePath?: string }
+export const MYSQL_ACCOUNT_UNMIGRATED: readonly string[] = []
 type CloudConnection = {
   localAccountId: string
   origin: string
@@ -27,6 +44,9 @@ type CloudConnection = {
 export class AccountService extends Service {
   store: CollabStore
   authorization: AuthorizationService
+  readonly mysql: MysqlAccountRepository | null
+  readonly accountMode: RuntimeRepositoryMode
+  private readonly pluginAccessCache = new Map<string, boolean>()
   replica: RecordReplica | null = null
   private db: {
     close(): void
@@ -39,7 +59,18 @@ export class AccountService extends Service {
     const db = openAndMigrateBiu(config.sqlitePath ?? biuSqlitePath())
     this.db = db
     this.store = new CollabStore(db)
-    if ((isOnlineRuntime() && !process.env.VITEST) || isOperationsRuntime()) {
+    let cloud: CloudStorageService | undefined
+    try {
+      cloud = ctx.get('cloudStorage') as CloudStorageService | undefined
+    } catch {
+      /* Offline/SQLite deployments do not require cloud storage. */
+    }
+    this.accountMode = isOnlineRuntime() ? (cloud?.accountMode ?? 'sqlite') : 'sqlite'
+    this.mysql = this.accountMode === 'sqlite' ? null : (cloud?.accountRepository ?? null)
+    if (this.accountMode !== 'sqlite' && !this.mysql) {
+      throw new Error(`BIU_ACCOUNT_MYSQL_MODE=${this.accountMode} requires the MySQL account repository`)
+    }
+    if ((isOnlineRuntime() && this.accountMode === 'sqlite' && !process.env.VITEST) || isOperationsRuntime()) {
       this.store.bootstrapOperations({
         email: process.env.BIU_OPERATIONS_ADMIN_EMAIL || 'admin',
         password: process.env.BIU_OPERATIONS_ADMIN_PASSWORD || (isOperationsRuntime() ? undefined : '97ortanon'),
@@ -89,6 +120,130 @@ export class AccountService extends Service {
       ),
     )
     ctx.on('dispose', () => db.close())
+  }
+
+  usesMysqlAccounts() {
+    return isOnlineRuntime() && this.accountMode === 'mysql'
+  }
+
+  requireMigrated(method: string): never {
+    throw new CollabError(`MySQL 账号控制面尚未迁移此方法：${method}`, 501)
+  }
+
+  async resolveMcpCredential(token: string) {
+    if (this.usesMysqlAccounts()) {
+      return this.mysql!.resolveMcpCredential(controlPlaneTokenHash(token))
+    }
+    return this.store.resolveMcpCredential(token)
+  }
+
+  async auditMcp(
+    tenant: { credentialId: string; accountId: string; workspaceId: string },
+    toolName: string,
+    success: boolean,
+  ) {
+    if (this.usesMysqlAccounts()) return this.mysql!.auditMcp(tenant, toolName, success)
+    this.store.auditMcp(tenant, toolName, success)
+  }
+
+  async tenantForRecord(collection: string, recordId: string) {
+    if (this.usesMysqlAccounts()) return this.mysql!.tenantForRecord(collection, recordId)
+    return this.store.tenantForRecord(collection, recordId)
+  }
+
+  async accountByToken(token: string) {
+    if (this.usesMysqlAccounts()) {
+      const found = await this.mysql!.accountByTokenHash(controlPlaneTokenHash(token))
+      if (!found || await this.mysql!.isSuspended(found.id)) return null
+      return found
+    }
+    return this.store.accountByToken(token)
+  }
+
+  async activeWorkspaceFor(accountId: string) {
+    if (this.usesMysqlAccounts()) return (await this.mysql!.accountById(accountId))?.activeWorkspaceId ?? ''
+    return this.store.listWorkspaces(accountId).find((item) => item.id === this.store.activeWorkspaceId())?.id ?? ''
+  }
+
+  activeWorkspaceId() {
+    if (this.usesMysqlAccounts()) return currentRequestWorkspaceId()
+    return this.store.activeWorkspaceId()
+  }
+
+  async isMemberAsync(accountId: string, workspaceId: string) {
+    if (this.usesMysqlAccounts()) {
+      return (await this.mysql!.listWorkspaces(accountId)).some((item) => item.id === workspaceId)
+    }
+    return this.store.isMember(accountId, workspaceId)
+  }
+
+  async canAccessPlugin(accountId: string, workspaceId: string, pluginId: string) {
+    const allowed = this.usesMysqlAccounts()
+      ? await this.mysql!.canAccessPlugin(accountId, workspaceId, pluginId)
+      : this.store.canAccessPlugin(accountId, workspaceId, pluginId)
+    this.pluginAccessCache.set(`${accountId}\t${workspaceId}\t${pluginId}`, allowed)
+    return allowed
+  }
+
+  canAccessPluginCached(accountId: string, workspaceId: string, pluginId: string) {
+    if (!this.usesMysqlAccounts()) return this.store.canAccessPlugin(accountId, workspaceId, pluginId)
+    return this.pluginAccessCache.get(`${accountId}\t${workspaceId}\t${pluginId}`) === true
+  }
+
+  async pluginLoadsFor(accountId: string, workspaceId: string) {
+    if (this.usesMysqlAccounts()) return this.mysql!.pluginLoadsFor(accountId, workspaceId)
+    return this.store.pluginLoadsFor(accountId, workspaceId)
+  }
+
+  async loadedPluginIds() {
+    if (this.usesMysqlAccounts()) return this.mysql!.loadedPluginIds()
+    return this.store.loadedPluginIds()
+  }
+
+  async setPluginLoad(accountId: string, workspaceId: string, pluginId: string, loaded: boolean) {
+    if (this.usesMysqlAccounts()) return this.mysql!.setPluginLoad(accountId, workspaceId, pluginId, loaded)
+    this.store.setPluginLoad(accountId, workspaceId, pluginId, loaded)
+  }
+
+  async recordPluginPackage(accountId: string, input: Record<string, unknown>) {
+    if (this.usesMysqlAccounts()) return this.mysql!.recordPluginPackage(accountId, input)
+    this.store.recordPluginPackage(accountId, input as never)
+  }
+
+  async syncInstalledPluginPackage(input: Record<string, unknown>) {
+    if (this.usesMysqlAccounts()) {
+      const actorId = currentAccountId()
+      if (!actorId) return false
+      await this.mysql!.recordPluginPackage(actorId, input)
+      return true
+    }
+    return this.store.syncInstalledPluginPackage(input as never)
+  }
+
+  async ensurePluginOwnerAssignments(pluginId: string) {
+    if (this.usesMysqlAccounts()) return this.mysql!.ensurePluginOwnerAssignments(pluginId)
+    return this.store.ensurePluginOwnerAssignments(pluginId)
+  }
+
+  async installPluginForWorkspace(accountId: string, workspaceId: string, pluginId: string, version = '') {
+    const result = this.usesMysqlAccounts()
+      ? await this.mysql!.installPluginForWorkspace(accountId, workspaceId, pluginId, version)
+      : this.store.installPluginForWorkspace(accountId, workspaceId, pluginId, version)
+    this.pluginAccessCache.set(`${accountId}\t${workspaceId}\t${pluginId}`, true)
+    return result
+  }
+
+  async uninstallPluginFromWorkspace(accountId: string, workspaceId: string, pluginId: string) {
+    const result = this.usesMysqlAccounts()
+      ? await this.mysql!.uninstallPluginFromWorkspace(accountId, workspaceId, pluginId)
+      : this.store.uninstallPluginFromWorkspace(accountId, workspaceId, pluginId)
+    this.pluginAccessCache.delete(`${accountId}\t${workspaceId}\t${pluginId}`)
+    return result
+  }
+
+  async removePluginPackage(accountId: string, pluginId: string) {
+    if (this.usesMysqlAccounts()) return this.mysql!.removePluginPackage(accountId, pluginId)
+    this.store.removePluginPackage(accountId, pluginId)
   }
 
   isRemote(collection: string, id: string) {
@@ -385,7 +540,19 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
   const account = new AccountService(ctx, config)
   const workspaceRefreshes = new Set<string>()
 
+  function cloudStorage() {
+    let storage: CloudStorageService | undefined
+    try {
+      storage = ctx.get('cloudStorage') as CloudStorageService | undefined
+    } catch {
+      /* SQLite-only installations intentionally have no cloud backup store. */
+    }
+    if (!storage?.privateBackups) throw new CollabError('私人云备份暂不可用', 503)
+    return storage
+  }
+
   function actor(route: RouteContext) {
+    if (account.usesMysqlAccounts()) account.requireMigrated(route.req.url || 'HTTP endpoint')
     const token = bearer(route)
     const found = token ? account.store.accountByToken(token) : null
     if (!found) throw new CollabError('需要登录', 401)
@@ -394,6 +561,63 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
     }
     rememberLogin(route, token)
     return found
+  }
+
+  async function mysqlActor(route: RouteContext) {
+    const token = bearer(route)
+    if (!token || !account.mysql) throw new CollabError('需要登录', 401)
+    const found = await account.mysql.accountByTokenHash(controlPlaneTokenHash(token))
+    if (!found) throw new CollabError('需要登录', 401)
+    if (await account.mysql.isSuspended(found.id)) throw new CollabError('账号已被暂停', 403)
+    rememberLogin(route, token)
+    return found
+  }
+
+  function checkedDeviceWorkspace(accountId: string, requested: unknown) {
+    const workspaceId = String(requested ?? account.store.activeWorkspaceId() ?? '').trim()
+    if (!workspaceId || workspaceId.length > 64) throw new CollabError('需要有效的本机 Workspace', 400)
+    const owned = account.store.listWorkspaces(accountId).some((item) => item.id === workspaceId)
+    if (!owned || account.workspaceLocation(workspaceId) !== 'device') {
+      throw new CollabError('只能备份或恢复当前账号的本机 Workspace', 403)
+    }
+    return workspaceId
+  }
+
+  function failBackup(route: RouteContext, error: unknown) {
+    if (
+      error instanceof Error &&
+      /^(invalid |backup (?:has too many items|is too large))/.test(error.message)
+    ) {
+      fail(route, new CollabError(error.message, 400))
+      return
+    }
+    fail(route, error)
+  }
+
+  async function cloudBackupRequest(
+    accountId: string,
+    path: string,
+    init: { method?: string; body?: unknown } = {},
+  ) {
+    const connection = account.cloudConnection(accountId)
+    if (!connection) throw new CollabError('请先登录云端账号', 401)
+    let response: Response
+    try {
+      response = await fetch(`${connection.origin}${path}`, {
+        method: init.method ?? 'GET',
+        headers: {
+          authorization: `Bearer ${connection.token}`,
+          ...(init.body === undefined ? {} : { 'content-type': 'application/json' }),
+        },
+        body: init.body === undefined ? undefined : JSON.stringify(init.body),
+        signal: AbortSignal.timeout(30_000),
+      })
+    } catch {
+      throw new CollabError('云端暂时连不上', 503)
+    }
+    const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>
+    if (!response.ok) throw new CollabError(String(payload.error ?? '云备份请求失败'), response.status)
+    return payload
   }
 
   async function relayCloudWorkspace(
@@ -483,6 +707,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
   }
 
   async function connectCloud(route: RouteContext, action: 'login' | 'register') {
+    if (isOnlineRuntime()) throw new CollabError('服务端不能连接另一个云端账号', 400)
     const local = actor(route)
     const body = (await route.json()) as { email?: string; password?: string }
     return connectCloudIdentity(local, action, String(body.email ?? ''), String(body.password ?? ''))
@@ -556,6 +781,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/cloud/active', async (route) => {
     try {
+      if (isOnlineRuntime()) throw new CollabError('服务端不能切换云端账号', 400)
       const me = actor(route)
       const body = (await route.json()) as { remoteAccountId?: string; origin?: string }
       const connection = account.activateCloud(me.id, String(body.origin ?? ''), String(body.remoteAccountId ?? ''))
@@ -571,6 +797,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('DELETE', '/api/account/cloud', async (route) => {
     try {
+      if (isOnlineRuntime()) throw new CollabError('服务端没有云端连接可断开', 400)
       const me = actor(route)
       account.removeCloudConnection(me.id)
       route.send(200, { ok: true })
@@ -581,6 +808,14 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('GET', '/api/account/active', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        route.send(200, {
+          workspaceId: me.activeWorkspaceId || null,
+          ...(me.activeWorkspaceId ? { location: 'cloud' } : {}),
+        })
+        return
+      }
       actor(route)
       const workspaceId = account.store.activeWorkspaceId()
       route.send(200, {
@@ -594,6 +829,16 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/active', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as { workspaceId?: string }
+        const workspaceId = String(body.workspaceId ?? '')
+        if (!(await account.mysql!.setActiveWorkspace(me.id, workspaceId))) {
+          throw new CollabError('不在这个空间', 403)
+        }
+        route.send(200, { workspaceId, location: 'cloud' })
+        return
+      }
       const me = actor(route)
       const body = (await route.json()) as { workspaceId?: string }
       const workspaceId = account.store.setActive(me.id, String(body.workspaceId ?? ''))
@@ -616,6 +861,33 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
       const email = String(body.email ?? '')
       if (!password.trim()) throw new CollabError('密码不能为空', 400)
       if (!email.trim()) throw new CollabError('邮箱不能为空', 400)
+      if (account.usesMysqlAccounts()) {
+        if (password.trim().length < 6) throw new CollabError('密码至少 6 位', 400)
+        const normalized = email.trim().toLowerCase()
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) throw new CollabError('邮箱格式不对', 400)
+        const now = Date.now()
+        const accountId = controlPlaneId('acc')
+        const workspaceId = controlPlaneId('ws')
+        const sessionId = controlPlaneId('ses')
+        const token = randomBytes(24).toString('hex')
+        await account.mysql!.register({
+          accountId,
+          name: normalized,
+          email: normalized,
+          passwordHash: controlPlaneHashPassword(password.trim()),
+          accountToken: randomBytes(24).toString('hex'),
+          workspaceId,
+          workspaceName: '我的工作区',
+          sessionId,
+          sessionTokenHash: controlPlaneTokenHash(token),
+          deviceName: String(route.req.headers['user-agent'] ?? '浏览器').slice(0, 120),
+          expiresAt: now + DEFAULT_SESSION_MS,
+          now,
+        })
+        rememberLogin(route, token)
+        route.send(201, { id: accountId, name: normalized, createdAt: now, token, workspaceId })
+        return
+      }
       const created = account.store.register('', Date.now(), password, email)
       const workspaceId = account.store.enter(created.id)
       const session = account.store.openSession(created.id, String(route.req.headers['user-agent'] ?? '浏览器').slice(0, 120))
@@ -630,6 +902,36 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
   ctx.http.route('POST', '/api/account/login', async (route) => {
     try {
       const body = (await route.json()) as { email?: string; password?: string }
+      if (account.usesMysqlAccounts()) {
+        const found = await account.mysql!.accountByEmail(String(body.email ?? ''))
+        if (!found?.passwordHash || !controlPlaneVerifyPassword(String(body.password ?? ''), found.passwordHash)) {
+          throw new CollabError('邮箱或密码不对', 401)
+        }
+        if (await account.mysql!.isSuspended(found.id)) throw new CollabError('账号已被暂停', 403)
+        const token = randomBytes(24).toString('hex')
+        const now = Date.now()
+        await account.mysql!.openSession({
+          id: controlPlaneId('ses'),
+          accountId: found.id,
+          tokenHash: controlPlaneTokenHash(token),
+          deviceName: String(route.req.headers['user-agent'] ?? '浏览器').slice(0, 120),
+          expiresAt: now + DEFAULT_SESSION_MS,
+          now,
+        })
+        const workspaces = await account.mysql!.listWorkspaces(found.id)
+        const workspaceId = workspaces.some((row) => row.id === found.activeWorkspaceId)
+          ? found.activeWorkspaceId
+          : workspaces[0]?.id ?? ''
+        if (workspaceId && workspaceId !== found.activeWorkspaceId) {
+          await account.mysql!.setActiveWorkspace(found.id, workspaceId)
+        }
+        rememberLogin(route, token)
+        route.send(200, {
+          id: found.id, name: found.name, createdAt: found.createdAt, token, workspaceId,
+          mustChangePassword: found.mustChangePassword,
+        })
+        return
+      }
       const found = account.store.login(
         String(body.email ?? ''),
         String(body.password ?? ''),
@@ -657,6 +959,15 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/logout', async (route) => {
     const token = bearer(route)
+    if (account.usesMysqlAccounts()) {
+      if (token) await account.mysql!.revokeSession(controlPlaneTokenHash(token))
+      route.res.setHeader('set-cookie', [
+        'biu_account=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0',
+        'biu_legacy_account=; Path=/; SameSite=Strict; Max-Age=0',
+      ])
+      route.send(200, { ok: true })
+      return
+    }
     const found = token ? account.store.accountByToken(token) : null
     account.store.revokeSession(token)
     if (found) ctx.http.disconnectRevokedSessions(found.id)
@@ -669,6 +980,23 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/password', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as { currentPassword?: string; nextPassword?: string }
+        const next = String(body.nextPassword ?? '').trim()
+        if (next.length < 6) throw new CollabError('密码至少 6 位', 400)
+        if (!controlPlaneVerifyPassword(String(body.currentPassword ?? ''), me.passwordHash)) {
+          throw new CollabError('当前密码不对', 401)
+        }
+        await account.mysql!.changePassword(
+          me.id,
+          controlPlaneHashPassword(next),
+          controlPlaneTokenHash(bearer(route)),
+        )
+        ctx.http.disconnectRevokedSessions(me.id)
+        route.send(200, { ok: true })
+        return
+      }
       const me = actor(route)
       const body = (await route.json()) as { currentPassword?: string; nextPassword?: string }
       const changed = account.store.changePassword(me.id, String(body.currentPassword ?? ''), String(body.nextPassword ?? ''), bearer(route))
@@ -681,6 +1009,11 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('GET', '/api/account/sessions', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        route.send(200, { sessions: await account.mysql!.listSessions(me.id) })
+        return
+      }
       const me = actor(route)
       route.send(200, { sessions: account.store.listSessions(me.id) })
     } catch (error) {
@@ -690,6 +1023,16 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('DELETE', '/api/account/sessions/:id', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const sessionId = String(route.params.id ?? '')
+        if (!(await account.mysql!.revokeSessionById(me.id, sessionId))) {
+          throw new CollabError('会话不存在', 404)
+        }
+        ctx.http.disconnectRevokedSessions(me.id)
+        route.send(200, { id: sessionId })
+        return
+      }
       const me = actor(route)
       const revoked = account.store.revokeSessionById(me.id, String(route.params.id ?? ''))
       ctx.http.disconnectRevokedSessions(me.id)
@@ -701,6 +1044,30 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/mcp/credentials', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as { workspaceId?: string; allowedTools?: unknown; expiresInHours?: unknown }
+        const workspaceId = String(body.workspaceId ?? '').trim()
+        if (!workspaceId) throw new CollabError('需要空间', 400)
+        const hours = Math.min(24 * 365, Math.max(1, Number(body.expiresInHours ?? 24 * 90)))
+        const allowedTools = Array.isArray(body.allowedTools) ? [...new Set(body.allowedTools.map(String).filter(Boolean))] : []
+        const token = randomBytes(24).toString('hex')
+        const credential = {
+          id: controlPlaneId('mcp'),
+          token,
+          workspaceId,
+          allowedTools,
+          expiresAt: Date.now() + hours * 60 * 60 * 1000,
+        }
+        await account.mysql!.issueMcpCredential({
+          ...credential,
+          tokenHash: controlPlaneTokenHash(token),
+          accountId: me.id,
+          now: Date.now(),
+        })
+        route.send(201, credential)
+        return
+      }
       const me = actor(route)
       const body = (await route.json()) as { workspaceId?: string; allowedTools?: unknown; expiresInHours?: unknown }
       const workspaceId = String(body.workspaceId ?? '').trim()
@@ -721,6 +1088,13 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('GET', '/api/account/mcp/credentials', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const workspaceId = String(route.query.get('workspaceId') ?? '').trim()
+        if (!workspaceId) throw new CollabError('需要空间', 400)
+        route.send(200, { credentials: await account.mysql!.listMcpCredentials(me.id, workspaceId) })
+        return
+      }
       const me = actor(route)
       const workspaceId = String(route.query.get('workspaceId') ?? '').trim()
       if (!workspaceId) throw new CollabError('需要空间', 400)
@@ -732,6 +1106,15 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('DELETE', '/api/account/mcp/credentials/:id', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const credentialId = String(route.params.id ?? '')
+        if (!(await account.mysql!.revokeMcpCredential(me.id, credentialId))) {
+          throw new CollabError('MCP 凭证不存在', 404)
+        }
+        route.send(200, { id: credentialId })
+        return
+      }
       route.send(200, account.store.revokeMcpCredential(actor(route).id, String(route.params.id ?? '')))
     } catch (error) {
       fail(route, error)
@@ -740,6 +1123,15 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('GET', '/api/account/mcp/audit', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const workspaceId = String(route.query.get('workspaceId') ?? '').trim()
+        if (!workspaceId) throw new CollabError('需要空间', 400)
+        route.send(200, {
+          events: await account.mysql!.listMcpAudit(me.id, workspaceId, Number(route.query.get('limit') ?? 100)),
+        })
+        return
+      }
       const me = actor(route)
       const workspaceId = String(route.query.get('workspaceId') ?? '').trim()
       if (!workspaceId) throw new CollabError('需要空间', 400)
@@ -753,6 +1145,19 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('GET', '/api/account/me', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        route.send(200, {
+          id: me.id,
+          name: me.name,
+          email: me.email,
+          createdAt: me.createdAt,
+          mustChangePassword: me.mustChangePassword,
+          online: true,
+          operations: isOperationsRuntime(),
+        })
+        return
+      }
       const me = actor(route)
       route.send(200, { ...me, online: isOnlineRuntime(), operations: isOperationsRuntime() })
     } catch (error) {
@@ -762,6 +1167,15 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('GET', '/api/account/plugins/audit', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const workspaceId = String(route.query.get('workspaceId') ?? '')
+        if (!workspaceId) throw new CollabError('需要空间', 400)
+        route.send(200, {
+          events: await account.mysql!.listPluginAudit(me.id, workspaceId, Number(route.query.get('limit') ?? 100)),
+        })
+        return
+      }
       const me = actor(route)
       route.send(200, {
         events: account.store.listPluginAudit(
@@ -777,6 +1191,12 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('GET', '/api/account/workspace-profile', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        if (!me.activeWorkspaceId) throw new CollabError('没有工作区', 400)
+        route.send(200, await account.mysql!.workspaceProfile(me.id, me.activeWorkspaceId))
+        return
+      }
       const me = actor(route)
       const workspaceId = account.store.activeWorkspaceId()
       if (workspaceId && (await relayCloudWorkspace(route, me.id, workspaceId, '/api/account/workspace-profile'))) return
@@ -788,6 +1208,17 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/workspace-profile', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        if (!me.activeWorkspaceId) throw new CollabError('没有工作区', 400)
+        const body = (await route.json()) as { name?: unknown; avatar?: unknown }
+        const name = typeof body.name === 'string' ? body.name.trim().slice(0, 40) : undefined
+        let avatar = typeof body.avatar === 'string' ? body.avatar.trim() : undefined
+        if (avatar && !avatar.startsWith('data:image/')) avatar = ''
+        if ((avatar?.length ?? 0) > 240_000) throw new CollabError('头像太大', 400)
+        route.send(200, await account.mysql!.saveWorkspaceProfile(me.id, me.activeWorkspaceId, { name, avatar }))
+        return
+      }
       const me = actor(route)
       const workspaceId = account.store.activeWorkspaceId()
       if (workspaceId && (await relayCloudWorkspace(route, me.id, workspaceId, '/api/account/workspace-profile'))) return
@@ -806,6 +1237,13 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('GET', '/api/account/workspaces', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const workspaces = (await account.mysql!.listWorkspaces(me.id))
+          .map((workspace) => ({ ...workspace, location: 'cloud' as const }))
+        route.send(200, { workspaces, cloudConnected: true, cloudUnavailable: false })
+        return
+      }
       const me = actor(route)
       const local = account.store
         .listWorkspaces(me.id)
@@ -849,6 +1287,20 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
   ctx.http.route('POST', '/api/account/workspaces', async (route) => {
     try {
       if (isOperationsRuntime()) throw new CollabError('运营端使用固定 Workspace', 403)
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as { name?: string }
+        const name = String(body.name ?? '').trim() || '云端空间'
+        if (name.length > 40) throw new CollabError('空间名称不能超过 40 个字符', 400)
+        const workspace = await account.mysql!.createWorkspace({
+          id: controlPlaneId('ws'),
+          ownerId: me.id,
+          name,
+          createdAt: Date.now(),
+        })
+        route.send(201, { ...workspace, location: 'cloud' })
+        return
+      }
       const me = actor(route)
       const body = (await route.json()) as { name?: string; location?: string }
       const name = String(body.name ?? '').trim() || (body.location === 'device' ? '本机空间' : '云端空间')
@@ -902,6 +1354,20 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('PATCH', '/api/account/workspaces/:id', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as { name?: string }
+        const name = String(body.name ?? '').trim()
+        if (!name) throw new CollabError('空间名称不能为空', 400)
+        if (name.length > 40) throw new CollabError('空间名称不能超过 40 个字符', 400)
+        const workspace = await account.mysql!.renameWorkspace(me.id, route.params.id!, name)
+        ctx.http.broadcastWorkspace(route.params.id!, 'workspace/changed', {
+          workspaceId: route.params.id!,
+          name: workspace.name,
+        })
+        route.send(200, { ...workspace, location: 'cloud' })
+        return
+      }
       const me = actor(route)
       const body = (await route.json()) as { name?: string }
       const workspaceId = route.params.id!
@@ -959,6 +1425,17 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
   ctx.http.route('DELETE', '/api/account/workspaces/:id', async (route) => {
     try {
       if (isOperationsRuntime() || route.params.id === 'ws_operations') throw new CollabError('不能删除运营 Workspace', 403)
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json().catch(() => ({}))) as { name?: string }
+        const deleted = await account.mysql!.deleteWorkspace(me.id, route.params.id!, String(body.name ?? ''))
+        route.send(200, {
+          id: deleted.id,
+          deleted: true,
+          activeWorkspaceId: deleted.activeWorkspaceId,
+        })
+        return
+      }
       const me = actor(route)
       const body = (await route.json().catch(() => ({}))) as { name?: string }
       const confirmName = String(body.name ?? '')
@@ -989,6 +1466,11 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('GET', '/api/account/workspaces/:id/members', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        route.send(200, { members: await account.mysql!.members(me.id, route.params.id!) })
+        return
+      }
       const me = actor(route)
       if (await relayCloudWorkspace(route, me.id, route.params.id!, `/api/account/workspaces/${route.params.id}/members`)) return
       requireCollaborativeWorkspace(route.params.id!)
@@ -1000,6 +1482,16 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/workspaces/:id/members', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as { email?: string; accountId?: string }
+        const members = String(body.email ?? '').trim()
+          ? await account.mysql!.addMemberByEmail(me.id, route.params.id!, String(body.email))
+          : await account.mysql!.addMember(me.id, route.params.id!, String(body.accountId ?? ''))
+        if (!members) throw new CollabError('没有这个邮箱，对方需要先注册', 404)
+        route.send(200, { members })
+        return
+      }
       const me = actor(route)
       if (await relayCloudWorkspace(route, me.id, route.params.id!, `/api/account/workspaces/${route.params.id}/members`)) return
       requireCollaborativeWorkspace(route.params.id!)
@@ -1016,6 +1508,32 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/workspaces/:id/invites', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as { role?: string; expiresInHours?: number }
+        const role = body.role === 'member' ? 'member' : 'viewer'
+        const now = Date.now()
+        const token = controlPlaneInviteToken()
+        const invite = {
+          id: controlPlaneId('inv'),
+          token,
+          workspaceId: route.params.id!,
+          kind: 'workspace' as const,
+          role,
+          expiresAt: now + Math.max(1, Math.min(24 * 30, Number(body.expiresInHours ?? 168))) * 60 * 60 * 1000,
+        }
+        await account.mysql!.createInvite({
+          id: invite.id,
+          tokenHash: controlPlaneTokenHash(token),
+          workspaceId: invite.workspaceId,
+          role,
+          expiresAt: invite.expiresAt,
+          actorId: me.id,
+          now,
+        })
+        route.send(201, { ...invite, path: `/?workspaceInvite=${encodeURIComponent(token)}` })
+        return
+      }
       const me = actor(route)
       if (await relayCloudWorkspace(route, me.id, route.params.id!, `/api/account/workspaces/${route.params.id}/invites`)) return
       requireCollaborativeWorkspace(route.params.id!)
@@ -1036,8 +1554,29 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
     }
   })
 
+  ctx.http.route('DELETE', '/api/account/workspaces/:id/invites/:inviteId', async (route) => {
+    try {
+      if (!account.usesMysqlAccounts()) account.requireMigrated('DELETE workspace invite')
+      const me = await mysqlActor(route)
+      await account.mysql!.revokeInvite(me.id, route.params.id!, route.params.inviteId!)
+      route.send(200, { id: route.params.inviteId, revoked: true })
+    } catch (error) {
+      fail(route, error)
+    }
+  })
+
   ctx.http.route('POST', '/api/account/invites/:token/accept', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const result = await account.mysql!.acceptInvite(
+          me.id,
+          controlPlaneTokenHash(route.params.token!),
+        )
+        ctx.http.broadcast('database', { ts: Date.now() })
+        route.send(200, result)
+        return
+      }
       const me = actor(route)
       const connection = !isOnlineRuntime() ? account.cloudConnection(me.id) : null
       if (connection) {
@@ -1069,6 +1608,25 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
   ctx.http.route('POST', '/api/account/guest-invites/:token/accept', async (route) => {
     try {
       if (!isOnlineRuntime()) throw new CollabError('本机空间不提供访客邀请', 403)
+      if (account.usesMysqlAccounts()) {
+        const body = (await route.json()) as { name?: string }
+        const accountId = controlPlaneId('guest')
+        const sessionId = controlPlaneId('gss')
+        const token = randomBytes(24).toString('hex')
+        const name = String(body.name ?? '').trim().slice(0, 40) || `临时访客-${accountId.slice(-4)}`
+        const result = await account.mysql!.acceptGuestInvite({
+          tokenHash: controlPlaneTokenHash(route.params.token!),
+          accountId,
+          sessionId,
+          sessionTokenHash: controlPlaneTokenHash(token),
+          legacyToken: randomBytes(24).toString('hex'),
+          name,
+          now: Date.now(),
+        })
+        rememberLogin(route, token)
+        route.send(200, { ...result, token })
+        return
+      }
       const body = (await route.json()) as { name?: string }
       const result = account.store.acceptGuestInvite(route.params.token!, String(body.name ?? ''))
       rememberLogin(route, result.token)
@@ -1081,6 +1639,13 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('DELETE', '/api/account/workspaces/:id/members/:accountId', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        await account.mysql!.removeMember(me.id, route.params.id!, route.params.accountId!)
+        ctx.http.disconnectTenant(route.params.accountId!, route.params.id!)
+        route.send(200, { members: await account.mysql!.members(me.id, route.params.id!) })
+        return
+      }
       const me = actor(route)
       if (
         await relayCloudWorkspace(
@@ -1101,6 +1666,17 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('PATCH', '/api/account/workspaces/:id/members/:accountId', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as { role?: string }
+        const role = String(body.role ?? '')
+        if (role !== 'owner' && role !== 'admin' && role !== 'member' && role !== 'viewer') {
+          throw new CollabError('角色只能是 owner、admin、member 或 viewer', 400)
+        }
+        await account.mysql!.updateMemberRole(me.id, route.params.id!, route.params.accountId!, role)
+        route.send(200, { members: await account.mysql!.members(me.id, route.params.id!) })
+        return
+      }
       const me = actor(route)
       if (
         await relayCloudWorkspace(
@@ -1125,6 +1701,11 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('GET', '/api/account/workspaces/:id/groups', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        route.send(200, { groups: await account.mysql!.groups(me.id, route.params.id!) })
+        return
+      }
       const me = actor(route)
       if (await relayCloudWorkspace(route, me.id, route.params.id!, `/api/account/workspaces/${route.params.id}/groups`)) return
       requireCollaborativeWorkspace(route.params.id!)
@@ -1136,6 +1717,28 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/workspaces/:id/groups', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as { name?: string }
+        const name = String(body.name ?? '').trim()
+        if (!name) throw new CollabError('组名不能为空', 400)
+        const group = {
+          id: controlPlaneId('grp'),
+          workspaceId: route.params.id!,
+          name,
+          createdBy: me.id,
+          createdAt: Date.now(),
+        }
+        await account.mysql!.createGroup({
+          id: group.id,
+          actorId: me.id,
+          workspaceId: group.workspaceId,
+          name,
+          now: group.createdAt,
+        })
+        route.send(201, group)
+        return
+      }
       const me = actor(route)
       if (await relayCloudWorkspace(route, me.id, route.params.id!, `/api/account/workspaces/${route.params.id}/groups`)) return
       requireCollaborativeWorkspace(route.params.id!)
@@ -1148,6 +1751,17 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/workspaces/:id/groups/:groupId/members', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as { email?: string }
+        const target = await account.mysql!.accountByEmail(String(body.email ?? ''))
+        if (!target) throw new CollabError('没有这个邮箱，对方需要先注册', 404)
+        await account.mysql!.addGroupMember(me.id, route.params.id!, route.params.groupId!, target.id)
+        route.send(200, {
+          members: await account.mysql!.groupMembers(me.id, route.params.id!, route.params.groupId!),
+        })
+        return
+      }
       const me = actor(route)
       if (
         await relayCloudWorkspace(
@@ -1175,8 +1789,82 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
     }
   })
 
+  ctx.http.route('GET', '/api/account/workspaces/:id/groups/:groupId/members', async (route) => {
+    try {
+      if (!account.usesMysqlAccounts()) account.requireMigrated('GET group members')
+      const me = await mysqlActor(route)
+      route.send(200, {
+        members: await account.mysql!.groupMembers(me.id, route.params.id!, route.params.groupId!),
+      })
+    } catch (error) {
+      fail(route, error)
+    }
+  })
+
+  ctx.http.route('PATCH', '/api/account/workspaces/:id/groups/:groupId', async (route) => {
+    try {
+      if (!account.usesMysqlAccounts()) account.requireMigrated('PATCH group')
+      const me = await mysqlActor(route)
+      const body = (await route.json()) as { name?: string }
+      const name = String(body.name ?? '').trim()
+      if (!name) throw new CollabError('组名不能为空', 400)
+      await account.mysql!.renameGroup(me.id, route.params.id!, route.params.groupId!, name)
+      route.send(200, { id: route.params.groupId, name })
+    } catch (error) {
+      fail(route, error)
+    }
+  })
+
+  ctx.http.route('DELETE', '/api/account/workspaces/:id/groups/:groupId', async (route) => {
+    try {
+      if (!account.usesMysqlAccounts()) account.requireMigrated('DELETE group')
+      const me = await mysqlActor(route)
+      await account.mysql!.deleteGroup(me.id, route.params.id!, route.params.groupId!)
+      route.send(200, { id: route.params.groupId, deleted: true })
+    } catch (error) {
+      fail(route, error)
+    }
+  })
+
+  ctx.http.route('DELETE', '/api/account/workspaces/:id/groups/:groupId/members/:accountId', async (route) => {
+    try {
+      if (!account.usesMysqlAccounts()) account.requireMigrated('DELETE group member')
+      const me = await mysqlActor(route)
+      await account.mysql!.removeGroupMember(
+        me.id,
+        route.params.id!,
+        route.params.groupId!,
+        route.params.accountId!,
+      )
+      route.send(200, {
+        members: await account.mysql!.groupMembers(me.id, route.params.id!, route.params.groupId!),
+      })
+    } catch (error) {
+      fail(route, error)
+    }
+  })
+
   ctx.http.route('GET', '/api/account/access', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const workspaceId = me.activeWorkspaceId
+        if (!workspaceId) throw new CollabError('没有工作区', 400)
+        const collection = String(route.query.get('collection') ?? '')
+        const viewId = String(route.query.get('viewId') ?? '')
+        route.send(
+          200,
+          viewId
+            ? await account.mysql!.viewAccess(me.id, workspaceId, collection, viewId)
+            : await account.mysql!.recordAccess(
+                me.id,
+                workspaceId,
+                collection,
+                String(route.query.get('recordId') ?? ''),
+              ),
+        )
+        return
+      }
       const me = actor(route)
       const activeWorkspace = account.store.activeWorkspaceId()
       if (
@@ -1204,6 +1892,93 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/access', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as {
+          collection?: string; recordId?: string; viewId?: string; email?: string;
+          groupId?: string; memberViewId?: string; role?: ResourceRole;
+          collaboratorKind?: 'internal' | 'external'
+        }
+        const workspaceId = me.activeWorkspaceId
+        if (!workspaceId) throw new CollabError('没有工作区', 400)
+        const collection = String(body.collection ?? '')
+        const role: ResourceRole =
+          body.role === 'viewer' || body.role === 'manager' || body.role === 'owner' ? body.role : 'editor'
+        const collaboratorKind = body.collaboratorKind === 'internal' ? 'internal' : 'external'
+        if (body.viewId) {
+          if (body.memberViewId) {
+            await account.mysql!.grantView({
+              actorId: me.id,
+              workspaceId,
+              collection,
+              viewId: String(body.viewId),
+              subjectType: 'member_view',
+              subjectId: String(body.memberViewId),
+              role,
+              now: Date.now(),
+            })
+          } else {
+            const target = await account.mysql!.shareViewWithEmail({
+              actorId: me.id,
+              workspaceId,
+              collection,
+              viewId: String(body.viewId),
+              email: String(body.email ?? ''),
+              role,
+              collaboratorKind,
+              now: Date.now(),
+            })
+            if (!target) throw new CollabError('没有这个邮箱，对方需要先注册', 404)
+          }
+          route.send(200, await account.mysql!.viewAccess(me.id, workspaceId, collection, String(body.viewId)))
+          return
+        }
+        let subjectType: 'account' | 'group' | 'member_view'
+        let subjectId: string
+        if (body.memberViewId) {
+          subjectType = 'member_view'
+          subjectId = String(body.memberViewId)
+        } else if (body.groupId) {
+          subjectType = 'group'
+          subjectId = String(body.groupId)
+        } else {
+          const target = await account.mysql!.shareRecordWithEmail({
+            actorId: me.id,
+            workspaceId,
+            collection,
+            recordId: String(body.recordId ?? ''),
+            email: String(body.email ?? ''),
+            role,
+            collaboratorKind,
+            now: Date.now(),
+          })
+          if (!target) throw new CollabError('没有这个邮箱，对方需要先注册', 404)
+          route.send(200, await account.mysql!.recordAccess(
+            me.id,
+            workspaceId,
+            collection,
+            String(body.recordId ?? ''),
+          ))
+          return
+        }
+        await account.mysql!.grantRecord({
+          actorId: me.id,
+          workspaceId,
+          collection,
+          recordId: String(body.recordId ?? ''),
+          subjectType,
+          subjectId,
+          role,
+          now: Date.now(),
+        })
+        route.send(200, await account.mysql!.recordAccess(
+          me.id,
+          workspaceId,
+          collection,
+          String(body.recordId ?? ''),
+        ))
+        return
+      }
       const me = actor(route)
       const activeWorkspace = account.store.activeWorkspaceId()
       if (activeWorkspace && (await relayCloudWorkspace(route, me.id, activeWorkspace, '/api/account/access'))) return
@@ -1243,6 +2018,50 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('DELETE', '/api/account/access', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as {
+          collection?: string; recordId?: string; viewId?: string;
+          subjectType?: 'account' | 'group' | 'member_view'; subjectId?: string
+        }
+        const workspaceId = me.activeWorkspaceId
+        if (!workspaceId) throw new CollabError('没有工作区', 400)
+        const collection = String(body.collection ?? '')
+        const subjectType =
+          body.subjectType === 'group' || body.subjectType === 'member_view' ? body.subjectType : 'account'
+        if (body.viewId) {
+          await account.mysql!.revokeView({
+            actorId: me.id,
+            workspaceId,
+            collection,
+            viewId: String(body.viewId),
+            subjectType: subjectType === 'member_view' ? 'member_view' : 'account',
+            subjectId: String(body.subjectId ?? ''),
+          })
+          route.send(200, await account.mysql!.viewAccess(
+            me.id,
+            workspaceId,
+            collection,
+            String(body.viewId),
+          ))
+          return
+        }
+        await account.mysql!.revokeRecordGrant({
+          actorId: me.id,
+          workspaceId,
+          collection,
+          recordId: String(body.recordId ?? ''),
+          subjectType,
+          subjectId: String(body.subjectId ?? ''),
+        })
+        route.send(200, await account.mysql!.recordAccess(
+          me.id,
+          workspaceId,
+          collection,
+          String(body.recordId ?? ''),
+        ))
+        return
+      }
       const me = actor(route)
       const activeWorkspace = account.store.activeWorkspaceId()
       if (activeWorkspace && (await relayCloudWorkspace(route, me.id, activeWorkspace, '/api/account/access'))) return
@@ -1282,6 +2101,41 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/access/guest-invite', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const workspaceId = me.activeWorkspaceId
+        if (!workspaceId) throw new CollabError('没有工作区', 400)
+        const body = (await route.json()) as {
+          collection?: string; recordId?: string; viewId?: string; role?: string; expiresInHours?: number
+        }
+        const token = controlPlaneInviteToken()
+        const now = Date.now()
+        const invite = {
+          id: controlPlaneId('inv'),
+          token,
+          workspaceId,
+          kind: 'guest' as const,
+          collection: String(body.collection ?? ''),
+          recordId: String(body.viewId ?? '') ? '' : String(body.recordId ?? ''),
+          viewId: String(body.viewId ?? ''),
+          role: body.role === 'editor' ? 'editor' as const : 'viewer' as const,
+          expiresAt: now + Math.max(1, Math.min(24 * 30, Number(body.expiresInHours ?? 24))) * 60 * 60 * 1000,
+        }
+        await account.mysql!.createGuestInvite({
+          id: invite.id,
+          tokenHash: controlPlaneTokenHash(token),
+          actorId: me.id,
+          workspaceId,
+          collection: invite.collection,
+          recordId: invite.recordId,
+          viewId: invite.viewId,
+          role: invite.role,
+          expiresAt: invite.expiresAt,
+          now,
+        })
+        route.send(201, { ...invite, path: `/?guestInvite=${encodeURIComponent(token)}` })
+        return
+      }
       const me = actor(route)
       const activeWorkspace = account.store.activeWorkspaceId()
       if (
@@ -1316,6 +2170,16 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/records/claim', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as { workspaceId?: string; collection?: string; recordId?: string }
+        const workspaceId = String(body.workspaceId ?? '')
+        const collection = String(body.collection ?? '')
+        const recordId = String(body.recordId ?? '')
+        await account.mysql!.claimRecord({ actorId: me.id, workspaceId, collection, recordId, now: Date.now() })
+        route.send(200, { workspaceId, collection, recordId, ownerId: me.id, version: 0 })
+        return
+      }
       const me = actor(route)
       const body = (await route.json()) as { workspaceId?: string; collection?: string; recordId?: string }
       route.send(
@@ -1329,6 +2193,25 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/sync', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as {
+          workspaceId?: string; collection?: string; recordId?: string; field?: string;
+          value?: unknown; expectedVersion?: number
+        }
+        const op = await account.mysql!.sync({
+          actorId: me.id,
+          workspaceId: String(body.workspaceId ?? ''),
+          collection: String(body.collection ?? ''),
+          recordId: String(body.recordId ?? ''),
+          field: String(body.field ?? ''),
+          value: body.value,
+          expectedVersion: Number(body.expectedVersion ?? 0),
+          now: Date.now(),
+        })
+        route.send(200, op)
+        return
+      }
       const me = actor(route)
       const body = (await route.json()) as {
         workspaceId?: string
@@ -1353,17 +2236,146 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
     }
   })
 
+  ctx.http.route('POST', '/api/private-backups', async (route) => {
+    try {
+      const me = account.usesMysqlAccounts() ? await mysqlActor(route) : actor(route)
+      if (!isOnlineRuntime()) throw new CollabError('本机请使用显式 publish API', 405)
+      const contentLength = Number(route.req.headers['content-length'] ?? 0)
+      if (contentLength > MAX_PRIVATE_BACKUP_BYTES + 64 * 1024) {
+        throw new CollabError('backup is too large', 413)
+      }
+      const body = (await route.json()) as {
+        name?: string
+        sourceDeviceId?: string
+        workspaceId?: string
+        snapshot?: MirrorSnapshot
+      }
+      const backup = await cloudStorage().createPrivateBackup(me.id, {
+        name: String(body.name ?? ''),
+        sourceDeviceId: String(body.sourceDeviceId ?? ''),
+        workspaceId: String(body.workspaceId ?? ''),
+        snapshot: body.snapshot as MirrorSnapshot,
+      })
+      route.send(201, backup)
+    } catch (error) {
+      failBackup(route, error)
+    }
+  })
+
+  ctx.http.route('GET', '/api/private-backups', async (route) => {
+    try {
+      const me = account.usesMysqlAccounts() ? await mysqlActor(route) : actor(route)
+      if (!isOnlineRuntime()) {
+        route.send(200, await cloudBackupRequest(me.id, '/api/private-backups'))
+        return
+      }
+      route.send(200, { backups: await cloudStorage().listPrivateBackups(me.id) })
+    } catch (error) {
+      failBackup(route, error)
+    }
+  })
+
+  ctx.http.route('GET', '/api/private-backups/:id', async (route) => {
+    try {
+      const me = account.usesMysqlAccounts() ? await mysqlActor(route) : actor(route)
+      const id = String(route.params.id ?? '')
+      if (!isOnlineRuntime()) {
+        route.send(200, await cloudBackupRequest(me.id, `/api/private-backups/${encodeURIComponent(id)}`))
+        return
+      }
+      const backup = await cloudStorage().readPrivateBackup(me.id, id)
+      if (!backup) throw new CollabError('备份不存在', 404)
+      route.send(200, backup)
+    } catch (error) {
+      failBackup(route, error)
+    }
+  })
+
+  ctx.http.route('DELETE', '/api/private-backups/:id', async (route) => {
+    try {
+      const me = account.usesMysqlAccounts() ? await mysqlActor(route) : actor(route)
+      const id = String(route.params.id ?? '')
+      if (!isOnlineRuntime()) {
+        await cloudBackupRequest(me.id, `/api/private-backups/${encodeURIComponent(id)}`, { method: 'DELETE' })
+        route.send(200, { id, deleted: true })
+        return
+      }
+      if (!(await cloudStorage().deletePrivateBackup(me.id, id))) {
+        throw new CollabError('备份不存在', 404)
+      }
+      route.send(200, { id, deleted: true })
+    } catch (error) {
+      failBackup(route, error)
+    }
+  })
+
+  ctx.http.route('POST', '/api/private-backups/publish', async (route) => {
+    try {
+      if (isOnlineRuntime()) throw new CollabError('publish 仅用于本机 Workspace', 405)
+      const me = actor(route)
+      const body = (await route.json()) as { name?: string; sourceDeviceId?: string; workspaceId?: string }
+      const workspaceId = checkedDeviceWorkspace(me.id, body.workspaceId)
+      const name = String(body.name ?? '').trim()
+      const sourceDeviceId = String(body.sourceDeviceId ?? '').trim()
+      if (!name || name.length > 255) throw new CollabError('需要有效的备份名称', 400)
+      if (!sourceDeviceId || sourceDeviceId.length > 64) throw new CollabError('需要有效的设备 ID', 400)
+      const snapshot = await runWithRequestWorkspace(workspaceId, () => takeSnapshot(ctx, { includeAssets: true }))
+      if (Buffer.byteLength(JSON.stringify(snapshot)) > MAX_PRIVATE_BACKUP_BYTES) {
+        throw new CollabError('backup is too large', 413)
+      }
+      const backup = await cloudBackupRequest(me.id, '/api/private-backups', {
+        method: 'POST',
+        body: { name, sourceDeviceId, workspaceId, snapshot },
+      })
+      route.send(201, backup)
+    } catch (error) {
+      failBackup(route, error)
+    }
+  })
+
+  ctx.http.route('POST', '/api/private-backups/:id/restore', async (route) => {
+    try {
+      if (isOnlineRuntime()) throw new CollabError('restore 仅用于本机 Workspace', 405)
+      const me = actor(route)
+      const body = (await route.json().catch(() => ({}))) as { workspaceId?: string }
+      const workspaceId = checkedDeviceWorkspace(me.id, body.workspaceId)
+      const backup = await cloudBackupRequest(
+        me.id,
+        `/api/private-backups/${encodeURIComponent(String(route.params.id ?? ''))}`,
+      )
+      const snapshot = backup.snapshot as MirrorSnapshot | undefined
+      if (!snapshot) throw new CollabError('云端备份内容无效', 502)
+      const result = await runWithRequestWorkspace(workspaceId, () => restoreSnapshotSafely(ctx, snapshot))
+      if (!result.restored) {
+        route.send(409, { error: '备份预检失败，未恢复任何内容', ...result })
+        return
+      }
+      route.send(200, { ...result, workspaceId })
+    } catch (error) {
+      failBackup(route, error)
+    }
+  })
+
   const snapshotInFlight = new Map<string, Promise<MirrorSnapshot>>()
 
   ctx.http.route('GET', '/api/replica/snapshot', async (route) => {
     try {
-      const me = actor(route)
+      const me = account.usesMysqlAccounts() ? await mysqlActor(route) : actor(route)
       const since = Math.max(0, Number(route.query.get('since') ?? 0) || 0)
-      const workspaceId = account.store.activeWorkspaceId() ?? ''
+      const workspaceId = account.usesMysqlAccounts()
+        ? String(route.req.headers['x-biu-workspace-id'] ?? ('activeWorkspaceId' in me ? me.activeWorkspaceId : '') ?? '')
+        : account.store.activeWorkspaceId() ?? ''
+      if (account.usesMysqlAccounts()) {
+        const allowed = (await account.mysql!.listWorkspaces(me.id)).some((item) => item.id === workspaceId)
+        if (!allowed) throw new CollabError('不在这个空间', 403)
+      }
       const flightKey = `${me.id}\t${workspaceId}\t${since}`
       let pending = snapshotInFlight.get(flightKey)
       if (!pending) {
-        pending = takeSnapshot(ctx, since > 0 ? { since } : undefined).finally(() => {
+        pending = runWithRequestWorkspace(
+          workspaceId,
+          () => takeSnapshot(ctx, since > 0 ? { since } : undefined),
+        ).finally(() => {
           snapshotInFlight.delete(flightKey)
         })
         snapshotInFlight.set(flightKey, pending)
@@ -1376,9 +2388,17 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/replica/snapshot', async (route) => {
     try {
-      actor(route)
+      const me = account.usesMysqlAccounts() ? await mysqlActor(route) : actor(route)
+      const workspaceId = account.usesMysqlAccounts()
+        ? String(route.req.headers['x-biu-workspace-id'] ?? ('activeWorkspaceId' in me ? me.activeWorkspaceId : '') ?? '')
+        : ''
+      if (account.usesMysqlAccounts()) {
+        const allowed = (await account.mysql!.listWorkspaces(me.id)).some((item) => item.id === workspaceId)
+        if (!allowed) throw new CollabError('不在这个空间', 403)
+      }
       const body = (await route.json()) as MirrorSnapshot
-      await applySnapshot(ctx, body, 'adopt')
+      if (workspaceId) await runWithRequestWorkspace(workspaceId, () => applySnapshot(ctx, body, 'adopt'))
+      else await applySnapshot(ctx, body, 'adopt')
       route.send(200, { ok: true })
     } catch (error) {
       fail(route, error)
@@ -1387,6 +2407,18 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('GET', '/api/account/sync', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const workspaceId = String(route.query.get('workspaceId') ?? '')
+        const ops = await account.mysql!.opsSince(
+          me.id,
+          workspaceId,
+          Number(route.query.get('after') ?? 0),
+          route.query.get('visible') === '1',
+        )
+        route.send(200, { ops })
+        return
+      }
       const me = actor(route)
       const workspaceId = String(route.query.get('workspaceId') ?? '')
       const after = Number(route.query.get('after') ?? 0)
@@ -1402,6 +2434,21 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/locks', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as {
+          workspaceId?: string; collection?: string; recordId?: string; ttlMs?: number
+        }
+        route.send(200, await account.mysql!.acquireLock({
+          actorId: me.id,
+          workspaceId: String(body.workspaceId ?? ''),
+          collection: String(body.collection ?? ''),
+          recordId: String(body.recordId ?? ''),
+          ttlMs: Number(body.ttlMs ?? 60_000),
+          now: Date.now(),
+        }))
+        return
+      }
       const me = actor(route)
       const body = (await route.json()) as {
         workspaceId?: string
@@ -1426,6 +2473,18 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('DELETE', '/api/account/locks', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as { workspaceId?: string; collection?: string; recordId?: string }
+        await account.mysql!.releaseLock(
+          me.id,
+          String(body.workspaceId ?? ''),
+          String(body.collection ?? ''),
+          String(body.recordId ?? ''),
+        )
+        route.send(200, { ok: true })
+        return
+      }
       const me = actor(route)
       const body = (await route.json()) as { workspaceId?: string; collection?: string; recordId?: string }
       account.store.releaseLock(
@@ -1442,6 +2501,20 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
 
   ctx.http.route('POST', '/api/account/presence', async (route) => {
     try {
+      if (account.usesMysqlAccounts()) {
+        const me = await mysqlActor(route)
+        const body = (await route.json()) as { workspaceId?: string; collection?: string; recordId?: string }
+        const workspaceId = String(body.workspaceId ?? '')
+        route.send(200, {
+          presence: await account.mysql!.pulse(
+            me.id,
+            workspaceId,
+            String(body.collection ?? ''),
+            String(body.recordId ?? ''),
+          ),
+        })
+        return
+      }
       const me = actor(route)
       const body = (await route.json()) as { workspaceId?: string; collection?: string; recordId?: string }
       requireCollaborativeWorkspace(String(body.workspaceId ?? ''))

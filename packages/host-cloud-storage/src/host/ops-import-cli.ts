@@ -26,6 +26,11 @@ async function main() {
       { name: 'online', path: online },
       { name: 'operations', path: operations },
     ])
+    await pool.query(
+      `INSERT INTO \`${config.operationsDatabase}\`.ops_import_runs
+       (sources_json, report_json, imported_at) VALUES (?, ?, ?)`,
+      [JSON.stringify(result.plan.sources), JSON.stringify(result.plan.tables), Date.now()],
+    )
     console.log(JSON.stringify({ database: config.operationsDatabase, imported: result.imported }, null, 2))
   } finally {
     await pool.end()

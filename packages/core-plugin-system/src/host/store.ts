@@ -323,9 +323,20 @@ export class PluginStoreService extends Service {
     return this.ctx.hub as unknown as StoreHub
   }
 
-  private accountStore() {
-    return (
+  private accountStore(): any {
+    const account = (
       this.ctx.get('account') as {
+        isMemberAsync?(accountId: string, workspaceId: string): Promise<boolean>
+        canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): Promise<boolean>
+        pluginLoadsFor?(accountId: string, workspaceId: string): Promise<string[]>
+        loadedPluginIds?(): Promise<string[]>
+        setPluginLoad?(accountId: string, workspaceId: string, pluginId: string, loaded: boolean): Promise<void>
+        recordPluginPackage?(accountId: string, input: Record<string, unknown>): Promise<void>
+        syncInstalledPluginPackage?(input: Record<string, unknown>): Promise<boolean>
+        ensurePluginOwnerAssignments?(pluginId: string): Promise<number>
+        installPluginForWorkspace?(accountId: string, workspaceId: string, pluginId: string, version?: string): Promise<unknown>
+        uninstallPluginFromWorkspace?(accountId: string, workspaceId: string, pluginId: string): Promise<unknown>
+        removePluginPackage?(accountId: string, pluginId: string): Promise<void>
         store?: {
           canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): boolean
           hasPluginLoad?(accountId: string, workspaceId: string, pluginId: string): boolean
@@ -343,7 +354,8 @@ export class PluginStoreService extends Service {
           removePluginPackage?(accountId: string, pluginId: string): void
         }
       } | undefined
-    )?.store
+    )
+    return account?.canAccessPlugin ? account : account?.store
   }
 
   private readState(): StoreState {
@@ -379,14 +391,17 @@ export class PluginStoreService extends Service {
   }
 
   private currentWorkspaceId() {
-    return currentRequestWorkspaceId() || this.accountStore()?.activeWorkspaceId?.() || ''
+    return currentRequestWorkspaceId() || (isOnlineRuntime() ? '' : this.accountStore()?.activeWorkspaceId?.()) || ''
   }
 
-  isInstalledForCurrentWorkspace(id: string) {
+  async isInstalledForCurrentWorkspace(id: string) {
     const accountId = currentAccountId()
     const workspaceId = this.currentWorkspaceId()
     if (!accountId || !workspaceId) return existsSync(join(this.pluginPath(id), 'manifest.json'))
-    return Boolean(this.accountStore()?.workspaceHasPlugin?.(workspaceId, id, accountId))
+    const account = this.accountStore()
+    return account?.canAccessPlugin
+      ? Boolean(await account.canAccessPlugin(accountId, workspaceId, id))
+      : Boolean(account?.workspaceHasPlugin?.(workspaceId, id, accountId))
   }
 
   private setEnabled(id: string, enabled: boolean) {
@@ -412,7 +427,7 @@ export class PluginStoreService extends Service {
 
   /** 在 .plugin-dev/<id>/ 开沙箱，不写入已安装目录。线上任何空间成员都能开。 */
   async initSandbox(input: PluginCreateInput) {
-    if (isOnlineRuntime()) this.requireWorkspaceMember()
+    if (isOnlineRuntime()) await this.requireWorkspaceMember()
     const id = String(input.id ?? '').trim()
     const name = String(input.name ?? '').trim()
     if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
@@ -440,16 +455,19 @@ export class PluginStoreService extends Service {
   }
 
   /** 线上：空间成员即可打包。改沙箱源码仍要写权限。 */
-  private requireWorkspaceMember() {
+  private async requireWorkspaceMember() {
     const accountId = currentAccountId()
     const workspaceId = this.currentWorkspaceId()
     const account = this.accountStore()
-    if (!accountId || !workspaceId || !account?.isMember?.(accountId, workspaceId)) throw new Error('需要登录')
+    const member = account?.isMemberAsync
+      ? await account.isMemberAsync(accountId, workspaceId)
+      : account?.isMember?.(accountId, workspaceId)
+    if (!accountId || !workspaceId || !member) throw new Error('需要登录')
   }
 
   /** 把沙箱 bundle 进 .plugin/<id>/。 */
   async pack(id: string) {
-    if (isOnlineRuntime()) this.requireWorkspaceMember()
+    if (isOnlineRuntime()) await this.requireWorkspaceMember()
     if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
     const sandbox = this.sandboxPath(id)
     if (!existsSync(join(sandbox, 'manifest.json'))) throw new Error(`sandbox not found: ${sandbox}`)
@@ -493,7 +511,7 @@ export class PluginStoreService extends Service {
     const accountId = currentAccountId()
     const workspaceId = this.currentWorkspaceId()
     const account = this.accountStore()
-    account?.recordPluginPackage?.(accountId, {
+    await account?.recordPluginPackage?.(accountId, {
       id: manifest.id,
       version: codeVersion,
       packageHash: codeVersion,
@@ -505,8 +523,13 @@ export class PluginStoreService extends Service {
       hasHost: Boolean(hostEntry),
       manifest,
     })
-    if (accountId && workspaceId && account?.isMember?.(accountId, workspaceId)) {
-      account.installPluginForWorkspace?.(accountId, workspaceId, manifest.id, codeVersion)
+    const member = accountId && workspaceId && (
+      account?.isMemberAsync
+        ? await account.isMemberAsync(accountId, workspaceId)
+        : account?.isMember?.(accountId, workspaceId)
+    )
+    if (member) {
+      await account.installPluginForWorkspace?.(accountId, workspaceId, manifest.id, codeVersion)
     }
     // 运行中才重新挂载；挂载失败不能留在运行中。
     if (this.isEnabled(manifest.id)) {
@@ -522,15 +545,19 @@ export class PluginStoreService extends Service {
   }
 
   /** 空间成员看得到 .plugin-dev；实例草稿权限仍单独放行。 */
-  private canSeeSandboxes() {
+  private async canSeeSandboxes() {
     if (!isOnlineRuntime()) return true
     const accountId = currentAccountId()
     const workspaceId = currentRequestWorkspaceId()
-    return Boolean(accountId && workspaceId && this.accountStore()?.isMember?.(accountId, workspaceId))
+    const account = this.accountStore()
+    const member = account?.isMemberAsync
+      ? await account.isMemberAsync(accountId, workspaceId)
+      : account?.isMember?.(accountId, workspaceId)
+    return Boolean(accountId && workspaceId && member)
   }
 
   async listSandboxes() {
-    const canReadDrafts = this.canSeeSandboxes()
+    const canReadDrafts = await this.canSeeSandboxes()
     const names = existsSync(this.sandboxDir) ? await readdir(this.sandboxDir) : []
     const items: Array<{
       id: string
@@ -611,11 +638,11 @@ export class PluginStoreService extends Service {
   }
 
   /** 每个账号、空间一份加载记录。进程里的 host 仍只挂一份，没人加载时才卸下。 */
-  private withViewerLoads(items: StoreListing[]) {
+  private async withViewerLoads(items: StoreListing[]) {
     const accountId = currentAccountId()
     const workspaceId = this.currentWorkspaceId()
     if (!accountId || !workspaceId) return items
-    const loaded = new Set(this.accountStore()?.pluginLoadsFor?.(accountId, workspaceId) ?? [])
+    const loaded = new Set(await this.accountStore()?.pluginLoadsFor?.(accountId, workspaceId) ?? [])
     return items.map((item) => ({ ...item, enabled: loaded.has(item.id), running: loaded.has(item.id) }))
   }
 
@@ -651,17 +678,22 @@ export class PluginStoreService extends Service {
     const accountId = currentAccountId()
     const workspaceId = this.currentWorkspaceId()
     const account = this.accountStore()
-    if (accountId && workspaceId && account?.isMember?.(accountId, workspaceId)) {
+    const member = accountId && workspaceId && (
+      account?.isMemberAsync
+        ? await account.isMemberAsync(accountId, workspaceId)
+        : account?.isMember?.(accountId, workspaceId)
+    )
+    if (member) {
       await this.ensurePacked(id)
       try {
         await this.mountInstalled(id)
       } catch (error) {
-        account.setPluginLoad?.(accountId, workspaceId, id, false)
+        await account.setPluginLoad?.(accountId, workspaceId, id, false)
         await this.hub().drop(id).catch(() => undefined)
         this.invalidateList()
         throw error
       }
-      account.setPluginLoad?.(accountId, workspaceId, id, true)
+      await account.setPluginLoad?.(accountId, workspaceId, id, true)
       this.invalidateList()
       return (await this.list()).find((item) => item.id === id)
     }
@@ -688,9 +720,14 @@ export class PluginStoreService extends Service {
     const accountId = currentAccountId()
     const workspaceId = this.currentWorkspaceId()
     const account = this.accountStore()
-    if (accountId && workspaceId && account?.isMember?.(accountId, workspaceId)) {
-      account.setPluginLoad?.(accountId, workspaceId, id, false)
-      const still = account.loadedPluginIds?.().includes(id)
+    const member = accountId && workspaceId && (
+      account?.isMemberAsync
+        ? await account.isMemberAsync(accountId, workspaceId)
+        : account?.isMember?.(accountId, workspaceId)
+    )
+    if (member) {
+      await account.setPluginLoad?.(accountId, workspaceId, id, false)
+      const still = (await account.loadedPluginIds?.())?.includes(id)
       if (!still) await this.hub().drop(id)
       this.invalidateList()
       return
@@ -707,14 +744,19 @@ export class PluginStoreService extends Service {
     const accountId = currentAccountId()
     const workspaceId = this.currentWorkspaceId()
     const account = this.accountStore()
-    if (accountId && workspaceId && account?.isMember?.(accountId, workspaceId)) {
-      account.uninstallPluginFromWorkspace?.(accountId, workspaceId, id)
-      const still = account.loadedPluginIds?.().includes(id)
+    const member = accountId && workspaceId && (
+      account?.isMemberAsync
+        ? await account.isMemberAsync(accountId, workspaceId)
+        : account?.isMember?.(accountId, workspaceId)
+    )
+    if (member) {
+      await account.uninstallPluginFromWorkspace?.(accountId, workspaceId, id)
+      const still = (await account.loadedPluginIds?.())?.includes(id)
       if (!still) await this.hub().drop(id)
       this.invalidateList()
       return
     }
-    if (isOnlineRuntime()) this.requireWorkspaceMember()
+    if (isOnlineRuntime()) await this.requireWorkspaceMember()
     await this.hub().drop(id)
     this.setEnabled(id, false)
     const dest = this.pluginPath(id)
@@ -728,7 +770,7 @@ export class PluginStoreService extends Service {
     delete origins[id]
     this.state = { ...this.state, lastRunAt, origins }
     this.writeState()
-    this.accountStore()?.removePluginPackage?.(currentAccountId(), id)
+    await this.accountStore()?.removePluginPackage?.(currentAccountId(), id)
   }
 
   /** 彻底删除：安装产物和沙箱一起删。回收站清空走这条。 */
@@ -786,7 +828,7 @@ export class PluginStoreService extends Service {
     if (this.installConflict(id, origin)) throw new Error(`plugin id conflict: ${id}`)
     const wasRunning =
       this.isEnabled(id) ||
-      Boolean(this.accountStore()?.loadedPluginIds?.().includes(id)) ||
+      Boolean((await this.accountStore()?.loadedPluginIds?.())?.includes(id)) ||
       this.hub().snapshot().plugins.some((row) => row.id === id && (row.enabled || row.state === 'active'))
     if (wasRunning) await this.hub().drop(id)
     const staging = join(this.pluginDir, '.incoming', id)
@@ -818,7 +860,7 @@ export class PluginStoreService extends Service {
     const accountId = currentAccountId()
     const workspaceId = this.currentWorkspaceId()
     const account = this.accountStore()
-    account?.recordPluginPackage?.(accountId, {
+    await account?.recordPluginPackage?.(accountId, {
       id,
       version: codeVersion,
       packageHash: codeVersion,
@@ -830,8 +872,13 @@ export class PluginStoreService extends Service {
       hasHost: existsSync(join(dest, 'host.js')),
       manifest: packedManifest,
     })
-    if (accountId && workspaceId && account?.isMember?.(accountId, workspaceId)) {
-      account.installPluginForWorkspace?.(accountId, workspaceId, id, codeVersion)
+    const member = accountId && workspaceId && (
+      account?.isMemberAsync
+        ? await account.isMemberAsync(accountId, workspaceId)
+        : account?.isMember?.(accountId, workspaceId)
+    )
+    if (member) {
+      await account.installPluginForWorkspace?.(accountId, workspaceId, id, codeVersion)
     }
     if (wasRunning) await this.mountFromDisk(packedManifest, dest)
     return { id, codeVersion, remounted: wasRunning }
@@ -897,7 +944,7 @@ export class PluginStoreService extends Service {
   }
 
   async writeReadme(id: string, markdown: string) {
-    if (isOnlineRuntime()) this.requireWorkspaceMember()
+    if (isOnlineRuntime()) await this.requireWorkspaceMember()
     const text = String(markdown ?? '')
     const sqlitePath = this.contentSqlitePath()
     mkdirSync(dirname(sqlitePath), { recursive: true })
@@ -919,7 +966,7 @@ export class PluginStoreService extends Service {
   }
 
   async restore() {
-    const ids = [...new Set([...(this.accountStore()?.loadedPluginIds?.() ?? []), ...this.state.enabled])]
+    const ids = [...new Set([...(await this.accountStore()?.loadedPluginIds?.() ?? []), ...this.state.enabled])]
     for (const id of ids) {
       const hit = await this.findPluginDir(id)
       if (!hit) continue
@@ -928,7 +975,7 @@ export class PluginStoreService extends Service {
         const stats = await pluginDirStats(hit)
         const codeVersion = (await hashInstalledPluginCode(hit)) ?? 'empty'
         if (isOnlineRuntime()) {
-          this.accountStore()?.syncInstalledPluginPackage?.({
+          await this.accountStore()?.syncInstalledPluginPackage?.({
             id: manifest.id,
             version: codeVersion,
             packageHash: codeVersion,
@@ -942,7 +989,7 @@ export class PluginStoreService extends Service {
           })
         }
         if (manifest.builtin === true) {
-          this.accountStore()?.ensurePluginOwnerAssignments?.(manifest.id)
+          await this.accountStore()?.ensurePluginOwnerAssignments?.(manifest.id)
         }
         await this.mountFromDisk(manifest, hit)
       } catch (error) {
@@ -956,7 +1003,11 @@ export class PluginStoreService extends Service {
     if (isOnlineRuntime()) {
       const accountId = currentAccountId()
       const workspaceId = currentRequestWorkspaceId()
-      if (!accountId || !workspaceId || !this.accountStore()?.canAccessPlugin?.(accountId, workspaceId, id)) {
+      const account = this.accountStore()
+      const allowed = account?.canAccessPlugin
+        ? await account.canAccessPlugin(accountId, workspaceId, id)
+        : account?.workspaceHasPlugin?.(workspaceId, id, accountId)
+      if (!accountId || !workspaceId || !allowed) {
         throw new Error('not found')
       }
     } else if (!this.isEnabled(id)) throw new Error('not found')

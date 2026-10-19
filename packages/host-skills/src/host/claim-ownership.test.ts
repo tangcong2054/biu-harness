@@ -69,7 +69,7 @@ async function boot() {
 test('import 自动把技能认领到当前工作区', async () => {
   const { ctx, claims, cleanup } = await boot()
   try {
-    const created = runWithAccount('acc_test', () =>
+    const created = await runWithAccount('acc_test', () =>
       ctx.skills.import({
         name: 'verify-claim',
         description: '验证导入自动认领',
@@ -87,7 +87,7 @@ test('import 自动把技能认领到当前工作区', async () => {
 test('create 自动把技能认领到当前工作区', async () => {
   const { ctx, claims, cleanup } = await boot()
   try {
-    const created = runWithAccount('acc_test', () =>
+    const created = await runWithAccount('acc_test', () =>
       ctx.skills.create({ name: 'verify-create', description: '验证新建', notes: '正文' }),
     )
     assert.deepEqual(claims, [
@@ -101,7 +101,7 @@ test('create 自动把技能认领到当前工作区', async () => {
 test('没有账号上下文时跳过认领且不抛错（启动期 legacy 迁移）', async () => {
   const { ctx, claims, cleanup } = await boot()
   try {
-    ctx.skills.import({
+    await ctx.skills.import({
       name: 'verify-no-context',
       description: '无上下文',
       files: [{ path: 'SKILL.md', content: '---\nname: verify-no-context\n---\n正文' }],

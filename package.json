@@ -35,6 +35,8 @@
     "dev:web": "sh -c 'node scripts/wait-port.mjs 3141 && exec vite'",
     "registry:dev": "tsx packages/core-plugin-system/src/host/registry-server.ts",
     "mysql:inventory": "tsx packages/host-cloud-storage/src/host/inventory-cli.ts",
+    "mysql:audit-tenancy": "tsx packages/host-cloud-storage/src/host/tenancy-audit-cli.ts",
+    "mysql:import-main": "tsx packages/host-cloud-storage/src/host/main-import-cli.ts",
     "mysql:import-ops": "tsx packages/host-cloud-storage/src/host/ops-import-cli.ts",
     "mysql:plan-ops": "tsx packages/host-cloud-storage/src/host/ops-plan-cli.ts",
     "mysql:snapshot": "tsx packages/host-cloud-storage/src/host/snapshot-cli.ts",

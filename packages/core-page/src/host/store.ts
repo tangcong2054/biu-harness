@@ -21,6 +21,7 @@ import {
   ASSET_GC_GRACE_MS as SHARED_ASSET_GC_GRACE_MS,
   workspaceFromSqlite,
 } from '@biu/host-plugin-loader/data-dir'
+import type { MetadataRepository, MetadataRuntimeMode } from '@biu/host-plugin-loader/metadata-runtime'
 import { splitMarkdown } from './markdown.ts'
 
 export { PAGE_ROOT, PAGE_DB, PAGE_ASSETS } from '@biu/host-plugin-loader/data-dir'
@@ -50,6 +51,24 @@ export type WorkspaceFs = {
   read: (rel: string) => Promise<string>
   write: (rel: string, content: string) => Promise<unknown>
   list: (rel?: string) => Promise<string[]>
+}
+
+export type PageRepository = {
+  list(ids?: string[]): Promise<Array<Pick<PageRow, 'id' | 'title' | 'notes' | 'parentId' | 'dependsOn' | 'emoji' | 'createdAt' | 'updatedAt'>>>
+  get(id: string): Promise<Pick<PageRow, 'id' | 'title' | 'notes' | 'parentId' | 'dependsOn' | 'emoji' | 'createdAt' | 'updatedAt'> | null>
+  create(row: PageRow): Promise<unknown>
+  update(row: PageRow): Promise<unknown>
+  delete(id: string): Promise<void>
+  createWithContent?(row: PageRow): Promise<unknown>
+  updateWithContent?(row: PageRow): Promise<unknown>
+  deleteWithContent?(id: string): Promise<void>
+}
+
+export type PageRepositoryMode = 'sqlite' | 'mysql' | 'shadow'
+export type PageContentRepository = {
+  read(collection: string, recordId: string): Promise<{ body: string; version: number }>
+  write(collection: string, recordId: string, body: string, expectedVersion?: number): Promise<{ body: string; version: number }>
+  delete?(collection: string, recordId: string): Promise<void>
 }
 
 function asStringList(value: unknown): string[] {
@@ -149,6 +168,13 @@ export class PagesStore {
   constructor(
     private fs: WorkspaceFs,
     private assetsDir = assetsRootPath(dataHome()),
+    private repository?: PageRepository,
+    private repositoryMode: PageRepositoryMode = 'sqlite',
+    private contentRepository?: PageContentRepository,
+    private contentMode: PageRepositoryMode = 'sqlite',
+    private onShadowError: (error: unknown) => void = () => {},
+    private metadataRepository?: MetadataRepository | null,
+    private metadataMode: MetadataRuntimeMode = 'sqlite',
   ) {}
 
   private db: import('node:sqlite').DatabaseSync | null = null
@@ -199,7 +225,7 @@ export class PagesStore {
     }
   }
 
-  private upsert(row: PageRow) {
+  private upsert(row: PageRow, includeContent = true) {
     if (!this.db) return
     this.db.prepare(`
       INSERT INTO pages (
@@ -211,10 +237,18 @@ export class PagesStore {
         parent_id=excluded.parent_id, depends_on_json=excluded.depends_on_json, emoji=excluded.emoji,
         updated_at=excluded.updated_at
     `).run(row.id, row.title, row.parentId, JSON.stringify(row.dependsOn), row.emoji, row.createdAt, row.updatedAt)
-    writeEditorContent(this.db, '/pages', row.id, row.notes, { transaction: false })
+    if (includeContent) writeEditorContent(this.db, '/pages', row.id, row.notes, { transaction: false })
   }
 
   async list(ids?: string[]): Promise<PageRow[]> {
+    if (this.repositoryMode === 'mysql' && this.repository) {
+      return (await this.repository.list(ids)).map((row) => ({
+        ...row,
+        notes: '',
+        tags: [],
+        facet: emptySchemaValue(),
+      }))
+    }
     const db = await this.openDb()
     if (ids) {
       const rows: PageRow[] = []
@@ -235,6 +269,14 @@ export class PagesStore {
 
   async get(id: string): Promise<PageRow | null> {
     if (!ID_RE.test(id)) return null
+    if (this.repositoryMode === 'mysql' && this.repository) {
+      const row = await this.repository.get(id)
+      if (!row) return null
+      const notes = this.contentMode === 'mysql' && this.contentRepository
+        ? (await this.contentRepository.read('/pages', id)).body
+        : readEditorContent(await this.openDb(), '/pages', id)
+      return { ...row, notes, tags: [], facet: emptySchemaValue() }
+    }
     const db = await this.openDb()
     const hit = db.prepare(`
       SELECT id, title, parent_id,
@@ -243,7 +285,9 @@ export class PagesStore {
     `).get(id) as SqlPage | undefined
     if (!hit) return null
     const row = rowFromSql(hit)
-    row.notes = readEditorContent(db, '/pages', id)
+    row.notes = this.contentMode === 'mysql' && this.contentRepository
+      ? (await this.contentRepository.read('/pages', id)).body
+      : readEditorContent(db, '/pages', id)
     return row
   }
 
@@ -256,8 +300,11 @@ export class PagesStore {
   }
 
   async create(fields: Record<string, unknown> = {}): Promise<PageRow> {
-    const db = await this.openDb()
-    const existing = new Set((db.prepare('SELECT id FROM pages').all() as Array<{ id: string }>).map((row) => row.id))
+    const existing = new Set(
+      this.repositoryMode === 'mysql' && this.repository
+        ? (await this.repository.list()).map((row) => row.id)
+        : ((await this.openDb()).prepare('SELECT id FROM pages').all() as Array<{ id: string }>).map((row) => row.id),
+    )
     let n = existing.size
     let id = `p${String(n).padStart(3, '0')}`
     while (existing.has(id) || !ID_RE.test(id)) {
@@ -277,9 +324,27 @@ export class PagesStore {
 
   async remove(id: string) {
     if (!ID_RE.test(id)) throw new Error(`unknown page: ${id}`)
+    if (this.repositoryMode === 'mysql' && this.repository) {
+      if (this.contentMode === 'mysql' && this.repository.deleteWithContent) {
+        await this.repository.deleteWithContent(id)
+      } else {
+        await this.repository.delete(id)
+      }
+      if (this.contentMode === 'mysql' && !this.repository.deleteWithContent) await this.contentRepository?.delete?.('/pages', id)
+      else if (this.contentMode === 'shadow') this.contentRepository?.delete?.('/pages', id).catch(this.onShadowError)
+      else (await this.openDb()).prepare(
+        'DELETE FROM editor_content WHERE collection = ? AND record_id = ?',
+      ).run('/pages', id)
+      return
+    }
     const db = await this.openDb()
     const info = db.prepare('DELETE FROM pages WHERE id = ?').run(id)
     if (!info.changes) throw new Error(`unknown page: ${id}`)
+    if (this.repositoryMode === 'shadow' && this.repository) {
+      this.repository.delete(id).catch(this.onShadowError)
+    }
+    if (this.contentMode === 'mysql') await this.contentRepository?.delete?.('/pages', id)
+    else if (this.contentMode === 'shadow') this.contentRepository?.delete?.('/pages', id).catch(this.onShadowError)
     try {
       await unlink(this.fs.resolve(pageRel(id)))
     } catch {
@@ -291,15 +356,24 @@ export class PagesStore {
     const file = basename(name)
     if (!file || file !== name.replace(/\\/g, '/') || !isPageAssetFileName(file)) throw new Error('invalid asset')
     const written = await writeDocument(join(this.assetsDir, 'name'), file, content, opts)
-    const db = await this.openDb()
-    upsertAttachmentRow(db, {
+    const attachment = {
       name: written.name,
       etag: written.etag,
       mime: mimeOf(written.name),
       bytes: written.bytes.length,
       kind: 'asset',
       storage: 'name',
-    })
+      created_at: Date.now(),
+    }
+    if (this.metadataMode === 'mysql' && this.metadataRepository?.upsert) {
+      await this.metadataRepository.upsert('attachments', attachment)
+    } else {
+      const db = await this.openDb()
+      upsertAttachmentRow(db, attachment)
+      if (this.metadataMode === 'shadow' && this.metadataRepository?.upsert) {
+        this.metadataRepository.upsert('attachments', attachment).catch(this.onShadowError)
+      }
+    }
     return { name: written.name, href: fileUrl(written.name), etag: written.etag }
   }
 
@@ -334,8 +408,36 @@ export class PagesStore {
   }
 
   private async write(row: PageRow) {
-    await this.openDb()
-    this.upsert(row)
+    if (this.repositoryMode === 'mysql' && this.repository) {
+      const exists = await this.repository.get(row.id)
+      if (this.contentMode === 'mysql') {
+        if (exists && this.repository.updateWithContent) await this.repository.updateWithContent(row)
+        else if (!exists && this.repository.createWithContent) await this.repository.createWithContent(row)
+        else if (exists) await this.repository.update(row)
+        else await this.repository.create(row)
+      } else if (exists) await this.repository.update(row)
+      else await this.repository.create(row)
+    } else {
+      await this.openDb()
+      this.upsert(row, this.contentMode !== 'mysql')
+      if (this.repositoryMode === 'shadow' && this.repository) {
+        const exists = await this.repository.get(row.id).catch(() => null)
+        const write = exists ? this.repository.update(row) : this.repository.create(row)
+        write.catch(this.onShadowError)
+      }
+    }
+    if (
+      this.contentMode === 'mysql'
+      && this.contentRepository
+      && !(this.repositoryMode === 'mysql' && (this.repository?.createWithContent || this.repository?.updateWithContent))
+    ) {
+      await this.contentRepository.write('/pages', row.id, row.notes)
+    } else if (this.contentMode === 'shadow' && this.contentRepository) {
+      this.contentRepository.write('/pages', row.id, row.notes).catch(this.onShadowError)
+    } else if (this.repositoryMode === 'mysql') {
+      const db = await this.openDb()
+      writeEditorContent(db, '/pages', row.id, row.notes)
+    }
   }
 }
 

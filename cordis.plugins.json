@@ -1,6 +1,7 @@
 {
   "host": [
     { "id": "http", "package": "@biu/host-http", "togglable": false, "enabled": true },
+    { "id": "cloud-storage", "package": "@biu/host-cloud-storage", "togglable": false, "enabled": true },
     { "id": "update", "package": "@biu/host-update", "togglable": false, "enabled": true },
     { "id": "session-store", "package": "@biu/host-session-store", "togglable": false, "enabled": true },
     { "id": "sessions", "package": "@biu/host-sessions", "togglable": false, "enabled": true },

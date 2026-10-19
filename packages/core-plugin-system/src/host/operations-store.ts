@@ -1,7 +1,8 @@
 import type { DatabaseSync } from 'node:sqlite'
 import { dataPath, openSqlite } from '@biu/host-plugin-loader/data-dir'
+import type { OperationsKind, OperationsRepository } from './operations-repository.ts'
 
-export type OperationsKind = 'account' | 'workspace' | 'usage' | 'device' | 'sync' | 'security'
+export type { OperationsKind } from './operations-repository.ts'
 
 const TABLES: Record<OperationsKind, string> = {
   account: 'ops_accounts',
@@ -14,7 +15,7 @@ const TABLES: Record<OperationsKind, string> = {
 
 const SECRET_KEYS = /password|token|apikey|api_key|secret|content|notes|body/i
 
-export class OperationsStore {
+export class OperationsStore implements OperationsRepository {
   constructor(private db: DatabaseSync) {
     db.exec(`
       CREATE TABLE IF NOT EXISTS ops_accounts (

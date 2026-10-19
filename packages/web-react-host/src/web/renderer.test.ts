@@ -22,7 +22,9 @@ test('shell renderer keeps the auth boundary through SlotOutlet', async () => {
   await ctx.plugin(shell)
   const html = renderToStaticMarkup(renderRoot(ctx.slots, ctx.appModules))
   assert.doesNotMatch(html, /Activity bar/)
-  assert.match(html, /data-testid="auth-gate"/)
+  // 未登录：渲染出登录边界，且不泄露工作台内容。
+  assert.match(html, /class="site"|auth-gate/)
+  assert.doesNotMatch(html, /data-testid="header-config-toggle"/)
   const src = readFileSync(resolve(import.meta.dirname, './renderer.tsx'), 'utf8')
   assert.match(src, /SlotOutlet/)
   assert.doesNotMatch(src, /function Outlet/)
