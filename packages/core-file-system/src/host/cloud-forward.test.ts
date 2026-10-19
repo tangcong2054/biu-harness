@@ -55,7 +55,7 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
       res.end(JSON.stringify({ workspaces: [{ id: 'cloud-ws', name: '云端空间', role: 'owner' }] }))
       return
     }
-    if (url === '/api/db/create') {
+    if (url === '/api/db/create' || url === '/api/db/update') {
       res.end(JSON.stringify({ items: [{ value: { id: 'p1', title: '云端页' } }] }))
       return
     }
@@ -97,7 +97,7 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ email: 'ada@example.com', password: 'secret1' }),
-    }).then((res) => res.json())) as { token: string }
+    }).then((res) => res.json())) as { token: string; workspaceId: string }
     const auth = {
       authorization: `Bearer ${registered.token}`,
       'content-type': 'application/json',
@@ -125,6 +125,15 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
     const createHit = captured.find((item) => item.url === '/api/db/create')
     assert.equal(createHit?.workspaceId, 'cloud-ws')
     assert.equal(createHit?.method, 'POST')
+
+    captured.length = 0
+    const updated = await fetch(`${origin}/api/db/update`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ path: '/pages/p1', patch: { title: '云端页 2' } }),
+    })
+    assert.equal(updated.status, 200)
+    assert.equal(captured.some((item) => item.url === '/api/db/update' && item.workspaceId === 'cloud-ws'), true)
 
     captured.length = 0
     const written = await fetch(`${origin}/api/db/content`, {
@@ -173,6 +182,22 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
     })
     assert.equal(revoked.status, 200)
     assert.equal(captured.some((item) => item.url === '/api/db/shares' && item.body.enabled === false && item.workspaceId === 'cloud-ws'), true)
+
+    assert.equal((await fetch(`${origin}/api/account/active`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ workspaceId: registered.workspaceId }),
+    })).status, 200)
+    captured.length = 0
+    const localCreated = await fetch(`${origin}/api/db/create`, {
+      method: 'POST',
+      headers: { ...auth, 'x-biu-workspace-id': registered.workspaceId },
+      body: JSON.stringify({ path: '/pages', records: [{ title: '本机页' }] }),
+    })
+    // 本测试没有挂 core-page，因而本地 handler 可返回 unknown collection；
+    // 关键边界是切回 device Workspace 后请求绝不能再到远端。
+    await localCreated.json()
+    assert.equal(captured.length, 0)
   } finally {
     await accountFiber.dispose()
     await httpFiber.dispose()
