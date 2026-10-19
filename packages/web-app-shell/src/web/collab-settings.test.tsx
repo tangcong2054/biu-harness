@@ -13,6 +13,7 @@ import {
   ShellWorkspaceSwitcher,
   defaultSessionPath,
   readAccountToken,
+  writeAccountToken,
 } from './shell-chrome.tsx'
 
 afterEach(() => {
@@ -56,6 +57,28 @@ test('opening /login shows the login page', () => {
   assert.equal(screen.getByRole('heading', { name: '登录' }).textContent, '登录')
   assert.equal(screen.queryByText('返回官网'), null, '顶栏已能回官网，表单不再重复放返回入口')
   assert.equal(screen.queryByTestId('inside'), null)
+})
+
+test('logging out from an app route replaces it with the login route', () => {
+  localStorage.clear()
+  sessionStorage.clear()
+  localStorage.setItem('biu.account.token', 'tok')
+  localStorage.setItem('biu.workspaceId', 'ws_1')
+  sessionStorage.setItem('biu.workspaceId', 'ws_1')
+  const calls: string[] = []
+  globalThis.fetch = (async (path: string) => {
+    calls.push(String(path))
+    return json({})
+  }) as typeof fetch
+  window.history.replaceState({}, '', '/s/session-1')
+
+  writeAccountToken('')
+
+  assert.equal(window.location.pathname, '/login')
+  assert.equal(localStorage.getItem('biu.account.token'), null)
+  assert.equal(localStorage.getItem('biu.workspaceId'), null)
+  assert.equal(sessionStorage.getItem('biu.workspaceId'), null)
+  assert.deepEqual(calls, ['/api/account/logout'])
 })
 
 test('the app shows the marketing site until a token exists', async () => {

@@ -457,6 +457,9 @@ export function writeAccountToken(next: string) {
   else {
     localStorage.removeItem(ACCOUNT_KEY)
     clearWorkspaceId()
+    // 退出后不能继续停留在 /s/*、/database 等登录态路径：
+    // AuthGate 会切到官网路由，同一路径会被官网的 * 路由误判成 404。
+    setBrowserPath('/login', 'replace')
   }
   if (typeof window !== 'undefined') window.dispatchEvent(new Event(ACCOUNT_EVENT))
 }
