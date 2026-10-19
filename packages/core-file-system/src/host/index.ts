@@ -669,9 +669,11 @@ function shareInflight<T>(map: Map<string, Promise<T>>, key: string, run: () => 
     })
   })
   map.set(key, pending)
-  pending.finally(() => {
+  const clear = () => {
     if (map.get(key) === pending) map.delete(key)
-  })
+  }
+  // 不丢弃 finally() 返回的 rejected Promise，避免列表失败时触发 unhandledRejection。
+  void pending.then(clear, clear)
   return pending
 }
 

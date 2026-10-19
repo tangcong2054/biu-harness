@@ -1203,11 +1203,13 @@ export class CollabStore {
         this.db.exec('ROLLBACK')
         throw error
       }
+      this.authorization.invalidateAll()
       return this.members(accountId, workspaceId).find((row) => row.id === accountId)!
     }
     this.db
       .prepare('UPDATE workspace_members SET role = ? WHERE workspace_id = ? AND account_id = ?')
       .run(role, workspaceId, accountId)
+    this.authorization.invalidateAll()
     return this.members(actorId, workspaceId).find((row) => row.id === accountId)!
   }
 
@@ -1267,6 +1269,8 @@ export class CollabStore {
          ON CONFLICT(group_id, account_id) DO NOTHING`,
       )
       .run(groupId, account.id, now)
+    // 组授权可能覆盖任意 collection，无法只失效一张表。
+    this.authorization.invalidateAll()
     return this.groupMembers(actorId, workspaceId, groupId)
   }
 

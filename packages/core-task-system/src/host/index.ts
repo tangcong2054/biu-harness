@@ -1079,6 +1079,15 @@ export class TasksService extends Service {
   }
 
   list(filter: TaskListFilter = {}): TaskRow[] {
+    return this.listRows(filter, false)
+  }
+
+  /** 数据库表格只需要摘要列；调度器必须继续使用 list() 读取完整 trigger/report 状态。 */
+  listProjected(filter: TaskListFilter = {}): TaskRow[] {
+    return this.listRows(filter, true)
+  }
+
+  private listRows(filter: TaskListFilter, projected: boolean): TaskRow[] {
     const clauses: string[] = []
     const params: SQLInputValue[] = []
     if (filter.status) {
@@ -1102,14 +1111,14 @@ export class TasksService extends Service {
       : ''
     const rows = this.db
       .prepare(
-        `SELECT ${LIST_TASK_COLUMNS} FROM tasks
+        `SELECT ${projected ? LIST_TASK_COLUMNS : 'tasks.*'} FROM tasks
          ${join}
          ${where} ORDER BY
           CASE tasks.status WHEN 'doing' THEN 0 WHEN 'todo' THEN 1 ELSE 2 END,
           tasks.sort DESC, tasks.updated_at DESC`,
       )
       .all(...params) as Array<Record<string, unknown>>
-    const mapped = rows.map((row) => mapRow(row, true))
+    const mapped = rows.map((row) => mapRow(row, projected))
     if (!filter.q?.trim()) return mapped
     return mapped.map((row) => this.withEditorDescription(row))
   }

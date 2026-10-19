@@ -241,6 +241,7 @@ describe('chat scroll memory per session', () => {
 describe('thread follows the latest message', () => {
   it('pins a sent user turn to the top and only follows while stuck to the bottom', () => {
     const src = readFileSync(resolve(import.meta.dirname, './thread.tsx'), 'utf8')
+    expect(src).toContain('if (!threadReady) return')
     expect(src).toContain("restoreChatScroll(parent, { kind: 'pin', nodeId: latestUserId })")
     expect(src).toContain('followedUserRef.current === latestUserId')
     expect(src).toContain('ResizeObserver')

@@ -805,6 +805,7 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
   const nodes = useSessionView((state) => state.nodes)
   const sessionId = useSessionView((state) => state.sessionId)
   const switchingSession = useSessionView((state) => state.switchingSession)
+  const threadReady = useSessionView((state) => state.threadReady)
   const turns = useMemo(() => groupNodesIntoTurns(nodes), [nodes])
   const totalTurns = turns.length
   const [revealStart, setRevealStart] = useState(() => firstPaintStartIndex(totalTurns))
@@ -1073,6 +1074,8 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
   useLayoutEffect(() => {
     const parent = scrollRef.current
     if (!parent) return
+    // 数据页只绑定 sessionId 时正文尚未加载，不能把暂时找不到的锚点当成失效锚点。
+    if (!threadReady) return
     const mem = recalledChatScroll(sessionId)
     if (sessionId && restoredForRef.current !== sessionId && mem?.kind === 'pin') {
       if (restoreChatScroll(parent, mem)) {
@@ -1107,7 +1110,7 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
     }
     prependHeightRef.current = parent.scrollHeight
     previousRevealStartRef.current = revealStart
-  }, [stickKey, mountedNodes.length, revealStart, sessionId])
+  }, [stickKey, mountedNodes.length, revealStart, sessionId, threadReady])
 
   if (nodes.length === 0 && !pending && !error && !switchingSession) {
     return <div className="w-full" data-testid="chat-empty" />

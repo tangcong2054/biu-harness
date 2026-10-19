@@ -986,8 +986,15 @@ test('data route cold-start binds the latest session without loading turns until
   await view.applyRoute({ kind: 'module', moduleId: 'database', path: '/database' })
   assert.equal(view.get().sessionId, 'new')
   assert.deepEqual(view.get().events, [])
+  assert.equal(view.get().threadReady, false)
 
-  await view.ensureSessionThread()
+  // 懒绑定期间的实时事件不能冒充完整线程，否则历史和滚动锚点都会丢失。
+  view.ingest('new', { type: 'user/message', text: 'live', seq: 2, ts: 2 })
+  assert.equal(view.get().events.length, 1)
+  assert.equal(view.get().threadReady, false)
+
+  await view.applyRoute({ kind: 'session', sessionId: 'new', view: 'chat' })
+  assert.equal(view.get().threadReady, true)
   assert.equal(view.get().events[0]?.type, 'session/open')
 })
 

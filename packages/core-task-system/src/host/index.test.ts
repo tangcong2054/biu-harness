@@ -713,6 +713,8 @@ test('trigger persists through create/update/reopen', async () => {
     assert.equal(t.trigger?.cron, '0 3 * * *')
     assert.equal(t.trigger?.state, 'idle')
     assert.equal(t.trigger?.lastRun, null)
+    assert.equal(tasks.list()[0]?.trigger?.cron, '0 3 * * *')
+    assert.equal(tasks.listProjected()[0]?.trigger, undefined)
 
     // partial update：合并既有 trigger，改 state
     tasks.update(t.id, { trigger: { state: 'delivered', lastRun: 123 } })
@@ -763,9 +765,10 @@ test('task list scans lean columns and skips unused json blobs', () => {
   const host = readFileSync(resolve(import.meta.dirname, './index.ts'), 'utf8')
   const collection = readFileSync(resolve(import.meta.dirname, './collection.ts'), 'utf8')
   assert.match(host, /const LIST_TASK_COLUMNS/)
-  assert.match(host, /SELECT \$\{LIST_TASK_COLUMNS\} FROM tasks/)
-  assert.doesNotMatch(host, /SELECT tasks\.\* FROM tasks/)
-  assert.match(host, /rows\.map\(\(row\) => mapRow\(row, true\)\)/)
+  assert.match(host, /listProjected\(filter: TaskListFilter/)
+  assert.match(host, /projected \? LIST_TASK_COLUMNS : 'tasks\.\*'/)
+  assert.match(host, /rows\.map\(\(row\) => mapRow\(row, projected\)\)/)
+  assert.match(collection, /tasks\.listProjected \?\? tasks\.list/)
   assert.match(host, /function isBlankJson/)
   assert.match(collection, /function missingLookup/)
   assert.match(collection, /if \(!tree\)/)

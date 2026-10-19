@@ -44,6 +44,25 @@ test('owner can add a member by email and a stranger cannot sync', () => {
   )
 })
 
+test('member role and group membership changes invalidate authorization caches', () => {
+  const collab = store()
+  const ada = collab.register('', Date.now(), 'secret1', 'cache-ada@example.com')
+  const bob = collab.register('', Date.now(), 'secret1', 'cache-bob@example.com')
+  const workspace = collab.createWorkspace(ada.id, 'Cache')
+  collab.addMemberByEmail(ada.id, workspace.id, bob.email)
+  let invalidations = 0
+  const off = collab.authorization.onInvalidate(() => {
+    invalidations += 1
+  })
+
+  collab.updateMemberRole(ada.id, workspace.id, bob.id, 'viewer')
+  assert.equal(invalidations, 1)
+  const group = collab.createGroup(ada.id, workspace.id, 'Reviewers')
+  collab.addGroupMemberByEmail(ada.id, workspace.id, group.id, bob.email)
+  assert.equal(invalidations, 2)
+  off()
+})
+
 test('a record cannot be claimed by two workspaces', () => {
   const collab = store()
   const ada = collab.register('Ada')

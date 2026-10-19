@@ -190,6 +190,8 @@ export interface SessionViewState {
   dispatchedTasksByTurn: Record<string, DispatchedTaskRow[]>
   /** Live：派工 turn usage 合计 */
   dispatchedUsage?: TrajectoryUsage
+  /** 当前 session 的 turns 已从缓存或网络完整装入；实时事件不能代替该状态。 */
+  threadReady: boolean
   /** 切会话且无缓存：保留上一段画面直到新数据到齐，避免先闪 EmptyHero */
   switchingSession: boolean
   /** 当前 session 的检查器绑定，只来自 GET /api/sessions/:id */
@@ -218,6 +220,7 @@ const empty: SessionViewState = {
   totalTurns: 0,
   dispatchedUsageByTurn: {},
   dispatchedTasksByTurn: {},
+  threadReady: false,
   switchingSession: false,
   inspectorReady: false,
 }
@@ -460,10 +463,13 @@ export class SessionViewService extends Service {
             trajectoryHasMore: false,
             trajectoryLoading: false,
             totalTurns: 0,
+            threadReady: false,
             switchingSession: false,
           })
           throw error
         }
+      } else if (!this.value.threadReady) {
+        await this.load(route.sessionId, { view: route.view })
       } else if (this.value.view !== route.view) {
         this.replace({
           view: route.view,
@@ -498,6 +504,7 @@ export class SessionViewService extends Service {
       trajectoryHasMore: false,
       trajectoryLoading: false,
       totalTurns: 0,
+      threadReady: false,
       switchingSession: false,
     })
   }
@@ -516,7 +523,7 @@ export class SessionViewService extends Service {
       await this.loadMostRecentSession()
       return
     }
-    if (this.value.events.length || this.value.nodes.length) return
+    if (this.value.threadReady) return
     await this.load(this.value.sessionId, { view: this.value.view || 'chat' })
   }
 
@@ -536,6 +543,7 @@ export class SessionViewService extends Service {
       trajectoryHasMore: false,
       trajectoryLoading: false,
       totalTurns: 0,
+      threadReady: false,
       switchingSession: false,
       ...this.pendingInspector(),
     })
@@ -908,6 +916,7 @@ export class SessionViewService extends Service {
             loadingOlder: false,
             trajectoryHasMore: false,
             trajectoryLoading: false,
+            threadReady: false,
             switchingSession: true,
             ...this.pendingInspector(),
           })
@@ -928,6 +937,7 @@ export class SessionViewService extends Service {
             trajectoryHasMore: false,
             trajectoryLoading: false,
             totalTurns: 0,
+            threadReady: false,
             switchingSession: true,
             ...this.pendingInspector(),
           })
@@ -958,6 +968,7 @@ export class SessionViewService extends Service {
           loadingOlder: false,
           trajectoryHasMore: false,
           trajectoryLoading: false,
+          threadReady: false,
           switchingSession: true,
           ...this.pendingInspector(),
         })
@@ -978,6 +989,7 @@ export class SessionViewService extends Service {
           trajectoryHasMore: false,
           trajectoryLoading: false,
           totalTurns: 0,
+          threadReady: false,
           switchingSession: true,
           ...this.pendingInspector(),
         })
@@ -1034,6 +1046,7 @@ export class SessionViewService extends Service {
           dispatchedTasksByTurn: tasksByTurn,
           dispatchedUsage,
           nodes,
+          threadReady: true,
           ...this.rememberSessionInspector(sessionId, this.inspectorFromPayload(body), body.config?.goal),
         })
         this.syncDispatchedPoll()
@@ -1050,6 +1063,7 @@ export class SessionViewService extends Service {
         dispatchedTasksByTurn: tasksByTurn,
         dispatchedUsage,
         trajectory: this.wantsTrajectory(view) ? this.value.trajectory : [],
+        threadReady: true,
         switchingSession: false,
         error: undefined,
         ...this.rememberSessionInspector(sessionId, this.inspectorFromPayload(body), body.config?.goal),
@@ -1084,6 +1098,7 @@ export class SessionViewService extends Service {
       dispatchedUsageByTurn: cached.dispatchedUsageByTurn,
       dispatchedTasksByTurn: cached.dispatchedTasksByTurn,
       dispatchedUsage: cached.dispatchedUsage,
+      threadReady: true,
       switchingSession: false,
       ...this.pendingInspector(),
     })
@@ -1093,7 +1108,8 @@ export class SessionViewService extends Service {
 
   private stashCurrent() {
     const id = this.value.sessionId
-    if (!id) return
+    // 数据页懒绑定期间可能只收到零散实时事件；不能把它缓存成完整线程。
+    if (!id || !this.value.threadReady) return
     this.putCache(id, {
       events: this.value.events,
       nodes: this.value.nodes,
@@ -1433,6 +1449,7 @@ export class SessionViewService extends Service {
             trajectoryHasMore: false,
             trajectoryLoading: false,
             totalTurns: 0,
+            threadReady: false,
             switchingSession: false,
             error: undefined,
           }
@@ -1473,6 +1490,7 @@ export class SessionViewService extends Service {
       trajectoryHasMore: false,
       trajectoryLoading: false,
       totalTurns: 0,
+      threadReady: false,
       switchingSession: false,
       error: undefined,
     })

@@ -36,6 +36,7 @@ type TaskRow = DbRecord & {
 
 export type TasksLike = {
   list: (filter?: { q?: string; status?: string }) => TaskRow[]
+  listProjected?: (filter?: { q?: string; status?: string }) => TaskRow[]
   get: (id: string) => TaskRow | undefined
   update: (id: string, patch: Record<string, unknown>) => DbRecord
   create: (input: Record<string, unknown> & { title: string; creator: Actor }) => TaskRow
@@ -213,6 +214,8 @@ async function resolvedAssignee(
 }
 
 export function tasksCollection(tasks: TasksLike, recordActions?: TaskRecordActions, people?: TaskPeople): CollectionSpec {
+  const listProjected = (filter?: { q?: string; status?: string }) =>
+    (tasks.listProjected ?? tasks.list)(filter)
   return {
     id: 'tasks',
     path: '/tasks',
@@ -255,9 +258,9 @@ export function tasksCollection(tasks: TasksLike, recordActions?: TaskRecordActi
         const rows = query.ids.map((id) => tasks.get(id)).filter((row): row is TaskRow => Boolean(row))
         return recordsWithUsage(rows)
       }
-      return recordsWithUsage(tasks.list(query?.q ? { q: query.q } : {}))
+      return recordsWithUsage(listProjected(query?.q ? { q: query.q } : {}))
     },
-    get: (id) => recordsWithUsage(tasks.list()).find((row) => row.id === id) ?? null,
+    get: (id) => recordsWithUsage(listProjected()).find((row) => row.id === id) ?? null,
     update: async (id, patch) => {
       const nextPatch = { ...patch }
       const assignee = await resolvedAssignee(people, patch)
@@ -274,7 +277,7 @@ export function tasksCollection(tasks: TasksLike, recordActions?: TaskRecordActi
         delete nextPatch.creatorSessionId
       }
       const next = tasks.update(id, nextPatch) as TaskRow
-      const rows = tasks.list().map((row) => (row.id === id ? { ...row, ...next, id } : row))
+      const rows = listProjected().map((row) => (row.id === id ? { ...row, ...next, id } : row))
       return recordsWithUsage(rows).find((row) => row.id === id) ?? taskRecord(next, (pid) => tasks.get(pid), ZERO_USAGE, false)
     },
     create: async (rows) =>
@@ -289,7 +292,7 @@ export function tasksCollection(tasks: TasksLike, recordActions?: TaskRecordActi
             creator,
             ...(assignee !== undefined ? { assignee } : {}),
           })
-          return recordsWithUsage(tasks.list()).find((item) => item.id === row.id) ?? taskRecord(row, (pid) => tasks.get(pid), ZERO_USAGE, false)
+          return recordsWithUsage(listProjected()).find((item) => item.id === row.id) ?? taskRecord(row, (pid) => tasks.get(pid), ZERO_USAGE, false)
         }),
       ),
     remove: (query) => {
