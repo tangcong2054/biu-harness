@@ -5,6 +5,8 @@ dist/
 .local-data/
 .desktop-data/
 .operations-data/
+# 分支级数据库迁移/云同步开发数据；不得复用现有本地运行数据
+.branch-data/
 .cordis/
 # 已安装插件是本地产物，整目录不入库
 .plugin/

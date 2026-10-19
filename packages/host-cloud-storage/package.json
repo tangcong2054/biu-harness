@@ -1,0 +1,16 @@
+{
+  "name": "@biu/host-cloud-storage",
+  "license": "Apache-2.0",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "云端 MySQL 配置、版本化迁移与 Offline 云备份基础设施",
+  "exports": {
+    ".": "./src/host/index.ts",
+    "./config": "./src/host/config.ts",
+    "./migrations": "./src/host/migrations.ts"
+  },
+  "dependencies": {
+    "mysql2": "^3.24.6"
+  }
+}
