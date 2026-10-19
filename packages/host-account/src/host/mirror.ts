@@ -1,6 +1,5 @@
-import { randomBytes } from 'node:crypto'
 import type { Context } from 'cordis'
-import { currentAccountId, isOnlineRuntime, runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
+import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime, runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import type { SessionRecord } from '@biu/type-session'
 
 export type MirrorSnapshot = {
@@ -35,6 +34,7 @@ type SessionStoreLike = {
 type DatabaseLike = {
   syncedRecords: (options?: { since?: number }) => Promise<MirrorSnapshot['collections']>
   applySynced: (path: string, records: MirrorSnapshot['collections'][number]['records']) => Promise<void>
+  batchChanges?: <T>(run: () => Promise<T> | T) => Promise<T>
   read?: (path: string) => Promise<{ value?: Record<string, unknown> & { id?: string } }>
   remove?: (path: string, query: { ids: string[] }) => Promise<unknown>
 }
@@ -44,9 +44,6 @@ type AccountLike = {
   markRemote?: (collection: string, id: string) => void
   clearPlace?: (collection: string, id: string) => void
   remoteIds?: (collection: string) => string[]
-  copiedCloud?: (collection: string, id: string) => string
-  rememberCopy?: (collection: string, localId: string, cloudId: string) => void
-  replica?: { active?: () => { token?: string; accountId?: string } | null }
   linkedCloud?: (localAccountId?: string) => { origin: string; token: string } | null
   workspaceLocation?: (workspaceId: string) => 'device' | 'cloud'
   store?: { activeWorkspaceId?: () => string | null }
@@ -91,7 +88,7 @@ function claim(ctx: Context, collection: string, id: string) {
     const account = ctx.get('account') as
       | { store?: { activeWorkspaceId(): string | null; attach(workspaceId: string, collection: string, recordId: string): void } }
       | undefined
-    const workspaceId = account?.store?.activeWorkspaceId()
+    const workspaceId = currentRequestWorkspaceId() || account?.store?.activeWorkspaceId()
     if (!workspaceId || !account?.store) return
     account.store.attach(workspaceId, collection, id)
   } catch {
@@ -103,13 +100,16 @@ function rememberCloud(ctx: Context, collection: string, id: string) {
   accountOf(ctx)?.markRemote?.(collection, id)
 }
 
-export function isCloudRecord(ctx: Context, collection: string, id: string) {
-  return Boolean(accountOf(ctx)?.isRemote?.(collection, id))
-}
-
-export function cloudCopyId(collection: string) {
-  const hex = randomBytes(8).toString('hex')
-  return collection === '/tasks' ? `task_${hex}` : `c${hex}`
+function desktopCloudWorkspace(ctx: Context) {
+  if (isOnlineRuntime()) return null
+  const origin = process.env.BIU_REMOTE_ORIGIN?.replace(/\/$/, '')
+  if (!origin) return null
+  const account = accountOf(ctx)
+  const workspaceId = currentRequestWorkspaceId() || account?.store?.activeWorkspaceId() || ''
+  if (!workspaceId || account?.workspaceLocation?.(workspaceId) !== 'cloud') return null
+  const linked = account?.linkedCloud?.(currentAccountId() || undefined)
+  if (!linked?.token) return null
+  return { origin: linked.origin || origin, token: linked.token, workspaceId }
 }
 
 export async function takeSnapshot(ctx: Context, options?: SnapshotOptions): Promise<MirrorSnapshot> {
@@ -153,7 +153,7 @@ export async function takeSnapshot(ctx: Context, options?: SnapshotOptions): Pro
   }
 }
 
-export async function applySnapshot(ctx: Context, snapshot: MirrorSnapshot, mode: ApplyMode = 'cache') {
+async function applySnapshotNow(ctx: Context, snapshot: MirrorSnapshot, mode: ApplyMode) {
   const account = accountOf(ctx)
   const store = sessionsOf(ctx)
   if (store) {
@@ -228,6 +228,14 @@ export async function applySnapshot(ctx: Context, snapshot: MirrorSnapshot, mode
   }
 }
 
+export async function applySnapshot(ctx: Context, snapshot: MirrorSnapshot, mode: ApplyMode = 'cache') {
+  const database = databaseOf(ctx)
+  if (database?.batchChanges) {
+    return database.batchChanges(() => applySnapshotNow(ctx, snapshot, mode))
+  }
+  return applySnapshotNow(ctx, snapshot, mode)
+}
+
 export async function exchangeSnapshot(
   ctx: Context,
   origin: string,
@@ -235,13 +243,14 @@ export async function exchangeSnapshot(
   accountId: string,
   workspaceId = '',
 ) {
+  if (!workspaceId) return
   const root = origin.replace(/\/$/, '')
   const watermarkKey = `${root}\t${accountId}\t${workspaceId}`
   const since = snapshotWatermarks.get(watermarkKey) ?? 0
   const url = since > 0 ? `${root}/api/replica/snapshot?since=${since}` : `${root}/api/replica/snapshot`
   const headers = {
     authorization: `Bearer ${token}`,
-    ...(workspaceId ? { 'x-biu-workspace-id': workspaceId } : {}),
+    'x-biu-workspace-id': workspaceId,
   }
   const pulled = await fetch(url, {
     headers,
@@ -268,128 +277,20 @@ export async function exchangeSnapshot(
   snapshotWatermarks.set(watermarkKey, maxUpdatedAt > 0 ? maxUpdatedAt : Date.now())
 }
 
-function cloudLogin(ctx: Context) {
-  const origin = process.env.BIU_REMOTE_ORIGIN?.replace(/\/$/, '')
-  if (isOnlineRuntime() || !origin) return null
-  const account = accountOf(ctx)
-  const linked = account?.linkedCloud?.()
-  const token = linked?.token || ''
-  if (!token) throw new Error('需要登录云端才能分享')
-  return {
-    origin: linked?.origin || origin,
-    token,
-    accountId: currentAccountId() || account?.replica?.active?.()?.accountId || '',
-  }
-}
-
-/**
- * 本机转发到云端的请求要带上当前云端空间。
- * 不带的话云端会用账号“记住的当前空间”，和本机选中的空间不一致时会报 unknown record。
- */
-export function cloudWorkspaceHeaders(ctx: Context): Record<string, string> {
-  const account = accountOf(ctx)
-  try {
-    const workspaceId = account?.store?.activeWorkspaceId?.() ?? ''
-    if (workspaceId && account?.workspaceLocation?.(workspaceId) === 'cloud') {
-      return { 'x-biu-workspace-id': workspaceId }
-    }
-  } catch {
-    /* 没有账号服务或空间表时，按不指定空间处理 */
-  }
-  return {}
-}
-
-export async function publishToCloud(ctx: Context, collection: string, ids: string[]) {
-  const linked: Record<string, string> = {}
-  const login = cloudLogin(ctx)
-  if (!login || !ids.length) return linked
-  const unique = [...new Set(ids.map((id) => String(id)).filter(Boolean))]
-  const account = accountOf(ctx)
-  const pending: string[] = []
-  for (const id of unique) {
-    if (account?.isRemote?.(collection, id)) {
-      linked[id] = id
-      continue
-    }
-    const copied = account?.copiedCloud?.(collection, id)
-    if (copied) {
-      linked[id] = copied
-      continue
-    }
-    pending.push(id)
-  }
-  if (!pending.length) return linked
-  const sessions: MirrorSnapshot['sessions'] = []
-  const records: MirrorSnapshot['collections'][number]['records'] = []
-  if (collection === '/sessions') {
-    const store = sessionsOf(ctx)
-    for (const id of pending) {
-      const full = await store?.load(id)
-      if (!full) continue
-      const copy = { ...full, id: cloudCopyId(collection), updatedAt: Date.now() }
-      sessions.push(copy)
-      linked[id] = copy.id
-    }
-  } else {
-    const database = databaseOf(ctx)
-    const found = (await database?.syncedRecords())?.find((item) => item.path === collection)
-    for (const id of pending) {
-      const source = found?.records.find((record) => String(record.id) === id)
-      if (!source) continue
-      const copy = { ...source, id: cloudCopyId(collection), updatedAt: Date.now() }
-      delete (copy as { remote?: unknown }).remote
-      records.push(copy)
-      linked[id] = copy.id
-    }
-  }
-  const snapshot: MirrorSnapshot = {
-    sessions,
-    collections: records.length ? [{ path: collection, records }] : [],
-  }
-  const res = await fetch(`${login.origin}/api/replica/snapshot`, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${login.token}`,
-      'content-type': 'application/json',
-      ...cloudWorkspaceHeaders(ctx),
-    },
-    body: JSON.stringify(snapshot),
-  })
-  if (!res.ok) {
-    const body = (await res.json().catch(() => null)) as { error?: string } | null
-    throw new Error(body?.error || '上传到云端失败')
-  }
-  const store = sessionsOf(ctx)
-  for (const copy of sessions) {
-    await store?.save(copy)
-    account?.markRemote?.('/sessions', copy.id)
-  }
-  if (records.length) await databaseOf(ctx)?.applySynced(collection, records)
-  for (const [localId, cloudId] of Object.entries(linked)) {
-    if (pending.includes(localId)) {
-      account?.markRemote?.(collection, cloudId)
-      account?.rememberCopy?.(collection, localId, cloudId)
-    }
-  }
-  return linked
-}
-
 export async function forwardCloud(
   ctx: Context,
-  collection: string,
-  id: string,
+  _collection: string,
+  _id: string,
   path: string,
   init: { method?: string; body?: unknown } = {},
 ): Promise<{ status: number; body: unknown } | null> {
-  if (isOnlineRuntime() || !process.env.BIU_REMOTE_ORIGIN) return null
-  if (!accountOf(ctx)?.isRemote?.(collection, id)) return null
-  const login = cloudLogin(ctx)
-  if (!login) return null
-  const res = await fetch(`${login.origin}${path}`, {
+  const cloud = desktopCloudWorkspace(ctx)
+  if (!cloud) return null
+  const res = await fetch(`${cloud.origin}${path}`, {
     method: init.method ?? 'POST',
     headers: {
-      authorization: `Bearer ${login.token}`,
-      ...cloudWorkspaceHeaders(ctx),
+      authorization: `Bearer ${cloud.token}`,
+      'x-biu-workspace-id': cloud.workspaceId,
       ...(init.body === undefined ? {} : { 'content-type': 'application/json' }),
     },
     body: init.body === undefined ? undefined : JSON.stringify(init.body),

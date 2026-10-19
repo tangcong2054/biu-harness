@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { currentAccountId, dataDir, dataHome, dataPath, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
+import { currentAccountId, currentRequestWorkspaceId, dataDir, dataHome, dataPath, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
 import { Service, type Context } from 'cordis'
 import type { ChatMessage } from './chat-types.ts'
 import { isAgentToolMode, normalizeAgentMode, type AgentToolMode } from '@biu/host-tools'
@@ -26,10 +26,15 @@ import { collectLiveDispatchedTasks } from '@biu/host-live-sessions/usage'
 import { loadLiveDispatchTasks, registerChatInspectorRoutes } from './inspector.ts'
 import { forwardCloud } from '@biu/host-account/mirror'
 
-function sessionIsCloud(ctx: Context, id: string) {
+function workspaceIsCloud(ctx: Context) {
+  if (isOnlineRuntime()) return true
   try {
-    const account = ctx.get('account') as { isRemote?: (collection: string, id: string) => boolean } | undefined
-    return Boolean(account?.isRemote?.('/sessions', id))
+    const account = ctx.get('account') as {
+      workspaceLocation?: (id: string) => string
+      store?: { activeWorkspaceId?: () => string | null }
+    } | undefined
+    const workspaceId = currentRequestWorkspaceId() || account?.store?.activeWorkspaceId?.() || ''
+    return Boolean(workspaceId && account?.workspaceLocation?.(workspaceId) === 'cloud')
   } catch {
     return false
   }
@@ -1270,7 +1275,7 @@ export function apply(ctx: Context) {
   const cloudExecutions = new Map<string, CloudExecution>()
 
   const beginCloudExecution = async (sessionId: string) => {
-    if (isOnlineRuntime() || !sessionIsCloud(ctx, sessionId)) return null
+    if (isOnlineRuntime() || !workspaceIsCloud(ctx)) return null
     const previous = cloudExecutions.get(sessionId)
     if (previous) {
       if (!previous.finishing) return previous
@@ -1575,7 +1580,6 @@ export function apply(ctx: Context) {
         ...(item.mascot ? { mascot: item.mascot } : {}),
         tags: item.config?.tags ?? [],
         pinned: Boolean(item.config?.pinned),
-        ...(sessionIsCloud(ctx, item.id) ? { remote: true } : {}),
         ...(item.config?.inspector ? { inspector: item.config.inspector } : {}),
         ...(item.config?.goal ? { goal: item.config.goal } : {}),
       })),

@@ -2124,14 +2124,14 @@ export class CollabStore {
       )
       .get(collection, recordId, workspaceId) as { workspace_id?: string } | undefined
     if (elsewhere) throw new CollabError('这条记录已经属于另一个空间', 409)
-    this.db
+    const inserted = this.db
       .prepare(
         `INSERT INTO record_owners (workspace_id, collection, record_id, owner_id, version, updated_at)
          VALUES (?, ?, ?, ?, 0, ?)
          ON CONFLICT(workspace_id, collection, record_id) DO NOTHING`,
       )
       .run(workspaceId, collection, recordId, recordOwner, now)
-    if (caller) {
+    if (caller && Number(inserted.changes) > 0) {
       this.authorization.attach(
         { type: 'account', accountId: caller, workspaceId },
         { type: 'record', workspaceId, collection, recordId },
@@ -2660,12 +2660,20 @@ export class CollabStore {
       .get(workspaceId, collection, recordId) as
       | { ownership: 'personal' | 'workspace' | 'shared'; owner_account_id: string }
       | undefined
+    const ownerRow = policy?.owner_account_id
+      ? { owner_id: policy.owner_account_id }
+      : this.db
+          .prepare(
+            `SELECT owner_id FROM record_owners WHERE workspace_id = ? AND collection = ? AND record_id = ?`,
+          )
+          .get(workspaceId, collection, recordId) as { owner_id?: string } | undefined
+    const ownerId = policy?.owner_account_id || ownerRow?.owner_id || ''
     const collaboratorCount =
-      rows.filter((row) => row.id !== policy?.owner_account_id).length + groups.length + memberViews.length
+      rows.filter((row) => row.id !== ownerId).length + groups.length + memberViews.length
     return {
       private: collaboratorCount === 0,
       scope: policy?.ownership ?? 'personal',
-      ownerId: policy?.owner_account_id ?? '',
+      ownerId,
       people: rows.map(({ member_kind, ...row }) => ({ ...row, memberKind: member_kind })),
       groups,
       memberViews,

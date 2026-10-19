@@ -71,6 +71,8 @@ test('share panel separates public sharing from internal and external collaborat
   assert.match(src, /数据归属链路/)
   assert.match(src, /fsdb-scope-chain/)
   assert.match(src, /effectiveDataScope/)
+  assert.match(src, /<ScopeMark scope=\{scope\} \/>/)
+  assert.doesNotMatch(src, /ScopeMark scope=\{label \|\| scope\}/)
   assert.match(src, /内部协作者/)
   assert.match(src, /外部协作者/)
   assert.match(src, /collaboratorKind/)
@@ -83,15 +85,28 @@ test('share panel separates public sharing from internal and external collaborat
   assert.match(databaseHost, /collab:/)
 })
 
+test('table titles do not show a cloud mark', () => {
+  const browser = readFileSync(resolve(import.meta.dirname, './browser.tsx'), 'utf8')
+  const databaseHost = readFileSync(resolve(import.meta.dirname, '../host/index.ts'), 'utf8')
+  assert.doesNotMatch(browser, /aria-label="云端"/)
+  assert.doesNotMatch(browser, /row\.remote === true/)
+  assert.doesNotMatch(databaseHost, /remote: true/)
+})
+
 test('device workspace keeps LAN links but hides collaboration and cloud publishing', () => {
   const src = readFileSync(resolve(import.meta.dirname, './share-popover.tsx'), 'utf8')
   const browser = readFileSync(resolve(import.meta.dirname, './browser.tsx'), 'utf8')
   const databaseHost = readFileSync(resolve(import.meta.dirname, '../host/index.ts'), 'utf8')
+  const sharesPost = databaseHost.slice(databaseHost.indexOf("POST', '/api/db/shares'"), databaseHost.indexOf("GET', '/api/share/:token'"))
   assert.match(src, /localOnly \? '局域网分享' : '公开分享'/)
   assert.match(src, /!localOnly && \(\(target\.kind === 'record'/)
   assert.match(src, /同一局域网/)
   assert.match(browser, /localOnly=\{localData\}/)
   assert.match(databaseHost, /activeDataLocation\(\) === 'cloud'/)
+  assert.doesNotMatch(databaseHost, /publishToCloud/)
+  assert.doesNotMatch(sharesPost, /localIds/)
+  assert.doesNotMatch(sharesPost, /body.enabled !== false/)
+  assert.match(databaseHost, /\/api\/db\/shares\?\$\{search\}/)
 })
 
 test('collaborator sections are stacked without a redundant popover heading', () => {

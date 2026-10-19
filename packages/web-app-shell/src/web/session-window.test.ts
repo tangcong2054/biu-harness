@@ -80,6 +80,18 @@ test('collapsed host stays hidden', () => {
   assert.equal(slice.padBottom, 200 * SESSION_ROW_PX)
 })
 
+test('one slightly shorter row stays visible instead of oscillating with its spacer', () => {
+  const host = {
+    getBoundingClientRect: () => ({ top: 120, bottom: 148, height: 28 }),
+  } as HTMLElement
+  const scroller = {
+    getBoundingClientRect: () => ({ top: 80, bottom: 800, height: 720 }),
+    clientHeight: 720,
+  } as HTMLElement
+  const slice = sessionWindowFromHost(1, host, scroller)
+  assert.deepEqual(slice, { start: 0, end: 1, padTop: 0, padBottom: 0 })
+})
+
 test('host in the scroller paints a window', () => {
   const host = {
     getBoundingClientRect: () => ({ top: 80, bottom: 80 + 200 * SESSION_ROW_PX, height: 200 * SESSION_ROW_PX }),

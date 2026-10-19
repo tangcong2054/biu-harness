@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { test } from 'vitest'
 import { Context } from 'cordis'
 import { Service } from 'cordis'
 import type { SessionRecord } from '@biu/type-session'
-import { applySnapshot, cloudCopyId, cloudWorkspaceHeaders, forwardCloud, takeSnapshot } from './mirror.ts'
+import { applySnapshot, exchangeSnapshot, forwardCloud, takeSnapshot } from './mirror.ts'
 
 test('cache keeps local sessions and replaces cloud sessions', async () => {
   const ctx = new Context()
@@ -96,34 +98,39 @@ test('cache keeps local sessions and replaces cloud sessions', async () => {
   assert.equal(rows.has('fresh'), true)
 })
 
-test('cloud copy ids are new and task ids keep the task prefix', () => {
-  const page = cloudCopyId('/pages')
-  const task = cloudCopyId('/tasks')
-  assert.notEqual(page, task)
-  assert.match(page, /^c[0-9a-f]+$/)
-  assert.match(task, /^task_[0-9a-f]+$/)
+test('desktop caches cloud rows but does not copy local records onto the cloud', () => {
+  const mirror = readFileSync(resolve(import.meta.dirname, './mirror.ts'), 'utf8')
+  const account = readFileSync(resolve(import.meta.dirname, './index.ts'), 'utf8')
+  assert.match(mirror, /markRemote/)
+  assert.match(mirror, /isRemote/)
+  assert.doesNotMatch(mirror, /publishToCloud/)
+  assert.doesNotMatch(mirror, /cloudCopyId/)
+  assert.doesNotMatch(account, /record_cloud_copy/)
+  assert.match(mirror, /workspaceLocation/)
 })
 
-async function accountCtx(active: string | null, location: 'device' | 'cloud') {
+test('snapshot application uses one database change batch', async () => {
   const ctx = new Context()
-  class Account extends Service {
-    store = { activeWorkspaceId: () => active }
+  let batches = 0
+  class Database extends Service {
     constructor(ctx: Context) {
-      super(ctx, 'account')
+      super(ctx, 'database')
     }
-    workspaceLocation() {
-      return location
+    syncedRecords() {
+      return Promise.resolve([])
+    }
+    applySynced() {
+      return Promise.resolve()
+    }
+    async batchChanges<T>(run: () => Promise<T> | T) {
+      batches += 1
+      return run()
     }
   }
-  await ctx.plugin(Account)
-  return ctx
-}
+  await ctx.plugin(Database)
 
-test('cloud forwarding carries the active cloud workspace', async () => {
-  assert.deepEqual(cloudWorkspaceHeaders(await accountCtx('ws_cloud', 'cloud')), { 'x-biu-workspace-id': 'ws_cloud' })
-  assert.deepEqual(cloudWorkspaceHeaders(await accountCtx('ws_device', 'device')), {})
-  assert.deepEqual(cloudWorkspaceHeaders(await accountCtx(null, 'cloud')), {})
-  assert.deepEqual(cloudWorkspaceHeaders(new Context()), {})
+  await applySnapshot(ctx, { sessions: [], collections: [] }, 'cache')
+  assert.equal(batches, 1)
 })
 
 test('forwardCloud sends the workspace header to the cloud', async () => {
@@ -164,3 +171,17 @@ test('forwardCloud sends the workspace header to the cloud', async () => {
   }
 })
 
+test('replica snapshot exchange does not run without a cloud workspace', async () => {
+  const previous = globalThis.fetch
+  let called = 0
+  globalThis.fetch = (async () => {
+    called += 1
+    return new Response('{}')
+  }) as typeof fetch
+  try {
+    await exchangeSnapshot(new Context(), 'http://127.0.0.1:9', 'token', 'ada', '')
+    assert.equal(called, 0)
+  } finally {
+    globalThis.fetch = previous
+  }
+})

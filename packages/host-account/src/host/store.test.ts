@@ -74,6 +74,23 @@ test('a record cannot be claimed by two workspaces', () => {
   assert.throws(() => collab.attach(bobWorkspace.id, '/pages', 'shared-id'), /另一个空间/)
 })
 
+test('attaching an existing record does not invalidate authorization again', () => {
+  const collab = store()
+  const ada = collab.register('', Date.now(), 'secret1', 'attach-ada@example.com')
+  const workspace = collab.createWorkspace(ada.id, 'A')
+  let invalidations = 0
+  collab.authorization.onInvalidate(() => {
+    invalidations += 1
+  })
+
+  runWithAccount(ada.id, () => collab.attach(workspace.id, '/sessions', 'session-1'))
+  const afterFirst = invalidations
+  runWithAccount(ada.id, () => collab.attach(workspace.id, '/sessions', 'session-1'))
+
+  assert.ok(afterFirst > 0)
+  assert.equal(invalidations, afterFirst)
+})
+
 test('online mode denies record reads without an account context', () => {
   const previous = process.env.BIU_ONLINE
   process.env.BIU_ONLINE = '1'

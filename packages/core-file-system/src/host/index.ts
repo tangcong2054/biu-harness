@@ -18,7 +18,7 @@ import {
 import { asPublicProfile, readWorkspaceProfile, writeWorkspaceProfile } from '@biu/host-workspace'
 import { roleCoversAction, type Action as PermissionAction, type AuthorizationService } from '@biu/host-account/authorization'
 import { isRegisteredBuiltinPlugin } from '@biu/host-account/store'
-import { cloudWorkspaceHeaders, forwardCloud, publishToCloud } from '@biu/host-account/mirror'
+import { forwardCloud } from '@biu/host-account/mirror'
 import { Service, type Context } from 'cordis'
 import {
   DATABASE_CHANNEL,
@@ -773,6 +773,8 @@ export class DatabaseService extends Service implements Database {
   recycleAssets?: () => void
 
   private bumpQueued = false
+  private changeBatchDepth = 0
+  private changeBatchDirty = false
 
   constructor(ctx: Context) {
     super(ctx, 'database')
@@ -1072,8 +1074,8 @@ export class DatabaseService extends Service implements Database {
   ): ViewGrantRole | null {
     const store = this.collabStore()
     const authorization = this.authorization()
-    if (!store?.viewGrantsFor || !authorization || !this.viewCatalog) return null
-    const saved = this.viewCatalog.viewsFor(collection)
+    if (!store?.viewGrantsFor || !authorization) return null
+    const saved = [builtinAllView({ path: collection }), ...(this.viewCatalog?.viewsFor(collection) ?? [])]
     const roles: ViewGrantRole[] = []
     for (const grant of store.viewGrantsFor(workspaceId, collection)) {
       const subjectMatches = grant.subject_type === 'account'
@@ -1254,14 +1256,16 @@ export class DatabaseService extends Service implements Database {
     const actor = authorization.currentActor()
     if (!actor) throw new Error('permission denied: UNAUTHENTICATED')
     const refs = this.facets.recordsReferencingAsset(name)
-    const allowed = refs.some((ref) =>
-      authorization.authorize(actor, action, {
-        type: 'record',
+    const allowed = refs.some((ref) => {
+      const resource = {
+        type: 'record' as const,
         workspaceId: actor.workspaceId,
         collection: ref.collection,
         recordId: ref.record_id,
-      }).allowed,
-    )
+      }
+      if (authorization.authorize(actor, action, resource).allowed) return true
+      return this.allowsViaView(ref.collection, { id: ref.record_id }, action)
+    })
     if (allowed) return
     if (action === 'resource:update' && refs.length === 0) {
       authorization.requireCurrent('resource:create', {
@@ -1452,12 +1456,15 @@ export class DatabaseService extends Service implements Database {
     }
   }
 
-  private bump() {
+  private invalidateCaches() {
     this.visibleGen += 1
     this.inflightMatches.clear()
     this.inflightScans.clear()
     this.inflightVisible.clear()
     this.visibleCache.clear()
+  }
+
+  private notifyChange() {
     this.ctx.emit('database/change')
     if (this.bumpQueued) return
     this.bumpQueued = true
@@ -1466,6 +1473,29 @@ export class DatabaseService extends Service implements Database {
       const http = this.ctx.get('http') as { broadcast?: (type: string, payload: unknown) => void } | undefined
       http?.broadcast?.(DATABASE_CHANNEL, { ts: Date.now() })
     })
+  }
+
+  private bump() {
+    this.invalidateCaches()
+    if (this.changeBatchDepth > 0) {
+      this.changeBatchDirty = true
+      return
+    }
+    this.notifyChange()
+  }
+
+  /** 批量导入期间只在全部写入完成后通知一次，避免前端被逐条刷新淹没。 */
+  async batchChanges<T>(run: () => Promise<T> | T): Promise<T> {
+    this.changeBatchDepth += 1
+    try {
+      return await run()
+    } finally {
+      this.changeBatchDepth -= 1
+      if (this.changeBatchDepth === 0 && this.changeBatchDirty) {
+        this.changeBatchDirty = false
+        this.notifyChange()
+      }
+    }
   }
 
   async stat(path: string) {
@@ -1659,7 +1689,6 @@ export class DatabaseService extends Service implements Database {
     const stored = this.ownershipOf(spec.path, String(row.id ?? ''))
     return {
       ...withMeta,
-      ...(this.cloudMarked(spec.path, String(row.id ?? '')) ? { remote: true } : {}),
       shareScope: this.shareScopeLabel(spec.path, String(row.id ?? ''), withMeta, stored),
       shareRole: this.shareRoleLabel(spec, withMeta),
     }
@@ -1669,31 +1698,13 @@ export class DatabaseService extends Service implements Database {
     if (this.hasPublicShare(collection, id) || stored === 'shared') return '共享'
     const scope = this.effectiveScope(collection, record, stored)
     if (scope === 'workspace') return '空间'
-    if (this.localMarked(collection, id) || scope === 'personal') return '私人'
+    if (scope === 'personal') return '私人'
     return SHARE_SCOPE_LABEL[scope]
   }
 
   private hasPublicShare(collection: string, id: string) {
     try {
       return Boolean(this.shares.findRecord(collection, id))
-    } catch {
-      return false
-    }
-  }
-
-  private localMarked(collection: string, id: string) {
-    try {
-      const account = this.ctx.get('account') as { isLocal?: (collection: string, id: string) => boolean } | undefined
-      return Boolean(account?.isLocal?.(collection, id))
-    } catch {
-      return false
-    }
-  }
-
-  private cloudMarked(collection: string, id: string) {
-    try {
-      const account = this.ctx.get('account') as { isRemote?: (collection: string, id: string) => boolean } | undefined
-      return Boolean(account?.isRemote?.(collection, id))
     } catch {
       return false
     }
@@ -1718,16 +1729,29 @@ export class DatabaseService extends Service implements Database {
 
   private effectiveScope(collection: string, record: DbRecord, stored: DataScopeName): DataScopeName {
     const store = this.collabStore()
-    const workspaceId = store?.activeWorkspaceId?.() ?? ''
-    if (!store?.viewGrantAudiences || !workspaceId || !this.viewCatalog) return stored
+    const workspaceId = store?.activeWorkspaceId?.() || currentRequestWorkspaceId() || ''
+    if (!workspaceId) return stored
     const key = `${workspaceId}\t${collection}`
+    const grantRows = store.viewGrantAudiences?.(workspaceId, collection)
+      ?? store.viewGrantsFor?.(workspaceId, collection)?.map((row) => ({
+        view_id: row.view_id,
+        subject_type: row.subject_type,
+        subject_id: row.subject_id,
+        granted_by: row.granted_by,
+        member_kind: '',
+      }))
+      ?? []
     if (!this.viewAudienceCache || this.viewAudienceCache.key !== key) {
-      this.viewAudienceCache = { key, rows: store.viewGrantAudiences(workspaceId, collection) }
+      this.viewAudienceCache = { key, rows: grantRows }
     }
     const memberViews = [
       builtinAllView({ path: '/workspace-members' }),
       ...builtinMemberViews(),
-      ...this.viewCatalog.viewsFor('/workspace-members'),
+      ...(this.viewCatalog?.viewsFor('/workspace-members') ?? []),
+    ]
+    const dataViews = [
+      builtinAllView({ path: collection }),
+      ...(this.viewCatalog?.viewsFor(collection) ?? []),
     ]
     return effectiveDataScope(
       stored,
@@ -1739,7 +1763,7 @@ export class DatabaseService extends Service implements Database {
         memberKind: row.member_kind,
         grantedBy: row.granted_by,
       })),
-      this.viewCatalog.viewsFor(collection),
+      dataViews,
       memberViews,
       this.recordOwner(collection, String(record.id ?? '')),
     )
@@ -3333,7 +3357,25 @@ export function apply(ctx: Context) {
     }
   })
   ctx.http.route('GET', '/api/db/stat', (route) => send(route, () => db.stat(route.query.get('path') || '/')))
-  ctx.http.route('GET', '/api/db/content', (route) => send(route, () => db.content(route.query.get('path') || '/')))
+  ctx.http.route('GET', '/api/db/content', async (route) => {
+    const path = route.query.get('path') || '/'
+    const parts = path.split('/').filter(Boolean)
+    if (parts.length === 2) {
+      const search = route.query.toString()
+      const forwarded = await forwardCloud(
+        ctx,
+        `/${parts[0]}`,
+        parts[1]!,
+        search ? `/api/db/content?${search}` : '/api/db/content',
+        { method: 'GET' },
+      )
+      if (forwarded) {
+        route.send(forwarded.status, forwarded.body)
+        return
+      }
+    }
+    await send(route, () => db.content(path))
+  })
   ctx.http.route('POST', '/api/db/content', async (route) => {
     try {
       const body = (await route.json()) as { path?: string; value?: unknown; version?: unknown }
@@ -3342,6 +3384,13 @@ export function apply(ctx: Context) {
       if (parts.length === 2) {
         const forwarded = await forwardCloud(ctx, `/${parts[0]}`, parts[1]!, '/api/db/content', { body })
         if (forwarded) {
+          if (forwarded.status < 300) {
+            try {
+              await db.writeContent(path, body?.value)
+            } catch {
+              /* 云端已写入，本地缓存由 replica 补齐 */
+            }
+          }
           route.send(forwarded.status, forwarded.body)
           return
         }
@@ -3390,72 +3439,55 @@ export function apply(ctx: Context) {
       }
       const scope =
         body?.scope === 'workspace' ? 'workspace' : body?.scope === 'shared' ? 'shared' : body?.scope === 'local' ? 'local' : 'personal'
-      let cloud:
-        | { origin: string; token: string }
-        | null = null
       let activeLocation: 'device' | 'cloud' = isOnlineRuntime() ? 'cloud' : 'device'
       if (!isOnlineRuntime()) {
         try {
           const account = ctx.get('account') as {
             store?: { activeWorkspaceId(): string | null }
             workspaceLocation?: (workspaceId: string) => 'device' | 'cloud'
-            cloudConnection?: (localAccountId: string) => { origin: string; token: string } | null
-            linkedCloud?: (localAccountId?: string) => { origin: string; token: string } | null
           }
           const workspaceId = account.store?.activeWorkspaceId()
           if (workspaceId && account.workspaceLocation) activeLocation = account.workspaceLocation(workspaceId)
-          const accountId = currentAccountId()
-          if (activeLocation === 'cloud') {
-            cloud = account.linkedCloud?.(accountId) ?? (accountId ? account.cloudConnection?.(accountId) ?? null : null)
-          }
         } catch {
           /* 本机无账号服务时只允许本地创建 */
         }
       }
       if (isDesktopRuntime() && activeLocation === 'cloud') {
-        if (!cloud) {
+        const collection = String(body?.path ?? '')
+        const forwarded = await forwardCloud(ctx, collection, '', '/api/db/create', {
+          body: {
+            path: body?.path,
+            records: body?.records ?? body?.content,
+            scope: scope === 'local' ? 'personal' : scope,
+          },
+        })
+        if (!forwarded) {
           route.send(401, { error: '请先登录云端账号' })
           return
         }
-        const headers: Record<string, string> = {
-          'content-type': 'application/json',
-          authorization: `Bearer ${cloud.token}`,
-        }
-        let remote: Response
-        try {
-          remote = await fetch(`${cloud.origin}/api/db/create`, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-              path: body?.path,
-              records: body?.records ?? body?.content,
-              scope: scope === 'local' ? 'personal' : scope,
-            }),
-          })
-        } catch {
-          route.send(503, { error: '云端暂时连不上' })
-          return
-        }
-        const payload = (await remote.json().catch(() => ({}))) as {
+        const payload = forwarded.body as {
           items?: Array<{ value?: { id?: string } }>
           error?: string
         }
-        if (remote.ok) {
-          const collection = String(body?.path ?? '')
+        if (forwarded.status < 300) {
           const values = (payload.items ?? []).map((item) => item.value).filter((value): value is { id: string } => Boolean(value?.id))
-          await db.applySynced(collection, values as DbRecord[])
-          for (const value of values) {
-            try {
-              const account = ctx.get('account') as { markRemote?: (collection: string, id: string) => void }
-              account.markRemote?.(collection, value.id)
-            } catch {
-              /* 没有账号库时仍返回云端结果 */
+          try {
+            await db.applySynced(collection, values as DbRecord[])
+            for (const value of values) {
+              try {
+                const account = ctx.get('account') as { markRemote?: (collection: string, id: string) => void }
+                account.markRemote?.(collection, value.id)
+              } catch {
+                /* 没有账号库时仍返回云端结果 */
+              }
+              if (scope === 'shared') db.markPublicView(collection, value.id)
+              else db.rememberScope(collection, value.id, scope === 'workspace' ? 'workspace' : 'personal')
             }
-            if (scope === 'shared') db.markPublicView(collection, value.id)
-            else db.rememberScope(collection, value.id, scope)
+          } catch {
+            /* 云端已创建，本地缓存稍后对齐 */
           }
         }
-        route.send(remote.status, payload)
+        route.send(forwarded.status, payload)
         return
       }
       const created = await db.create(String(body?.path ?? ''), body?.records ?? body?.content, {
@@ -3472,13 +3504,17 @@ export function apply(ctx: Context) {
       const path = String(body?.path ?? '')
       const ids = Array.isArray(body.ids) ? body.ids.map((id) => String(id)) : []
       const collection = path.startsWith('/') ? path : `/${path}`
-      if (ids.length === 1) {
-        const forwarded = await forwardCloud(ctx, collection, ids[0]!, '/api/db/delete', { body })
-        if (forwarded) {
-          if (forwarded.status < 300) await db.remove(collection, { ids })
-          route.send(forwarded.status, forwarded.body)
-          return
+      const forwarded = await forwardCloud(ctx, collection, ids[0] || '', '/api/db/delete', { body })
+      if (forwarded) {
+        if (forwarded.status < 300) {
+          try {
+            await db.remove(path, asDeleteQuery((body ?? {}) as Record<string, unknown>))
+          } catch {
+            /* 云端已删除，本地缓存稍后对齐 */
+          }
         }
+        route.send(forwarded.status, forwarded.body)
+        return
       }
       route.send(200, await db.remove(path, asDeleteQuery((body ?? {}) as Record<string, unknown>)))
     } catch (error) {
@@ -3488,7 +3524,20 @@ export function apply(ctx: Context) {
   ctx.http.route('POST', '/api/db/restore', async (route) => {
     try {
       const body = (await route.json()) as { path?: string; ids?: unknown; q?: unknown; filter?: unknown }
-      route.send(200, await db.restore(String(body?.path ?? ''), asDeleteQuery((body ?? {}) as Record<string, unknown>)))
+      const path = String(body?.path ?? '')
+      const forwarded = await forwardCloud(ctx, path.startsWith('/') ? path : `/${path}`, '', '/api/db/restore', { body })
+      if (forwarded) {
+        if (forwarded.status < 300) {
+          try {
+            await db.restore(path, asDeleteQuery((body ?? {}) as Record<string, unknown>))
+          } catch {
+            /* 云端已恢复，本地缓存稍后对齐 */
+          }
+        }
+        route.send(forwarded.status, forwarded.body)
+        return
+      }
+      route.send(200, await db.restore(path, asDeleteQuery((body ?? {}) as Record<string, unknown>)))
     } catch (error) {
       route.send(400, { error: String(error) })
     }
@@ -3539,6 +3588,24 @@ export function apply(ctx: Context) {
     }
   }
   ctx.http.route('GET', '/api/db/shares', async (route) => {
+    if (activeDataLocation() === 'cloud' && !isOnlineRuntime()) {
+      const search = route.query.toString()
+      const forwarded = await forwardCloud(
+        ctx,
+        route.query.get('collection') || '',
+        route.query.get('recordId') || '',
+        search ? `/api/db/shares?${search}` : '/api/db/shares',
+        { method: 'GET' },
+      )
+      if (forwarded) {
+        route.send(forwarded.status, forwarded.body)
+        return
+      }
+      if (process.env.BIU_REMOTE_ORIGIN) {
+        route.send(401, { error: '请先登录云端账号' })
+        return
+      }
+    }
     const collection = route.query.get('collection') || ''
     if (!collection) {
       const items = []
@@ -3644,49 +3711,16 @@ export function apply(ctx: Context) {
       const kind = body.kind === 'record' ? 'record' as const : 'view' as const
       const collection = String(body.collection ?? '')
       const recordId = String(body.recordId ?? '')
-      await db.requirePath(kind === 'record' ? `${collection}/${recordId}` : collection, 'resource:share')
-      if (
-        body.enabled !== false &&
-        activeDataLocation() === 'cloud' &&
-        !isOnlineRuntime() &&
-        process.env.BIU_REMOTE_ORIGIN
-      ) {
-        const localIds =
-          kind === 'record'
-            ? [recordId]
-            : ((await db.syncedRecords()).find((item) => item.path === collection)?.records ?? [])
-                .map((record) => String(record.id))
-                .filter((id) => {
-                  try {
-                    const account = ctx.get('account') as { isRemote?: (collection: string, id: string) => boolean }
-                    return !account?.isRemote?.(collection, id)
-                  } catch {
-                    return true
-                  }
-                })
-        const copies = await publishToCloud(ctx, collection, localIds)
-        if (kind === 'record' && copies[recordId]) body.recordId = copies[recordId]
-        let token = ''
-        try {
-          const account = ctx.get('account') as { replica?: { active?: () => { token?: string } | null } }
-          token = account.replica?.active?.()?.token || ''
-        } catch {
-          token = ''
+      if (activeDataLocation() === 'cloud' && !isOnlineRuntime() && process.env.BIU_REMOTE_ORIGIN) {
+        const forwarded = await forwardCloud(ctx, collection, recordId, '/api/db/shares', { body })
+        if (forwarded) {
+          route.send(forwarded.status, forwarded.body)
+          return
         }
-        const forwarded = await fetch(`${process.env.BIU_REMOTE_ORIGIN.replace(/\/$/, '')}/api/db/shares`, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            ...cloudWorkspaceHeaders(ctx),
-            ...(token
-              ? { authorization: `Bearer ${token}` }
-              : { cookie: String(route.req.headers.cookie ?? '') }),
-          },
-          body: JSON.stringify(body),
-        })
-        route.send(forwarded.status, await forwarded.json().catch(() => ({})))
+        route.send(401, { error: '请先登录云端账号' })
         return
       }
+      await db.requirePath(kind === 'record' ? `${collection}/${recordId}` : collection, 'resource:share')
       if (body.enabled === false) {
         if (kind === 'record') shares.revokeRecord(collection, recordId)
         else shares.revokeTarget(kind, collection, body.viewId ?? '', body.recordId ?? '')
