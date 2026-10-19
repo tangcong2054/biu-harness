@@ -856,15 +856,24 @@ export class DatabaseService extends Service implements Database {
     const listed = !query.ids?.length ? rows : rows.filter((row) => query.ids!.includes(row.id))
     const hidden = this.facets.deletedIds(spec.path)
     const builtinPlugin = (row: { builtin?: unknown }) => spec.path === '/plugins' && row.builtin === true
-    const scoped = query.trash
+    return query.trash
       ? listed.filter((row) => hidden.has(row.id) && !builtinPlugin(row))
       : listed.filter((row) => !hidden.has(row.id) || builtinPlugin(row))
+  }
+
+  /** 只装饰当前页，避免为整张表逐行读取 owner、view grant 和人物信息。 */
+  private decorateSlice(spec: CollectionSpec, rows: DbRecord[]) {
+    this.ownershipCache = null
+    this.ownerCache = null
+    this.viewAudienceCache = null
+    this.viewShareCache = null
     try {
-      return scoped.map((row) => this.decorateRecord(spec, row))
+      return rows.map((row) => this.decorateRecord(spec, row))
     } finally {
       this.ownershipCache = null
       this.ownerCache = null
       this.viewAudienceCache = null
+      this.viewShareCache = null
     }
   }
 

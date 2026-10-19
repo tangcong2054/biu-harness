@@ -77,7 +77,7 @@ test('wrap groups larger than the window only fully fetch the first group', asyn
       return { items: [{ id: String(limits.length), title: 'row' }], total: 80, schema }
     },
   })
-  assert.deepEqual(limits, [100, 1, 1])
+  assert.deepEqual(limits, [100, 1, 1, 1])
 })
 
 test('scrolled wrap groups can fill later buckets at page size', async () => {
@@ -98,6 +98,7 @@ test('scrolled wrap groups can fill later buckets at page size', async () => {
     { status: 'todo', limit: 100 },
     { status: 'doing', limit: 100 },
     { status: 'done', limit: 1 },
+    { status: undefined, limit: 1 },
   ])
 })
 

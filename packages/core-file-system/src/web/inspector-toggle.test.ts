@@ -151,7 +151,7 @@ test('sidebar records paint detail immediately without reloading the view', () =
   assert.match(browser, /if \(path === collectionPath\) \{\s*applyView\(view\)/)
   assert.doesNotMatch(browser, /onOpenRecord=\{\(path, view, recordId\) => \{\s*selectView/)
   assert.match(page, /viewId: viewId \?\? viewFromRoute/)
-  assert.match(page, /parsed\.kind === 'collection-view' \|\| parsed\.kind === 'record'\s*\n\s*\? parsed\.viewId/)
+  assert.match(page, /const viewFromRoute = routeCollection\s*\n\s*\? routeCollection\.viewId/)
   assert.match(browser, /!detailId \?/)
   assert.match(sidebar, /onOpenRecord\?\.\(row\.id, row\)/)
   assert.match(sidebar, /event.stopPropagation\(\)/)
