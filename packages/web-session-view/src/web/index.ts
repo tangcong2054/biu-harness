@@ -15,6 +15,7 @@ import {
 import type { AppRoute } from './session-route.ts'
 import { mostRecentSessionId } from './session-groups.ts'
 import { markSidebarMascotFresh } from './session-mascot-fresh.ts'
+import { getSessionTurns, getSessionsList } from './sessions-list.ts'
 
 export type { AppRoute, RouteView, InspectorCenterKind } from './session-route.ts'
 export {
@@ -80,6 +81,7 @@ export {
   remainingSidebarMascotIntroMs,
   clearSidebarMascotFresh,
 } from './session-mascot-fresh.ts'
+export { SESSION_LOAD_TURNS, resetSessionsListGet, seedSessionFetches } from './sessions-list.ts'
 
 export interface ApprovalItem {
   id: string
@@ -142,7 +144,6 @@ export type InboxQueueItem = {
 /** 打开会话与上翻分页分批拉取，避免长会话一次渲染数千条事件和附件。 */
 export const SESSION_TAIL_TURNS = 24
 export const TRAJECTORY_TAIL_TURNS = 48
-export const SESSION_LOAD_TURNS = SESSION_TAIL_TURNS
 
 export interface UsageTrendPoint {
   seq: number
@@ -320,6 +321,7 @@ export class SessionViewService extends Service {
   private trajGen = 0
   private trajFetchSessionId: string | null = null
   private dispatchedPoll: ReturnType<typeof setInterval> | null = null
+  private dispatchedAbort: AbortController | null = null
   private busyHoldUntil = 0
   /** 切会话时画面还是上一段：ingest 不能往旧 events 上叠新 session */
   private holdPreviousThread = false
@@ -360,12 +362,15 @@ export class SessionViewService extends Service {
       clearInterval(this.dispatchedPoll)
       this.dispatchedPoll = null
     }
+    this.dispatchedAbort?.abort()
+    this.dispatchedAbort = null
   }
 
   private syncDispatchedPoll() {
     this.stopDispatchedPoll()
     const id = this.value.sessionId
     if (!id) return
+    if (!this.wantsTrajectory() && !turnInProgress(this.value.events)) return
     this.dispatchedPoll = setInterval(() => {
       void this.refreshDispatchedUsage()
     }, 2000)
@@ -374,8 +379,11 @@ export class SessionViewService extends Service {
   async refreshDispatchedUsage() {
     const sessionId = this.value.sessionId
     if (!sessionId) return
+    this.dispatchedAbort?.abort()
+    const ac = new AbortController()
+    this.dispatchedAbort = ac
     try {
-      const res = await fetch(`/api/sessions/${sessionId}/dispatched-usage`)
+      const res = await fetch(`/api/sessions/${sessionId}/dispatched-usage`, { signal: ac.signal })
       if (!res.ok || this.value.sessionId !== sessionId) return
       const body = (await res.json()) as {
         dispatchedUsage?: TrajectoryUsage | null
@@ -432,7 +440,7 @@ export class SessionViewService extends Service {
 
   /** URL → 状态：只由路由层调用，不回写 URL。
    * 只有 `/s/:id` 才换成主 Session。搜索把页面/其它记录开到左侧、进数据模块，都不改全局会话。
-   * 冷启动还没有会话时，给悬浮窗补最近一条。 */
+   * 聊天首页冷启动拉最近一条；数据页只绑定最近 Session，不提前拉取 turns。 */
   async applyRoute(route: AppRoute) {
     if (route.kind === 'session') {
       if (this.value.sessionId !== route.sessionId) {
@@ -465,7 +473,33 @@ export class SessionViewService extends Service {
       if (this.wantsTrajectory(route.view)) void this.ensureTrajectory()
       return
     }
-    if (!this.value.sessionId) await this.loadMostRecentSession()
+    if (route.kind === 'home') {
+      if (!this.value.sessionId) await this.loadMostRecentSession()
+      return
+    }
+    if (!this.value.sessionId) await this.bindMostRecentSession()
+  }
+
+  private async bindMostRecentSession(skipId?: string) {
+    if (!this.value.sessions.length) await this.refreshSessions()
+    const latest = mostRecentSessionId(this.value.sessions.filter((item) => item.id !== skipId))
+    if (!latest || this.value.sessionId === latest) return
+    const listedProject = this.value.sessions.find((item) => item.id === latest)?.project
+    this.replace({
+      sessionId: latest,
+      events: [],
+      nodes: [],
+      trajectory: [],
+      project: listedProject,
+      view: 'chat',
+      error: undefined,
+      hasMoreOlder: false,
+      loadingOlder: false,
+      trajectoryHasMore: false,
+      trajectoryLoading: false,
+      totalTurns: 0,
+      switchingSession: false,
+    })
   }
 
   private async loadMostRecentSession(skipId?: string) {
@@ -474,6 +508,16 @@ export class SessionViewService extends Service {
     if (!latest) return
     if (this.value.sessionId === latest) return
     await this.load(latest, { view: 'chat' })
+  }
+
+  /** 数据页冷启动只绑定了 Session ID；打开聊天浮窗时再补齐正文。 */
+  async ensureSessionThread() {
+    if (!this.value.sessionId) {
+      await this.loadMostRecentSession()
+      return
+    }
+    if (this.value.events.length || this.value.nodes.length) return
+    await this.load(this.value.sessionId, { view: this.value.view || 'chat' })
   }
 
   /** 路由指向已删除/不存在的会话：不报 404，回首页并打开最近一条。 */
@@ -498,7 +542,7 @@ export class SessionViewService extends Service {
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('biu:session-missing', { detail: { sessionId } }))
     }
-    await this.refreshSessions()
+    await this.refreshSessions({ refresh: true })
     await this.loadMostRecentSession(sessionId)
   }
 
@@ -537,6 +581,7 @@ export class SessionViewService extends Service {
       error: undefined,
     })
     this.stashCurrent()
+    if (event.type === 'turn/end' || event.type === 'turn/start') this.syncDispatchedPoll()
     // 检查器打开后 trajectoryLive=true：即使 URL 仍是 chat 也要刷新右侧轨迹
     if (this.wantsTrajectory()) void this.refreshTrajectoryIndex()
     this.scheduleRefreshSessions()
@@ -716,12 +761,10 @@ export class SessionViewService extends Service {
     }, 200)
   }
 
-  async refreshSessions() {
+  async refreshSessions(opts?: { refresh?: boolean }) {
     try {
-      const res = await fetch('/api/sessions')
-      if (!res.ok) return
-      const body = (await res.json()) as { sessions?: SessionListItem[] }
-      const next = Array.isArray(body.sessions) ? body.sessions : []
+      const next = await getSessionsList<SessionListItem>(opts)
+      if (!next) return
       const busySessions = this.syncBusyFromSessions(next)
       const sessionsChanged = !sessionsEqual(this.value.sessions, next)
       if (!sessionsChanged && !busySessions) return
@@ -801,7 +844,7 @@ export class SessionViewService extends Service {
     }
     markSidebarMascotFresh(body.id)
     await this.load(body.id, { view: 'chat' })
-    await this.refreshSessions()
+    await this.refreshSessions({ refresh: true })
     return body.id
   }
 
@@ -948,13 +991,14 @@ export class SessionViewService extends Service {
   private async revalidate(sessionId: string, view: ConversationView) {
     const gen = this.loadGen
     try {
-      const res = await fetch(`/api/sessions/${sessionId}?turns=${SESSION_LOAD_TURNS}`)
+      const got = await getSessionTurns<SessionPayload>(sessionId)
       if (gen !== this.loadGen || this.value.sessionId !== sessionId) return
-      if (!res.ok) {
-        if (res.status === 404) await this.leaveMissingSession(sessionId)
+      if (!got) return
+      if (got.status !== 200) {
+        if (got.status === 404) await this.leaveMissingSession(sessionId)
         return
       }
-      const body = (await res.json()) as SessionPayload
+      const body = got.body
       if (gen !== this.loadGen || this.value.sessionId !== sessionId) return
       const events = compactSessionEvents(Array.isArray(body.events) ? body.events : [])
       const byTurn = body.dispatchedUsageByTurn ?? {}
@@ -1300,7 +1344,7 @@ export class SessionViewService extends Service {
       })
     }
     await this.load(body.id, { view: 'chat' })
-    await this.refreshSessions()
+    await this.refreshSessions({ refresh: true })
     return body.id
   }
 
@@ -1320,7 +1364,7 @@ export class SessionViewService extends Service {
       this.replace({ sessions: prev, error: String(error) })
       throw error
     }
-    void this.refreshSessions()
+    void this.refreshSessions({ refresh: true })
   }
 
   async setSessionTitle(id: string, title: string) {
@@ -1342,7 +1386,7 @@ export class SessionViewService extends Service {
       this.replace({ sessions: prev, error: String(error) })
       throw error
     }
-    void this.refreshSessions()
+    void this.refreshSessions({ refresh: true })
   }
 
   async patchInspector(id: string, inspector: SessionInspectorBind) {
@@ -1404,7 +1448,7 @@ export class SessionViewService extends Service {
       throw error
     }
 
-    await this.refreshSessions()
+    await this.refreshSessions({ refresh: true })
     if (!wasActive) return
     const next = this.value.sessions[0]?.id
     if (next) {

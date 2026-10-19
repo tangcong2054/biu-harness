@@ -1,8 +1,12 @@
-import { test } from 'vitest'
+import { afterEach, test } from 'vitest'
 import assert from 'node:assert/strict'
 import { Context } from 'cordis'
 import * as sessionView from './index.ts'
-import { SessionViewService } from './index.ts'
+import { resetSessionsListGet, SessionViewService } from './index.ts'
+
+afterEach(() => {
+  resetSessionsListGet()
+})
 
 function mockFetch(handlers: Record<string, (init?: RequestInit) => unknown>) {
   const calls: Array<{ url: string; init?: RequestInit }> = []
@@ -959,6 +963,32 @@ test('home cold-start picks latest chat; opening pages or data does not switch s
     viewId: 'mine',
   })
   assert.equal(view.get().sessionId, 'old')
+})
+
+test('data route cold-start binds the latest session without loading turns until chat opens', async () => {
+  mockFetch({
+    '/api/sessions': () => ({
+      sessions: [{ id: 'new', title: 'new', eventCount: 1, updatedAt: 9 }],
+    }),
+    '/api/sessions/new?turns=': () => ({
+      id: 'new',
+      events: [{ type: 'session/open', version: 1, seq: 0, ts: 1 }],
+      hasMore: false,
+      totalTurns: 0,
+    }),
+    '/api/approvals': () => ({ mode: 'auto', pending: [] }),
+  })
+  const ctx = new Context()
+  await ctx.plugin(sessionView)
+  const view = ctx.sessionView as SessionViewService
+  await view.refreshSessions()
+
+  await view.applyRoute({ kind: 'module', moduleId: 'database', path: '/database' })
+  assert.equal(view.get().sessionId, 'new')
+  assert.deepEqual(view.get().events, [])
+
+  await view.ensureSessionThread()
+  assert.equal(view.get().events[0]?.type, 'session/open')
 })
 
 test('missing session route does not surface 404 and opens the latest chat', async () => {

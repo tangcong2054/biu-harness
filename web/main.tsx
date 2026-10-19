@@ -4,12 +4,14 @@ import './types.ts'
 import './style.css'
 import { applyStoredTheme } from '@biu/web-app-shell/theme'
 import { applyPagePrefs } from '../packages/core-file-system/src/web/page-width.ts'
+import { seedSessionFetches } from '../packages/web-session-view/src/web/sessions-list.ts'
 import { webRuntimeLoaders } from 'virtual:cordis-web-runtime'
 import { isShareHref, mountShareApp } from './share-mount.tsx'
 
 installInsecureRandomUUID()
 applyStoredTheme()
 applyPagePrefs()
+if (!isShareHref()) seedSessionFetches()
 
 const el = document.querySelector<HTMLElement>('#app')
 if (!el) throw new Error('#app missing')

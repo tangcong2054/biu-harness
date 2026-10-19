@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type RefObject } from 'react'
 import { createPortal } from 'react-dom'
 import type { NodeViewProps } from '@tiptap/react'
 import { NodeViewWrapper } from '@tiptap/react'
@@ -16,6 +16,7 @@ import {
   PagePresentationPlaceholder,
   usePagePresentation,
 } from './presentation.tsx'
+import { PAGE_BLOCK_IDLE_MIN_PX, PAGE_BLOCK_IDLE_ROOT_MARGIN, schedulePageBlockMount } from './page-block-idle.ts'
 
 function assetName(file: string) {
   return file.replace(/^assets\//, '')
@@ -72,6 +73,60 @@ export function PageBlockMissing({ kind, plugin, data }: { kind: string; plugin:
   )
 }
 
+function PageBlockIdle() {
+  return (
+    <div
+      className="page-block-idle"
+      data-page-block-idle=""
+      aria-hidden
+      style={{ minHeight: PAGE_BLOCK_IDLE_MIN_PX }}
+    />
+  )
+}
+
+function useIdlePageBlockMount(active: boolean, host: RefObject<HTMLElement | null>) {
+  const [mounted, setMounted] = useState(false)
+  useEffect(() => {
+    if (!active || mounted) return
+    let gone = false
+    let observer: IntersectionObserver | null = null
+    let tries = 0
+    const mount = () => {
+      if (gone) return
+      schedulePageBlockMount(() => {
+        if (!gone) setMounted(true)
+      })
+    }
+    const observe = () => {
+      if (gone) return
+      const element = host.current
+      if (!element) {
+        if (tries++ < 8) requestAnimationFrame(observe)
+        return
+      }
+      if (typeof IntersectionObserver === 'undefined') {
+        mount()
+        return
+      }
+      observer = new IntersectionObserver(
+        (entries) => {
+          if (!entries.some((entry) => entry.isIntersecting)) return
+          observer?.disconnect()
+          mount()
+        },
+        { rootMargin: PAGE_BLOCK_IDLE_ROOT_MARGIN, threshold: 0 },
+      )
+      observer.observe(element)
+    }
+    observe()
+    return () => {
+      gone = true
+      observer?.disconnect()
+    }
+  }, [active, host, mounted])
+  return active && mounted
+}
+
 function samePageBlockProps(prev: NodeViewProps, next: NodeViewProps) {
   return (
     prev.node.attrs.kind === next.node.attrs.kind &&
@@ -111,6 +166,7 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
   const View = spec?.View
   const MinimizedView = spec?.MinimizedView
   const hostRef = useRef<HTMLElement | null>(null)
+  const showView = useIdlePageBlockMount(Boolean(View), hostRef)
   const inlineRef = useRef<HTMLDivElement | null>(null)
   const contentHost = useMemo(() => {
     const element = document.createElement('div')
@@ -126,14 +182,14 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
   }, [blockId])
   useLayoutEffect(() => {
     const disposeHost = bindPageBlockPlugin(hostRef.current, plugin)
-    const disposeContent = bindPageBlockPlugin(contentHost, plugin)
+    const disposeContent = showView ? bindPageBlockPlugin(contentHost, plugin) : () => undefined
     return () => {
       disposeHost()
       disposeContent()
     }
-  }, [plugin, kind, View, data, contentHost])
+  }, [plugin, kind, View, data, contentHost, showView])
   useLayoutEffect(() => {
-    if (!View || !inlineRef.current) return
+    if (!View || !showView || !inlineRef.current) return
     const service = getPagePresentation()
     if (!service) {
       inlineRef.current.appendChild(contentHost)
@@ -147,7 +203,7 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
       inlineTarget: inlineRef.current,
       recordId: recordKey,
     })
-  }, [View, presentationId, plugin, contentHost])
+  }, [View, presentationId, plugin, contentHost, showView])
   useEffect(() => {
     getPagePresentation()?.updateMeta(presentationId, { plugin, title: presentationTitle, recordId: recordKey })
   }, [presentationId, plugin, presentationTitle, recordKey])
@@ -195,7 +251,7 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
       {View && presentation ? <PagePresentationInlineActions controls={presentation} /> : null}
       {cloneFrom ? (
         <div className="page-block-missing">正在复制附件…</div>
-      ) : View ? (
+      ) : View && showView ? (
         <>
           <div ref={inlineRef} className="page-presentation-inline-slot" />
           {presentation?.mode === 'minimized' ? (
@@ -227,6 +283,8 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
             contentHost,
           )}
         </>
+      ) : View ? (
+        <PageBlockIdle />
       ) : (
         <PageBlockMissing kind={kind} plugin={plugin} data={data} />
       )}

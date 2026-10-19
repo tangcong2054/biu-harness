@@ -252,6 +252,7 @@ function MainShell(props: SlotProps) {
   const modules = useAppModules()
   const navReady = useAppModulesNavReady ? useAppModulesNavReady() : true
   const pluginModules = modules.filter((item) => item.id !== 'agent')
+  const overlayOpen = useSyncExternalStore(subscribeChatOverlay, getChatOverlay, () => false)
 
   useEffect(() => {
     if (!uiActions) return
@@ -690,6 +691,11 @@ function MainShell(props: SlotProps) {
     if (route.kind === 'auth') return
     void sessionView.applyRoute(route).catch(() => undefined)
   }, [location.pathname, navReady, sessionView, appModules.version()])
+
+  useEffect(() => {
+    if (!overlayOpen) return
+    void sessionView.ensureSessionThread()
+  }, [overlayOpen, sessionView])
 
   useEffect(() => {
     const onMissing = (event: Event) => {
