@@ -109,6 +109,30 @@ test('desktop caches cloud rows but does not copy local records onto the cloud',
   assert.match(mirror, /workspaceLocation/)
 })
 
+test('snapshot application uses one database change batch', async () => {
+  const ctx = new Context()
+  let batches = 0
+  class Database extends Service {
+    constructor(ctx: Context) {
+      super(ctx, 'database')
+    }
+    syncedRecords() {
+      return Promise.resolve([])
+    }
+    applySynced() {
+      return Promise.resolve()
+    }
+    async batchChanges<T>(run: () => Promise<T> | T) {
+      batches += 1
+      return run()
+    }
+  }
+  await ctx.plugin(Database)
+
+  await applySnapshot(ctx, { sessions: [], collections: [] }, 'cache')
+  assert.equal(batches, 1)
+})
+
 test('forwardCloud sends the workspace header to the cloud', async () => {
   const previous = process.env.BIU_REMOTE_ORIGIN
   const realFetch = globalThis.fetch

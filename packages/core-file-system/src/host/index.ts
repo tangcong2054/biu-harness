@@ -773,6 +773,8 @@ export class DatabaseService extends Service implements Database {
   recycleAssets?: () => void
 
   private bumpQueued = false
+  private changeBatchDepth = 0
+  private changeBatchDirty = false
 
   constructor(ctx: Context) {
     super(ctx, 'database')
@@ -1454,12 +1456,15 @@ export class DatabaseService extends Service implements Database {
     }
   }
 
-  private bump() {
+  private invalidateCaches() {
     this.visibleGen += 1
     this.inflightMatches.clear()
     this.inflightScans.clear()
     this.inflightVisible.clear()
     this.visibleCache.clear()
+  }
+
+  private notifyChange() {
     this.ctx.emit('database/change')
     if (this.bumpQueued) return
     this.bumpQueued = true
@@ -1468,6 +1473,29 @@ export class DatabaseService extends Service implements Database {
       const http = this.ctx.get('http') as { broadcast?: (type: string, payload: unknown) => void } | undefined
       http?.broadcast?.(DATABASE_CHANNEL, { ts: Date.now() })
     })
+  }
+
+  private bump() {
+    this.invalidateCaches()
+    if (this.changeBatchDepth > 0) {
+      this.changeBatchDirty = true
+      return
+    }
+    this.notifyChange()
+  }
+
+  /** 批量导入期间只在全部写入完成后通知一次，避免前端被逐条刷新淹没。 */
+  async batchChanges<T>(run: () => Promise<T> | T): Promise<T> {
+    this.changeBatchDepth += 1
+    try {
+      return await run()
+    } finally {
+      this.changeBatchDepth -= 1
+      if (this.changeBatchDepth === 0 && this.changeBatchDirty) {
+        this.changeBatchDirty = false
+        this.notifyChange()
+      }
+    }
   }
 
   async stat(path: string) {

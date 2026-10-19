@@ -2124,14 +2124,14 @@ export class CollabStore {
       )
       .get(collection, recordId, workspaceId) as { workspace_id?: string } | undefined
     if (elsewhere) throw new CollabError('这条记录已经属于另一个空间', 409)
-    this.db
+    const inserted = this.db
       .prepare(
         `INSERT INTO record_owners (workspace_id, collection, record_id, owner_id, version, updated_at)
          VALUES (?, ?, ?, ?, 0, ?)
          ON CONFLICT(workspace_id, collection, record_id) DO NOTHING`,
       )
       .run(workspaceId, collection, recordId, recordOwner, now)
-    if (caller) {
+    if (caller && Number(inserted.changes) > 0) {
       this.authorization.attach(
         { type: 'account', accountId: caller, workspaceId },
         { type: 'record', workspaceId, collection, recordId },

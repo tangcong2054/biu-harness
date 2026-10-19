@@ -62,7 +62,7 @@ export function sessionWindowFromHost(
   const scrollerRect = scroller.getBoundingClientRect()
   const slack = overscan * rowPx
   if (
-    hostRect.height < rowPx ||
+    hostRect.height <= 0 ||
     hostRect.bottom < scrollerRect.top - slack ||
     hostRect.top > scrollerRect.bottom + slack
   ) {
