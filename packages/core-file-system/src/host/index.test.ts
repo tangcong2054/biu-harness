@@ -78,6 +78,27 @@ test('database HTTP failures distinguish missing resources from bad requests', (
   })
 })
 
+test('batchChanges coalesces database change notifications', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  let changes = 0
+  ctx.on('database/change', () => {
+    changes += 1
+  })
+
+  await db.batchChanges(() => {
+    db.register(notesCollection())
+    db.register({
+      ...notesCollection(),
+      id: 'other-notes',
+      path: '/other-notes',
+      view: { moduleId: 'other-notes', route: '/other-notes', title: '其他笔记' },
+    })
+  })
+
+  assert.equal(changes, 1)
+})
+
 test('root lists registered collections; record read/update follows schema', async () => {
   const ctx = new Context()
   const db = new DatabaseService(ctx)

@@ -35,6 +35,7 @@ type SessionStoreLike = {
 type DatabaseLike = {
   syncedRecords: (options?: { since?: number }) => Promise<MirrorSnapshot['collections']>
   applySynced: (path: string, records: MirrorSnapshot['collections'][number]['records']) => Promise<void>
+  batchChanges?: <T>(run: () => Promise<T> | T) => Promise<T>
   read?: (path: string) => Promise<{ value?: Record<string, unknown> & { id?: string } }>
   remove?: (path: string, query: { ids: string[] }) => Promise<unknown>
 }
@@ -153,7 +154,7 @@ export async function takeSnapshot(ctx: Context, options?: SnapshotOptions): Pro
   }
 }
 
-export async function applySnapshot(ctx: Context, snapshot: MirrorSnapshot, mode: ApplyMode = 'cache') {
+async function applySnapshotNow(ctx: Context, snapshot: MirrorSnapshot, mode: ApplyMode) {
   const account = accountOf(ctx)
   const store = sessionsOf(ctx)
   if (store) {
@@ -226,6 +227,14 @@ export async function applySnapshot(ctx: Context, snapshot: MirrorSnapshot, mode
       }
     }
   }
+}
+
+export async function applySnapshot(ctx: Context, snapshot: MirrorSnapshot, mode: ApplyMode = 'cache') {
+  const database = databaseOf(ctx)
+  if (database?.batchChanges) {
+    return database.batchChanges(() => applySnapshotNow(ctx, snapshot, mode))
+  }
+  return applySnapshotNow(ctx, snapshot, mode)
 }
 
 export async function exchangeSnapshot(

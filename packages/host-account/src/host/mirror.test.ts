@@ -96,6 +96,30 @@ test('cache keeps local sessions and replaces cloud sessions', async () => {
   assert.equal(rows.has('fresh'), true)
 })
 
+test('snapshot application uses one database change batch', async () => {
+  const ctx = new Context()
+  let batches = 0
+  class Database extends Service {
+    constructor(ctx: Context) {
+      super(ctx, 'database')
+    }
+    syncedRecords() {
+      return Promise.resolve([])
+    }
+    applySynced() {
+      return Promise.resolve()
+    }
+    async batchChanges<T>(run: () => Promise<T> | T) {
+      batches += 1
+      return run()
+    }
+  }
+  await ctx.plugin(Database)
+
+  await applySnapshot(ctx, { sessions: [], collections: [] }, 'cache')
+  assert.equal(batches, 1)
+})
+
 test('cloud copy ids are new and task ids keep the task prefix', () => {
   const page = cloudCopyId('/pages')
   const task = cloudCopyId('/tasks')
