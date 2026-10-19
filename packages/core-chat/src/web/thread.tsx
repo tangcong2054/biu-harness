@@ -327,6 +327,11 @@ export function splitReplyForDisplay(node: Extract<ChatNode, { kind: 'reply' }>)
   hasDetails: boolean
 } {
   const parts = node.parts
+  // 取消时没有权威的最终 Message：思考、半截正文和工具轨迹统一折叠到 Details。
+  // 流式阶段仍由 ReplyParts 强制展开；turn/end 到达后自然回到默认折叠态。
+  if (node.endReason === 'cancelled') {
+    return { detailParts: parts, finalParts: [], hasDetails: parts.length > 0 }
+  }
   let finalIndex = -1
   for (let i = parts.length - 1; i >= 0; i -= 1) {
     const part = parts[i]!
@@ -692,7 +697,7 @@ function NodeView({
             <ContentEditsTable files={node.contentEdits} sessionId={sessionId} turn={node.turn} />
           ) : null}
         </div>
-        {!streaming ? (
+        {!streaming && node.endReason !== 'cancelled' ? (
           <div className="chat-reply-actions-row">
             <ReplyActions text={node.copyText} onFork={onFork} />
           </div>

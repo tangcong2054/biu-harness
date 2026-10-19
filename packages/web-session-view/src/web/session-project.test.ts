@@ -239,6 +239,26 @@ test('turn/end non-complete becomes a status row', () => {
   assert.match(nodes[0]?.kind === 'turn' ? nodes[0].text : '', /cancelled/)
 })
 
+test('turn/end cancelled finalizes a reply that already has reasoning and tools', () => {
+  const nodes = projectNodes([
+    { type: 'turn/start', turn: 1, seq: 0, ts: 1 },
+    { type: 'user/message', text: 'run it', seq: 1, ts: 2 },
+    { type: 'step/start', turn: 1, step: 0, seq: 2, ts: 3 },
+    { type: 'assistant/chunk', text: 'unfinished reasoning', channel: 'reasoning', seq: 3, ts: 4 },
+    { type: 'tool/call', id: 'c1', name: 'bash', arguments: '{}', seq: 4, ts: 5 },
+    { type: 'tool/result', id: 'c1', name: 'bash', ok: false, detail: 'Error: cancelled', seq: 5, ts: 6 },
+    { type: 'turn/end', turn: 1, reason: 'cancelled', seq: 6, ts: 7 },
+  ])
+  const reply = nodes.find((node) => node.kind === 'reply')
+  assert.equal(reply?.kind, 'reply')
+  if (reply?.kind !== 'reply') return
+  assert.equal(reply.streaming, false)
+  assert.equal(reply.finished, true)
+  assert.equal(reply.endReason, 'cancelled')
+  assert.deepEqual(reply.parts.map((part) => part.kind), ['think', 'tool'])
+  assert.equal(reply.parts[0]?.kind === 'think' && reply.parts[0].streaming, false)
+})
+
 test('reply aggregates turn duration and usage for footer', () => {
   const nodes = projectNodes([
     { type: 'turn/start', turn: 1, seq: 1, ts: 1000 },

@@ -59,6 +59,24 @@ describe('splitReplyForDisplay', () => {
     expect(split.hasDetails).toBe(false)
     expect(split.finalParts).toHaveLength(1)
   })
+
+  it('treats every interrupted part as details when a turn is cancelled', () => {
+    const split = splitReplyForDisplay({
+      id: 'r-cancelled',
+      kind: 'reply',
+      copyText: 'partial answer',
+      endReason: 'cancelled',
+      finished: true,
+      parts: [
+        { id: 'think-1', kind: 'think', text: 'reasoning' },
+        { id: 'a-partial', kind: 'assistant', text: 'partial answer' },
+        { id: 't-1', kind: 'tool', name: 'bash', callId: 'c1', arguments: '{}' },
+      ],
+    })
+    expect(split.hasDetails).toBe(true)
+    expect(split.detailParts.map((part) => part.id)).toEqual(['think-1', 'a-partial', 't-1'])
+    expect(split.finalParts).toHaveLength(0)
+  })
 })
 
 describe('Details collapse UI', () => {
@@ -86,6 +104,37 @@ describe('Details collapse UI', () => {
     expect(screen.getByTestId('user-tool-count').textContent).toBe('1')
     // 展开后最终 Message 所在 step 的统计也要有
     expect(screen.getByRole('group', { name: 'Step 2' })).toBeTruthy()
+  })
+
+  it('collapses an interrupted reply after cancellation and keeps it expandable', () => {
+    const nodes: ChatNode[] = [
+      { id: 'u-1', kind: 'user', text: 'run it' },
+      {
+        id: 'r-cancelled',
+        kind: 'reply',
+        copyText: '',
+        turn: 1,
+        finished: true,
+        streaming: false,
+        endReason: 'cancelled',
+        parts: [
+          { id: 'think-1', kind: 'think', text: 'unfinished reasoning' },
+          { id: 't-1', kind: 'tool', name: 'bash', callId: 'c1', arguments: '{}' },
+        ],
+      },
+    ]
+    render(<ChatNodeList nodes={nodes} onInspect={vi.fn()} onFork={vi.fn(async () => {})} />)
+
+    const details = screen.getByTestId('reply-details')
+    expect(details).toHaveProperty('hidden', true)
+    expect(screen.getByTestId('details-toggle').getAttribute('aria-expanded')).toBe('false')
+    expect(screen.getByTestId('user-turn-end-status').getAttribute('aria-label')).toBe('回合已取消')
+    expect(screen.queryByRole('group', { name: '回合操作' })).toBeNull()
+
+    fireEvent.click(screen.getByTestId('details-toggle'))
+    expect(details).toHaveProperty('hidden', false)
+    expect(screen.getByText('unfinished reasoning')).toBeTruthy()
+    expect(details.querySelector('.tool-call')).toBeTruthy()
   })
 
   it('keeps Details open chrome at sidebar-fg instead of the black active token', () => {
