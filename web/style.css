@@ -2343,6 +2343,13 @@ html:not(.dark) .shell-workspace-menu-item.is-active .shell-workspace-menu-icon 
   padding-top: 12px;
 }
 
+.settings-private-backups {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  margin-top: 10px;
+}
+
 .settings-cloud-sync .settings-account-hint {
   text-align: left;
 }

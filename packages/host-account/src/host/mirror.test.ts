@@ -136,7 +136,7 @@ test('snapshot application uses one database change batch', async () => {
   assert.equal(batches, 1)
 })
 
-test('safe restore reports every conflict and writes nothing', async () => {
+test('safe restore keeps existing records and writes only the missing ones', async () => {
   const ctx = new Context()
   let sessionWrites = 0
   let recordWrites = 0
@@ -177,15 +177,50 @@ test('safe restore reports every conflict and writes nothing', async () => {
     sessions: [{ id: 'session-existing', version: 1, events: [], config: {} }],
     collections: [{ path: '/pages', records: [{ id: 'page-existing' }, { id: 'page-new' }] }],
   })
-  assert.deepEqual(result, {
-    restored: false,
-    conflicts: [
-      { collection: '/sessions', id: 'session-existing' },
-      { collection: '/pages', id: 'page-existing' },
-    ],
-  })
+  assert.equal(result.restored, true)
+  assert.equal(result.restoredRecords, 1)
   assert.equal(sessionWrites, 0)
-  assert.equal(recordWrites, 0)
+  assert.equal(recordWrites, 1)
+})
+
+test('safe restore revives a trashed record without touching a live one', async () => {
+  const ctx = new Context()
+  const revived: string[] = []
+  let recordWrites = 0
+  class Database extends Service {
+    constructor(ctx: Context) {
+      super(ctx, 'database')
+    }
+    read(path: string) {
+      return path === '/pages/page-live'
+        ? Promise.resolve({ value: { id: 'page-live' } })
+        : Promise.reject(new Error('unknown record'))
+    }
+    isRecordDeleted(_path: string, id: string) {
+      return id === 'page-trashed'
+    }
+    reviveDeleted(_path: string, ids: string[]) {
+      revived.push(...ids)
+      return Promise.resolve(ids)
+    }
+    applySynced() {
+      recordWrites += 1
+      return Promise.resolve()
+    }
+    syncedRecords() {
+      return Promise.resolve([])
+    }
+  }
+  await ctx.plugin(Database)
+
+  const result = await restoreSnapshotSafely(ctx, {
+    sessions: [],
+    collections: [{ path: '/pages', records: [{ id: 'page-live' }, { id: 'page-trashed' }, { id: 'page-new' }] }],
+  })
+  assert.equal(result.restored, true)
+  assert.equal(result.restoredRecords, 2)
+  assert.deepEqual(revived, ['page-trashed'])
+  assert.equal(recordWrites, 1)
 })
 
 test('safe restore validates and restores a referenced CAS asset before records', async () => {

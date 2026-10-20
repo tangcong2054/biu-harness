@@ -1863,7 +1863,14 @@ export class DatabaseService extends Service implements Database {
     const names = [...collectAssetNames(...records)].sort()
     const exported = []
     for (const name of names) {
-      const asset = await this.assets.readAny(name)
+      let asset: Awaited<ReturnType<FileSystemAssets['readAny']>>
+      try {
+        asset = await this.assets.readAny(name)
+      } catch (error) {
+        // 记录里还指着这个文件，但本地已经没有字节。缺一个附件不应该让整份备份失败。
+        if (error instanceof Error && error.message === 'not found') continue
+        throw error
+      }
       exported.push({
         name,
         etag: asset.etag,
@@ -2680,6 +2687,26 @@ export class DatabaseService extends Service implements Database {
     this.bump()
     this.recycleAssets?.()
     return this.finishMetadata({ kind: 'deleted' as const, path: spec.path, ids })
+  }
+
+  isRecordDeleted(path: string, id: string) {
+    const spec = this.collection(normalizeCollectionPath(path))
+    if (!spec || !id) return false
+    return this.facets.isDeleted(spec.path, id)
+  }
+
+  async reviveDeleted(path: string, ids: string[]) {
+    await this.prepareMetadata()
+    const spec = this.collection(normalizeCollectionPath(path))
+    if (!spec) return []
+    const revived = []
+    for (const id of ids) {
+      if (!id || !this.facets.isDeleted(spec.path, id)) continue
+      this.facets.restoreDeleted(spec.path, id)
+      revived.push(id)
+    }
+    if (revived.length) this.bump()
+    return revived
   }
 
   async restore(path: string, query: CollectionListQuery = {}) {

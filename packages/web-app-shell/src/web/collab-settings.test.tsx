@@ -244,6 +244,73 @@ test('workspace and member settings are separate and workspace switching stays o
   assert.equal(calls.some((line) => line.includes('/login')), false)
 })
 
+test('device workspace settings upload, list, restore and delete private backups', async () => {
+  localStorage.clear()
+  localStorage.setItem('biu.account.token', 'tok')
+  const calls: Array<{ method: string; url: string; body?: string }> = []
+  globalThis.fetch = (async (path: string, init?: RequestInit) => {
+    const url = String(path)
+    const method = init?.method ?? 'GET'
+    calls.push({ method, url, body: typeof init?.body === 'string' ? init.body : undefined })
+    if (url.endsWith('/me')) return json({ id: 'acc_1', name: 'Ada', online: false })
+    if (url.endsWith('/workspaces') && method === 'GET') {
+      return json({ workspaces: [{ id: 'ws_device', name: '本机空间', role: 'owner', location: 'device' }] })
+    }
+    if (url.endsWith('/active')) return json({ workspaceId: 'ws_device' })
+    if (url.endsWith('/api/account/cloud')) return json({ available: true, connected: true, accounts: [] })
+    if (url.endsWith('/api/private-backups') && method === 'GET') {
+      return json({
+        backups: [{ id: 'backup_1', name: '出门前', sourceDeviceId: 'device-a', workspaceId: 'ws_device', itemCount: 3, createdAt: 1_700_000_000_000 }],
+      })
+    }
+    if (url.endsWith('/api/private-backups/publish') && method === 'POST') {
+      return json({ id: 'backup_2', name: '今晚' }, 201)
+    }
+    if (url.endsWith('/api/private-backups/backup_1') && method === 'DELETE') return json({ id: 'backup_1', deleted: true })
+    if (url.endsWith('/api/private-backups/backup_1/restore') && method === 'POST') {
+      return json({ error: '备份预检失败，未恢复任何内容', conflicts: [{ collection: '/pages', id: 'p1' }] }, 409)
+    }
+    return json({})
+  }) as typeof fetch
+
+  render(<ShellSettingsWorkspace />)
+  await waitFor(() => assert.equal(screen.getByTestId('settings-private-backup-list').textContent?.includes('出门前'), true))
+  fireEvent.change(screen.getByTestId('settings-private-backup-name'), { target: { value: '今晚' } })
+  await act(async () => {
+    fireEvent.click(screen.getByTestId('settings-private-backup-upload'))
+  })
+  const publish = calls.find((call) => call.url.endsWith('/api/private-backups/publish'))
+  assert.equal(publish?.method, 'POST')
+  const published = JSON.parse(publish?.body ?? '{}') as { name?: string; workspaceId?: string; sourceDeviceId?: string }
+  assert.equal(published.name, '今晚')
+  assert.equal(published.workspaceId, 'ws_device')
+  assert.equal(published.sourceDeviceId, localStorage.getItem('biu.device.id'))
+  assert.ok(published.sourceDeviceId)
+  await waitFor(() => assert.match(screen.getByTestId('settings-private-backup-message').textContent ?? '', /已把当前本机空间上传/))
+
+  fireEvent.click(screen.getByTestId('settings-private-backup-restore-backup_1'))
+  fireEvent.click(screen.getByTestId('settings-private-backup-confirm').querySelector('.biu-confirm-submit')!)
+  await waitFor(() => assert.match(screen.getByTestId('settings-private-backup-message').textContent ?? '', /\/pages p1/))
+
+  fireEvent.click(screen.getByTestId('settings-private-backup-delete-backup_1'))
+  fireEvent.click(screen.getByTestId('settings-private-backup-confirm').querySelector('.biu-confirm-submit')!)
+  await waitFor(() => assert.equal(calls.some((call) => call.method === 'DELETE' && call.url.endsWith('/api/private-backups/backup_1')), true))
+
+  cleanup()
+  localStorage.clear()
+  localStorage.setItem('biu.account.token', 'tok')
+  globalThis.fetch = (async (path: string) => {
+    const url = String(path)
+    if (url.endsWith('/me')) return json({ id: 'acc_1', online: false })
+    if (url.endsWith('/workspaces')) return json({ workspaces: [{ id: 'ws_cloud', name: '云端空间', role: 'owner', location: 'cloud' }] })
+    if (url.endsWith('/active')) return json({ workspaceId: 'ws_cloud' })
+    return json({})
+  }) as typeof fetch
+  render(<ShellSettingsWorkspace />)
+  await waitFor(() => assert.match(screen.getByText('当前是云端空间，内容已经保存在云端。整份上传和恢复只用于本机空间。').textContent ?? '', /本机空间/))
+  assert.equal(screen.queryByTestId('settings-private-backup-upload'), null)
+})
+
 test('account settings are global and workspace switcher lives in the sidebar header', async () => {
   localStorage.setItem('biu.account.token', 'tok')
   const source = readFileSync(resolve(import.meta.dirname, './shell-chrome.tsx'), 'utf8')

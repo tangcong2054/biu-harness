@@ -35,6 +35,10 @@ test('snapshot asset export includes referenced files once and excludes orphans'
 
   assert.deepEqual(assets.map((asset) => asset.name), [referenced.name, 'board.json'].sort())
   assert.equal(assets[0]?.bytesBase64.length > 0, true)
+  const withMissing = await db.exportSnapshotAssets([
+    { id: 'page-two', notes: `![gone](/api/db/file/missing-file.png)\n![ok](/api/db/file/${referenced.name})` },
+  ])
+  assert.deepEqual(withMissing.map((asset) => asset.name), [referenced.name])
 
   const restoredDir = await mkdtemp(join(tmpdir(), 'restored-assets-'))
   dirs.push(restoredDir)

@@ -59,6 +59,8 @@ type DatabaseLike = {
   applySynced: (path: string, records: MirrorSnapshot['collections'][number]['records']) => Promise<void>
   batchChanges?: <T>(run: () => Promise<T> | T) => Promise<T>
   read?: (path: string) => Promise<{ value?: Record<string, unknown> & { id?: string } }>
+  isRecordDeleted?: (path: string, id: string) => boolean | Promise<boolean>
+  reviveDeleted?: (path: string, ids: string[]) => Promise<unknown>
   remove?: (path: string, query: { ids: string[] }) => Promise<unknown>
   exportSnapshotAssets?: (records: unknown[]) => Promise<SnapshotAsset[]>
   preflightSnapshotAssets?: (assets: SnapshotAsset[]) => Promise<SnapshotConflict[]>
@@ -270,8 +272,9 @@ export async function applySnapshot(ctx: Context, snapshot: MirrorSnapshot, mode
 }
 
 /**
- * Restores a private backup as new local data. Conflict detection completes
- * before the first write so an existing local record is never overwritten.
+ * Restores records the current device workspace is missing, and puts trashed
+ * copies back. Live records stay as they are. Asset content conflicts still
+ * cancel the restore before the first write.
  */
 export async function restoreSnapshotSafely(ctx: Context, snapshot: MirrorSnapshot) {
   const conflicts: SnapshotConflict[] = []
@@ -319,32 +322,35 @@ export async function restoreSnapshotSafely(ctx: Context, snapshot: MirrorSnapsh
   if (decodedBytes > 10 * 1024 * 1024 || itemCount > 20_000) {
     conflicts.push({ collection: '/assets', id: '', reason: 'backup-limit-exceeded' })
   }
-  const store = sessionsOf(ctx)
-  const currentSessions = new Set((await store?.listSummaries())?.map((item) => item.id) ?? [])
-  for (const record of snapshot.sessions ?? []) {
-    if (record?.id && currentSessions.has(record.id)) {
-      conflicts.push({ collection: '/sessions', id: record.id })
-    }
-  }
   const database = databaseOf(ctx)
   if ((snapshot.assets?.length ?? 0) > 0 && !database?.preflightSnapshotAssets) {
     conflicts.push({ collection: '/assets', id: '', reason: 'asset-service-unavailable' })
   } else if (decodedAssets.length && conflicts.length === 0) {
     conflicts.push(...((await database?.preflightSnapshotAssets?.(snapshot.assets ?? [])) ?? []))
   }
+  if (conflicts.length) return { restored: false as const, conflicts }
+  const store = sessionsOf(ctx)
+  const currentSessions = new Set((await store?.listSummaries())?.map((item) => item.id) ?? [])
+  const sessions = (snapshot.sessions ?? []).filter((record) => record?.id && !currentSessions.has(record.id))
+  const collections: MirrorSnapshot['collections'] = []
   for (const collection of snapshot.collections ?? []) {
     if (collection.path === '/sessions') continue
+    const records = []
+    const trashed = []
     for (const record of collection.records ?? []) {
       const id = String(record?.id ?? '')
       if (!id) continue
       const existing = await database?.read?.(`${collection.path}/${id}`).catch(() => null)
-      if (existing?.value?.id) conflicts.push({ collection: collection.path, id })
+      if (existing?.value?.id) continue
+      if (await database?.isRecordDeleted?.(collection.path, id)) trashed.push(id)
+      records.push(record)
     }
+    if (trashed.length) await database?.reviveDeleted?.(collection.path, trashed)
+    if (records.length) collections.push({ path: collection.path, records })
   }
-  if (conflicts.length) return { restored: false as const, conflicts }
   if (decodedAssets.length) await database?.restoreSnapshotAssets?.(decodedAssets)
-  await applySnapshot(ctx, snapshot, 'adopt')
-  return { restored: true as const, conflicts: [] as SnapshotConflict[] }
+  await applySnapshot(ctx, { sessions, collections }, 'adopt')
+  return { restored: true as const, conflicts: [] as SnapshotConflict[], restoredRecords: sessions.length + collections.reduce((sum, collection) => sum + collection.records.length, 0) }
 }
 
 export async function exchangeSnapshot(

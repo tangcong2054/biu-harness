@@ -432,6 +432,21 @@ export class AccountService extends Service {
     this.disconnectCloud(localAccountId)
   }
 
+  /** 删掉一条已保存的云端关联。如果删的是当前连接，同时清掉本机正在使用的云端凭证。 */
+  forgetCloudConnection(localAccountId: string, origin: string, remoteAccountId: string) {
+    const active = this.cloudConnection(localAccountId)
+    const result = this.db
+      .prepare(
+        `DELETE FROM cloud_connections
+         WHERE local_account_id = ? AND origin = ? AND remote_account_id = ?`,
+      )
+      .run(localAccountId, origin, remoteAccountId) as { changes?: number }
+    if (!result.changes) throw new CollabError('还没有关联这个云端账号', 404)
+    if (active?.origin === origin && active.remoteAccountId === remoteAccountId) {
+      this.replica?.forget(localAccountId)
+    }
+  }
+
   workspaceLocation(workspaceId: string): 'device' | 'cloud' {
     if (isOnlineRuntime()) return 'cloud'
     const row = this.db.prepare('SELECT place FROM workspace_place WHERE workspace_id = ?').get(workspaceId) as
@@ -727,6 +742,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
       }))
       route.send(200, {
         available: Boolean(configuredRemoteOrigin()),
+        serviceOrigin: configuredRemoteOrigin(),
         connected: Boolean(connection),
         accounts,
         ...(connection
@@ -800,6 +816,20 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
       if (isOnlineRuntime()) throw new CollabError('服务端没有云端连接可断开', 400)
       const me = actor(route)
       account.removeCloudConnection(me.id)
+      route.send(200, { ok: true })
+    } catch (error) {
+      fail(route, error)
+    }
+  })
+
+  ctx.http.route('DELETE', '/api/account/cloud/saved', async (route) => {
+    try {
+      if (isOnlineRuntime()) throw new CollabError('服务端没有云端连接可删除', 400)
+      const me = actor(route)
+      const origin = String(route.query.get('origin') ?? '').trim()
+      const remoteAccountId = String(route.query.get('remoteAccountId') ?? '').trim()
+      if (!origin || !remoteAccountId) throw new CollabError('需要指定要删除的云端账号', 400)
+      account.forgetCloudConnection(me.id, origin, remoteAccountId)
       route.send(200, { ok: true })
     } catch (error) {
       fail(route, error)

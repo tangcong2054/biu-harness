@@ -630,6 +630,9 @@ test('saved cloud accounts stay after disconnect and can be selected again', asy
     service.activateCloud(ada.id, 'http://127.0.0.1:9', 'remote-a')
     assert.equal(service.cloudConnection(ada.id)?.token, 'token-a')
     assert.equal(service.listCloudConnections(ada.id).find((item) => item.remoteAccountId === 'remote-a')?.active, true)
+    service.forgetCloudConnection(ada.id, 'http://127.0.0.1:9', 'remote-a')
+    assert.equal(service.cloudConnection(ada.id), null)
+    assert.deepEqual(service.listCloudConnections(ada.id).map((item) => item.remoteAccountId), ['remote-b'])
   } finally {
     ctx.emit('dispose')
     if (previousOnline === undefined) delete process.env.BIU_ONLINE

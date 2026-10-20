@@ -175,9 +175,16 @@ export function ShellSettingsAccount() {
     available: boolean
     connected: boolean
     origin?: string
+    serviceOrigin?: string
     account?: { id?: string; name?: string; email?: string }
     accounts: Array<{ id: string; name?: string; email?: string; origin?: string; active?: boolean }>
   }>({ available: false, connected: false, accounts: [] })
+  const [pendingCloudDelete, setPendingCloudDelete] = useState<{
+    id: string
+    origin?: string
+    email?: string
+    name?: string
+  } | null>(null)
   const [cloudEmail, setCloudEmail] = useState('')
   const [cloudPassword, setCloudPassword] = useState('')
   const [cloudMessage, setCloudMessage] = useState('')
@@ -197,6 +204,7 @@ export function ShellSettingsAccount() {
           available: body.available === true,
           connected: body.connected === true,
           origin: typeof body.origin === 'string' ? body.origin : undefined,
+          serviceOrigin: typeof body.serviceOrigin === 'string' ? body.serviceOrigin : undefined,
           account:
             body.account && typeof body.account === 'object'
               ? (body.account as { id?: string; name?: string; email?: string })
@@ -232,7 +240,7 @@ export function ShellSettingsAccount() {
       <div className="settings-account-row">
         <div className="settings-account-copy">
           <p className="settings-account-label">云端账号</p>
-          <p className="settings-muted settings-account-hint">可以关联多个云端账号，同一时间连接其中一个。断开后关联记录会保留。</p>
+          <p className="settings-muted settings-account-hint">可以关联多个云端账号，同一时间连接其中一个。断开只停止使用；删除会去掉这条关联，云端账号本身还在。</p>
           {cloud.accounts.length ? (
             <div className="settings-cloud-accounts" data-testid="settings-cloud-accounts">
               {cloud.accounts.map((item) => (
@@ -280,6 +288,14 @@ export function ShellSettingsAccount() {
                         连接
                       </button>
                     )}
+                    <button
+                      type="button"
+                      className="settings-account-action is-danger"
+                      data-testid="settings-cloud-forget"
+                      onClick={() => setPendingCloudDelete(item)}
+                    >
+                      删除
+                    </button>
                   </span>
                 </div>
               ))}
@@ -287,6 +303,11 @@ export function ShellSettingsAccount() {
           ) : null}
           {cloud.available ? (
             <div className="settings-cloud-connect">
+              {cloud.serviceOrigin ? (
+                <p className="settings-muted settings-account-hint" data-testid="settings-cloud-service-origin">
+                  新的登录和创建都会关联到 {cloud.serviceOrigin}。
+                </p>
+              ) : null}
               <form
                 className="settings-cloud-login"
                 onSubmit={(event) => {
@@ -361,6 +382,31 @@ export function ShellSettingsAccount() {
           {cloudMessage ? <p className="settings-muted settings-account-hint">{cloudMessage}</p> : null}
         </div>
       </div>
+      {pendingCloudDelete ? (
+        <ConfirmDialog
+          title="删除云端关联"
+          message={<>确定去掉「{pendingCloudDelete.email || pendingCloudDelete.name || '这个云端账号'}」在 {pendingCloudDelete.origin || '该服务'} 上的关联吗？只删除这台设备上的连接记录，云端账号不会被注销。</>}
+          confirmLabel="删除"
+          danger
+          testId="settings-cloud-forget-confirm"
+          onCancel={() => setPendingCloudDelete(null)}
+          onConfirm={() => {
+            const target = pendingCloudDelete
+            setPendingCloudDelete(null)
+            const params = new URLSearchParams({
+              origin: target.origin ?? '',
+              remoteAccountId: target.id,
+            })
+            void accountFetch(token, `/api/account/cloud/saved?${params.toString()}`, { method: 'DELETE' })
+              .then(() => {
+                setCloudMessage('已删除这条云端关联。')
+                void loadCloud()
+                window.dispatchEvent(new Event(ACCOUNT_EVENT))
+              })
+              .catch((error) => setCloudMessage(error instanceof Error ? error.message : '删除失败'))
+          }}
+        />
+      ) : null}
       <div className="settings-account-row">
         <div className="settings-account-copy">
           <p className="settings-account-label">登录邮箱</p>
@@ -796,7 +842,21 @@ export function defaultSessionPath(sessions: Array<{ id?: string; updatedAt?: nu
 }
 
 /** 带 HTTP 状态码的请求错误，用于区分「凭证失效」和「网络/服务故障」。 */
-export type AccountFetchError = Error & { status?: number }
+export type AccountFetchError = Error & { status?: number; body?: Record<string, unknown> }
+
+const DEVICE_KEY = 'biu.device.id'
+
+/** 本机上传备份时带上的设备标识。只存在这台浏览器里，用来标记备份来源。 */
+export function readDeviceId() {
+  if (typeof localStorage === 'undefined') return 'device'
+  const current = localStorage.getItem(DEVICE_KEY)?.trim() ?? ''
+  if (current && current.length <= 64) return current
+  const created = (globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`)
+    .replace(/-/g, '')
+    .slice(0, 32)
+  localStorage.setItem(DEVICE_KEY, created)
+  return created
+}
 
 /** 只有这两个状态码才算凭证真的失效，此时才应该清 token。 */
 export function isAuthFailure(err: unknown): boolean {
@@ -813,14 +873,15 @@ async function accountFetch(token: string, path: string, init?: RequestInit) {
       ...init?.headers,
     },
   })
-  const body = (await res.json().catch(() => ({}))) as { error?: string }
+  const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
   if (!res.ok) {
     // message 保持原样（调用方按文案判断），另附 status 供上层区分。
-    const err = new Error(body.error || '请求失败') as AccountFetchError
+    const err = new Error(String(body.error || '请求失败')) as AccountFetchError
     err.status = res.status
+    err.body = body
     throw err
   }
-  return body as Record<string, unknown>
+  return body
 }
 
 export function ShellWorkspaceSwitcher({ onWorkspaceSettings }: { onWorkspaceSettings?: () => void }) {
@@ -1175,6 +1236,7 @@ export function ShellSettingsCollab({ panel = 'members' }: { panel?: 'workspace'
   const [presence, setPresence] = useState<CollabPresence[]>([])
   const [pendingRemove, setPendingRemove] = useState<CollabMember | null>(null)
   const [deleteName, setDeleteName] = useState('')
+  const [hostOnline, setHostOnline] = useState(false)
   const [error, setError] = useState('')
 
   const remember = (next: string) => {
@@ -1207,12 +1269,14 @@ export function ShellSettingsCollab({ panel = 'members' }: { panel?: 'workspace'
       try {
         const listed = (await accountFetch(token, '/api/account/workspaces')) as { workspaces?: CollabWorkspace[] }
         const active = (await accountFetch(token, '/api/account/active')) as { workspaceId?: string }
+        const me = (await accountFetch(token, '/api/account/me')) as { online?: boolean }
         if (gone) return
         const rows = listed.workspaces ?? []
         const nextWorkspaceId = String(active.workspaceId || rows[0]?.id || '')
         setWorkspaces(rows)
         setWorkspaceId(nextWorkspaceId)
         setWorkspaceName(rows.find((row) => row.id === nextWorkspaceId)?.name ?? '')
+        setHostOnline(me.online === true)
         setDeleteName('')
         setError('')
       } catch (err) {
@@ -1311,6 +1375,19 @@ export function ShellSettingsCollab({ panel = 'members' }: { panel?: 'workspace'
           </button>
         </div>
       </form>
+      {!hostOnline && (currentWorkspace?.location ?? 'device') === 'device' ? (
+        <PrivateWorkspaceBackup token={token} workspaceId={workspaceId} workspaceName={savedWorkspaceName} />
+      ) : null}
+      {!hostOnline && currentWorkspace?.location === 'cloud' ? (
+        <div className="settings-account-row">
+          <div className="settings-account-copy">
+            <p className="settings-account-label">云端备份</p>
+            <p className="settings-muted settings-account-hint">
+              当前是云端空间，内容已经保存在云端。整份上传和恢复只用于本机空间。
+            </p>
+          </div>
+        </div>
+      ) : null}
       {canDeleteWorkspace ? (
       <form
         className="settings-account-row"
@@ -1533,6 +1610,211 @@ export function ShellSettingsCollab({ panel = 'members' }: { panel?: 'workspace'
         />
       ) : null}
     </section>
+  )
+}
+
+type PrivateBackup = {
+  id: string
+  name: string
+  sourceDeviceId: string
+  workspaceId: string
+  itemCount: number
+  createdAt: number
+}
+
+function describeBackupError(error: unknown) {
+  const err = error as AccountFetchError
+  const message = err instanceof Error ? err.message : '请求失败'
+  if (message === 'backup is too large') return '当前本机空间超过 10 MiB，无法整份上传。'
+  if (message === 'backup has too many items') return '当前本机空间超过 2 万条记录，无法整份上传。'
+  const conflicts = Array.isArray(err.body?.conflicts)
+    ? err.body.conflicts as Array<{ collection?: string; id?: string }>
+    : []
+  const sample = conflicts
+    .slice(0, 3)
+    .map((item) => [item.collection, item.id].filter(Boolean).join(' '))
+    .filter(Boolean)
+    .join('，')
+  return sample ? `${message}：${sample}` : message
+}
+
+function PrivateWorkspaceBackup({
+  token,
+  workspaceId,
+  workspaceName,
+}: {
+  token: string
+  workspaceId: string
+  workspaceName: string
+}) {
+  const [cloudConnected, setCloudConnected] = useState(false)
+  const [cloudReady, setCloudReady] = useState(false)
+  const [backups, setBackups] = useState<PrivateBackup[]>([])
+  const [name, setName] = useState('')
+  const [message, setMessage] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [pending, setPending] = useState<{ action: 'restore' | 'delete'; backup: PrivateBackup } | null>(null)
+
+  const loadBackups = useCallback(async () => {
+    const listed = await accountFetch(token, '/api/private-backups') as { backups?: PrivateBackup[] }
+    setBackups(listed.backups ?? [])
+  }, [token])
+
+  useEffect(() => {
+    if (!token || !workspaceId) return
+    let gone = false
+    void accountFetch(token, '/api/account/cloud')
+      .then(async (body) => {
+        if (gone) return
+        const connected = body.connected === true
+        setCloudConnected(connected)
+        setCloudReady(true)
+        if (connected) await loadBackups()
+      })
+      .catch((error) => {
+        if (gone) return
+        setCloudReady(true)
+        setMessage(describeBackupError(error))
+      })
+    return () => {
+      gone = true
+    }
+  }, [token, workspaceId, loadBackups])
+
+  const upload = () => {
+    const backupName = name.trim()
+    if (!token || !workspaceId || !backupName || busy) return
+    setBusy(true)
+    setMessage('')
+    void accountFetch(token, '/api/private-backups/publish', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: backupName,
+        sourceDeviceId: readDeviceId(),
+        workspaceId,
+      }),
+    })
+      .then(() => loadBackups())
+      .then(() => {
+        setName('')
+        setMessage('已把当前本机空间上传到云端账号。')
+      })
+      .catch((error) => setMessage(describeBackupError(error)))
+      .finally(() => setBusy(false))
+  }
+
+  const confirmPending = () => {
+    if (!pending || busy) return
+    const { action, backup } = pending
+    setPending(null)
+    setBusy(true)
+    setMessage('')
+    const request = action === 'delete'
+      ? accountFetch(token, `/api/private-backups/${encodeURIComponent(backup.id)}`, { method: 'DELETE' })
+        .then(() => loadBackups())
+        .then(() => setMessage('已删除这份云端备份。'))
+      : accountFetch(token, `/api/private-backups/${encodeURIComponent(backup.id)}/restore`, {
+          method: 'POST',
+          body: JSON.stringify({ workspaceId }),
+        }).then(() => {
+          setMessage('已恢复到当前本机空间。')
+          try {
+            window.location.reload()
+          } catch {
+            setMessage('已恢复到当前本机空间。请刷新页面后查看。')
+          }
+        })
+    void request.catch((error) => setMessage(describeBackupError(error))).finally(() => setBusy(false))
+  }
+
+  if (!workspaceId) return null
+  return (
+    <div className="settings-account-row settings-members-section" data-testid="settings-private-backups">
+      <div className="settings-account-copy">
+        <p className="settings-account-label">云端备份</p>
+        <p className="settings-muted settings-account-hint">
+          上传会把当前本机空间「{workspaceName || '未命名'}」里的会话、页面和其他记录，连同引用到的附件，整份保存到已连接的云端账号。恢复会补回缺少的记录，并把回收站里的同名记录还原；还在使用的记录不会覆盖。附件内容冲突时，整次恢复会取消。
+        </p>
+        {cloudReady && !cloudConnected ? (
+          <p className="settings-muted settings-account-hint">请先到「账户」登录并关联云端账号。</p>
+        ) : null}
+        {cloudConnected ? (
+          <form
+            className="settings-cloud-login"
+            onSubmit={(event) => {
+              event.preventDefault()
+              upload()
+            }}
+          >
+            <input
+              className="settings-account-input"
+              maxLength={255}
+              placeholder="备份名称"
+              value={name}
+              data-testid="settings-private-backup-name"
+              onChange={(event) => setName(event.target.value)}
+            />
+            <button
+              className="settings-account-action"
+              type="submit"
+              disabled={busy || !name.trim()}
+              data-testid="settings-private-backup-upload"
+            >
+              {busy ? '处理中…' : '上传整个本机空间'}
+            </button>
+          </form>
+        ) : null}
+        {cloudConnected ? (
+          <div className="settings-private-backups" data-testid="settings-private-backup-list">
+            {backups.length ? backups.map((backup) => (
+              <div className="settings-member-row" key={backup.id}>
+                <span className="settings-member-identity">
+                  <strong>{backup.name || '未命名备份'}</strong>
+                  <small>
+                    {backup.createdAt ? new Date(backup.createdAt).toLocaleString() : ''}
+                    {backup.itemCount ? ` · ${backup.itemCount} 条` : ''}
+                  </small>
+                </span>
+                <span className="settings-member-controls">
+                  <button
+                    type="button"
+                    className="settings-account-action"
+                    disabled={busy}
+                    data-testid={`settings-private-backup-restore-${backup.id}`}
+                    onClick={() => setPending({ action: 'restore', backup })}
+                  >
+                    恢复到此空间
+                  </button>
+                  <button
+                    type="button"
+                    className="settings-account-action is-danger"
+                    disabled={busy}
+                    data-testid={`settings-private-backup-delete-${backup.id}`}
+                    onClick={() => setPending({ action: 'delete', backup })}
+                  >
+                    删除
+                  </button>
+                </span>
+              </div>
+            )) : <p className="settings-muted settings-account-hint">还没有云端备份。</p>}
+          </div>
+        ) : null}
+        {message ? <p className="settings-muted settings-account-hint" data-testid="settings-private-backup-message">{message}</p> : null}
+      </div>
+      {pending ? (
+        <ConfirmDialog
+          title={pending.action === 'restore' ? '恢复云端备份' : '删除云端备份'}
+          message={pending.action === 'restore'
+            ? `确定把「${pending.backup.name || '这份备份'}」里本地缺少的记录补回当前本机空间吗？回收站里的同名记录会还原，还在使用的记录保持原样。`
+            : `确定删除云端备份「${pending.backup.name || '这份备份'}」吗？本机数据不会受影响。`}
+          confirmLabel={pending.action === 'restore' ? '恢复' : '删除'}
+          danger={pending.action === 'delete'}
+          testId="settings-private-backup-confirm"
+          onCancel={() => setPending(null)}
+          onConfirm={confirmPending}
+        />
+      ) : null}
+    </div>
   )
 }
 
