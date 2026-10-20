@@ -3,6 +3,7 @@ import { Plugin, PluginKey } from '@tiptap/pm/state'
 import { Markdown } from '@tiptap/markdown'
 import { CodeBlockLowlight } from '@tiptap/extension-code-block-lowlight'
 import { pageImage } from './page-image.ts'
+import { pageFileDrop } from './page-file-drop.ts'
 import { BlockMath, InlineMath, Mathematics } from '@tiptap/extension-mathematics'
 import Placeholder from '@tiptap/extension-placeholder'
 import { TableKit } from '@tiptap/extension-table'
@@ -208,6 +209,7 @@ export function pageEditorExtensions() {
     Color,
     pageHighlight,
     pageImage,
+    pageFileDrop,
     TableKit.configure({
       table: { resizable: true, allowTableNodeSelection: true },
     }),

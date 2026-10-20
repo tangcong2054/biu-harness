@@ -1,0 +1,17 @@
+{
+  "id": "local-files",
+  "name": "本地文件",
+  "blurb": "像 VS Code 一样在 Biu 里打开你电脑上的文件和文件夹：资源管理器 + 多标签 + 代码编辑器（语法高亮、搜索、Ctrl+S）+ Markdown / 图片 / PDF / 音视频预览。把文件或文件夹直接拖进页面就会生成「本地文件」块，可切到右侧栏或全屏；会话右侧栏也有「本地文件」tab。Chrome / Edge 可直接写回原文件，Firefox / Safari 为只读（保存会下载为新文件）。文件内容只在浏览器里读写，不上传服务器；只有点「保存快照到页面」才会把当前文件作为页面附件上传。agent 可通过 uiActions 列目录、读文件、打开文件；写文件每次都需要你确认。",
+  "tags": [
+    "page",
+    "editor",
+    "file",
+    "local",
+    "vscode",
+    "inspector"
+  ],
+  "author": "用户",
+  "authorUrl": "",
+  "headless": true,
+  "createdAt": 1792468800000
+}

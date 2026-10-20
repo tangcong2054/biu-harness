@@ -19,6 +19,12 @@ export type PageBlockViewProps = {
   presentation?: PagePresentationControls
 }
 
+export type PageBlockDropSpec = {
+  match: (dataTransfer: DataTransfer) => boolean
+  /** 在 drop 事件同步阶段获取句柄或条目，然后再异步读取。 */
+  take: (dataTransfer: DataTransfer) => Promise<Array<Record<string, unknown>>>
+}
+
 /** 斜杠菜单分类。'basic' 进「基础模块」；其它字符串各自成组。 */
 export const BASIC_BLOCK_TYPE = 'basic'
 
@@ -49,6 +55,8 @@ export type PageBlockSpec = {
    * 完整 View 仍保留挂载，避免终端、查询等运行状态因收起而中断。
    */
   MinimizedView?: ComponentType<PageBlockViewProps>
+  /** 声明后，把文件 / 文件夹拖进页面时由本块接收并在落点插入。 */
+  acceptDrop?: PageBlockDropSpec
 }
 
 export type SlashInsert =

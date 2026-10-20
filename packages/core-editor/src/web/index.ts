@@ -17,7 +17,7 @@ import { pageBlocksCollectionView, PageBlockContent } from './page-blocks-view.t
 export { PageEditor, PageEditor as RecordEditor } from './page-editor.tsx'
 export { SourceToggle } from './source-toggle.tsx'
 export { PageEditorService, BASIC_BLOCK_TYPE, getPageEditor, usePageEditorVersion } from './service.ts'
-export type { HeadingReplacement, PageBlockSpec, PageBlockViewProps, SlashCommandSpec, SlashInsert } from './service.ts'
+export type { HeadingReplacement, PageBlockDropSpec, PageBlockSpec, PageBlockViewProps, SlashCommandSpec, SlashInsert } from './service.ts'
 export {
   PagePresentationService,
   getPagePresentation,
