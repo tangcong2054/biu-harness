@@ -122,7 +122,7 @@ export function pluginCatalogCollection(client: PluginRegistryClient): Collectio
         id: 'uninstall',
         label: '从空间卸载',
         when: { installed: true },
-        description: '只移除当前 Workspace 的插件安装关系；商店版本和宿主缓存保留。',
+        description: '只移除当前账号在当前 Workspace 的插件安装关系；其他成员和宿主缓存不受影响。',
         run: async (id) => client.uninstall(id),
       },
       {

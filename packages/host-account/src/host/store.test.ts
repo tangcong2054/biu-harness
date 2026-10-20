@@ -268,7 +268,7 @@ test('plugin packages record without instance roles', () => {
   }
 })
 
-test('workspace installation is shared while each member keeps a separate load state', () => {
+test('plugin installation and load state are scoped to each account in a workspace', () => {
   const collab = store()
   const ada = collab.register('Ada')
   const bob = collab.register('Bob')
@@ -290,17 +290,24 @@ test('workspace installation is shared while each member keeps a separate load s
     manifest: { id: 'page-html-blocks' },
   })
   collab.installPluginForWorkspace(ada.id, workspaceA.id, 'page-html-blocks', 'v1')
+  assert.equal(collab.canAccessPlugin(ada.id, workspaceA.id, 'page-html-blocks'), false)
+  collab.installPluginForAccount(ada.id, workspaceA.id, 'page-html-blocks', 'v1')
   assert.equal(collab.canAccessPlugin(ada.id, workspaceA.id, 'page-html-blocks'), true)
-  assert.equal(collab.canAccessPlugin(bob.id, workspaceA.id, 'page-html-blocks'), true)
+  assert.equal(collab.canAccessPlugin(bob.id, workspaceA.id, 'page-html-blocks'), false)
+  assert.throws(() => collab.setPluginLoad(bob.id, workspaceA.id, 'page-html-blocks', true))
+  collab.installPluginForAccount(bob.id, workspaceA.id, 'page-html-blocks', 'v1')
   collab.setPluginLoad(bob.id, workspaceA.id, 'page-html-blocks', true)
+  collab.setPluginLoad(ada.id, workspaceA.id, 'page-html-blocks', true)
   assert.equal(collab.canAccessPlugin(cara.id, workspaceA.id, 'page-html-blocks'), false)
   assert.equal(collab.canAccessPlugin(bob.id, workspaceB.id, 'page-html-blocks'), false)
   assert.deepEqual(collab.loadedPluginIds(), ['page-html-blocks'])
-  collab.setPluginLoad(bob.id, workspaceA.id, 'page-html-blocks', false)
-  assert.equal(collab.hasPluginLoad(bob.id, workspaceA.id, 'page-html-blocks'), false)
+  collab.uninstallPluginForAccount(ada.id, workspaceA.id, 'page-html-blocks')
+  assert.equal(collab.canAccessPlugin(ada.id, workspaceA.id, 'page-html-blocks'), false)
+  assert.equal(collab.hasPluginLoad(ada.id, workspaceA.id, 'page-html-blocks'), false)
   assert.equal(collab.canAccessPlugin(bob.id, workspaceA.id, 'page-html-blocks'), true)
-  collab.uninstallPluginFromWorkspace(ada.id, workspaceA.id, 'page-html-blocks')
-  assert.equal(collab.canAccessPlugin(bob.id, workspaceA.id, 'page-html-blocks'), false)
+  assert.equal(collab.hasPluginLoad(bob.id, workspaceA.id, 'page-html-blocks'), true)
+  collab.uninstallPluginForAccount(bob.id, workspaceA.id, 'page-html-blocks')
+  assert.deepEqual(collab.loadedPluginIds(), [])
 })
 
 test('sync bumps version and rejects a stale writer while a lock is held', () => {

@@ -267,6 +267,7 @@ export class PluginRegistryClient {
     const detail = await this.transport.detail(id, token)
     if (!detail) throw new Error(`unknown registry plugin: ${id}`)
     const local = (await this.store.list()).find((row) => row.id === id)
+    if (!this.store.isInstalledForCurrentWorkspace(id)) throw new Error(`plugin not installed for current account: ${id}`)
     if (local?.codeVersion === detail.codeVersion) return { id, updated: false, codeVersion: detail.codeVersion }
     const bundle = await this.transport.bundle(id, detail.codeVersion, token)
     if (!bundle) throw new Error(`unknown registry version: ${id}@${detail.codeVersion}`)

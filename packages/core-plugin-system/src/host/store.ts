@@ -337,8 +337,8 @@ export class PluginStoreService extends Service {
           isMember?(accountId: string, workspaceId: string): boolean
           activeWorkspaceId?(): string | null
           workspaceHasPlugin?(workspaceId: string, pluginId: string, accountId?: string): boolean
-          installPluginForWorkspace?(accountId: string, workspaceId: string, pluginId: string, version?: string): unknown
-          uninstallPluginFromWorkspace?(accountId: string, workspaceId: string, pluginId: string): unknown
+          installPluginForAccount?(accountId: string, workspaceId: string, pluginId: string, version?: string): unknown
+          uninstallPluginForAccount?(accountId: string, workspaceId: string, pluginId: string): unknown
           ensurePluginOwnerAssignments?(pluginId: string): number
           recordPluginPackage?(accountId: string, input: Record<string, unknown>): void
           syncInstalledPluginPackage?(input: Record<string, unknown>): boolean
@@ -387,7 +387,7 @@ export class PluginStoreService extends Service {
   isInstalledForCurrentWorkspace(id: string) {
     const accountId = currentAccountId()
     const workspaceId = this.currentWorkspaceId()
-    if (!accountId || !workspaceId) return existsSync(join(this.pluginPath(id), 'manifest.json'))
+    if (!accountId || !workspaceId) return !isOnlineRuntime() && existsSync(join(this.pluginPath(id), 'manifest.json'))
     return Boolean(this.accountStore()?.workspaceHasPlugin?.(workspaceId, id, accountId))
   }
 
@@ -508,7 +508,7 @@ export class PluginStoreService extends Service {
       manifest,
     })
     if (accountId && workspaceId && account?.isMember?.(accountId, workspaceId)) {
-      account.installPluginForWorkspace?.(accountId, workspaceId, manifest.id, codeVersion)
+      account.installPluginForAccount?.(accountId, workspaceId, manifest.id, codeVersion)
     }
     // 运行中才重新挂载；挂载失败不能留在运行中。
     if (this.isEnabled(manifest.id)) {
@@ -709,7 +709,7 @@ export class PluginStoreService extends Service {
     this.invalidateList()
   }
 
-  /** 卸载：有账号上下文时只移除当前 Workspace 安装关系；无租户时沿用本地物理卸载。 */
+  /** 卸载：线上只移除当前账号在当前 Workspace 的安装关系；本地单机模式物理卸载。 */
   async uninstall(id: string) {
     if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
     if (id === 'platform-operations') throw new Error('不能卸载平台运营插件')
@@ -717,13 +717,13 @@ export class PluginStoreService extends Service {
     const workspaceId = this.currentWorkspaceId()
     const account = this.accountStore()
     if (accountId && workspaceId && account?.isMember?.(accountId, workspaceId)) {
-      account.uninstallPluginFromWorkspace?.(accountId, workspaceId, id)
+      account.uninstallPluginForAccount?.(accountId, workspaceId, id)
       const still = account.loadedPluginIds?.().includes(id)
       if (!still) await this.hub().drop(id)
       this.invalidateList()
       return
     }
-    if (isOnlineRuntime()) this.requireWorkspaceMember()
+    if (isOnlineRuntime()) throw new Error('线上卸载需要当前账号及空间')
     await this.hub().drop(id)
     this.setEnabled(id, false)
     const dest = this.pluginPath(id)
@@ -745,6 +745,7 @@ export class PluginStoreService extends Service {
     if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
     if (id === 'platform-operations') throw new Error('不能删除平台运营插件')
     if (this.isBuiltin(id)) throw new Error(`cannot delete built-in plugin: ${id}`)
+    if (isOnlineRuntime()) throw new Error('线上不能删除其他账号共用的插件包，请使用卸载')
     await this.uninstall(id)
     const installed = this.pluginPath(id)
     if (isPathInside(this.pluginDir, installed) && existsSync(installed)) {
@@ -782,6 +783,7 @@ export class PluginStoreService extends Service {
 
   /** 把商店里的打包结果写入 .plugin/<id>/。来源对不上且本地已有同 id 时拒绝覆盖。 */
   async installBundle(bundle: InstalledBundle) {
+    if (isOnlineRuntime()) this.requireWorkspaceMember()
     const id = String(bundle.id ?? '').trim()
     if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
     const manifestText = bundle.files?.['manifest.json']
@@ -840,7 +842,7 @@ export class PluginStoreService extends Service {
       manifest: packedManifest,
     })
     if (accountId && workspaceId && account?.isMember?.(accountId, workspaceId)) {
-      account.installPluginForWorkspace?.(accountId, workspaceId, id, codeVersion)
+      account.installPluginForAccount?.(accountId, workspaceId, id, codeVersion)
     }
     if (wasRunning) await this.mountFromDisk(packedManifest, dest)
     return { id, codeVersion, remounted: wasRunning }

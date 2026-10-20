@@ -1285,13 +1285,13 @@ export class DatabaseService extends Service implements Database {
     q: string,
     overlay = true,
   ) {
-    const key = `${spec.path}\t${query.trash ? 1 : 0}\t${q}\t${overlay ? 1 : 0}\t${JSON.stringify(query.filter ?? {})}\t${(query.ids ?? []).join(',')}`
+    const key = `${spec.path}\t${query.trash ? 1 : 0}\t${q}\t${overlay ? 1 : 0}\t${JSON.stringify(query.filter ?? {})}\t${(query.ids ?? []).join(',')}\t${currentAccountId()}\t${currentRequestWorkspaceId()}`
     return shareInflight(this.inflightMatches, key, () => this.matchCollectionRowsNow(spec, query, filter, q, overlay))
   }
 
   private scanCollectionRows(spec: CollectionSpec, query: CollectionListQuery, overlay: boolean) {
     const load = specListQuery(query)
-    const key = `${spec.path}\t${load.trash ? 1 : 0}\t${load.q ?? ''}\t${overlay ? 1 : 0}\t${JSON.stringify(load.filter ?? {})}\t${(load.ids ?? []).join(',')}`
+    const key = `${spec.path}\t${load.trash ? 1 : 0}\t${load.q ?? ''}\t${overlay ? 1 : 0}\t${JSON.stringify(load.filter ?? {})}\t${(load.ids ?? []).join(',')}\t${currentAccountId()}\t${currentRequestWorkspaceId()}`
     return shareInflight(this.inflightScans, key, () => this.scanCollectionRowsNow(spec, load, overlay))
   }
 

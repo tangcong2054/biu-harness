@@ -308,9 +308,9 @@ export function pluginsCollection(store: PluginStoreService, registry?: PluginRe
         id: 'uninstall',
         label: '卸载',
         tone: 'danger',
-        confirm: '确定卸载这个插件？已安装的代码会被删掉。',
+        confirm: '确定卸载这个插件？线上只会移除你在当前空间的安装，其他成员不受影响。',
         when: { installed: true, builtin: false },
-        description: '删除 .plugin/<id>/。沙箱 .plugin-dev/<id>/ 还在的话行不会消失，只是 installed 变 false。',
+        description: '线上只移除当前账号在当前空间的安装；本地单机模式删除 .plugin/<id>/。',
         requiredAction: 'resource:delete',
         run: async (id) => {
           await store.uninstall(id)
