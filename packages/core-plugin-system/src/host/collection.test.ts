@@ -2,8 +2,49 @@ import { test } from 'vitest'
 import assert from 'node:assert/strict'
 import type { DbRecord } from '@biu/type-file-system'
 import { BIU_GITHUB, BIU_OFFICIAL_NAME, pluginsCollection } from './collection.ts'
-import type { PluginStoreService } from './store.ts'
+import type { PluginStoreService, RemoteFlag } from './store.ts'
+import type { PluginRegistryClient } from './registry-client.ts'
 import { defaultStoreShell } from '../shell.ts'
+
+function stubRegistry(canPublish: (id: string) => boolean, ownerId = 'own_1111111111111111'): PluginRegistryClient {
+  return {
+    canPublish,
+    ownerId: () => ownerId,
+    publish: async () => ({ codeVersion: 'v1', ownerId, registryId: 'reg' }),
+  } as unknown as PluginRegistryClient
+}
+
+function remoteFlag(ownerId: string): RemoteFlag {
+  return {
+    remoteCodeVersion: 'v1',
+    localCodeVersion: 'v1',
+    cached: true,
+    installed: true,
+    updateAvailable: false,
+    idConflict: false,
+    ownerId,
+  }
+}
+
+function installedListing(id: string, installed: boolean) {
+  return {
+    id,
+    name: id,
+    blurb: '',
+    tags: [],
+    author: '',
+    authorUrl: '',
+    installed,
+    enabled: false,
+    running: false,
+    bytes: 4,
+    createdAt: 1,
+    updatedAt: 2,
+    lastRunAt: null,
+    hasHost: true,
+    hasWeb: true,
+  }
+}
 
 function stubStore(partial: Partial<PluginStoreService>): PluginStoreService {
   return {
@@ -286,4 +327,63 @@ test('builtin plugins list BIU官方 and the GitHub link', async () => {
   assert.equal(spec.schema.fields.author, undefined)
   assert.equal(spec.schema.fields.authorUrl, undefined)
   assert.equal(spec.schema.columns?.includes('author'), false)
+})
+
+test('uninstalled rows stop offering start and publish', async () => {
+  const spec = pluginsCollection(
+    stubStore({
+      list: () => Promise.resolve([installedListing('demo', false)]),
+      listSandboxes: () => Promise.resolve([]),
+    }),
+    stubRegistry(() => true),
+  )
+  const [row] = await spec.list()
+  assert.notEqual(row?.installed, true)
+  assert.equal(row?.canPublish, undefined)
+  assert.deepEqual(spec.actions?.find((item) => item.id === 'publish')?.when, {
+    installed: true,
+    canPublish: true,
+    builtin: false,
+  })
+})
+
+test('publish stays hidden when the store id belongs to another uploader', async () => {
+  const spec = pluginsCollection(
+    stubStore({
+      list: () => Promise.resolve([installedListing('theirs', true)]),
+      listSandboxes: () => Promise.resolve([]),
+      remoteFlags: () => Promise.resolve({ theirs: remoteFlag('own_2222222222222222') }),
+    }),
+    stubRegistry(() => true),
+  )
+  const [row] = await spec.list()
+  assert.equal(row?.canPublish, undefined)
+})
+
+test('builtin plugins never offer publish', async () => {
+  const spec = pluginsCollection(
+    stubStore({
+      list: () => Promise.resolve([{ ...installedListing('official', true), builtin: true }]),
+      listSandboxes: () => Promise.resolve([]),
+    }),
+    stubRegistry(() => true),
+  )
+  const [row] = await spec.list()
+  assert.equal(row?.builtin, true)
+  assert.equal(row?.canPublish, true)
+  const publish = spec.actions?.find((item) => item.id === 'publish')
+  assert.equal(publish?.when?.builtin, false)
+})
+
+test('publish is only offered for plugins the viewer can publish', async () => {
+  const spec = pluginsCollection(
+    stubStore({
+      list: () => Promise.resolve([installedListing('mine', true), installedListing('theirs', true)]),
+      listSandboxes: () => Promise.resolve([]),
+    }),
+    stubRegistry((id) => id === 'mine'),
+  )
+  const rows = await spec.list()
+  assert.equal(rows.find((row) => row.id === 'mine')?.canPublish, true)
+  assert.equal(rows.find((row) => row.id === 'theirs')?.canPublish, undefined)
 })

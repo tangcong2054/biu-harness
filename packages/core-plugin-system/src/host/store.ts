@@ -42,6 +42,8 @@ export type StoreListing = {
   tags: string[]
   author: string
   authorUrl: string
+  /** 当前空间视角下的安装状态。磁盘上有 .plugin/<id>/ 只是"物理存在"，空间卸载后应为 false。 */
+  installed?: boolean
   enabled: boolean
   running: boolean
   bytes: number
@@ -594,6 +596,7 @@ export class PluginStoreService extends Service {
       items.push({
         ...manifest,
         ...(manifest.builtin || this.isBuiltin(manifest.id) ? { builtin: true } : {}),
+        installed: true,
         enabled,
         running: running.has(manifest.id),
         bytes: stats.bytes,
@@ -616,7 +619,13 @@ export class PluginStoreService extends Service {
     const workspaceId = this.currentWorkspaceId()
     if (!accountId || !workspaceId) return items
     const loaded = new Set(this.accountStore()?.pluginLoadsFor?.(accountId, workspaceId) ?? [])
-    return items.map((item) => ({ ...item, enabled: loaded.has(item.id), running: loaded.has(item.id) }))
+    return items.map((item) => {
+      // 线上卸载只摘掉当前空间的安装关系，.plugin/<id>/ 仍留在磁盘上；
+      // 所以 installed 必须按空间安装关系算，否则卸载后"运行/发布到商店"还会亮着。
+      const installed = this.isInstalledForCurrentWorkspace(item.id)
+      const active = installed && loaded.has(item.id)
+      return { ...item, installed, enabled: active, running: active }
+    })
   }
 
   private hasBundle(dir: string | null) {

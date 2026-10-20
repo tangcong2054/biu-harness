@@ -278,8 +278,22 @@ export class PluginRegistryClient {
     return this.store.uninstall(id)
   }
 
+  /** 本机（当前账号）在商店里的发布者身份。 */
+  ownerId() {
+    return ownerIdForToken(this.token())
+  }
+
+  /** 没发布过的插件谁都能上架；已发布过的只有拿着同一把发布密钥的人能更新。 */
+  canPublish(id: string) {
+    if (id === 'platform-operations') return false
+    const origin = this.store.originOf(id)
+    if (!origin?.ownerId) return true
+    return origin.ownerId === ownerIdForToken(this.token())
+  }
+
   async publish(id: string) {
     if (id === 'platform-operations') throw new Error('平台运营插件只留在运营端，不上传到插件商店')
+    if (!this.canPublish(id)) throw new Error('这个插件是别人发布的，只有发布者本人能更新到商店')
     if (existsSync(join(this.store.sandboxPath(id), 'manifest.json'))) await this.store.pack(id)
     const dir = this.store.pluginPath(id)
     if (!existsSync(join(dir, 'manifest.json'))) throw new Error(`plugin is not packed: ${id}`)

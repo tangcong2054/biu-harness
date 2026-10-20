@@ -47,7 +47,8 @@ function asInstalledRecord(row: StoreListing, store: PluginStoreService): DbReco
     blurb: row.blurb,
     tags: row.tags,
     ...withOfficial(row),
-    installed: true,
+    // 空间卸载后磁盘目录还在，installed 以 store 给出的空间视角为准。
+    installed: row.installed !== false,
     pluginPath: store.pluginPath(row.id),
     enabled: row.enabled,
     running: row.running,
@@ -122,11 +123,21 @@ export function pluginsCollection(store: PluginStoreService, registry?: PluginRe
     return [...ids]
       .sort()
       .map((id) => {
-        const row = mergeLifecycle(byInstalled.get(id), bySandbox.get(id), store)
+        const listing = byInstalled.get(id)
+        const row = mergeLifecycle(listing, bySandbox.get(id), store)
+        // 只有"已安装 + 自己发布的（或商店里还没人占这个 id）"才给发布按钮，
+        // 避免点了才被商店或记录权限打成 permission denied。
+        // installed 要在 omitEmpty 抹掉 false 之前看原始 listing。
+        const remoteOwner = String(flags[id]?.ownerId ?? '')
+        const ownedRemotely = !remoteOwner || remoteOwner === registry?.ownerId?.()
+        const publishable = Boolean(
+          registry && listing && listing.installed !== false && ownedRemotely && registry.canPublish(id),
+        )
+        const rowWithPublish = publishable ? { ...row, canPublish: true } : row
         const flag = flags[id]
-        if (!flag) return row
+        if (!flag) return rowWithPublish
         return omitEmpty({
-          ...row,
+          ...rowWithPublish,
           remoteCodeVersion: flag.remoteCodeVersion,
           localCodeVersion: flag.localCodeVersion,
           updateAvailable: flag.updateAvailable,
@@ -199,6 +210,7 @@ export function pluginsCollection(store: PluginStoreService, registry?: PluginRe
         remoteCodeVersion: { type: 'string', label: '商店版本' },
         localCodeVersion: { type: 'string', label: '本地版本' },
         updateAvailable: { type: 'boolean', label: '可更新' },
+        canPublish: { type: 'boolean', label: '可发布' },
         idConflict: { type: 'boolean', label: 'ID 冲突' },
         headless: { type: 'boolean', label: '无头' },
         shellWidth: { type: 'number', label: '窗口宽' },
@@ -273,7 +285,9 @@ export function pluginsCollection(store: PluginStoreService, registry?: PluginRe
       {
         id: 'publish',
         label: '发布到商店',
-        when: { installed: true },
+        // canPublish 由列表按"已安装 + 自己的插件（或全新 id）"算出，没配商店时不会给出。
+        // builtin 插件记录对非只读操作一律 permission denied，按钮必须收掉。
+        when: { installed: true, canPublish: true, builtin: false },
         description: '把 .plugin/<id>/ 的打包结果上传到插件商店。有沙箱时先 pack。同一把本机发布密钥才能更新已占用的 id。',
         run: async (id) => {
           if (!registry) throw new Error('plugin registry is not configured')
