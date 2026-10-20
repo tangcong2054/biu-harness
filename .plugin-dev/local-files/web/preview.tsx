@@ -1,14 +1,15 @@
 /**
  * 只读预览。安全要点：
- *   - Markdown / HTML 一律放进 sandbox iframe（不给 allow-same-origin、不给 allow-scripts），
- *     拿不到 Biu 的 cookie / DOM，脚本也不会跑。
+ *   - Markdown 经严格白名单清洗后渲染；HTML 原文仍放在不允许脚本或同源访问的 sandbox iframe。
  *   - 图片 / 音视频 / PDF 用 blob URL，且按扩展名强制 MIME，防止内容嗅探成 HTML。
  */
 import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 import { mimeFor, type ViewKind } from './kinds.ts'
+import { bindPreviewHotkey, readPreviewSelectionCached, type FileSelection } from './selection.ts'
 
 const React = globalThis.React
-const { useEffect, useMemo, useState } = React
+const { useEffect, useMemo, useRef, useState } = React
 
 const FRAME_CSP =
   "default-src 'none'; img-src https: data:; media-src https: data:; style-src 'unsafe-inline'; font-src https: data:"
@@ -54,9 +55,99 @@ function SandboxFrame({ html, title }: { html: string; title: string }) {
   )
 }
 
-export function MarkdownPreview({ text, title }: { text: string; title: string }) {
-  const html = useMemo(() => markdownDocument(text), [text])
-  return <SandboxFrame html={html} title={title} />
+export function safeMarkdownHtml(text: string) {
+  let html: string
+  try {
+    html = String(marked.parse(text, { async: false, gfm: true }))
+  } catch {
+    html = `<pre>${escapeHtml(text)}</pre>`
+  }
+  return DOMPurify.sanitize(html, {
+    ALLOWED_TAGS: ['p', 'br', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'strong', 'b', 'em', 'i', 's', 'del', 'blockquote', 'pre', 'code', 'ul', 'ol', 'li', 'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td', 'a', 'img', 'span', 'div', 'details', 'summary', 'sup', 'sub'],
+    ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'colspan', 'rowspan', 'start', 'open'],
+    ALLOW_DATA_ATTR: false,
+    ALLOW_ARIA_ATTR: false,
+    ALLOWED_URI_REGEXP: /^(?:https?:\/\/|data:image\/(?:png|jpeg|gif|webp);base64,)/i,
+  })
+}
+
+/**
+ * 页面块外层被页面编辑器设成 draggable（整块可拖动），在里面按住拖动会变成「拖整个块」而不是选字。
+ * 按下时临时关掉祖先的 draggable，松开后恢复，块的拖动手柄不受影响。
+ */
+export function releaseAncestorDrag(start: Element) {
+  const doc = start.ownerDocument
+  const changed: HTMLElement[] = []
+  for (let el = start.parentElement; el; el = el.parentElement) {
+    if (el.getAttribute('draggable') === 'true') {
+      el.setAttribute('draggable', 'false')
+      changed.push(el)
+    }
+  }
+  if (!changed.length) return
+  const win = doc.defaultView
+  const restore = () => {
+    for (const el of changed) if (el.getAttribute('draggable') === 'false') el.setAttribute('draggable', 'true')
+    doc.removeEventListener('mouseup', restore, true)
+    doc.removeEventListener('pointercancel', restore, true)
+    win?.removeEventListener('blur', restore)
+  }
+  doc.addEventListener('mouseup', restore, true)
+  doc.addEventListener('pointercancel', restore, true)
+  win?.addEventListener('blur', restore)
+}
+
+function isPickMode(doc: Document) {
+  return doc.documentElement.classList.contains('pick-mode')
+}
+
+export function MarkdownPreview({ text, title, onAttach }: { text: string; title: string; onAttach?: (selection: FileSelection | null) => void }) {
+  const html = useMemo(() => safeMarkdownHtml(text), [text])
+  const host = useRef<HTMLDivElement | null>(null)
+  const latest = useRef(onAttach)
+  latest.current = onAttach
+  useEffect(() => {
+    if (!host.current || !onAttach) return
+    return bindPreviewHotkey(host.current, (selection) => latest.current?.(selection))
+  }, [Boolean(onAttach)])
+  return (
+    <>
+      <div
+        ref={host}
+        className="lf-markdown"
+        tabIndex={0}
+        aria-label={`${title} Markdown 预览`}
+        dangerouslySetInnerHTML={{ __html: html }}
+        onMouseDown={(event: MouseEvent) => {
+          const el = event.currentTarget as HTMLElement
+          if (event.button !== 0 || isPickMode(el.ownerDocument)) return
+          releaseAncestorDrag(el)
+          // 不让页面块把这次按下当成「选中整个块」，否则浏览器选区会被换成整块。
+          event.stopPropagation()
+        }}
+        onDragStart={(event: DragEvent) => {
+          // 拖动已选中的文字时也不要把整个块拖走。
+          event.stopPropagation()
+        }}
+        onClick={(event: MouseEvent) => {
+          const target = event.target
+          if (!(target instanceof Element)) return
+          const link = target.closest('a[href]')
+          if (!link) return
+          event.preventDefault()
+          const href = link.getAttribute('href') ?? ''
+          if (/^https?:\/\//i.test(href)) window.open(href, '_blank', 'noopener,noreferrer')
+        }}
+      />
+      {onAttach ? (
+        <div className="lf-selection-tools">
+          <button type="button" className="lf-btn" onMouseDown={(event: MouseEvent) => event.preventDefault()} onClick={() => onAttach(host.current ? readPreviewSelectionCached(host.current) : null)}>
+            加入对话（Ctrl/⌘+L）
+          </button>
+        </div>
+      ) : null}
+    </>
+  )
 }
 
 export function HtmlPreview({ text, title }: { text: string; title: string }) {

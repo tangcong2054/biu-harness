@@ -4,6 +4,8 @@
  */
 import {
   IGNORED_NAMES,
+  READING_EVENT,
+  SnapshotRoot,
   baseName,
   captureDrop,
   isAbort,
@@ -14,10 +16,14 @@ import {
   type FsEntry,
   type FsRoot,
   type PermissionState,
+  type ReadingDetail,
 } from './fs.ts'
 import {
   addHandleRoot,
-  addSnapshotRoot,
+  openSnapshotRoot,
+  liveRoots,
+  snapshotPersistence,
+  subscribePersistence,
   allRoots,
   deleteDraft,
   forgetRoot,
@@ -115,8 +121,23 @@ function needsAccess(error: unknown) {
   return error instanceof DOMException && (error.name === 'NotAllowedError' || error.name === 'SecurityError')
 }
 
-function randomInstance() {
-  return `wb-${Math.random().toString(36).slice(2, 10)}`
+/** 浏览器枚举文件夹时（Firefox 关掉选择窗口才开始读）给个可见的状态，别让人觉得没反应。 */
+const IDLE_READING: ReadingDetail = { busy: false, folder: false }
+
+function useReading(): ReadingDetail {
+  const [state, setState] = useState<ReadingDetail>(IDLE_READING)
+  useEffect(() => {
+    const onReading = (event: Event) => {
+      const detail = (event as CustomEvent<ReadingDetail>).detail
+      setState(detail && detail.busy ? { busy: true, folder: Boolean(detail.folder) } : IDLE_READING)
+    }
+    window.addEventListener(READING_EVENT, onReading)
+    return () => window.removeEventListener(READING_EVENT, onReading)
+  }, [])
+  return state
+}
+
+function randomInstance() {  return `wb-${Math.random().toString(36).slice(2, 10)}`
 }
 
 /* ---------------- 添加根 ---------------- */
@@ -128,7 +149,7 @@ export async function pickFolderRoots(): Promise<string[]> {
       const handle = await (window as any).showDirectoryPicker({ mode: 'readwrite' })
       return [await addHandleRoot(handle)]
     }
-    return await Promise.all((await pickWithInput(true)).map((root) => addSnapshotRoot(root)))
+    return (await pickWithInput(true)).map(openSnapshotRoot)
   } catch (error) {
     if (isAbort(error)) return []
     throw error
@@ -143,7 +164,7 @@ export async function pickFileRoots(): Promise<string[]> {
       for (const handle of handles) ids.push(await addHandleRoot(handle))
       return ids
     }
-    return await Promise.all((await pickWithInput(false)).map((root) => addSnapshotRoot(root)))
+    return (await pickWithInput(false)).map(openSnapshotRoot)
   } catch (error) {
     if (isAbort(error)) return []
     throw error
@@ -154,7 +175,7 @@ export async function rootsFromDrop(dataTransfer: DataTransfer): Promise<string[
   const sources = await captureDrop(dataTransfer)
   const ids: string[] = []
   for (const source of sources) {
-    ids.push(source.type === 'handle' ? await addHandleRoot(source.handle) : await addSnapshotRoot(source.root))
+    ids.push(source.type === 'handle' ? await addHandleRoot(source.handle) : openSnapshotRoot(source.root))
   }
   return ids
 }
@@ -212,7 +233,16 @@ function TextPane({
     if (!hidden) editor.current?.focus()
   }, [hidden])
 
-  return <div ref={host} className="lf-cm" />
+  return (
+    <>
+      <div ref={host} className="lf-cm" />
+      <div className="lf-selection-tools">
+        <button type="button" className="lf-btn" onMouseDown={(event: MouseEvent) => event.preventDefault()} onClick={() => onAttach(tab.key, editor.current?.getSelection() ?? null)}>
+          加入对话（Ctrl/⌘+L）
+        </button>
+      </div>
+    </>
+  )
 }
 
 /* ---------------- 工作台 ---------------- */
@@ -234,6 +264,7 @@ export type WorkbenchProps = {
 export function Workbench(props: WorkbenchProps) {
   ensureStyles()
   const { rootIds, initial, allowAddRoots = true, onRootsAdded, onActiveChange, surface = 'main', label, flat, toolbar } = props
+  const reading = useReading()
   const [roots, setRoots] = useState<FsRoot[]>([])
   const [rootsReady, setRootsReady] = useState(false)
   const [access, setAccess] = useState<Record<string, PermissionState>>({})
@@ -278,7 +309,7 @@ export function Workbench(props: WorkbenchProps) {
 
   const attachSelection = useCallback((key: string, selection: FileSelection | null) => {
     if (!selection) {
-      say('warn', '请先在文件编辑区选中文字，再按 Ctrl/⌘+L 加入对话')
+      say('warn', '请先在文件编辑区或 Markdown 预览中选中文字，再按 Ctrl/⌘+L 或点「加入对话」')
       return
     }
     const tab = tabsRef.current.find((item) => item.key === key)
@@ -296,7 +327,7 @@ export function Workbench(props: WorkbenchProps) {
         route: window.location.pathname,
         unsaved: isDirty(tab),
       })])
-      say('info', `已加入对话：${tab.name} 第 ${selection.startLine}–${selection.endLine} 行（来源：本地文件插件）`)
+      say('info', `已加入对话：${tab.name} ${selection.startLine === null ? 'Markdown 预览选区' : `第 ${selection.startLine}–${selection.endLine} 行`}（来源：本地文件插件）`)
     } catch (error) {
       say('error', errorText(error))
     }
@@ -304,19 +335,28 @@ export function Workbench(props: WorkbenchProps) {
 
   /* ---- 根 ---- */
 
+  const [, setPersistenceVersion] = useState(0)
+  useEffect(() => subscribePersistence(() => setPersistenceVersion((value) => value + 1)), [])
+
   useEffect(() => {
     let cancelled = false
+    let generation = 0
     const load = async () => {
+      const current = ++generation
+      const available = liveRoots().filter((root) => rootIds === 'all' || rootIds.includes(root.id))
+      setRoots(available)
+      if (available.length) setRootsReady(true)
+      setAccess((cur) => ({ ...cur, ...Object.fromEntries(available.filter((root) => root.source === 'snapshot').map((root) => [root.id, 'granted'])) }))
       const next =
         rootIds === 'all'
           ? await allRoots()
           : (await Promise.all(rootIds.map((id) => rootById(id)))).filter((root): root is FsRoot => Boolean(root))
-      if (cancelled) return
+      if (cancelled || current !== generation) return
       setRoots(next)
       setRootsReady(true)
       const states: Record<string, PermissionState> = {}
       for (const root of next) states[root.id] = await root.permission(false)
-      if (!cancelled) setAccess(states)
+      if (!cancelled && current === generation) setAccess(states)
     }
     void load()
     const stop = subscribeRoots(() => void load())
@@ -907,10 +947,21 @@ export function Workbench(props: WorkbenchProps) {
         onDrop={onDrop}
       >
         <div className="lf-empty" style={{ flex: 1 }}>
-          <h4>打开本地文件</h4>
-          <div>选择文件夹或文件，或直接把它们拖到这里。</div>
-          {allowAddRoots ? <div className="lf-actions">{addButtons(true)}</div> : null}
+          <h4>{reading.busy ? '正在读取…' : '打开本地文件'}</h4>
+          <div>
+            {reading.busy
+              ? reading.folder
+                ? '浏览器正在枚举你选择的文件夹（含 node_modules 等大目录时会慢一些），读完就会自动打开。'
+                : '浏览器正在读取你选择的文件，读完就会自动打开。'
+              : '选择文件夹或文件，或直接把它们拖到这里。'}
+          </div>
+          {allowAddRoots && !reading.busy ? <div className="lf-actions">{addButtons(true)}</div> : null}
           <div style={{ fontSize: 11.5 }}>{capability}</div>
+          {flash ? (
+            <div role="alert" style={{ color: flash.tone === 'error' ? '#b91c1c' : 'var(--lf-muted)', whiteSpace: 'pre-wrap' }}>
+              {flash.text}
+            </div>
+          ) : null}
         </div>
         {dragging ? <div className="lf-drop">松开即可打开</div> : null}
       </div>
@@ -919,7 +970,10 @@ export function Workbench(props: WorkbenchProps) {
 
   const activeRoot = activeTab ? roots.find((root) => root.id === activeTab.rootId) : undefined
   const banner = flash ?? activeTab?.notice ?? null
-
+  const failedCopy = roots.find((root) => snapshotPersistence(root.id)?.state === 'error')
+  const pendingCopy = roots.find((root) => snapshotPersistence(root.id)?.state === 'pending')
+  const copyRoot = failedCopy ?? pendingCopy
+  const copyStatus = copyRoot ? snapshotPersistence(copyRoot.id) : undefined
   return (
     <div
       className={`lf-wb${flat ? ' is-flat' : ''}`}
@@ -1034,8 +1088,14 @@ export function Workbench(props: WorkbenchProps) {
             {toolbar as never}
           </div>
         </div>
-        {activeTab?.external ? (
-          <div className="lf-banner">
+        {reading.busy ? (
+          <div className="lf-banner is-info" role="status">
+            <span className="lf-grow">
+              {reading.folder ? '浏览器正在枚举你选择的文件夹' : '浏览器正在读取你选择的文件'}（大文件夹会慢一些），读完就会自动打开。
+            </span>
+          </div>
+        ) : null}
+        {activeTab?.external ? (          <div className="lf-banner">
             <span className="lf-grow">「{activeTab.name}」已在外部被修改，而这里有未保存的修改。</span>
             <button type="button" className="lf-link" onClick={() => void reloadTab(activeTab.key)}>重新加载（丢弃我的修改）</button>
             <button type="button" className="lf-link" onClick={() => patchTab(activeTab.key, (tab) => ({ external: false, modified: tab.file?.lastModified }))}>保留我的修改</button>
@@ -1060,6 +1120,18 @@ export function Workbench(props: WorkbenchProps) {
             </button>
           </div>
         ) : null}
+        {copyRoot && copyStatus ? (
+          <div className={`lf-banner${copyStatus.state === 'error' ? ' is-error' : ' is-info'}`} role="status">
+            <span className="lf-grow">
+              {copyStatus.state === 'error'
+                ? `「${copyRoot.name}」仅在本次打开中可用，刷新后可能丢失：${copyStatus.error}`
+                : `「${copyRoot.name}」可立即浏览，正在后台保存副本（${copyStatus.completed}/${copyStatus.total}）；完成前请勿刷新。`}
+            </span>
+            {copyStatus.state === 'error' && copyRoot instanceof SnapshotRoot ? (
+              <button type="button" className="lf-link" onClick={() => openSnapshotRoot(copyRoot)}>重试保存</button>
+            ) : null}
+          </div>
+        ) : null}
         <div className="lf-content">
           {!activeTab ? (
             <div className="lf-empty">
@@ -1082,7 +1154,7 @@ export function Workbench(props: WorkbenchProps) {
                   </div>
                   {showPreview ? (
                     <div className="lf-pane">
-                      {tab.kind === 'markdown' ? <MarkdownPreview text={tab.text ?? ''} title={tab.name} /> : <HtmlPreview text={tab.text ?? ''} title={tab.name} />}
+                      {tab.kind === 'markdown' ? <MarkdownPreview text={tab.text ?? ''} title={tab.name} onAttach={(selection) => attachSelection(tab.key, selection)} /> : <HtmlPreview text={tab.text ?? ''} title={tab.name} />}
                     </div>
                   ) : null}
                 </>
@@ -1112,9 +1184,12 @@ export function Workbench(props: WorkbenchProps) {
           </span>
           {activeTab && isTextual(activeTab.kind) && cursor ? <span>行 {cursor.line}，列 {cursor.col}</span> : null}
           {activeTab ? <span>{isTextual(activeTab.kind) ? languageLabel(activeTab.name) : formatBytes(activeTab.size ?? 0)}</span> : null}
-          {activeTab && isTextual(activeTab.kind) ? <span title="在编辑模式中选中文字后按 Ctrl/⌘+L，携带文件路径和插件来源加入对话">Ctrl/⌘+L 加入对话</span> : null}
+          {activeTab && isTextual(activeTab.kind) ? <span title="在编辑区或 Markdown 预览中选中文字，按 Ctrl/⌘+L 或点加入对话；HTML 预览请先切到编辑">Ctrl/⌘+L 加入对话</span> : null}
           {activeTab && isTextual(activeTab.kind) ? <span>UTF-8</span> : null}
           {activeRoot ? <span>{activeRoot.mode === 'readwrite' ? '可读写' : '只读快照'}</span> : null}
+          {activeRoot && snapshotPersistence(activeRoot.id) ? (
+            <span>{snapshotPersistence(activeRoot.id)?.state === 'saved' ? '副本已保存，可刷新恢复' : snapshotPersistence(activeRoot.id)?.state === 'error' ? '副本保存失败' : '副本保存中'}</span>
+          ) : null}
           {activeTab && isTextual(activeTab.kind) ? <span>{isDirty(activeTab) ? '未保存' : '已保存'}</span> : null}
         </div>
       </section>

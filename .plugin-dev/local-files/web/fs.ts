@@ -230,17 +230,23 @@ export class HandleRoot implements FsRoot {
 export class SnapshotRoot implements FsRoot {
   readonly source = 'snapshot' as const
   readonly mode: RootMode = 'readonly'
-  private readonly files = new Map<string, File>()
+  private readonly files = new Map<string, File | true>()
   private readonly tree = new Map<string, FsEntry[]>()
   truncated = false
 
+  /**
+   * entries 里 file=true 表示内容存在别处（IndexedDB），读取时交给 load 按需取，
+   * 避免刷新恢复时一次性把整个文件夹的内容读进内存。
+   */
   constructor(
     readonly id: string,
     readonly name: string,
     readonly kind: EntryKind,
-    entries: Array<{ path: string; file?: File }>,
+    entries: Array<{ path: string; file?: File | true }>,
+    private readonly load?: (path: string) => Promise<File>,
   ) {
     this.tree.set('', [])
+    const seen = new Set<string>([''])
     for (const item of entries) {
       if (this.files.size >= SNAPSHOT_MAX_FILES) {
         this.truncated = true
@@ -253,27 +259,33 @@ export class SnapshotRoot implements FsRoot {
         continue
       }
       if (!parts.length) continue
+      let dir = ''
       for (let i = 0; i < parts.length; i += 1) {
-        const dir = parts.slice(0, i).join('/')
-        const path = parts.slice(0, i + 1).join('/')
+        const path = dir ? `${dir}/${parts[i]}` : parts[i]
         const isLeaf = i === parts.length - 1
         const kind: EntryKind = isLeaf && item.file ? 'file' : 'directory'
-        const siblings = this.tree.get(dir) ?? []
-        if (!siblings.some((entry) => entry.path === path)) {
+        if (!seen.has(path)) {
+          seen.add(path)
+          let siblings = this.tree.get(dir)
+          if (!siblings) {
+            siblings = []
+            this.tree.set(dir, siblings)
+          }
           siblings.push({ name: parts[i], path, kind })
-          this.tree.set(dir, siblings)
         }
         if (kind === 'directory' && !this.tree.has(path)) this.tree.set(path, [])
+        dir = path
       }
       if (item.file) this.files.set(parts.join('/'), item.file)
     }
     for (const list of this.tree.values()) sortEntries(list)
   }
 
-  entries(): Array<{ path: string; file?: File }> {
-    const entries: Array<{ path: string; file?: File }> = []
-    for (const path of this.tree.keys()) if (path) entries.push({ path })
-    for (const [path, file] of this.files) entries.push({ path, file })
+  /** 只返回内存里真正持有内容的文件；按需加载的条目只带路径和 stored 标记。 */
+  entries(): Array<{ path: string; file?: File; stored?: true }> {
+    const entries: Array<{ path: string; file?: File; stored?: true }> = []
+    for (const path of this.tree.keys()) if (path && !this.files.has(path)) entries.push({ path })
+    for (const [path, file] of this.files) entries.push(file === true ? { path, stored: true } : { path, file })
     return entries
   }
 
@@ -291,9 +303,12 @@ export class SnapshotRoot implements FsRoot {
   }
 
   async file(path: string) {
-    const hit = this.files.get(splitPath(path).join('/'))
+    const key = splitPath(path).join('/')
+    const hit = this.files.get(key)
     if (!hit) throw new Error(`文件不存在：${path}`)
-    return hit
+    if (hit !== true) return hit
+    if (!this.load) throw new Error(`文件副本不可用：${path}`)
+    return this.load(key)
   }
 }
 
@@ -323,6 +338,15 @@ export function snapshotFromFileList(files: File[], folder: boolean): SnapshotRo
   return [new SnapshotRoot(newRootId(), rootName, 'directory', entries)]
 }
 
+/** 选择窗口关闭后、浏览器还在枚举文件期间广播的事件，界面据此显示「正在读取」。 */
+export const READING_EVENT = 'lf:reading'
+export type ReadingDetail = { busy: boolean; folder: boolean }
+
+function announceReading(detail: ReadingDetail) {
+  if (typeof window === 'undefined') return
+  window.dispatchEvent(new CustomEvent<ReadingDetail>(READING_EVENT, { detail }))
+}
+
 /** 不支持句柄时退回 <input type=file>，和「导入 Skill」同一种做法。 */
 export function pickWithInput(folder: boolean): Promise<SnapshotRoot[]> {
   return new Promise((resolve) => {
@@ -332,14 +356,35 @@ export function pickWithInput(folder: boolean): Promise<SnapshotRoot[]> {
     if (folder) input.setAttribute('webkitdirectory', '')
     input.style.display = 'none'
     let settled = false
+    let reading = false
+    // Firefox 在关掉选择窗口后才枚举整个文件夹（含 node_modules），change 要等枚举完才触发。
+    const onFocus = () => {
+      if (settled || reading) return
+      reading = true
+      announceReading({ busy: true, folder })
+      // 老浏览器取消时不发 cancel，别让提示一直挂着。
+      setTimeout(() => {
+        if (!settled && reading && !input.files?.length) {
+          reading = false
+          announceReading({ busy: false, folder })
+        }
+      }, 120_000)
+    }
     const finish = (roots: SnapshotRoot[]) => {
       if (settled) return
       settled = true
+      window.removeEventListener('focus', onFocus)
       input.remove()
+      if (reading) announceReading({ busy: false, folder })
       resolve(roots)
     }
-    input.addEventListener('change', () => finish(snapshotFromFileList(Array.from(input.files ?? []), folder)))
+    input.addEventListener('change', () => {
+      onFocus()
+      // 让「正在读取」先画出来，再做同步的整理。
+      setTimeout(() => finish(snapshotFromFileList(Array.from(input.files ?? []), folder)), 0)
+    })
     input.addEventListener('cancel', () => finish([]))
+    window.addEventListener('focus', onFocus)
     document.body.appendChild(input)
     input.click()
   })

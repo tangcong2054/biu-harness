@@ -54,6 +54,15 @@ function blockHeight(data: BlockData) {
   return Number.isFinite(n) && n >= 200 ? Math.round(n) : DEFAULT_HEIGHT
 }
 
+/** 宿主「在独立窗口打开」时，整个窗口只放这一个块，应铺满。 */
+function inPopout() {
+  try {
+    return new URLSearchParams(window.location.search).get('popout') === 'page-block'
+  } catch {
+    return false
+  }
+}
+
 function snapshotOf(data: BlockData): Snapshot | null {
   const snap = data.snapshot
   if (!snap || typeof snap !== 'object' || typeof snap.href !== 'string' || !snap.href.startsWith('/api/db/file/')) return null
@@ -109,7 +118,7 @@ function LocalFileBlock({ data: raw, update, writable, presentation }: BlockProp
   const [snapError, setSnapError] = useState('')
   const [busy, setBusy] = useState(false)
   const [active, setActive] = useState<OpenRef | null>(null)
-  const presented = Boolean(presentation && (presentation.mode === 'sidebar' || presentation.mode === 'maximized'))
+  const presented = Boolean(presentation && (presentation.mode === 'sidebar' || presentation.mode === 'maximized')) || inPopout()
 
   useEffect(() => {
     let cancelled = false
@@ -196,29 +205,16 @@ function LocalFileBlock({ data: raw, update, writable, presentation }: BlockProp
           <Icon id="trash" />
         </button>
       ) : null}
-      {presentation ? (
-        presentation.detached ? (
-          <button type="button" className="lf-icon-btn" title="放回页面" onClick={() => presentation.inline()}>
-            <Icon id="close" />
-          </button>
-        ) : (
-          <>
-            <button type="button" className="lf-icon-btn" title="在右侧栏打开" onClick={() => presentation.sidebar()}>
-              <Icon id="sidebar" />
-            </button>
-            <button type="button" className="lf-icon-btn" title="全屏" onClick={() => presentation.maximize()}>
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true"><path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10" /></svg>
-            </button>
-          </>
-        )
-      ) : null}
+      {/* 右侧栏 / 独立窗口 / 收起由宿主的块控件提供，这里不再重复。 */}
     </>
   )
 
+  // 独立窗口里块外层没有确定高度，100% 会塌成内容高度；按窗口高度减去宿主标题栏（42px）和内边距（24px）。
+  const height = inPopout() ? 'calc(100vh - 66px)' : presented ? '100%' : blockHeight(data)
   const frame = (child: unknown) => (
     <div
       data-testid="local-file-block"
-      style={{ width: '100%', height: presented ? '100%' : blockHeight(data), minHeight: presented ? 0 : undefined, display: 'flex' }}
+      style={{ width: '100%', height, minHeight: presented ? 0 : undefined, display: 'flex' }}
     >
       {child as never}
     </div>

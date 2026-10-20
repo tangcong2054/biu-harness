@@ -49,6 +49,19 @@ const CSS = `
 .lf-pane { position: absolute; inset: 0; display: flex; flex-direction: column; }
 .lf-pane[hidden] { display: none; }
 .lf-cm { flex: 1; min-height: 0; }
+.lf-selection-tools { display: flex; justify-content: flex-end; padding: 5px 10px; background: var(--lf-bar); border-top: 1px solid var(--lf-border); flex: none; }
+.lf-markdown { flex: 1; min-height: 0; overflow: auto; padding: 20px 28px 40px; font: 14px/1.7 ui-sans-serif, system-ui, sans-serif; color: var(--lf-ink); overflow-wrap: anywhere; -webkit-user-select: text; user-select: text; cursor: text; }
+.lf-markdown:focus { outline: none; }
+.lf-markdown h1, .lf-markdown h2, .lf-markdown h3 { line-height: 1.3; margin: 1.4em 0 .6em; }
+.lf-markdown h1, .lf-markdown h2 { border-bottom: 1px solid var(--lf-border); padding-bottom: .3em; }
+.lf-markdown code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #f3f4f6; padding: .1em .35em; border-radius: 4px; font-size: .92em; }
+.lf-markdown pre { background: #f6f8fa; padding: 12px 14px; border-radius: 8px; overflow: auto; }
+.lf-markdown pre code { background: none; padding: 0; }
+.lf-markdown blockquote { padding: 0 1em; color: var(--lf-muted); border-left: 3px solid var(--lf-border); }
+.lf-markdown table { border-collapse: collapse; }
+.lf-markdown th, .lf-markdown td { border: 1px solid var(--lf-border); padding: 6px 10px; }
+.lf-markdown img { max-width: 100%; }
+.lf-markdown a { color: var(--lf-accent); }
 .lf-status { display: flex; align-items: center; gap: 12px; height: 24px; padding: 0 10px; font-size: 11px; color: var(--lf-muted); background: var(--lf-bar); border-top: 1px solid var(--lf-border); flex: none; white-space: nowrap; overflow: hidden; }
 .lf-status .lf-grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .lf-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; height: 100%; padding: 24px; text-align: center; color: var(--lf-muted); }

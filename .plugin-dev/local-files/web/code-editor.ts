@@ -45,7 +45,7 @@ import { lua } from '@codemirror/legacy-modes/mode/lua'
 import { ruby } from '@codemirror/legacy-modes/mode/ruby'
 import { dockerFile } from '@codemirror/legacy-modes/mode/dockerfile'
 import { extOf } from './kinds.ts'
-import { bindSelectionHotkey, type FileSelection } from './selection.ts'
+import { bindSelectionHotkey, readFileSelection, type FileSelection } from './selection.ts'
 
 export function languageFor(name: string): Extension {
   const ext = extOf(name)
@@ -149,6 +149,7 @@ export type CodeEditorHandle = {
   setReadOnly: (readOnly: boolean) => void
   setName: (name: string) => void
   getDoc: () => string
+  getSelection: () => FileSelection | null
   focus: () => void
   destroy: () => void
 }
@@ -223,6 +224,7 @@ export function createCodeEditor(parent: HTMLElement, options: CodeEditorOptions
       view.dispatch({ effects: language.reconfigure(languageFor(name)) })
     },
     getDoc: () => view.state.doc.toString(),
+    getSelection: () => readFileSelection(view.state),
     focus: () => view.focus(),
     destroy: () => {
       stopSelectionHotkey()
