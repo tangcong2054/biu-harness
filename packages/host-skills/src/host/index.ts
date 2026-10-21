@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Service, type Context } from 'cordis'
-import { currentAccountId } from '@biu/host-plugin-loader/data-dir'
+import { currentAccountId, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
+import type { Database } from '@biu/type-file-system'
 import { skillsCollection } from './collection.ts'
 import { LEGACY_MIGRATED, legacySkillImports, SkillsStore, type SkillImportInput, type SkillRecord } from './store.ts'
 
@@ -28,11 +29,14 @@ export class SkillsService extends Service {
 
   private changed() {
     this.ctx.emit('hub/change')
+    let database: Database | undefined
     try {
-      this.ctx.emit('database/change')
+      database = this.ctx.get('database') as Database | undefined
     } catch {
-      // File System 尚未挂载时不影响仓库本身。
+      // 启动期数据库尚未注册时仍通知订阅者。
     }
+    if (database?.collectionChanged) database.collectionChanged()
+    else this.ctx.emit('database/change')
   }
 
   /**
@@ -42,22 +46,25 @@ export class SkillsService extends Service {
    * 云端导入必须补这一步，否则「导入成功但页面看不到」。
    */
   private claimOwnership(id: string) {
+    let store: {
+      activeWorkspaceId?: () => string | null
+      claim?: (actorId: string, workspaceId: string, collection: string, recordId: string) => unknown
+    } | undefined
     try {
-      const store = (this.ctx.get('account') as {
-        store?: {
-          activeWorkspaceId?: () => string | null
-          claim?: (actorId: string, workspaceId: string, collection: string, recordId: string) => unknown
-        }
-      } | undefined)?.store
-      if (!store?.claim) return
-      const workspaceId = store.activeWorkspaceId?.() ?? ''
-      const actorId = currentAccountId()
-      // 启动期的 legacy 迁移没有账号上下文，跳过即可（后续由使用者在页面里认领）。
-      if (!workspaceId || !actorId) return
-      store.claim(actorId, workspaceId, '/skills', id)
+      store = (this.ctx.get('account') as { store?: typeof store } | undefined)?.store
     } catch {
-      // 已归属其它空间 / 非成员等情况不影响技能本身已落盘。
+      if (isOnlineRuntime() && currentAccountId()) throw new Error('账号服务不可用，无法认领 Skill')
+      return
     }
+    if (!store?.claim) {
+      if (isOnlineRuntime() && currentAccountId()) throw new Error('无法认领 Skill：缺少账号服务')
+      return
+    }
+    const actorId = currentAccountId()
+    if (!actorId) return
+    const workspaceId = store.activeWorkspaceId?.() ?? ''
+    if (!workspaceId) throw new Error('没有可用工作区，无法认领 Skill')
+    store.claim(actorId, workspaceId, '/skills', id)
   }
 
   /**
@@ -181,7 +188,12 @@ export class SkillsService extends Service {
 
   import(input: SkillImportInput) {
     const created = this.store.import(input)
-    this.claimOwnership(created.id)
+    try {
+      this.claimOwnership(created.id)
+    } catch (error) {
+      this.store.remove(created.id)
+      throw error
+    }
     this.changed()
     return created
   }

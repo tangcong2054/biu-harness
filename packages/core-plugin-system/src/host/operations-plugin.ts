@@ -447,12 +447,15 @@ function renderDetailTable(tab, items, busy, run) {
                 row.blurb ? h('div', { className: 'ops-ksub' }, String(row.blurb).slice(0, 68)) : null,
               ),
               h('td', null, String(row.author || '—')),
-              h('td', null, h('span', { className: 'ops-badge ' + toneForStatus(row.reviewStatus) }, String(row.reviewStatus || 'pending'))),
+              h('td', null,
+                h('span', { className: 'ops-badge ' + toneForStatus(row.reviewStatus) }, String(row.reviewStatus || 'pending')),
+                row.currentPublished ? h('span', { className: 'ops-ksub' }, '当前上架') : row.reviewStatus === 'approved' ? h('span', { className: 'ops-ksub' }, '历史已通过') : null,
+              ),
               h('td', null, h('span', { className: 'ops-badge ' + toneForStatus(row.scanStatus) }, String(row.scanStatus || 'passed'))),
               h(
                 'td',
                 { className: 'ops-actions' },
-                ['approve', 'reject', 'quarantine', 'revoke'].map((action) =>
+                (row.reviewStatus === 'pending' ? ['approve', 'reject', 'quarantine'] : row.currentPublished && row.reviewStatus === 'approved' ? ['revoke'] : []).map((action) =>
                   h(
                     'button',
                     { key: action, className: 'ops-btn sm', type: 'button', disabled: Boolean(busy), onClick: () => run('/plugin-reviews/' + row.id, action) },
@@ -508,6 +511,7 @@ function OperationsBlock(props) {
   useOpsStyle()
   const initialTab = props && props.data && typeof props.data.tab === 'string' ? props.data.tab : 'overview'
   const [tab, setTab] = useState(initialTab)
+  const [reviewView, setReviewView] = useState('pending')
   const [items, setItems] = useState([])
   const [counts, setCounts] = useState({})
   const [previewAccounts, setPreviewAccounts] = useState([])
@@ -527,7 +531,7 @@ function OperationsBlock(props) {
     let live = true
     void Promise.all([
       readJson('/api/operations/v1/summary'),
-      readJson('/api/db/list?path=/plugin-reviews&limit=1&offset=0').catch(() => ({ total: 0 })),
+      readJson('/api/db/list?path=/plugin-reviews&limit=1&offset=0&filter=%7B%22reviewStatus%22%3A%22pending%22%7D').catch(() => ({ total: 0 })),
     ])
       .then(([body, reviews]) => {
         if (!live) return
@@ -547,7 +551,8 @@ function OperationsBlock(props) {
     if (tab === 'overview') return
     let live = true
     setError('')
-    const params = new URLSearchParams({ path: SOURCES[tab], limit: '100', offset: '0', q: '', sort: 'updatedAt', dir: 'desc', filter: '{}' })
+    const filter = tab === 'plugins' && reviewView === 'pending' ? { reviewStatus: 'pending' } : {}
+    const params = new URLSearchParams({ path: SOURCES[tab], limit: '100', offset: '0', q: '', sort: 'updatedAt', dir: 'desc', filter: JSON.stringify(filter) })
     void readJson('/api/db/list?' + params.toString())
       .then((body) => {
         if (live) setItems(body.items || [])
@@ -558,7 +563,7 @@ function OperationsBlock(props) {
     return () => {
       live = false
     }
-  }, [tab, busy, refreshTick])
+  }, [tab, reviewView, busy, refreshTick])
 
   async function run(path, action) {
     setBusy(path + ':' + action)
@@ -676,7 +681,17 @@ function OperationsBlock(props) {
                 )
               : null,
           )
-        : renderDetailTable(tab, items, busy, run),
+        : tab === 'plugins'
+          ? h('div', null,
+              h('div', { className: 'ops-sec' },
+                ['pending', 'all'].map((view) => h('button', {
+                  key: view, type: 'button', className: 'ops-btn' + (reviewView === view ? ' pri' : ''),
+                  onClick: () => setReviewView(view),
+                }, view === 'pending' ? '待审核' : '全部版本（历史）')),
+              ),
+              renderDetailTable(tab, items, busy, run),
+            )
+          : renderDetailTable(tab, items, busy, run),
     ),
   )
 }
@@ -804,7 +819,7 @@ export function bindPlatformOperationsAccount(ctx: Context) {
         hasHost: boolean
         manifest: typeof MANIFEST
       }) => unknown
-      installPluginForWorkspace?: (actorId: string, workspaceId: string, pluginId: string, pluginVersion?: string) => unknown
+      installPluginForAccount?: (actorId: string, workspaceId: string, pluginId: string, pluginVersion?: string) => unknown
       setPluginLoad?: (accountId: string, workspaceId: string, pluginId: string, loaded: boolean) => void
     }
     authorization?: {
@@ -829,7 +844,7 @@ export function bindPlatformOperationsAccount(ctx: Context) {
       hasHost: true,
       manifest: MANIFEST,
     })
-    account?.store?.installPluginForWorkspace?.('acc_operations_admin', 'ws_operations', PLATFORM_OPERATIONS_PLUGIN_ID, 'ops-v1')
+    account?.store?.installPluginForAccount?.('acc_operations_admin', 'ws_operations', PLATFORM_OPERATIONS_PLUGIN_ID, 'ops-v1')
     account?.store?.setPluginLoad?.('acc_operations_admin', 'ws_operations', PLATFORM_OPERATIONS_PLUGIN_ID, true)
     account?.authorization?.attach?.(
       { type: 'account', accountId: 'acc_operations_admin', workspaceId: 'ws_operations' },

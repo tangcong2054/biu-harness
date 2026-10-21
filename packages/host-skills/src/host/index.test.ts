@@ -26,6 +26,9 @@ afterEach(() => {
 
 class FakeDatabase extends Service implements Database {
   specs: CollectionSpec[] = []
+  changes = 0
+
+  collectionChanged() { this.changes += 1 }
 
   constructor(ctx: Context) {
     super(ctx, 'database')
@@ -197,7 +200,7 @@ test('fileList is a read-only field derived from disk', async () => {
 })
 
 test('browser directory import creates an independent Skill record', async () => {
-  const { http } = await boot()
+  const { http, database } = await boot()
   const handler = http.routes.get('POST /api/skills/import')
   assert.ok(handler)
 
@@ -208,6 +211,7 @@ test('browser directory import creates an independent Skill record', async () =>
   })
 
   assert.deepEqual(replies, [{ code: 201, body: { ok: true, id: 'abc' } }])
+  assert.equal(database.changes, 1)
   assert.equal(new SkillsStore().get('abc')?.notes, '先阅读能力一。')
   assert.equal(readFileSync(join(process.env.BIU_SKILL_ROOT!, 'abc/cap/cap1.md'), 'utf8'), '能力一')
 })

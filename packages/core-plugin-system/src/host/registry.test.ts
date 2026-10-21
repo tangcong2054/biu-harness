@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from 'cordis'
 import type { CatalogEntry } from '@biu/host-hub'
-import { pluginCatalogCollection } from './catalog.ts'
+import { pluginCatalogCollection, pluginReviewsCollection } from './catalog.ts'
 import { loadRegistryConfig } from './registry-config.ts'
 import { PluginRegistryClient, localRegistryTransport, registryTokenPath } from './registry-client.ts'
 import { createRegistryServer } from './registry-server.ts'
@@ -150,7 +150,23 @@ test('publish, search, install, update and reject a different token', async () =
         'host.js': `export const name = 'slow-log'\nexport function apply() { return 2 }\n`,
         'README.md': '# 慢日志\n',
       }, {}, await readToken(dir))
+      assert.equal((await registry.listReviews('admin-token', 'pending')).length, 1)
+      assert.equal((await registry.search('慢日志'))[0]?.codeVersion, published.codeVersion)
+      const reviewer = new PluginRegistryClient(store, localRegistryTransport(registry), 'local', registryTokenPath(dir), 'admin-token', () => true)
+      const reviews = pluginReviewsCollection(reviewer)
+      const pendingRows = await reviews.list?.()
+      assert.equal(pendingRows?.find((row) => row.id === `slow-log@${published.codeVersion}`)?.currentPublished, true)
+      assert.equal(pendingRows?.find((row) => row.id === `slow-log@${second.codeVersion}`)?.currentPublished, undefined)
       await registry.review('slow-log', second.codeVersion, 'approved', '', 'admin-token')
+      assert.equal((await registry.listReviews('admin-token')).length, 2)
+      assert.equal((await registry.listReviews('admin-token', 'pending')).length, 0)
+      assert.deepEqual((await registry.search('慢日志')).map((row) => row.codeVersion), [second.codeVersion])
+      const history = await reviews.list?.()
+      assert.equal(history?.find((row) => row.id === `slow-log@${published.codeVersion}`)?.currentPublished, undefined)
+      assert.equal(history?.find((row) => row.id === `slow-log@${second.codeVersion}`)?.currentPublished, true)
+      const reviewActions = reviews.actions ?? []
+      assert.deepEqual(reviewActions.find((action) => action.id === 'approve')?.when, { reviewStatus: 'pending' })
+      assert.deepEqual(reviewActions.find((action) => action.id === 'revoke')?.when, { reviewStatus: 'approved', currentPublished: true })
       const listed = await catalog.list?.()
       assert.equal(listed?.[0]?.updateAvailable, true)
       assert.notEqual(listed?.[0]?.localCodeVersion, listed?.[0]?.remoteCodeVersion)

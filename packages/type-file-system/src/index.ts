@@ -740,6 +740,8 @@ export type ListPage = {
 /** File System 实现必须满足的服务面。换实现时只要还叫 ctx.database 并遵守这套方法。 */
 export interface Database {
   register(spec: CollectionSpec): unknown
+  /** 外部集合直接修改存储后，使列表缓存失效并通知客户端刷新。 */
+  collectionChanged?(): void
   list(path: string, filter?: Record<string, unknown>, page?: ListPage): Promise<unknown>
   read(path: string): Promise<unknown>
   update(path: string, content: unknown): Promise<unknown>
