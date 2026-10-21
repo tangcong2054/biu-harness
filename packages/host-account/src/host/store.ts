@@ -1624,6 +1624,13 @@ export class CollabStore {
     return { workspaceId, pluginId, subjectType: subject.type, subjectId: subject.id }
   }
 
+  isApprovedPluginPackage(pluginId: string, version: string) {
+    if (!pluginId || !version) return false
+    return Boolean(this.db.prepare(
+      `SELECT 1 FROM plugin_packages WHERE id = ? AND version = ? AND trust_state = 'approved' LIMIT 1`,
+    ).get(pluginId, version))
+  }
+
   installPluginForAccount(actorId: string, workspaceId: string, pluginId: string, pluginVersion = '') {
     return this.grantPluginAssignment(actorId, workspaceId, pluginId, { type: 'account', id: actorId }, pluginVersion)
   }

@@ -970,6 +970,14 @@ export class DatabaseService extends Service implements Database {
     return membership.active === membership.home
   }
 
+  private installedPluginVisible(id: string, accountId: string, workspaceId: string) {
+    if (!id || !accountId || !workspaceId) return false
+    const store = this.collabStore() as (WorkspaceFiles & {
+      canAccessPlugin?: (accountId: string, workspaceId: string, pluginId: string) => boolean
+    }) | undefined
+    return store?.canAccessPlugin?.(accountId, workspaceId, id) === true
+  }
+
   private visibleRecords<T extends { id?: unknown; pageId?: unknown; collection?: unknown; sessionId?: unknown; sourceId?: unknown; tablePath?: unknown }>(
     collection: string,
     rows: T[],
@@ -985,6 +993,9 @@ export class DatabaseService extends Service implements Database {
         if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) {
           return action === 'resource:read' || action === 'resource:list'
         }
+        if (collection === '/plugins' && actor.type === 'account' && 'pluginPath' in row &&
+          (action === 'resource:read' || action === 'resource:list') &&
+          this.installedPluginVisible(String(row.id ?? ''), actor.accountId, actor.workspaceId)) return true
         const target = this.scopeTarget(collection, String(row.id ?? ''), row)
         const resource = {
           type: 'record' as const,
@@ -1048,6 +1059,10 @@ export class DatabaseService extends Service implements Database {
     if (!authorization || !actor) return rows
     return rows.filter((row) => {
       if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) return scope === 'shared'
+      if (collection === '/plugins' && actor.type === 'account' && 'pluginPath' in row &&
+        this.installedPluginVisible(String(row.id ?? ''), actor.accountId, actor.workspaceId)) {
+        return scope === 'personal'
+      }
       const target = this.scopeTarget(collection, String(row.id ?? ''), row)
       return authorization.scopeCurrent({
         type: 'record',
@@ -1202,6 +1217,11 @@ export class DatabaseService extends Service implements Database {
       || (spec.path === '/mcp' && id === 'echo' && (record as { builtin?: unknown } | undefined)?.builtin === true)) {
       if (action === 'resource:read' || action === 'resource:list') return
       throw new Error('permission denied: INSUFFICIENT_PERMISSION')
+    }
+    if (spec.path === '/plugins' && (action === 'resource:read' || action === 'resource:list')) {
+      const actor = this.authorization()?.currentActor()
+      if (actor?.type === 'account' && record && 'pluginPath' in record &&
+        this.installedPluginVisible(id, actor.accountId, actor.workspaceId)) return
     }
     if (this.facets.isDeleted(spec.path, id)) throw new Error(`unknown record: ${spec.path}/${id}`)
     const authorization = this.authorization()
@@ -1391,6 +1411,11 @@ export class DatabaseService extends Service implements Database {
     for (const row of rows) {
       if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) {
         shared.push(row)
+        continue
+      }
+      if (collection === '/plugins' && actor.type === 'account' && 'pluginPath' in row &&
+        this.installedPluginVisible(String(row.id ?? ''), actor.accountId, actor.workspaceId)) {
+        personal.push(row)
         continue
       }
       const target = this.scopeTarget(collection, String(row.id ?? ''), row)
@@ -2347,8 +2372,12 @@ export class DatabaseService extends Service implements Database {
     const record = loaded ?? (action.allowMissing ? { id: parts[1]! } : null)
     if (!record) throw new Error(`unknown record: ${spec.path}/${parts[1]}`)
     const personalLoad = spec.path === '/plugins' && (actionId === 'start' || actionId === 'stop')
-    const pluginAuthor = spec.path === '/plugins' && (actionId === 'sandbox' || actionId === 'pack')
-    if (pluginAuthor) {
+    const cachedInstall = spec.path === '/plugins' &&
+      (actionId === 'install' || (actionId === 'pack' && record.pluginPath && record.installed !== true))
+    const pluginAuthor = spec.path === '/plugins' && (actionId === 'sandbox' || (actionId === 'pack' && !cachedInstall))
+    if (cachedInstall) {
+      await this.requirePath(spec.path, 'resource:read')
+    } else if (pluginAuthor) {
       await this.requirePath(spec.path, 'resource:read')
       if (loaded) {
         const owner = this.recordOwner(spec.path, record.id)
@@ -2365,7 +2394,7 @@ export class DatabaseService extends Service implements Database {
     if (spec.path === '/plugins' && actionId === 'sandbox' && !this.recordOwner(spec.path, parts[1]!)) {
       this.attachWorkspaceRecord(spec.path, parts[1]!, { ownership: 'personal', accessMode: 'private' })
     }
-    if (spec.path === '/plugins' && (actionId === 'sandbox' || actionId === 'pack')) {
+    if (pluginAuthor) {
       await this.stampActor(spec.path, parts[1]!)
     }
     const next = (await spec.get(parts[1]!)) ?? record

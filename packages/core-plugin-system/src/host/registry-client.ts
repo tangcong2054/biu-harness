@@ -245,7 +245,9 @@ export class PluginRegistryClient {
       const installedForWorkspace = this.store.isInstalledForCurrentWorkspace(row.id)
       flags[row.id] = {
         remoteCodeVersion: row.codeVersion,
+        remoteUpdatedAt: row.updatedAt,
         localCodeVersion,
+        localUpdatedAt: local?.updatedAt ?? 0,
         cached: Boolean(local),
         installed: installedForWorkspace,
         updateAvailable: Boolean(installedForWorkspace && local && owned && localCodeVersion && localCodeVersion !== row.codeVersion),
@@ -256,23 +258,49 @@ export class PluginRegistryClient {
     return flags
   }
 
-  async install(id: string, version?: string) {
+  private async requireOlderOverwriteConfirmation(
+    id: string,
+    localVersion: string | undefined,
+    remoteVersion: string,
+    remoteUpdatedAt: number,
+    confirmation?: { confirmOlder?: boolean; localCodeVersion?: string; remoteCodeVersion?: string },
+  ) {
+    if (!localVersion || localVersion === remoteVersion) return
+    const localUpdatedAt = await this.store.installedUpdatedAt(id)
+    if (!localUpdatedAt || (remoteUpdatedAt && localUpdatedAt <= remoteUpdatedAt)) return
+    const currentVersion = await hashInstalledPluginCode(this.store.pluginPath(id)) ?? localVersion
+    if (confirmation?.confirmOlder === true
+      && confirmation.localCodeVersion === currentVersion
+      && confirmation.remoteCodeVersion === remoteVersion) return
+    throw new Error(`本地插件更新时间晚于商店版本，覆盖可能丢失较新的修改；请确认后重试：${id}`)
+  }
+
+  async install(id: string, version?: string, confirmation?: { confirmOlder?: boolean; localCodeVersion?: string; remoteCodeVersion?: string }) {
     const token = this.token()
     const detail = await this.transport.detail(id, token)
     if (!detail) throw new Error(`unknown registry plugin: ${id}`)
     const codeVersion = String(version ?? '').trim() || detail.codeVersion
+    const local = (await this.store.list()).find((row) => row.id === id)
+    const origin = this.store.originOf(id)
+    if (local?.codeVersion === codeVersion && origin?.registryId === (detail.registryId || this.registryId) &&
+      origin.ownerId === detail.ownerId && this.store.isApprovedCachedVersion(id, codeVersion)) {
+      return this.store.installCached(id)
+    }
+    const remoteUpdatedAt = codeVersion === detail.codeVersion ? detail.updatedAt : 0
+    await this.requireOlderOverwriteConfirmation(id, local?.codeVersion, codeVersion, remoteUpdatedAt, confirmation)
     const bundle = await this.transport.bundle(id, codeVersion, token)
     if (!bundle) throw new Error(`unknown registry version: ${id}@${codeVersion}`)
     return this.store.installBundle(bundle)
   }
 
-  async update(id: string) {
+  async update(id: string, confirmation?: { confirmOlder?: boolean; localCodeVersion?: string; remoteCodeVersion?: string }) {
     const token = this.token()
     const detail = await this.transport.detail(id, token)
     if (!detail) throw new Error(`unknown registry plugin: ${id}`)
     const local = (await this.store.list()).find((row) => row.id === id)
     if (!this.store.isInstalledForCurrentWorkspace(id)) throw new Error(`plugin not installed for current account: ${id}`)
     if (local?.codeVersion === detail.codeVersion) return { id, updated: false, codeVersion: detail.codeVersion }
+    await this.requireOlderOverwriteConfirmation(id, local?.codeVersion, detail.codeVersion, detail.updatedAt, confirmation)
     const bundle = await this.transport.bundle(id, detail.codeVersion, token)
     if (!bundle) throw new Error(`unknown registry version: ${id}@${detail.codeVersion}`)
     const installed = await this.store.installBundle(bundle)

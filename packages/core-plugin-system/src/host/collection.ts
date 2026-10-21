@@ -139,7 +139,9 @@ export function pluginsCollection(store: PluginStoreService, registry?: PluginRe
         return omitEmpty({
           ...rowWithPublish,
           remoteCodeVersion: flag.remoteCodeVersion,
+          remoteUpdatedAt: flag.remoteUpdatedAt,
           localCodeVersion: flag.localCodeVersion,
+          localUpdatedAt: flag.localUpdatedAt,
           updateAvailable: flag.updateAvailable,
           idConflict: flag.idConflict,
         })
@@ -209,6 +211,8 @@ export function pluginsCollection(store: PluginStoreService, registry?: PluginRe
         codeVersion: { type: 'string', label: '代码版本' },
         remoteCodeVersion: { type: 'string', label: '商店版本' },
         localCodeVersion: { type: 'string', label: '本地版本' },
+        localUpdatedAt: { type: 'datetime', label: '本地安装包更新时间' },
+        remoteUpdatedAt: { type: 'datetime', label: '商店更新时间' },
         updateAvailable: { type: 'boolean', label: '可更新' },
         canPublish: { type: 'boolean', label: '可发布' },
         idConflict: { type: 'boolean', label: 'ID 冲突' },
@@ -277,10 +281,20 @@ export function pluginsCollection(store: PluginStoreService, registry?: PluginRe
         id: 'pack',
         label: '安装',
         when: { sandbox: true },
-        description: PLUGIN_PACK_DESCRIPTION,
+        description: `${PLUGIN_PACK_DESCRIPTION} 若宿主已有批准的同 ID 安装包且本人尚未安装，只为本人在当前空间建立安装关系，不重复打包。`,
         requiredAction: 'resource:read',
         parameters: { type: 'object', description: PLUGIN_PACK_DESCRIPTION, properties: {} },
-        run: async (id) => store.pack(id),
+        run: async (id, record) => record.pluginPath && record.installed !== true
+          ? store.installCached(id)
+          : store.pack(id),
+      },
+      {
+        id: 'install',
+        label: '安装',
+        when: { installed: false, sandbox: false },
+        description: '使用宿主已缓存且经过批准的插件包，为当前账号在当前空间安装；不覆盖其他人的代码。',
+        requiredAction: 'resource:read',
+        run: async (id) => store.installCached(id),
       },
       {
         id: 'publish',
@@ -298,10 +312,22 @@ export function pluginsCollection(store: PluginStoreService, registry?: PluginRe
         id: 'update',
         label: '从商店更新',
         when: { updateAvailable: true },
-        description: '下载商店最新版覆盖 .plugin/<id>/。正在运行时会重新挂载。',
-        run: async (id) => {
+        description: '下载商店最新版覆盖 .plugin/<id>/；本地包较新时先经用户确认，再传 confirmOlder、localCodeVersion、remoteCodeVersion 重试。正在运行时会重新挂载。',
+        parameters: {
+          type: 'object',
+          properties: {
+            confirmOlder: { type: 'boolean', description: '用户确认用较旧商店包覆盖本地插件时填 true' },
+            localCodeVersion: { type: 'string', description: '确认时本地插件的 codeVersion' },
+            remoteCodeVersion: { type: 'string', description: '确认时商店目标插件的 codeVersion' },
+          },
+        },
+        run: async (id, _record, args = {}) => {
           if (!registry) throw new Error('plugin registry is not configured')
-          return registry.update(id)
+          return registry.update(id, {
+            confirmOlder: args.confirmOlder === true,
+            localCodeVersion: typeof args.localCodeVersion === 'string' ? args.localCodeVersion : undefined,
+            remoteCodeVersion: typeof args.remoteCodeVersion === 'string' ? args.remoteCodeVersion : undefined,
+          })
         },
       },
       {

@@ -55,6 +55,7 @@ function stubStore(partial: Partial<PluginStoreService>): PluginStoreService {
     openPlugin: async () => undefined,
     close: async () => {},
     pack: async (id: string) => ({ id, sandboxPath: '', pluginPath: '' }),
+    installCached: async (id: string) => ({ id, codeVersion: 'cached' }),
     uninstall: async () => {},
     pluginPath: (id: string) => `/workspace/.plugin/${id}`,
     sandboxPath: (id: string) => `/workspace/.plugin-dev/${id}`,
@@ -115,6 +116,10 @@ test('pluginsCollection lists installed plugins and sandboxes in one table', asy
       calls.push(`pack:${id}`)
       return { id, sandboxPath: '', pluginPath: '' }
     },
+    async installCached(id: string) {
+      calls.push(`install:${id}`)
+      return { id, codeVersion: 'cached' }
+    },
     async uninstall(id: string) {
       calls.push(`uninstall:${id}`)
     },
@@ -140,11 +145,14 @@ test('pluginsCollection lists installed plugins and sandboxes in one table', asy
   assert.equal(draft?.shellWidth, undefined)
   assert.deepEqual(
     spec.actions?.map((item) => item.id),
-    ['sandbox', 'start', 'stop', 'pack', 'publish', 'update', 'uninstall'],
+    ['sandbox', 'start', 'stop', 'pack', 'install', 'publish', 'update', 'uninstall'],
   )
   await spec.actions!.find((item) => item.id === 'start')!.run('demo', demo!)
   await spec.actions!.find((item) => item.id === 'pack')!.run('draft-hello', draft!)
-  assert.deepEqual(calls, ['open:demo', 'pack:draft-hello'])
+  await spec.actions!.find((item) => item.id === 'pack')!.run('demo', { ...demo!, sandbox: true, installed: false })
+  await spec.actions!.find((item) => item.id === 'install')!.run('demo', { ...demo!, installed: false })
+  assert.deepEqual(calls, ['open:demo', 'pack:draft-hello', 'install:demo', 'install:demo'])
+  assert.deepEqual(spec.actions?.find((item) => item.id === 'install')?.when, { installed: false, sandbox: false })
   assert.equal(typeof spec.update, 'function')
   assert.equal(spec.schema.contentField, 'readme')
   assert.match(String(spec.view?.blurb ?? ''), /示例写法/)

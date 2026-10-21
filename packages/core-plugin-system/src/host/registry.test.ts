@@ -8,7 +8,7 @@ import { Context } from 'cordis'
 import type { CatalogEntry } from '@biu/host-hub'
 import { pluginCatalogCollection, pluginReviewsCollection } from './catalog.ts'
 import { loadRegistryConfig } from './registry-config.ts'
-import { PluginRegistryClient, localRegistryTransport, registryTokenPath } from './registry-client.ts'
+import { PluginRegistryClient, localRegistryTransport, registryTokenPath, type RegistryTransport } from './registry-client.ts'
 import { createRegistryServer } from './registry-server.ts'
 import { PluginRegistryStore, ownerIdForToken } from './registry.ts'
 import { PluginStoreService } from './store.ts'
@@ -137,7 +137,10 @@ test('publish, search, install, update and reject a different token', async () =
       consumer.attachRegistry(remote)
       const catalog = pluginCatalogCollection(remote)
       assert.equal(catalog.view?.inspector, true)
+      assert.ok(catalog.schema.columns?.includes('updatedAt'))
+      assert.equal(catalog.schema.fields.updatedAt?.type, 'datetime')
       const before = await catalog.list?.()
+      assert.ok(Number(before?.[0]?.updatedAt) > 0)
       assert.equal(before?.[0]?.installed, undefined)
       assert.equal(before?.[0]?.updateAvailable, undefined)
       await catalog.actions?.find((item) => item.id === 'install')?.run('slow-log', before![0]!)
@@ -154,7 +157,10 @@ test('publish, search, install, update and reject a different token', async () =
       assert.equal((await registry.search('慢日志'))[0]?.codeVersion, published.codeVersion)
       const reviewer = new PluginRegistryClient(store, localRegistryTransport(registry), 'local', registryTokenPath(dir), 'admin-token', () => true)
       const reviews = pluginReviewsCollection(reviewer)
+      assert.ok(reviews.schema.columns?.includes('latestUpdatedAt'))
+      assert.equal(reviews.schema.fields.latestUpdatedAt?.type, 'datetime')
       const pendingRows = await reviews.list?.()
+      assert.ok(Number(pendingRows?.find((row) => row.id === `slow-log@${second.codeVersion}`)?.latestUpdatedAt) > 0)
       assert.equal(pendingRows?.find((row) => row.id === `slow-log@${published.codeVersion}`)?.currentPublished, true)
       assert.equal(pendingRows?.find((row) => row.id === `slow-log@${second.codeVersion}`)?.currentPublished, undefined)
       await registry.review('slow-log', second.codeVersion, 'approved', '', 'admin-token')
@@ -162,6 +168,8 @@ test('publish, search, install, update and reject a different token', async () =
       assert.equal((await registry.listReviews('admin-token', 'pending')).length, 0)
       assert.deepEqual((await registry.search('慢日志')).map((row) => row.codeVersion), [second.codeVersion])
       const history = await reviews.list?.()
+      assert.ok(Number(history?.find((row) => row.id === `slow-log@${second.codeVersion}`)?.latestUpdatedAt)
+        >= Number(pendingRows?.find((row) => row.id === `slow-log@${second.codeVersion}`)?.latestUpdatedAt))
       assert.equal(history?.find((row) => row.id === `slow-log@${published.codeVersion}`)?.currentPublished, undefined)
       assert.equal(history?.find((row) => row.id === `slow-log@${second.codeVersion}`)?.currentPublished, true)
       const reviewActions = reviews.actions ?? []
@@ -194,6 +202,72 @@ test('publish, search, install, update and reject a different token', async () =
   } finally {
     if (prevToken === undefined) delete process.env.BIU_PLUGIN_TOKEN
     else process.env.BIU_PLUGIN_TOKEN = prevToken
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('newer local plugin requires explicit version-matched confirmation before a store overwrite', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-registry-older-'))
+  try {
+    let downloaded = 0
+    let overwritten = 0
+    let localVersion = 'local-newer'
+    let localUpdatedAt = 200
+    let remoteVersion = 'store-older'
+    const store = {
+      list: async () => [{ id: 'demo', codeVersion: localVersion, updatedAt: localUpdatedAt }],
+      installedUpdatedAt: async () => localUpdatedAt,
+      pluginPath: () => join(dir, '.plugin', 'demo'),
+      isInstalledForCurrentWorkspace: () => true,
+      originOf: () => ({ registryId: 'local', ownerId: 'own_1111111111111111' }),
+      installBundle: async () => { overwritten += 1; return { codeVersion: remoteVersion } },
+    } as unknown as PluginStoreService
+    const transport = {
+      detail: async () => ({ id: 'demo', codeVersion: remoteVersion, updatedAt: 100, registryId: 'local', ownerId: 'own_1111111111111111' }),
+      bundle: async () => { downloaded += 1; return { id: 'demo', codeVersion: remoteVersion } },
+    } as unknown as RegistryTransport
+    const client = new PluginRegistryClient(store, transport, 'local', registryTokenPath(dir))
+    await assert.rejects(() => client.update('demo'), /本地插件更新时间晚于商店版本/)
+    await assert.rejects(() => client.install('demo'), /本地插件更新时间晚于商店版本/)
+    assert.equal(downloaded, 0)
+    assert.equal(overwritten, 0)
+    await assert.rejects(() => client.update('demo', { confirmOlder: true, localCodeVersion: 'another', remoteCodeVersion: remoteVersion }), /请确认/)
+    remoteVersion = 'changed-after-dialog'
+    await assert.rejects(() => client.update('demo', { confirmOlder: true, localCodeVersion: localVersion, remoteCodeVersion: 'store-older' }), /请确认/)
+    remoteVersion = 'store-older'
+    await client.update('demo', { confirmOlder: true, localCodeVersion: localVersion, remoteCodeVersion: remoteVersion })
+    assert.equal(downloaded, 1)
+    assert.equal(overwritten, 1)
+    localVersion = 'another-local'
+    await assert.rejects(() => client.install('demo', undefined, { confirmOlder: true, localCodeVersion: 'local-newer', remoteCodeVersion: remoteVersion }), /请确认/)
+    localUpdatedAt = 50
+    await client.update('demo')
+    assert.equal(overwritten, 2)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('another workspace uses an approved same-origin cached bundle without downloading or rewriting it', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-registry-cached-'))
+  try {
+    let downloads = 0
+    let installs = 0
+    const store = {
+      list: async () => [{ id: 'cached-plugin', codeVersion: 'abc123' }],
+      originOf: () => ({ registryId: 'local', ownerId: 'own_1111111111111111' }),
+      isApprovedCachedVersion: () => true,
+      installCached: async () => { installs += 1; return { id: 'cached-plugin', codeVersion: 'abc123' } },
+    } as unknown as PluginStoreService
+    const transport = {
+      detail: async () => ({ id: 'cached-plugin', codeVersion: 'abc123', registryId: 'local', ownerId: 'own_1111111111111111' }),
+      bundle: async () => { downloads += 1; throw new Error('already cached') },
+    } as unknown as RegistryTransport
+    const client = new PluginRegistryClient(store, transport, 'local', registryTokenPath(dir))
+    assert.equal((await client.install('cached-plugin')).codeVersion, 'abc123')
+    assert.equal(installs, 1)
+    assert.equal(downloads, 0)
+  } finally {
     await rm(dir, { recursive: true, force: true })
   }
 })

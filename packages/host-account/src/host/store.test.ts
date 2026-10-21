@@ -303,6 +303,8 @@ test('plugin installation and load state are scoped to each account in a workspa
     hasHost: true,
     manifest: { id: 'page-html-blocks' },
   })
+  assert.equal(collab.isApprovedPluginPackage('page-html-blocks', 'v1'), true)
+  assert.equal(collab.isApprovedPluginPackage('page-html-blocks', 'other'), false)
   collab.installPluginForWorkspace(ada.id, workspaceA.id, 'page-html-blocks', 'v1')
   assert.equal(collab.canAccessPlugin(ada.id, workspaceA.id, 'page-html-blocks'), false)
   collab.installPluginForAccount(ada.id, workspaceA.id, 'page-html-blocks', 'v1')

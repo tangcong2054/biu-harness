@@ -108,6 +108,42 @@ test('online members can open a sandbox without instance draft permission', asyn
   }
 })
 
+test('cached package can be installed in two workspaces without rewriting shared code', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-cached-install-'))
+  const previous = process.env.BIU_ONLINE
+  process.env.BIU_ONLINE = '1'
+  try {
+    const ctx = new Context()
+    stubHub(ctx)
+    const assignments: string[] = []
+    let approved = false
+    ;(ctx as unknown as { get(name: string): unknown }).get = (name: string) =>
+      name === 'account' ? { store: {
+        isMember: (accountId: string) => accountId === 'ada',
+        isApprovedPluginPackage: () => approved,
+        installPluginForAccount: (accountId: string, workspaceId: string, id: string) => assignments.push(`${accountId}/${workspaceId}/${id}`),
+      } } : undefined
+    const store = new PluginStoreService(ctx, join(dir, '.plugin'), join(dir, 'store.json'), join(dir, '.plugin-dev')).open()
+    await mkdir(join(dir, '.plugin', 'demo'), { recursive: true })
+    await writeFile(join(dir, '.plugin', 'demo', 'manifest.json'), '{"id":"demo"}')
+    await writeFile(join(dir, '.plugin', 'demo', 'web.js'), 'export const version = 1')
+    await assert.rejects(() => runWithAccount('bob', () => runWithRequestWorkspace('ws2', () => store.installCached('demo'))), /需要登录/)
+    await assert.rejects(() => runWithAccount('ada', () => runWithRequestWorkspace('ws2', () => store.installCached('demo'))), /not approved/)
+    approved = true
+    process.env.BIU_ONLINE = '0'
+    assert.equal(runWithAccount('ada', () => store.isApprovedCachedVersion('demo', 'v1')), true)
+    for (const workspace of ['ws1', 'ws2']) {
+      await runWithAccount('ada', () => runWithRequestWorkspace(workspace, () => store.installCached('demo')))
+    }
+    assert.deepEqual(assignments, ['ada/ws1/demo', 'ada/ws2/demo'])
+    assert.equal(await readFile(join(dir, '.plugin', 'demo', 'web.js'), 'utf8'), 'export const version = 1')
+  } finally {
+    if (previous === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('online members can pack without instance install permission', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'plugin-pack-member-'))
   const previous = process.env.BIU_ONLINE

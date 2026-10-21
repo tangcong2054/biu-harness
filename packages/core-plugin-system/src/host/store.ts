@@ -190,7 +190,9 @@ export type PluginOrigin = { registryId: string; ownerId: string }
 
 export type RemoteFlag = {
   remoteCodeVersion: string
+  remoteUpdatedAt: number
   localCodeVersion: string
+  localUpdatedAt: number
   cached: boolean
   installed: boolean
   updateAvailable: boolean
@@ -338,6 +340,7 @@ export class PluginStoreService extends Service {
           activeWorkspaceId?(): string | null
           workspaceHasPlugin?(workspaceId: string, pluginId: string, accountId?: string): boolean
           installPluginForAccount?(accountId: string, workspaceId: string, pluginId: string, version?: string): unknown
+          isApprovedPluginPackage?(pluginId: string, version: string): boolean
           uninstallPluginForAccount?(accountId: string, workspaceId: string, pluginId: string): unknown
           ensurePluginOwnerAssignments?(pluginId: string): number
           recordPluginPackage?(accountId: string, input: Record<string, unknown>): void
@@ -406,6 +409,12 @@ export class PluginStoreService extends Service {
 
   pluginPath(id: string) {
     return join(this.pluginDir, id)
+  }
+
+  /** 即将被商店覆盖的安装目录时间，不混入沙箱；每次重新读取磁盘避免列表缓存过期。 */
+  async installedUpdatedAt(id: string) {
+    const dir = this.pluginPath(id)
+    return existsSync(join(dir, 'manifest.json')) ? (await pluginDirStats(dir)).updatedAt : 0
   }
 
   sandboxPath(id: string) {
@@ -779,6 +788,33 @@ export class PluginStoreService extends Service {
     } catch {
       return {}
     }
+  }
+
+  isApprovedCachedVersion(id: string, version: string) {
+    if (!currentAccountId() && !isOnlineRuntime()) return true
+    return this.accountStore()?.isApprovedPluginPackage?.(id, version) === true
+  }
+
+  /** 已缓存且经过批准的包只建立当前账号在当前空间的安装关系，不重新打包共享代码。 */
+  async installCached(id: string) {
+    if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
+    if (isOnlineRuntime()) this.requireWorkspaceMember()
+    const dir = this.pluginPath(id)
+    if (!existsSync(join(dir, 'manifest.json'))) throw new Error(`plugin is not packed: ${id}`)
+    const codeVersion = await hashInstalledPluginCode(dir)
+    if (!codeVersion) throw new Error(`plugin bundle has no code: ${id}`)
+    const account = this.accountStore()
+    const accountId = currentAccountId()
+    const workspaceId = this.currentWorkspaceId()
+    if (accountId || isOnlineRuntime()) {
+      if (!accountId || !workspaceId || !account?.isMember?.(accountId, workspaceId)) throw new Error('需要登录并加入当前空间')
+      if (!account.installPluginForAccount || !account.isApprovedPluginPackage?.(id, codeVersion)) {
+        throw new Error(`plugin package is not approved: ${id}@${codeVersion}`)
+      }
+      account.installPluginForAccount(accountId, workspaceId, id, codeVersion)
+    }
+    this.invalidateList()
+    return { id, codeVersion }
   }
 
   /** 把商店里的打包结果写入 .plugin/<id>/。来源对不上且本地已有同 id 时拒绝覆盖。 */

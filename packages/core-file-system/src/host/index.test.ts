@@ -2429,6 +2429,45 @@ test('builtin MCP echo is shared and read-only in every workspace without record
   }
 })
 
+test('installing cached plugin in another workspace leaves its record ownership untouched', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const dir = mkdtempSync(join(tmpdir(), 'biu-plugin-cached-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    constructor(inner: Context) { super(inner, 'account') }
+  }
+  await ctx.plugin(AccountBridge)
+  const owner = collab.register('Owner')
+  const other = collab.register('Other')
+  const first = collab.createWorkspace(owner.id, 'First')
+  const second = collab.createWorkspace(owner.id, 'Second')
+  collab.addMember(owner.id, second.id, other.id)
+  collab.recordPluginPackage(owner.id, { id: 'shared-plugin', version: 'v1', packageHash: 'v1',
+    packagePath: '/tmp/shared-plugin', sourceKind: 'registry', trustState: 'approved', tenantMode: 'assigned',
+    hasWeb: true, hasHost: false, manifest: { id: 'shared-plugin' } })
+  runWithAccount(owner.id, () => runWithRequestWorkspace(first.id, () => collab.claim(owner.id, first.id, '/plugins', 'shared-plugin')))
+  db.register({
+    id: 'plugins', path: '/plugins', schema: { fields: { ...REQUIRED_RECORD_FIELDS } },
+    list: () => [{ id: 'shared-plugin', title: 'Plugin', pluginPath: '/tmp/shared-plugin', sandbox: true }],
+    get: (id) => id === 'shared-plugin' ? { id, title: 'Plugin', pluginPath: '/tmp/shared-plugin', sandbox: true } : null,
+    actions: [{ id: 'pack', label: '安装', when: { sandbox: true }, requiredAction: 'resource:read',
+      run: (id) => collab.installPluginForAccount(owner.id, second.id, id, 'v1') }],
+  })
+  const run = <T,>(accountId: string, workspaceId: string, fn: () => T) =>
+    runWithAccount(accountId, () => runWithRequestWorkspace(workspaceId, fn))
+  await run(owner.id, second.id, () => db.action('/plugins/shared-plugin', 'pack'))
+  assert.equal(collab.canAccessPlugin(owner.id, second.id, 'shared-plugin'), true)
+  assert.equal(collab.canAccessPlugin(other.id, second.id, 'shared-plugin'), false)
+  assert.deepEqual((await run(owner.id, second.id, () => db.list('/plugins'))).items.map((row) => row.id), ['shared-plugin'])
+  assert.deepEqual((await run(owner.id, second.id, () => db.list('/plugins', { $scope: 'personal' }))).items.map((row) => row.id), ['shared-plugin'])
+  assert.deepEqual((await run(other.id, second.id, () => db.list('/plugins'))).items.map((row) => row.id), [])
+  assert.equal((await run(owner.id, second.id, () => db.read('/plugins/shared-plugin'))).kind, 'record')
+  await assert.rejects(() => run(owner.id, second.id, () => db.update('/plugins/shared-plugin', { title: 'No' })))
+})
+
 test('builtin plugins stay visible in the workspace plugin list', async () => {
   const previous = process.env.BIU_ONLINE
   process.env.BIU_ONLINE = '1'
