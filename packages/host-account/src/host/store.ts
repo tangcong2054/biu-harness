@@ -1430,6 +1430,8 @@ export class CollabStore {
 
   workspaceHasPlugin(workspaceId: string, pluginId: string, accountId = '') {
     if (!workspaceId || !pluginId || !accountId) return false
+    if (pluginId === 'platform-operations' &&
+      (workspaceId !== OPERATIONS_WORKSPACE_ID || accountId !== OPERATIONS_ADMIN_ACCOUNT_ID)) return false
     const builtin = isRegisteredBuiltinPlugin(pluginId)
     const row = this.db
       .prepare(

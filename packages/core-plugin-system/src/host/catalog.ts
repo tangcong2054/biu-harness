@@ -145,7 +145,8 @@ export function pluginCatalogCollection(client: PluginRegistryClient): Collectio
 
 export function pluginReviewsCollection(client: PluginRegistryClient): CollectionSpec {
   const list = async (query?: { q?: string }) => {
-    const rows = await client.reviews()
+    const [rows, publicCatalog] = await Promise.all([client.reviews(), client.searchPublic()])
+    const currentVersions = new Map(publicCatalog.plugins.map((row) => [row.id, row.codeVersion]))
     const q = String(query?.q ?? '').trim().toLowerCase()
     return rows
       .filter((row) => !q || `${row.id}\n${row.name}\n${row.blurb}\n${row.reviewReason}\n${row.scanIssues.join('\n')}`.toLowerCase().includes(q))
@@ -159,6 +160,7 @@ export function pluginReviewsCollection(client: PluginRegistryClient): Collectio
         codeVersion: row.codeVersion,
         ownerId: row.ownerId,
         reviewStatus: row.reviewStatus,
+        currentPublished: currentVersions.get(row.id) === row.codeVersion,
         reviewReason: row.reviewReason,
         scanStatus: row.scanStatus,
         scanIssues: row.scanIssues,
@@ -172,6 +174,7 @@ export function pluginReviewsCollection(client: PluginRegistryClient): Collectio
   ) => ({
     id,
     label,
+    when: id === 'revoke' ? { reviewStatus: 'approved', currentPublished: true } : { reviewStatus: 'pending' },
     description: `${label}商店插件版本。args.reason 可填写运营原因。`,
     parameters: { type: 'object', properties: { reason: { type: 'string' } } },
     run: async (_id: string, record: DbRecord, args: Record<string, unknown> = {}) =>
@@ -180,20 +183,20 @@ export function pluginReviewsCollection(client: PluginRegistryClient): Collectio
   return {
     id: 'plugin-reviews',
     path: '/plugin-reviews',
-    label: '插件审核',
+    label: '插件版本审核',
     view: {
       moduleId: 'plugin-reviews',
       route: '/plugin-reviews',
-      title: '插件审核',
+      title: '插件版本审核',
       inspector: true,
-      blurb: '平台运营端的插件审核队列。仅运营 Workspace 中具备 owner/admin 角色的账号可见，用于审核、驳回、隔离和撤销版本。',
+      blurb: '平台运营端的插件版本记录，含待审核与历史版本；按审核状态筛选待审核项。仅运营 Workspace 中具备 owner/admin 角色的账号可见。旧版本保留用于审计，不代表商店同时公开多个版本。',
       order: 32,
       icon: 'puzzle-piece',
     },
     records: { update: false, create: false, delete: false },
     schema: {
       labelField: 'title',
-      columns: ['title', 'reviewStatus', 'scanStatus', 'scanIssues', 'reviewReason', 'author', 'submittedAt'],
+      columns: ['title', 'reviewStatus', 'currentPublished', 'scanStatus', 'scanIssues', 'reviewReason', 'author', 'submittedAt'],
       fields: {
         ...REQUIRED_RECORD_FIELDS,
         title: { type: 'string', label: '版本' },
@@ -204,6 +207,7 @@ export function pluginReviewsCollection(client: PluginRegistryClient): Collectio
         codeVersion: { type: 'string', label: '代码版本' },
         ownerId: { type: 'string', label: '所有者' },
         reviewStatus: { type: 'select', label: '审核状态' },
+        currentPublished: { type: 'boolean', label: '当前上架' },
         reviewReason: { type: 'string', label: '审核原因' },
         scanStatus: { type: 'select', label: '检测状态' },
         scanIssues: { type: 'string[]', label: '检测问题' },

@@ -13,7 +13,7 @@ import { REQUIRED_RECORD_FIELDS } from '@biu/type-file-system'
 import { facetsCollection } from './facets-collection.ts'
 import { trashCollection } from './trash-collection.ts'
 import { runWithSession } from '@biu/host-sessions/scope'
-import { openAndMigrateBiu, runWithAccount } from '@biu/host-plugin-loader/data-dir'
+import { openAndMigrateBiu, runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import { CollabStore } from '@biu/host-account/store'
 import { workspaceMembersCollection } from '@biu/host-account/workspace-members-collection'
 import { builtinAllViewId, stubBuiltinAllView, stubBuiltinMemberView } from '../catalog-views.ts'
@@ -96,6 +96,21 @@ test('batchChanges coalesces database change notifications', async () => {
     })
   })
 
+  assert.equal(changes, 1)
+})
+
+test('external collection changes invalidate cached lists and notify subscribers', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows: DbRecord[] = [{ id: 'one', title: '原记录' }]
+  db.register({ ...notesCollection(), list: () => rows })
+  assert.equal((await db.list('/notes')).total, 1)
+  rows.push({ id: 'two', title: '新导入记录' })
+  assert.equal((await db.list('/notes')).total, 1)
+  let changes = 0
+  ctx.on('database/change', () => { changes += 1 })
+  db.collectionChanged()
+  assert.equal((await db.list('/notes')).total, 2)
   assert.equal(changes, 1)
 })
 
@@ -2367,6 +2382,51 @@ test('index rows follow the user records each person can read and omit share', a
   assert.equal(bobStamps.items.length, 0)
   const adaStamps = await runWithAccount(ada.id, () => db.list('/facets', { facetId: hiddenId }))
   assert.equal(adaStamps.items.length, 1)
+})
+
+test('builtin MCP echo is shared and read-only in every workspace without record ownership', async () => {
+  const previous = process.env.BIU_ONLINE
+  process.env.BIU_ONLINE = '1'
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.register({
+    id: 'mcp', path: '/mcp',
+    schema: { labelField: 'title', fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string' }, builtin: { type: 'boolean' } } },
+    list: () => [
+      { id: 'echo', title: 'echo', builtin: true },
+      { id: 'other', title: 'other', builtin: false },
+    ],
+    get: (id) => id === 'echo' ? { id, title: 'echo', builtin: true } : null,
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'biu-db-shared-mcp-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    constructor(inner: Context) { super(inner, 'account') }
+  }
+  try {
+    await ctx.plugin(AccountBridge)
+    const ada = collab.register('', Date.now(), 'secret1', 'mcp-ada@example.com')
+    const bob = collab.register('', Date.now(), 'secret1', 'mcp-bob@example.com')
+    const first = collab.createWorkspace(ada.id, 'First')
+    const second = collab.createWorkspace(bob.id, 'Second')
+    for (const [id, workspace] of [[ada.id, first.id], [bob.id, second.id]]) {
+      const run = <T>(fn: () => T) => runWithAccount(id, () => runWithRequestWorkspace(workspace, fn))
+      const rows = await run(() => db.list('/mcp'))
+      assert.deepEqual(rows.items.map((row) => row.id), ['echo'])
+      assert.equal(rows.items[0]?.shareScope, '共享')
+      assert.equal(rows.items[0]?.shareRole, '阅读')
+      assert.deepEqual((await run(() => db.list('/mcp', { $scope: 'shared' }))).items.map((row) => row.id), ['echo'])
+      assert.equal((await run(() => db.list('/mcp', { $scope: 'workspace' }))).items.length, 0)
+      const read = await run(() => db.read('/mcp/echo'))
+      assert.equal(read.kind === 'record' && read.value.id, 'echo')
+      await assert.rejects(() => run(() => db.update('/mcp/echo', { title: 'changed' })), /INSUFFICIENT_PERMISSION/)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previous
+  }
 })
 
 test('builtin plugins stay visible in the workspace plugin list', async () => {

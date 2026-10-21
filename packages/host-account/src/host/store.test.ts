@@ -128,6 +128,20 @@ test('operations runtime bootstraps one fixed admin workspace without retaining 
     assert.equal(collab.enter(OPERATIONS_ADMIN_ACCOUNT_ID), OPERATIONS_WORKSPACE_ID)
     assert.equal(collab.isOperationsOperator(OPERATIONS_ADMIN_ACCOUNT_ID), true)
     assert.equal(collab.listWorkspaces(OPERATIONS_ADMIN_ACCOUNT_ID)[0]?.id, OPERATIONS_WORKSPACE_ID)
+    collab.recordPluginPackage(OPERATIONS_ADMIN_ACCOUNT_ID, {
+      id: 'platform-operations', version: 'ops-v1', packageHash: 'ops-v1',
+      packagePath: '/tmp/platform-operations', sourceKind: 'legacy-installed',
+      trustState: 'approved', tenantMode: 'assigned', hasWeb: true, hasHost: true,
+      manifest: { id: 'platform-operations' },
+    })
+    collab.installPluginForWorkspace(OPERATIONS_ADMIN_ACCOUNT_ID, OPERATIONS_WORKSPACE_ID, 'platform-operations', 'ops-v1')
+    assert.equal(collab.canAccessPlugin(OPERATIONS_ADMIN_ACCOUNT_ID, OPERATIONS_WORKSPACE_ID, 'platform-operations'), false)
+    collab.installPluginForAccount(OPERATIONS_ADMIN_ACCOUNT_ID, OPERATIONS_WORKSPACE_ID, 'platform-operations', 'ops-v1')
+    assert.equal(collab.canAccessPlugin(OPERATIONS_ADMIN_ACCOUNT_ID, OPERATIONS_WORKSPACE_ID, 'platform-operations'), true)
+    const colleague = collab.register('Colleague')
+    collab.addMember(OPERATIONS_ADMIN_ACCOUNT_ID, OPERATIONS_WORKSPACE_ID, colleague.id)
+    assert.equal(collab.canAccessPlugin(colleague.id, OPERATIONS_WORKSPACE_ID, 'platform-operations'), false)
+    assert.equal(collab.canAccessPlugin(OPERATIONS_ADMIN_ACCOUNT_ID, 'ws_other', 'platform-operations'), false)
     assert.equal(
       collab.bootstrapOperations({ email: 'admin' }).created,
       false,

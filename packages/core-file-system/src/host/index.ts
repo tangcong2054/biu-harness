@@ -859,10 +859,10 @@ export class DatabaseService extends Service implements Database {
     const rows = await spec.list(query)
     const listed = !query.ids?.length ? rows : rows.filter((row) => query.ids!.includes(row.id))
     const hidden = this.facets.deletedIds(spec.path)
-    const builtinPlugin = (row: { builtin?: unknown }) => spec.path === '/plugins' && row.builtin === true
+    const builtinShared = (row: { id?: unknown; builtin?: unknown }) => this.builtinShared(spec.path, row)
     return query.trash
-      ? listed.filter((row) => hidden.has(row.id) && !builtinPlugin(row))
-      : listed.filter((row) => !hidden.has(row.id) || builtinPlugin(row))
+      ? listed.filter((row) => hidden.has(row.id) && !builtinShared(row))
+      : listed.filter((row) => !hidden.has(row.id) || builtinShared(row))
   }
 
   /** 只装饰当前页，避免为整张表逐行读取 owner、view grant 和人物信息。 */
@@ -982,7 +982,7 @@ export class DatabaseService extends Service implements Database {
         if (collection === '/plugin-catalog' || collection === '/plugin-reviews' || isOperationsMetadata(collection)) {
           return action === 'resource:read' || action === 'resource:list'
         }
-        if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
+        if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) {
           return action === 'resource:read' || action === 'resource:list'
         }
         const target = this.scopeTarget(collection, String(row.id ?? ''), row)
@@ -1009,7 +1009,7 @@ export class DatabaseService extends Service implements Database {
       if (collection === '/plugin-catalog' || collection === '/plugin-reviews' || isOperationsMetadata(collection)) {
         return action === 'resource:read' || action === 'resource:list'
       }
-      if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
+      if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) {
         return action === 'resource:read' || action === 'resource:list'
       }
       const target = this.scopeTarget(collection, String(row.id ?? ''), row)
@@ -1047,7 +1047,7 @@ export class DatabaseService extends Service implements Database {
     const actor = authorization?.currentActor()
     if (!authorization || !actor) return rows
     return rows.filter((row) => {
-      if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) return scope === 'shared'
+      if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) return scope === 'shared'
       const target = this.scopeTarget(collection, String(row.id ?? ''), row)
       return authorization.scopeCurrent({
         type: 'record',
@@ -1178,6 +1178,12 @@ export class DatabaseService extends Service implements Database {
     return record?.builtin === true || isRegisteredBuiltinPlugin(id)
   }
 
+  /** 内置 echo 无需记录归属；与内置插件一样供各工作区只读自检。 */
+  private builtinShared(collection: string, record: { id?: unknown; builtin?: unknown }) {
+    return (collection === '/plugins' && record.builtin === true)
+      || (collection === '/mcp' && record.id === 'echo' && record.builtin === true)
+  }
+
   private assertLiveRecord(
     spec: CollectionSpec,
     id: string,
@@ -1192,7 +1198,8 @@ export class DatabaseService extends Service implements Database {
       ) return
       throw new Error('permission denied: INSUFFICIENT_PERMISSION')
     }
-    if (this.builtinPlugin(spec, id, record)) {
+    if (this.builtinPlugin(spec, id, record as { builtin?: unknown } | undefined)
+      || (spec.path === '/mcp' && id === 'echo' && (record as { builtin?: unknown } | undefined)?.builtin === true)) {
       if (action === 'resource:read' || action === 'resource:list') return
       throw new Error('permission denied: INSUFFICIENT_PERMISSION')
     }
@@ -1382,7 +1389,7 @@ export class DatabaseService extends Service implements Database {
     const workspace: DbRecord[] = []
     const shared: DbRecord[] = []
     for (const row of rows) {
-      if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
+      if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) {
         shared.push(row)
         continue
       }
@@ -1473,6 +1480,11 @@ export class DatabaseService extends Service implements Database {
       const http = this.ctx.get('http') as { broadcast?: (type: string, payload: unknown) => void } | undefined
       http?.broadcast?.(DATABASE_CHANNEL, { ts: Date.now() })
     })
+  }
+
+  /** 外部集合直接写入存储后调用，失效列表缓存并通知所有客户端。 */
+  collectionChanged() {
+    this.bump()
   }
 
   private bump() {
@@ -1685,7 +1697,7 @@ export class DatabaseService extends Service implements Database {
     const withPeople = this.applyPersonOverlay(spec, withFacet)
     const withMeta = this.applyMetaOverlay(spec, withPeople)
     if (isSystemCollection(spec.path) || isIndexCollection(spec.path)) return withMeta
-    if (spec.path === '/plugins' && row.builtin === true) return { ...withMeta, shareScope: '共享', shareRole: '阅读' }
+    if (this.builtinShared(spec.path, row)) return { ...withMeta, shareScope: '共享', shareRole: '阅读' }
     const stored = this.ownershipOf(spec.path, String(row.id ?? ''))
     return {
       ...withMeta,
@@ -2294,7 +2306,7 @@ export class DatabaseService extends Service implements Database {
       if (!spec) continue
       const record = await spec.get(row.record_id)
       if (!record) continue
-      if (row.collection === '/plugins' && (record as { builtin?: unknown }).builtin === true) continue
+      if (this.builtinShared(row.collection, record as { id?: unknown; builtin?: unknown })) continue
       const authorization = this.authorization()
       const actor = authorization?.currentActor()
       if (authorization && actor) {
@@ -3991,15 +4003,49 @@ export function apply(ctx: Context) {
   ctx.http.route('GET', '/api/doc/file/:name', serveDbFile)
   ctx.http.route('PUT', '/api/doc/file/:name', putDbFile)
   ctx.http.route('POST', '/api/db/action', async (route) => {
+    let path = ''
+    let action = ''
+    const started = Date.now()
     try {
       const body = (await route.json()) as { path?: string; action?: string; args?: unknown }
+      path = String(body?.path ?? '')
+      action = String(body?.action ?? '')
       const extra =
         body?.args && typeof body.args === 'object' && !Array.isArray(body.args)
           ? (body.args as Record<string, unknown>)
           : undefined
-      route.send(200, await db.action(String(body?.path ?? ''), String(body?.action ?? ''), extra))
+      const result = await db.action(path, action, extra)
+      logPluginAction(ctx, path, action, started, true)
+      route.send(200, result)
     } catch (error) {
+      logPluginAction(ctx, path, action, started, false, error)
       route.send(400, { error: String(error) })
     }
   })
+}
+
+const PLUGIN_ACTION_COLLECTIONS = new Set(['/plugin-catalog', '/plugins'])
+
+function logField(value: unknown, max = 200) {
+  return String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, max)
+}
+
+/** 插件动作审计日志：只记录路径、动作、身份和结果，不记录 args 与凭证。 */
+function logPluginAction(ctx: Context, path: string, action: string, started: number, ok: boolean, error?: unknown) {
+  const [, collection = '', recordId = ''] = /^(\/[^/]+)(?:\/(.*))?$/.exec(path) ?? []
+  if (!PLUGIN_ACTION_COLLECTIONS.has(collection)) return
+  const entry = JSON.stringify({
+    event: 'plugin.action',
+    collection,
+    recordId: logField(recordId, 80),
+    action: logField(action, 40),
+    accountId: currentAccountId(),
+    workspaceId: currentRequestWorkspaceId(),
+    ok,
+    ms: Date.now() - started,
+    ...(ok ? {} : { error: logField(error instanceof Error ? error.message : error) }),
+  })
+  const logger = ctx.logger('plugin-action')
+  if (ok) logger.info(entry)
+  else logger.warn(entry)
 }

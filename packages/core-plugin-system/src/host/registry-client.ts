@@ -220,6 +220,10 @@ export class PluginRegistryClient {
     return this.transport.search(q, tag, this.token())
   }
 
+  searchPublic() {
+    return this.transport.search('', '')
+  }
+
   detail(id: string) {
     return this.transport.detail(id, this.token())
   }

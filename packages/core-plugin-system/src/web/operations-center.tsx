@@ -27,8 +27,9 @@ const SOURCES: Record<string, string> = {
 
 type TabId = (typeof TABS)[number][0]
 
-async function load(path: string) {
-  const params = new URLSearchParams({ path, limit: '100', offset: '0', q: '', sort: 'updatedAt', dir: 'desc', filter: '{}' })
+async function load(path: string, pendingOnly = false) {
+  const filter = pendingOnly ? { reviewStatus: 'pending' } : {}
+  const params = new URLSearchParams({ path, limit: '100', offset: '0', q: '', sort: 'updatedAt', dir: 'desc', filter: JSON.stringify(filter) })
   const res = await fetch(`/api/db/list?${params}`)
   const body = (await res.json()) as { items?: DbRecord[]; error?: string }
   if (!res.ok) throw new Error(body.error || '读取运营数据失败')
@@ -37,6 +38,7 @@ async function load(path: string) {
 
 export function OperationsCenter({ rows }: FsViewProps) {
   const [tab, setTab] = useState<TabId>('overview')
+  const [reviewView, setReviewView] = useState<'pending' | 'all'>('pending')
   const [items, setItems] = useState<DbRecord[]>([])
   const [error, setError] = useState('')
   const [busy, setBusy] = useState('')
@@ -45,7 +47,7 @@ export function OperationsCenter({ rows }: FsViewProps) {
     if (tab === 'overview') return
     let live = true
     setError('')
-    void load(SOURCES[tab]!)
+    void load(SOURCES[tab]!, tab === 'plugins' && reviewView === 'pending')
       .then((next) => {
         if (live) setItems(next)
       })
@@ -55,7 +57,7 @@ export function OperationsCenter({ rows }: FsViewProps) {
     return () => {
       live = false
     }
-  }, [tab, busy])
+  }, [tab, reviewView, busy])
 
   async function run(path: string, action: string) {
     setBusy(`${path}:${action}`)
@@ -84,7 +86,17 @@ export function OperationsCenter({ rows }: FsViewProps) {
         ))}
       </nav>
       {error ? <p className="ops-error">{error}</p> : null}
-      {tab === 'overview' ? <Overview rows={rows} onOpen={setTab} /> : <DataTable tab={tab} items={items} busy={busy} onRun={run} />}
+      {tab === 'overview' ? <Overview rows={rows} onOpen={setTab} /> : (
+        <>
+          {tab === 'plugins' ? (
+            <div className="ops-review-views">
+              <button type="button" aria-pressed={reviewView === 'pending'} onClick={() => setReviewView('pending')}>待审核</button>
+              <button type="button" aria-pressed={reviewView === 'all'} onClick={() => setReviewView('all')}>全部版本（历史）</button>
+            </div>
+          ) : null}
+          <DataTable tab={tab} items={items} busy={busy} onRun={run} />
+        </>
+      )}
     </section>
   )
 }
@@ -125,14 +137,14 @@ function DataTable({
   busy: string
   onRun: (path: string, action: string) => void
 }) {
-  if (!items.length) return <p className="ops-empty">还没有上报数据。Online 和 Offline 会把运营元数据写到这里，不包含正文、密码或 Token。</p>
+  if (!items.length) return <p className="ops-empty">{tab === 'plugins' ? '当前没有符合条件的插件版本。' : '还没有上报数据。Online 和 Offline 会把运营元数据写到这里，不包含正文、密码或 Token。'}</p>
   return (
     <table className="ops-table">
       <tbody>
         {items.map((row) => (
           <tr key={row.id}>
             <td>{String(row.title ?? row.id)}</td>
-            <td>{String(row.status ?? row.summary ?? row.reviewStatus ?? row.version ?? '')}</td>
+            <td>{String(row.status ?? row.summary ?? row.reviewStatus ?? row.version ?? '')}{tab === 'plugins' && row.currentPublished === true ? ' · 当前上架' : tab === 'plugins' && row.reviewStatus === 'approved' ? ' · 历史已通过' : ''}</td>
             <td className="ops-actions">
               {tab === 'accounts' ? (
                 <>
@@ -142,7 +154,7 @@ function DataTable({
               ) : null}
               {tab === 'plugins' ? (
                 <>
-                  {['approve', 'reject', 'quarantine', 'revoke'].map((action) => (
+                  {(row.reviewStatus === 'pending' ? ['approve', 'reject', 'quarantine'] : row.currentPublished === true && row.reviewStatus === 'approved' ? ['revoke'] : []).map((action) => (
                     <button key={action} type="button" disabled={Boolean(busy)} onClick={() => onRun(`/plugin-reviews/${row.id}`, action)}>
                       {action === 'approve' ? '通过' : action === 'reject' ? '驳回' : action === 'quarantine' ? '隔离' : '撤销'}
                     </button>

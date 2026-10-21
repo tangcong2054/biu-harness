@@ -53,6 +53,7 @@ test('index all views do not group by share', () => {
   const all = builtinAllView({ path: '/page-blocks', label: '组件' })
   assert.equal(all.groupBy, '')
   assert.equal(withViewDisplay('/page-blocks', { ...all, groupBy: 'shareScope' }).groupBy, '')
+  assert.equal(builtinAllView({ path: '/plugin-catalog', label: '插件商店' }).groupBy, '')
   assert.equal(builtinAllView({ path: '/tasks', label: '任务' }).groupBy, 'shareScope')
 })
 
