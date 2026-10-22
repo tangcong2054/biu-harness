@@ -2066,7 +2066,24 @@ export function CollectionBrowser({
     patchActiveView({ tree: next })
   }
 
+  function overwritesNewerPlugin(row: DbRecord, action: CollectionActionInfo) {
+    if ((dataPath !== '/plugins' && dataPath !== '/plugin-catalog') || (action.id !== 'install' && action.id !== 'update')) return false
+    const localVersion = String(row.localCodeVersion || row.codeVersion || '')
+    const remoteVersion = String(row.remoteCodeVersion || '')
+    const localUpdatedAt = Number(row.localUpdatedAt || (dataPath === '/plugins' && !row.sandbox ? row.updatedAt : 0))
+    const remoteUpdatedAt = Number(row.remoteUpdatedAt || (dataPath === '/plugin-catalog' ? row.updatedAt : 0))
+    return Boolean(localVersion && remoteVersion && localVersion !== remoteVersion
+      && localUpdatedAt > 0 && remoteUpdatedAt > 0 && localUpdatedAt > remoteUpdatedAt)
+  }
+
   async function runAction(row: DbRecord, action: CollectionActionInfo) {
+    if (overwritesNewerPlugin(row, action)) {
+      setDlg({ kind: 'action', row, action: {
+        ...action,
+        confirm: '本地插件的更新时间晚于插件商店。继续会用商店的旧版本覆盖本地较新的插件，可能丢失修改。确定继续吗？',
+      } })
+      return
+    }
     if (action.id === 'pack' && (row.installed === true || row.installed === 'true')) {
       setDlg({
         kind: 'action',
@@ -2099,7 +2116,7 @@ export function CollectionBrowser({
     )
   }
 
-  async function executeAction(row: DbRecord, action: CollectionActionInfo) {
+  async function executeAction(row: DbRecord, action: CollectionActionInfo, confirmedOlder = false) {
     if (actingRef.current) return
     const preview = previewActionRecord(row, action)
     actingRef.current = true
@@ -2112,7 +2129,15 @@ export function CollectionBrowser({
       await readJson('/api/db/action', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ path: `${dataPath}/${row.id}`, action: action.id }),
+        body: JSON.stringify({
+          path: `${dataPath}/${row.id}`,
+          action: action.id,
+          ...(confirmedOlder && overwritesNewerPlugin(row, action) ? { args: {
+            confirmOlder: true,
+            localCodeVersion: String(row.localCodeVersion || row.codeVersion || ''),
+            remoteCodeVersion: String(row.remoteCodeVersion || ''),
+          } } : {}),
+        }),
       })
       showNotice(`${action.label}成功`)
       quietUntil.current = Date.now() + 800
@@ -4175,7 +4200,7 @@ export function CollectionBrowser({
           onConfirm={() => {
             const { row, action } = dlg
             setDlg(null)
-            void executeAction(row, action)
+            void executeAction(row, action, true)
           }}
           body={<p>{dlg.action.confirm}</p>}
         />

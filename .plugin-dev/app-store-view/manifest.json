@@ -1,0 +1,15 @@
+{
+  "id": "app-store-view",
+  "name": "应用商店视图",
+  "blurb": "把「插件商店」整页画成软件商店：顶部搜索 + 分类标签，应用卡片网格（图标、标题、作者、简介、形态徽章、大小、版本），点卡片右侧抽屉看介绍并直接安装/更新/卸载。无头插件，只登记 databaseUi.registerView('/plugin-catalog')，在查看模式菜单里选「商店」；也可让 agent 用 set_search / set_category / open_app / install_app 驱动。",
+  "tags": [
+    "ui",
+    "view",
+    "database",
+    "store"
+  ],
+  "author": "Biu",
+  "authorUrl": "",
+  "createdAt": 1792227708541,
+  "headless": true
+}

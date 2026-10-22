@@ -4687,6 +4687,22 @@ html.dark .app-side-bar .chat-session-row-star:not(.is-on) svg {
   color: #d9730d;
 }
 
+.project-chip-context-fill {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.project-chip-context-fill-bar {
+  position: absolute;
+  inset-inline: 0;
+  bottom: 0;
+  background: color-mix(in srgb, #d9730d 28%, transparent);
+  transition: height 0.2s ease;
+}
+
 .project-chip.project-chip-pick-toggle:hover:not(:disabled),
 .project-chip.project-chip-pick-toggle.is-active,
 .project-chip.project-chip-pick-toggle.is-active:hover:not(:disabled),
@@ -4779,6 +4795,10 @@ html.dark .app-side-bar .chat-session-row-star:not(.is-on) svg {
   left: 100%;
   bottom: calc(100% + 6px);
   transform: none;
+}
+
+.project-chip-clear-ctx[data-dock-tip][data-dock-tip-at]::after {
+  left: 0;
 }
 
 

@@ -579,6 +579,20 @@ test('extractUsagePoints returns empty when no usage-bearing rows', () => {
   assert.deepEqual(extractUsagePoints(rows), [])
 })
 
+test('context meter preserves the last request input and window, not accumulated turn usage', () => {
+  const nodes = projectNodes([
+    { type: 'turn/start', turn: 1, seq: 1, ts: 1 },
+    { type: 'user/message', kind: 'wake', text: 'hi', seq: 2, ts: 2 },
+    { type: 'assistant/message', text: 'first', usage: { inputTokens: 1000, outputTokens: 10, contextWindowTokens: 200000 }, seq: 3, ts: 3 },
+    { type: 'assistant/message', text: 'last', usage: { inputTokens: 12000, outputTokens: 20, contextWindowTokens: 200000 }, seq: 4, ts: 4 },
+    { type: 'turn/end', turn: 1, reason: 'complete', seq: 5, ts: 5 },
+  ])
+  const reply = nodes.find((node) => node.kind === 'reply')
+  assert.equal(reply?.kind === 'reply' && reply.usage?.inputTokens, 13000)
+  assert.equal(reply?.kind === 'reply' && reply.usage?.contextInputTokens, 12000)
+  assert.equal(reply?.kind === 'reply' && reply.usage?.contextWindowTokens, 200000)
+})
+
 test('reply & step histPct is token-weighted average over all llm.chat usage', () => {
   const nodes = projectNodes([
     { type: 'turn/start', turn: 1, seq: 1, ts: 1000 },

@@ -430,6 +430,7 @@ function renderDetailTable(tab, items, busy, run) {
             h('th', null, '作者'),
             h('th', null, '审核状态'),
             h('th', null, '扫描状态'),
+            h('th', null, '最近更新'),
             h('th', { style: { textAlign: 'right' } }, '审核操作'),
           ),
         ),
@@ -452,6 +453,7 @@ function renderDetailTable(tab, items, busy, run) {
                 row.currentPublished ? h('span', { className: 'ops-ksub' }, '当前上架') : row.reviewStatus === 'approved' ? h('span', { className: 'ops-ksub' }, '历史已通过') : null,
               ),
               h('td', null, h('span', { className: 'ops-badge ' + toneForStatus(row.scanStatus) }, String(row.scanStatus || 'passed'))),
+              h('td', { className: 'ops-mono' }, fmtTime(row.latestUpdatedAt || row.submittedAt)),
               h(
                 'td',
                 { className: 'ops-actions' },

@@ -533,7 +533,7 @@ export function ChatConfig(props?: { onClose?: () => void }) {
   }
 
   async function onRemoveConnection(id: string) {
-    if (isOfficial(id)) return
+    if (!canRemoveConnection(endpoints.find((ep) => ep.id === id))) return
     setError('')
     const res = await fetch('/api/chat/config', {
       method: 'POST',
@@ -549,16 +549,16 @@ export function ChatConfig(props?: { onClose?: () => void }) {
     setStatus('已删除连接')
   }
 
-  /** 凡能「添加」进列表的第三方连接，都可删除（含预设接入与自定义）。 */
+  /** 官方入口和被固定的自定义入口不显示删除按钮；第三方预设仍可移除。 */
   function canRemoveConnection(ep: EndpointView | undefined): boolean {
-    return Boolean(ep && !isOfficial(ep.id))
+    return Boolean(ep && !isOfficial(ep.id) && !(ep.group === 'custom' && ep.builtin === true))
   }
 
   function providerRow(ep: EndpointView, opts?: { removable?: boolean }) {
     const activeRow = ep.id === activeId && !adding
     const isDef = ep.id === defaultEndpointId
     const ok = ep.configured || providers?.[ep.id]?.configured
-    const removable = opts?.removable ?? canRemoveConnection(ep)
+    const removable = opts?.removable !== false && canRemoveConnection(ep)
     return (
       <div
         key={ep.id}

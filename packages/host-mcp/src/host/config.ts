@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
-import { dataHome, dataPath } from '@biu/host-plugin-loader/data-dir'
+import { dirname, join } from 'node:path'
+import { currentAccountId, currentRequestWorkspaceId, dataHome, dataPath, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
 
 export type McpTransportKind = 'stdio' | 'http' | 'sse'
 
@@ -27,8 +27,14 @@ export type McpServerConfig = {
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 
-export function mcpConfigPath(cwd = dataHome()) {
-  return process.env.BIU_MCP_CONFIG || dataPath(cwd, 'mcp.json')
+export function mcpConfigPath(cwd = dataHome(), workspaceId = currentRequestWorkspaceId()) {
+  // 有登录账号时，无论 BIU_ONLINE 是否开启都读取该账号所在工作区；
+  // 仅无账号的本机模式继续使用旧的 mcp.json，不让在线请求回退到全局配置。
+  if (!isOnlineRuntime() && !currentAccountId() && !workspaceId) {
+    return process.env.BIU_MCP_CONFIG || dataPath(cwd, 'mcp.json')
+  }
+  if (!/^ws_[A-Za-z0-9_-]{1,100}$/.test(workspaceId)) throw new Error('MCP 操作需要有效的工作区上下文')
+  return join(dataPath(cwd), 'mcp-workspaces', `${workspaceId}.json`)
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

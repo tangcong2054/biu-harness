@@ -20,7 +20,7 @@ import {
   buildTrajectoryWindow,
   findEvent,
 } from '@biu/host-sessions/trajectory'
-import { estimateTokens, liftToolImages } from '@biu/host-sessions'
+import { deriveMessages, estimateRequestTokens, estimateToolSchemaTokens, estimateTokens, liftToolImages } from '@biu/host-sessions'
 import { readArtifactFile } from '@biu/host-sessions/artifacts'
 import { collectLiveDispatchedTasks } from '@biu/host-live-sessions/usage'
 import { loadLiveDispatchTasks, registerChatInspectorRoutes } from './inspector.ts'
@@ -378,7 +378,7 @@ function mergeCustomEndpoints(saved: Partial<ChatConfig> | null): LlmEndpointDef
       provider,
       note: typeof raw.note === 'string' ? raw.note : undefined,
       placeholder: typeof raw.placeholder === 'string' ? raw.placeholder : 'sk-…',
-      builtin: false,
+      builtin: raw.builtin === true,
     })
   }
   return out
@@ -619,7 +619,7 @@ export class ChatService extends Service {
         hint: hint(this.config.apiKeys[ep.id] ?? ''),
         placeholder: ep.placeholder ?? 'sk-…',
         note: ep.note,
-        builtin: ep.builtin !== false && ep.group !== 'custom',
+        builtin: ep.builtin === true,
       })),
       modelCatalog: models.map((m) => ({
         ...m,
@@ -1782,6 +1782,23 @@ export function apply(ctx: Context) {
       seq,
       messages: await liftToolImages(buildRequestMessages(record.events, seq), record.id),
       toolsTokens: toolsSchemaTokens,
+    })
+  })
+  // 预计下一次请求的上下文占用：按 agent-loop 同一口径（压缩点后的投影消息 + 工具 schema）本地估算，非供应商实测。
+  ctx.http.route('GET', '/api/sessions/:id/context-estimate', async (route) => {
+    const record = await visibleSession(route.params.id)
+    if (!record) return route.send(404, { error: 'unknown session' })
+    const tools = ctx.tools.schemas()
+    const messages = await liftToolImages(deriveMessages(record.events), record.id)
+    const toolSchemaTokens = estimateToolSchemaTokens(tools)
+    const estimatedTokens = estimateRequestTokens(messages, tools)
+    const llm = chat.resolveLlm(record.id)
+    route.send(200, {
+      id: record.id,
+      estimatedTokens,
+      messageTokens: Math.max(0, estimatedTokens - toolSchemaTokens),
+      toolSchemaTokens,
+      contextWindowTokens: llm.contextWindowTokens ?? 200_000,
     })
   })
   ctx.http.route('PUT', '/api/sessions/:id/project', async (route) => {

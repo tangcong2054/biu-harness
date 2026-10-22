@@ -33,6 +33,7 @@ export function pluginCatalogCollection(client: PluginRegistryClient): Collectio
         updatedAt: row.updatedAt,
         remoteCodeVersion: row.codeVersion,
         localCodeVersion: flag?.localCodeVersion ?? '',
+        localUpdatedAt: flag?.localUpdatedAt ?? 0,
         ownerId: row.ownerId,
         ownedByRequester: row.ownedByRequester === true,
         reviewStatus: row.reviewStatus,
@@ -65,19 +66,21 @@ export function pluginCatalogCollection(client: PluginRegistryClient): Collectio
       labelField: 'title',
       contentField: 'readme',
       contentBackend: 'computed',
-      columns: ['title', 'blurb', 'tags', 'installed', 'updateAvailable', 'reviewStatus', 'remoteCodeVersion', 'author'],
+      columns: ['title', 'blurb', 'tags', 'installed', 'updateAvailable', 'reviewStatus', 'remoteCodeVersion', 'author', 'updatedAt'],
       fields: {
         ...REQUIRED_RECORD_FIELDS,
         title: { type: 'string', label: '标题' },
         blurb: { type: 'string', label: '简介' },
         tags: { type: 'multi-select', label: '标签' },
         author: { type: 'string', label: '作者' },
+        updatedAt: { type: 'datetime', label: '最近更新', description: '商店记录的最近一次上传时间；待审核版本也可能更新此时间，不代表当前上架版本的发布时间' },
         installed: { type: 'boolean', label: '已安装' },
         cached: { type: 'boolean', label: '宿主已缓存' },
         updateAvailable: { type: 'boolean', label: '可更新' },
         idConflict: { type: 'boolean', label: 'ID 冲突' },
         remoteCodeVersion: { type: 'string', label: '商店版本' },
         localCodeVersion: { type: 'string', label: '本地版本' },
+        localUpdatedAt: { type: 'datetime', label: '本地安装包更新时间' },
         ownerId: { type: 'string', label: '所有者' },
         ownedByRequester: { type: 'boolean', label: '我的上传' },
         reviewStatus: { type: 'select', label: '审核状态' },
@@ -104,19 +107,40 @@ export function pluginCatalogCollection(client: PluginRegistryClient): Collectio
         id: 'install',
         label: '安装',
         when: { installed: false, idConflict: false },
-        description: '把商店里的打包结果下载到 .plugin/<id>/，不建沙箱。args.version 可填 codeVersion，缺省 latest。id 冲突时不要调用。',
+        description: '把商店里的打包结果下载到 .plugin/<id>/，不建沙箱。args.version 可填 codeVersion，缺省 latest。本地包比商店新时需用户确认后携带 confirmOlder、localCodeVersion、remoteCodeVersion 重试；id 冲突时不要调用。',
         parameters: {
           type: 'object',
-          properties: { version: { type: 'string', description: '要安装的 codeVersion，缺省最新' } },
+          properties: {
+            version: { type: 'string', description: '要安装的 codeVersion，缺省最新' },
+            confirmOlder: { type: 'boolean', description: '用户明确确认要用较旧商店包覆盖本地包时填 true' },
+            localCodeVersion: { type: 'string', description: '确认时本地插件的 codeVersion' },
+            remoteCodeVersion: { type: 'string', description: '确认时商店目标插件的 codeVersion' },
+          },
         },
-        run: async (id, _record, args = {}) => client.install(id, typeof args.version === 'string' ? args.version : undefined),
+        run: async (id, _record, args = {}) => client.install(id, typeof args.version === 'string' ? args.version : undefined, {
+          confirmOlder: args.confirmOlder === true,
+          localCodeVersion: typeof args.localCodeVersion === 'string' ? args.localCodeVersion : undefined,
+          remoteCodeVersion: typeof args.remoteCodeVersion === 'string' ? args.remoteCodeVersion : undefined,
+        }),
       },
       {
         id: 'update',
         label: '更新',
         when: { updateAvailable: true },
-        description: '下载商店 latest 并覆盖 .plugin/<id>/。插件正在运行时会卸掉再挂上新的 host.js / web.js。',
-        run: async (id) => client.update(id),
+        description: '下载商店 latest 并覆盖 .plugin/<id>/。本地更新时间比商店晚时须先经用户确认，再传 confirmOlder、localCodeVersion、remoteCodeVersion 重试；正在运行时会重新挂载。',
+        parameters: {
+          type: 'object',
+          properties: {
+            confirmOlder: { type: 'boolean', description: '用户明确确认用较旧商店包覆盖本地包时填 true' },
+            localCodeVersion: { type: 'string', description: '确认时本地插件的 codeVersion' },
+            remoteCodeVersion: { type: 'string', description: '确认时商店目标插件的 codeVersion' },
+          },
+        },
+        run: async (id, _record, args = {}) => client.update(id, {
+          confirmOlder: args.confirmOlder === true,
+          localCodeVersion: typeof args.localCodeVersion === 'string' ? args.localCodeVersion : undefined,
+          remoteCodeVersion: typeof args.remoteCodeVersion === 'string' ? args.remoteCodeVersion : undefined,
+        }),
       },
       {
         id: 'uninstall',
@@ -165,6 +189,7 @@ export function pluginReviewsCollection(client: PluginRegistryClient): Collectio
         scanStatus: row.scanStatus,
         scanIssues: row.scanIssues,
         submittedAt: row.updatedAt,
+        latestUpdatedAt: row.updatedAt,
       }))
   }
   const reviewAction = (
@@ -196,7 +221,7 @@ export function pluginReviewsCollection(client: PluginRegistryClient): Collectio
     records: { update: false, create: false, delete: false },
     schema: {
       labelField: 'title',
-      columns: ['title', 'reviewStatus', 'currentPublished', 'scanStatus', 'scanIssues', 'reviewReason', 'author', 'submittedAt'],
+      columns: ['title', 'reviewStatus', 'currentPublished', 'scanStatus', 'scanIssues', 'reviewReason', 'author', 'latestUpdatedAt'],
       fields: {
         ...REQUIRED_RECORD_FIELDS,
         title: { type: 'string', label: '版本' },
@@ -211,7 +236,8 @@ export function pluginReviewsCollection(client: PluginRegistryClient): Collectio
         reviewReason: { type: 'string', label: '审核原因' },
         scanStatus: { type: 'select', label: '检测状态' },
         scanIssues: { type: 'string[]', label: '检测问题' },
-        submittedAt: { type: 'datetime', label: '提交时间' },
+        submittedAt: { type: 'datetime', label: '最近更新' },
+        latestUpdatedAt: { type: 'datetime', label: '最近更新', description: '该插件版本最近一次提交或审核的时间' },
       },
     },
     list,

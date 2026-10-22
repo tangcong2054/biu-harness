@@ -27,6 +27,7 @@ export type SessionEvent = {
         outputTokens: number
         totalTokens?: number
         cacheReadTokens?: number
+        contextWindowTokens?: number
         /** 该次 llm.chat 输入中「历史 turn」占比（0~1）；后端 agent-loop 在 derive 时挂载。 */
         histPct?: number
       }
@@ -58,6 +59,10 @@ export interface TrajectoryUsage {
   outputTokens: number
   totalTokens?: number
   cacheReadTokens?: number
+  /** 最近一次模型调用时生效的窗口大小（非本回合累计值）。 */
+  contextWindowTokens?: number
+  /** 最近一次模型调用的输入 token 数（含缓存），非本回合累加值。 */
+  contextInputTokens?: number
   /** 该次 LLM 输入中「历史 turn」占比（0~1）；后端 agent-loop 在 derive 时挂载。curPct=1-histPct。 */
   histPct?: number
 }
@@ -212,6 +217,9 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
     streamingThinkId: string | null
     tools: Map<string, ChatToolPart>
     usage: { input: number; output: number; total: number; cache: number; hit: boolean }
+    /** 仅保留最后一次有 usage 的模型调用，不能用本回合累计 input 计算窗口占用。 */
+    contextWindowTokens?: number
+    contextInputTokens?: number
     /** 历史占比加权累加器：Σ(histPct × inputTokens) / Σ(inputTokens)。 */
     histSum: number
     histWeight: number
@@ -279,6 +287,10 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
     r.usage.output += usage.outputTokens
     r.usage.total += usage.totalTokens ?? usage.inputTokens + usage.outputTokens
     r.usage.cache += usage.cacheReadTokens ?? 0
+    if (usage.contextWindowTokens && usage.inputTokens >= 0) {
+      r.contextWindowTokens = usage.contextWindowTokens
+      r.contextInputTokens = usage.inputTokens
+    }
     // 历史占比：按 input token 加权累计，而非覆盖（replay 计入本回合全部 llm.chat usage）
     if (usage.histPct !== undefined && usage.inputTokens > 0) {
       r.histSum += usage.histPct * usage.inputTokens
@@ -322,6 +334,7 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
           outputTokens: reply.usage.output,
           totalTokens: reply.usage.total,
           ...(reply.usage.cache ? { cacheReadTokens: reply.usage.cache } : {}),
+          ...(reply.contextWindowTokens ? { contextWindowTokens: reply.contextWindowTokens, contextInputTokens: reply.contextInputTokens } : {}),
           ...(histPct !== undefined ? { histPct } : {}),
         }
       : undefined

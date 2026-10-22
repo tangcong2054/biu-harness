@@ -11,7 +11,7 @@ import {
   Squares2X2Icon,
 } from '@heroicons/react/16/solid'
 import type { SlotProps } from '@biu/web-slots'
-import { bindSessionView, type ChatNode, type DispatchedTaskRow, type SessionViewService } from '@biu/web-session-view'
+import { bindSessionView, type DispatchedTaskRow, type SessionEvent, type SessionViewService } from '@biu/web-session-view'
 import { BrandCornerMascot, SidebarMascot, resolveSessionMascot } from '@biu/public-mascot'
 import { HeadlessDismiss } from '@biu/public-ui'
 import { ChatSidebar } from '@biu/web-app-shell/chat-sidebar'
@@ -31,13 +31,42 @@ function parseAgentMode(value: unknown): AgentMode {
   return 'standard'
 }
 
-/** 最新一条回复里，上下文（更早 turn）占发给模型的输入文字的比例（0..1）。 */
-function latestHistRatio(nodes: ChatNode[]): number | null {
-  const last = nodes.at(-1)
-  if (!last || last.kind !== 'reply') return null
-  const hist = last.usage?.histPct
-  if (typeof hist !== 'number' || !Number.isFinite(hist)) return null
-  return Math.min(1, Math.max(0, hist))
+type ContextEstimate = {
+  estimatedTokens: number
+  contextWindowTokens: number
+  ratio: number
+}
+
+function parseContextEstimate(data: unknown): ContextEstimate | null {
+  const raw = data as { estimatedTokens?: unknown; contextWindowTokens?: unknown } | null
+  const num = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null)
+  const estimatedTokens = num(raw?.estimatedTokens)
+  const windowTokens = num(raw?.contextWindowTokens)
+  if (estimatedTokens == null || !windowTokens) return null
+  return {
+    estimatedTokens,
+    contextWindowTokens: windowTokens,
+    ratio: Math.min(1, estimatedTokens / windowTokens),
+  }
+}
+
+/** 影响下一次请求内容的最后一条事件；流式 chunk、partial 结果不触发重新估算。 */
+function contextEstimateKey(events: SessionEvent[]): number {
+  const last = events.findLast((event) =>
+    event.type === 'user/message' ||
+    event.type === 'assistant/message' ||
+    event.type === 'tool/call' ||
+    (event.type === 'tool/result' && !event.partial))
+  return last?.seq ?? 0
+}
+
+function formatTokens(tokens: number): string {
+  return tokens >= 1_000_000 ? `${(tokens / 1_000_000).toFixed(1)}M` : `${(tokens / 1000).toFixed(1)}K`
+}
+
+function contextTip(estimate: ContextEstimate | null): string {
+  if (!estimate) return '清空上下文'
+  return `清空上下文：预计 ${(estimate.ratio * 100).toFixed(1)}%·${formatTokens(estimate.estimatedTokens)}/${formatTokens(estimate.contextWindowTokens)}`
 }
 
 function DockIconMenu<T extends string>({
@@ -167,8 +196,30 @@ export function ApprovalsRail(props: SlotProps) {
   const hiddenWorkerCount = Math.max(0, workerAgents.length - visibleWorkers.length)
   const approvals = useSessionView((state) => state.approvals)
   const approvalMode = useSessionView((state) => state.approvalMode)
-  const nodes = useSessionView((state) => state.nodes)
-  const histRatio = useMemo(() => latestHistRatio(nodes), [nodes])
+  const events = useSessionView((state) => state.events)
+  const estimateKey = useMemo(() => contextEstimateKey(events), [events])
+  const [contextEstimate, setContextEstimate] = useState<ContextEstimate | null>(null)
+  useEffect(() => {
+    setContextEstimate(null)
+  }, [sessionId])
+  useEffect(() => {
+    if (!sessionId) return
+    const controller = new AbortController()
+    const timer = setTimeout(() => {
+      fetch(`/api/sessions/${encodeURIComponent(sessionId)}/context-estimate`, { signal: controller.signal })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (!controller.signal.aborted) setContextEstimate(parseContextEstimate(data))
+        })
+        .catch(() => {
+          /* host 未就绪或请求被取消 */
+        })
+    }, 300)
+    return () => {
+      clearTimeout(timer)
+      controller.abort()
+    }
+  }, [sessionId, estimateKey])
   const overlayOpen = useSyncExternalStore(subscribeChatOverlay, getChatOverlay, () => false)
   const overlayThread = useSyncExternalStore(subscribeOverlayThread, getOverlayThread, () => false)
   const [agentMode, setAgentMode] = useState<AgentMode>('standard')
@@ -303,14 +354,15 @@ export function ApprovalsRail(props: SlotProps) {
             aria-label="清空上下文"
             className="project-chip project-chip-icon-only project-chip-clear-ctx relative"
             data-dock-tip-at="ne"
-            data-dock-tip={
-              histRatio != null
-                ? `清空上下文 · 上下文占输入文字 ${Math.round(histRatio * 100)}%`
-                : '清空上下文'
-            }
+            data-dock-tip={contextTip(contextEstimate)}
             onClick={() => void clearContext()}
           >
-            <PaintBrushIcon className="size-4" aria-hidden />
+            {contextEstimate && contextEstimate.ratio > 0 ? (
+              <span className="project-chip-context-fill" aria-hidden>
+                <span className="project-chip-context-fill-bar" style={{ height: `${contextEstimate.ratio * 100}%` }} />
+              </span>
+            ) : null}
+            <PaintBrushIcon className="size-4 relative z-1" aria-hidden />
           </button>
           {typeof props.renderSlot === 'function' ? props.renderSlot('header-tools') : null}
           {sessionId ? (

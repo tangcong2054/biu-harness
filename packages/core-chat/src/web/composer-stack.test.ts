@@ -222,11 +222,14 @@ describe('composer dock stacking above sticky user', () => {
     expect(css).toMatch(/\.pick-overlay-marquee[\s\S]*background:\s*var\(--dsw-pick-fill\)/)
   })
 
-  it('uses facet orange fill on clear-context only when there is history', () => {
+  it('fills clear-context from the estimated next request rather than history ratio', () => {
     const css = readFileSync(resolve(root, 'web/style.css'), 'utf8')
     const approvals = readFileSync(resolve(root, 'packages/core-chat/src/web/approvals.tsx'), 'utf8')
     expect(css).not.toMatch(/\.project-chip-hist-bar/)
     expect(approvals).not.toMatch(/project-chip-hist-bar/)
+    expect(approvals).toContain('contextEstimate.ratio * 100')
+    expect(approvals).toContain('/context-estimate')
+    expect(css).toMatch(/\.project-chip-context-fill-bar\s*\{[^}]*#d9730d[^}]*transition: height 0\.2s ease/s)
     expect(css).toMatch(/\.chat-pane\s*\{[^}]*--dsw-ok:\s*#448361/s)
     expect(css).toMatch(/\.chat-pane\s*\{[^}]*--dsw-danger:\s*#c4554d/s)
     expect(css).toMatch(/\.tool-call-status\.is-ok\s*\{[^}]*color:\s*#448361/s)
@@ -257,7 +260,8 @@ describe('composer dock stacking above sticky user', () => {
     expect(usage).toMatch(/var\(--dsw-usage-track-hist\)/)
     expect(usage).toMatch(/stroke="currentColor"/)
     expect(usage).not.toMatch(/style=\{\{ color/)
-    expect(approvals).toContain('上下文占输入文字')
+    expect(approvals).toContain('清空上下文：预计 ')
+    expect(approvals).not.toContain('上下文占输入文字')
     expect(approvals).not.toMatch(/清空上下文 · 历史/)
     expect(approvals).not.toMatch(/backgroundColor/)
     expect(approvals).not.toMatch(/<ChatLiveMetrics/)

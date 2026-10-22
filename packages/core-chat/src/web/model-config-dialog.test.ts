@@ -11,6 +11,16 @@ describe('model config dialog stacking', () => {
     expect(src).not.toMatch(/z-30/)
   })
 
+  it('hides delete for builtin custom endpoints in both sidebar and detail', () => {
+    const host = readFileSync(resolve(import.meta.dirname, '../host/index.ts'), 'utf8')
+    const config = readFileSync(resolve(import.meta.dirname, './config.tsx'), 'utf8')
+    expect(host).toMatch(/builtin: raw\.builtin === true/)
+    expect(host).toMatch(/builtin: ep\.builtin === true/)
+    expect(config).toMatch(/!\(ep\.group === 'custom' && ep\.builtin === true\)/)
+    expect(config).toMatch(/opts\?\.removable !== false && canRemoveConnection\(ep\)/)
+    expect(config).toMatch(/if \(!canRemoveConnection\(endpoints\.find\(\(ep\) => ep\.id === id\)\)\) return/)
+  })
+
   it('does not repeat thinking or effort knobs already on the composer', () => {
     const src = readFileSync(resolve(import.meta.dirname, './config.tsx'), 'utf8')
     expect(src).not.toMatch(/ModelModeControls/)

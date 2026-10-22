@@ -1,0 +1,16 @@
+{
+  "id": "calc-block",
+  "name": "计算器块",
+  "blurb": "页面块插件（无头，registerBlock kind=calc）：斜杠菜单输入 calc / 计算器，就能在文档里插一个真能算的计算器。基础/科学/换算三种外观——点键或用键盘直接敲算式，结果实时预览，Enter 或 = 落进右侧历史；科学模式含 sin/cos/tan/ln/log/π/e/x²/xʸ/√/n!/1÷x、DEG↔RAD 切换、HEX+BIN 显示、内存 MC/MR/M+；换算模式覆盖长度/重量/温度/面积/体积/速度/时间/数据/角度 共 9 类单位。头部点「悬浮」会把它变成可拖动的固定小窗（位置存 floatPos）。并注册 uiActions 10 个动作（read_state/set_expression/press_key/evaluate/convert/set_mode/clear_history…），agent 可直接驱动。",
+  "tags": [
+    "page",
+    "editor",
+    "calc",
+    "tool",
+    "convert"
+  ],
+  "author": "用户",
+  "authorUrl": "",
+  "createdAt": 1792139725691,
+  "headless": true
+}

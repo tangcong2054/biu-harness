@@ -187,29 +187,6 @@ function AlgorithmCard({
         risk: 'read',
         run: () => dataRef.current,
       },
-      set_problem: {
-        description: '更新算法题字段',
-        risk: 'write',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            title: { type: 'string' },
-            difficulty: { type: 'string', enum: ['Easy', 'Medium', 'Hard'] },
-            prompt: { type: 'string' },
-            lang: { type: 'string' },
-            code: { type: 'string' },
-          },
-        },
-        run: (args: Record<string, unknown>) => {
-          if (!writableRef.current) throw new Error('算法题当前为只读态')
-          const patch = Object.fromEntries(
-            Object.entries(args).filter(([key, value]) =>
-              ['title', 'difficulty', 'prompt', 'lang', 'code'].includes(key) && typeof value === 'string'),
-          )
-          updateRef.current(patch)
-          return patch
-        },
-      },
     },
   }), [])
 

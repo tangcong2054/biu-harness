@@ -1,6 +1,7 @@
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
 import { Context } from 'cordis'
+import { currentAccountId, currentRequestWorkspaceId, runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import * as sessionStore from '@biu/host-session-store'
 import * as sessions from '@biu/host-sessions'
 import * as tools from '@biu/host-tools'
@@ -33,6 +34,40 @@ async function spine() {
   const session = await ctx.sessions.create()
   return { ctx, sessionId: session.id }
 }
+
+test('online agent turn pins account and workspace to its session, including background runs', async () => {
+  const { ctx, sessionId } = await spine()
+  const previous = process.env.BIU_ONLINE
+  process.env.BIU_ONLINE = '1'
+  const seen: Array<{ account: string; workspace: string }> = []
+  ctx.provide('account', { store: {
+    tenantForRecord: (_collection: string, id: string) => id === sessionId
+      ? { accountId: 'acc_owner', workspaceId: 'ws_owner' } : null,
+    activeWorkspaceId: () => null,
+    isMember: (account: string, workspace: string) => account === 'acc_owner' && workspace === 'ws_owner',
+  } })
+  try {
+    const llm: LlmClient = {
+      async chat() {
+        seen.push({ account: currentAccountId(), workspace: currentRequestWorkspaceId() })
+        return { content: 'ok', toolCalls: [] }
+      },
+    }
+    const run = () => new AgentLoop(ctx, llm, sessionId, new AbortController().signal)
+      .run([{ kind: 'wake', text: 'hi' }])
+    await runWithAccount('acc_owner', run)
+    assert.deepEqual(seen, [{ account: 'acc_owner', workspace: 'ws_owner' }])
+    await assert.rejects(() => run(), /缺少当前工作区成员的账号身份/)
+    await assert.rejects(
+      () => runWithAccount('acc_owner', () => runWithRequestWorkspace('ws_other', run)),
+      /不属于当前工作区/,
+    )
+    assert.equal(seen.length, 1)
+  } finally {
+    if (previous === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previous
+  }
+})
 
 test('loop appends multiple assistant/chunk deltas from onDelta', async () => {
   const { ctx, sessionId } = await spine()
@@ -147,6 +182,8 @@ test('loop automatically compacts semantic history before the normal model reque
   )
   const turn = await loop.run([{ kind: 'wake', text: '执行下一步' }])
   assert.equal(turn.text, '继续完成')
+  const lastReply = (await ctx.sessions.require(sessionId)).events.filter((event) => event.type === 'assistant/message').at(-1)
+  assert.equal(lastReply?.type === 'assistant/message' && lastReply.usage?.contextWindowTokens, 5_000)
   assert.equal(calls.length, 2)
   assert.deepEqual(calls[0]?.tools, [])
   assert.equal(calls[0]?.options?.thinking, 'disabled')
