@@ -1,8 +1,17 @@
 import type { CollectionSchema, DbRecord } from '@biu/type-file-system'
 import type { SortRule } from '../query-logic.ts'
 import type { ListPage } from './db-client.ts'
-import { groupListFilter, groupListKeys, mergeListFilters, type GroupBucket } from './fields.ts'
+import {
+  groupField,
+  groupListFilter,
+  groupListKeys,
+  mergeListFilters,
+  resolveFieldType,
+  type GroupBucket,
+} from './fields.ts'
 import { groupedFullFetchCount } from './table-window.ts'
+
+const MULTI_VALUED = new Set<string>(['multi-select', 'facet'])
 
 export type GroupedCollectionPage = {
   buckets: GroupBucket[]
@@ -44,6 +53,25 @@ export async function listGroupedCollection(opts: {
   const pageSize = Math.max(1, opts.pageSize)
   const fullCount = groupedFullFetchCount(pageSize, keys.length, opts.wrap)
   const filled = new Set(opts.fillKeys ?? [])
+  // 标签 / 多选：一条记录可落在多个组，各组 total 相加会重复计数；另取一次不分组的总数（只要 1 行）。
+  const group = groupField(opts.schema, opts.groupBy)
+  const multiValued = group ? MULTI_VALUED.has(resolveFieldType(group.field)) : false
+  const distinctTotal = multiValued
+    ? opts
+        .list({
+          path: opts.path,
+          limit: 1,
+          offset: 0,
+          query: opts.query,
+          sortField: opts.sortField,
+          sortDir: opts.sortDir,
+          sorts: opts.sorts,
+          filters: opts.filters,
+          columns: opts.columns,
+        })
+        .then((page) => page.total)
+        .catch(() => undefined)
+    : Promise.resolve(undefined)
   const pages = await Promise.all(
     keys.map(async (item, index) => {
       const filters = mergeListFilters(opts.filters ?? {}, groupListFilter(opts.groupBy, item.key))
@@ -67,8 +95,19 @@ export async function listGroupedCollection(opts: {
   const buckets = pages
     .map(({ key, label, rows, total }) => ({ key, label, rows, total }))
     .filter((item) => item.total > 0)
-  const items = buckets.flatMap((item) => item.rows) as Array<DbRecord & { path?: string }>
-  const total = buckets.reduce((sum, item) => sum + item.total, 0)
+  // 多值字段（标签 / 多选）分组时同一条记录会出现在多个组里；buckets 保留重复用于分组展示，
+  // items 是整张表的记录集，必须按 id 去重，否则切回不分组时会出现同一行多次、React key 冲突。
+  const seen = new Set<string>()
+  const items: Array<DbRecord & { path?: string }> = []
+  for (const row of buckets.flatMap((item) => item.rows) as Array<DbRecord & { path?: string }>) {
+    const id = String(row.id)
+    if (seen.has(id)) continue
+    seen.add(id)
+    items.push(row)
+  }
+  const summed = buckets.reduce((sum, item) => sum + item.total, 0)
+  const exact = await distinctTotal
+  const total = Number.isFinite(exact) ? Number(exact) : summed
   const schema = pages.find((item) => item.schema)?.schema
   return { buckets, items, total, schema }
 }

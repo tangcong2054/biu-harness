@@ -26,13 +26,27 @@ export function applyTheme(mode: ThemeMode) {
   if (meta) meta.setAttribute('content', mode)
 }
 
+let themeWriteGen = 0
+
+/** 先切界面；保存失败（网络或非 2xx）且期间没有新的切换时，回滚到切换前的主题。 */
 export function persistTheme(mode: ThemeMode) {
+  const previous = readTheme()
+  const gen = ++themeWriteGen
   applyTheme(mode)
-  void fetch('/api/profile', {
+  return fetch('/api/profile', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ theme: mode }),
-  }).catch(() => undefined)
+  })
+    .then((res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      return true
+    })
+    .catch((error) => {
+      if (gen === themeWriteGen) applyTheme(previous)
+      console.warn('[theme] save failed', error)
+      return false
+    })
 }
 
 export function applyStoredTheme() {

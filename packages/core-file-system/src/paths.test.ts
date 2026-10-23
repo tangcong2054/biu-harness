@@ -66,3 +66,13 @@ test('savedViewRecordPath matches /views row ids including builtin view ids', ()
   assert.equal(savedViewRecordPath('pages/', 'builtin-all:/pages'), '/views/pages::builtin-all:/pages')
   assert.equal(savedViewRecordPath('/', 'mine'), '')
 })
+
+test('databaseRevealFromPath keeps record ids that start with a slash', () => {
+  assert.deepEqual(databaseRevealFromPath('/page-blocks//pages::p001::b1'), {
+    collection: '/page-blocks',
+    recordId: '/pages::p001::b1',
+  })
+  assert.deepEqual(databaseRevealFromPath('/pages/p001'), { collection: '/pages', recordId: 'p001' })
+  assert.deepEqual(databaseRevealFromPath('/pages'), { collection: '/pages' })
+  assert.equal(databaseRevealFromPath('/'), null)
+})

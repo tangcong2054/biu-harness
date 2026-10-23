@@ -46,7 +46,7 @@ import {
 } from '@heroicons/react/16/solid'
 import type { CollectionActionInfo, CollectionInfo, CollectionSchema, CollectionSchemaPack, DbRecord, FieldSpec, FieldType } from '@biu/type-file-system'
 import { normalizeSchemaValue } from '@biu/type-file-system'
-import type { CollectionChrome, CollectionRowViewType, CollectionViewType, DatabaseUi } from '@biu/type-file-system/ui'
+import type { CollectionChrome, CollectionRowViewType, CollectionViewType, DatabaseUi, FsContentStatus } from '@biu/type-file-system/ui'
 import { TrashGlyph } from '@biu/web-session-view/trash-glyph'
 import { DndGrip } from './dnd-grip.tsx'
 import { BoolBox, ChatCount, RecordEmojiBoard, HeadlessDismiss, HeadlessPopover, HEADLESS_DISMISS_IGNORE, tagTextColor } from '@biu/public-ui'
@@ -588,6 +588,8 @@ export function CollectionBrowser({
   const [openDetailId, setOpenDetailId] = useState<string | null>(routeRecordId)
   const [detailRow, setDetailRow] = useState<DbRecord | null>(null)
   const [detailBody, setDetailBody] = useState<unknown>(null)
+  const [detailBodyStatus, setDetailBodyStatus] = useState<FsContentStatus>('loading')
+  const [detailBodyError, setDetailBodyError] = useState('')
   const [draft, setDraft] = useState<Record<string, string>>({})
   const [acting, setActing] = useState(false)
   const actingRef = useRef(false)
@@ -760,6 +762,8 @@ export function CollectionBrowser({
   const confirmedCreates = useRef(new Set<string>())
   const hydratePath = useRef('')
   const viewsRef = useRef<SavedView[]>([])
+  const viewsWriteGenRef = useRef(new Map<string, number>())
+  const [viewsSaveError, setViewsSaveError] = useState('')
   const skipPersistGen = useRef(0)
   const activeViewIdRef = useRef<string | null>(null)
   const syncViewsRef = useRef<() => Promise<void>>(async () => {})
@@ -1046,6 +1050,8 @@ export function CollectionBrowser({
     const id = detailIdRef.current
     if (!id) {
       setDetailBody(null)
+      setDetailBodyStatus('ready')
+      setDetailBodyError('')
       return
     }
     const path = `${dataPath}/${id}`
@@ -1060,10 +1066,14 @@ export function CollectionBrowser({
         if (Number.isInteger(data.version)) contentVersions.current.set(path, data.version!)
         else contentVersions.current.delete(path)
         setDetailBody(data.value ?? null)
+        setDetailBodyStatus('ready')
+        setDetailBodyError('')
       })
-      .catch(() => {
+      .catch((error) => {
         if (gen !== contentGen.current) return
         setDetailBody(null)
+        setDetailBodyStatus('failed')
+        setDetailBodyError(error instanceof Error ? error.message : '正文加载失败')
       })
   }, [dataPath])
   const pullDetailRecord = useCallback(() => {
@@ -1738,10 +1748,18 @@ export function CollectionBrowser({
     if (openedContentPath.current !== path) {
       if (path) contentConflicts.current.delete(path)
       openedContentPath.current = path
+      // 换了记录：正文未到之前是「加载中」，不能当空正文给编辑器写。
+      if (path) {
+        setDetailBody(null)
+        setDetailBodyStatus('loading')
+        setDetailBodyError('')
+      }
     }
     if (!detailId) {
       contentGen.current += 1
       setDetailBody(null)
+      setDetailBodyStatus('ready')
+      setDetailBodyError('')
       return
     }
     pullDetailBody()
@@ -1752,12 +1770,9 @@ export function CollectionBrowser({
     setDlgError('')
   }, [dlg])
 
-  function persistViewsFor(path: string, next: SavedView[]) {
-    if (sheet) return
-    const listed = listedViews(path, next).map((view) => withViewDisplay(path, view))
+  function applyViewsLocally(path: string, listed: SavedView[]) {
     const stored = listed.filter((view) => !view.builtin)
     rememberViews(path, listed)
-    pushSavedViews(path, stored)
     if (!nested) {
       localStorage.setItem(viewsKey(path), JSON.stringify(stored))
     }
@@ -1767,6 +1782,23 @@ export function CollectionBrowser({
     }
     window.dispatchEvent(new Event('fsdb:change'))
     window.dispatchEvent(new Event('fsdb:crumb-labels'))
+  }
+
+  function persistViewsFor(path: string, next: SavedView[]) {
+    if (sheet) return
+    const previous = path === collectionPath ? viewsRef.current : loadViews(path)
+    const listed = listedViews(path, next).map((view) => withViewDisplay(path, view))
+    const stored = listed.filter((view) => !view.builtin)
+    const gen = (viewsWriteGenRef.current.get(path) ?? 0) + 1
+    viewsWriteGenRef.current.set(path, gen)
+    applyViewsLocally(path, listed)
+    setViewsSaveError('')
+    void pushSavedViews(path, stored).catch((error) => {
+      // 只回滚最后一次写入；中间又有新写入时交给新写入决定最终状态。
+      if (viewsWriteGenRef.current.get(path) !== gen) return
+      applyViewsLocally(path, previous)
+      setViewsSaveError(error instanceof Error ? error.message : String(error))
+    })
   }
 
   function persistViews(next: SavedView[]) {
@@ -2170,6 +2202,8 @@ export function CollectionBrowser({
         contentGen.current += 1
         contentWritePending.current.set(path, (contentWritePending.current.get(path) ?? 0) + 1)
         setDetailBody(value)
+        setDetailBodyStatus('ready')
+        setDetailBodyError('')
         const previous = contentWriteQueues.current.get(path) ?? Promise.resolve()
         const run = previous.catch(() => undefined).then(async () => {
           if (contentConflicts.current.has(path)) return
@@ -2976,8 +3010,8 @@ export function CollectionBrowser({
   function tablePadRow(px: number, side: 'top' | 'bottom') {
     if (px <= 0) return null
     return (
-      <tr key={`pad-${side}`} className="fsdb-table-pad" aria-hidden>
-        <td colSpan={tableColSpan} style={{ height: px, padding: 0, border: 0 }} />
+      <tr key={`pad-${side}`} className="fsdb-table-pad" aria-hidden style={{ height: px }}>
+        <td colSpan={tableColSpan} />
       </tr>
     )
   }
@@ -3404,6 +3438,14 @@ export function CollectionBrowser({
             ) : null}
           </div>
           <div className="tasks-toolbar-right" ref={toolbarRightRef}>
+            {viewsSaveError ? (
+              <div className="fsdb-views-error" role="alert" title={viewsSaveError}>
+                <span>视图没有保存成功，已恢复为上一次的状态。</span>
+                <button type="button" onClick={() => setViewsSaveError('')}>
+                  知道了
+                </button>
+              </div>
+            ) : null}
             {chrome?.ToolbarRight ? <chrome.ToolbarRight /> : null}
             <HeadlessDismiss
               enabled={searchExpanded}
@@ -4030,6 +4072,9 @@ export function CollectionBrowser({
           chrome={chrome}
           draft={draft}
           detailBody={detailBody}
+          detailBodyStatus={detailBodyStatus}
+          detailBodyError={detailBodyError}
+          onRetryBody={pullDetailBody}
           labelOf={labelOf}
           renderCell={renderCell}
           setDraft={setDraft}

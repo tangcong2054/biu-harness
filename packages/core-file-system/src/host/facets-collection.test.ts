@@ -54,3 +54,14 @@ test('facetsCollection lists facets with stamp counts and supports create/update
   assert.equal(collected[0]?.sourceId, 'home')
   assert.equal(collected[0]?.facetId, 'dp')
 })
+
+test('facet fields reject malformed input instead of wiping existing properties', async () => {
+  const store = new FacetStore()
+  store.replace([{ id: 'dp', label: '动态规划', fields: [{ key: 'complexity', type: 'string' }] }])
+  const spec = facetsCollection(store)
+  await assert.rejects(async () => spec.update!('dp', { fields: '[{"key":"a",' }), /JSON 数组/)
+  await assert.rejects(async () => spec.update!('dp', { fields: [{ key: 'a', type: 'text' }] }), /unknown field type/)
+  assert.equal(store.get('dp')?.fields[0]?.key, 'complexity')
+  await spec.update!('dp', { fields: '[{"key":"category","type":"string","label":"类别"}]' })
+  assert.equal(store.get('dp')?.fields[0]?.key, 'category')
+})

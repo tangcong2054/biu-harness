@@ -3,7 +3,9 @@ import assert from 'node:assert/strict'
 import { Editor } from '@tiptap/core'
 import {
   collectClipboardImages,
+  editorResourcePath,
   insertClipboardImages,
+  setEditorResourcePath,
   stripPastedDataImages,
   uploadPageImage,
 } from './page-image.ts'
@@ -48,6 +50,31 @@ test('insertClipboardImages writes an asset href, not a data URL', async () => {
     const md = editor.getMarkdown()
     assert.match(md, /\/api\/db\/file\/deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\.png/)
     assert.doesNotMatch(md, /data:image/)
+  } finally {
+    editor.destroy()
+    globalThis.fetch = prev
+  }
+})
+
+test('uploads carry the record path so the host can authorize resource:update', async () => {
+  const urls: string[] = []
+  const prev = globalThis.fetch
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    urls.push(String(input))
+    return new Response(JSON.stringify({ href: '/api/db/file/' + 'cd'.repeat(32) + '.png' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }) as typeof fetch
+  const editor = new Editor({ extensions: pageEditorExtensions(), content: 'hi', contentType: 'markdown' })
+  try {
+    const file = new File([new Uint8Array([0x89, 0x50])], 'shot.png', { type: 'image/png' })
+    await uploadPageImage(file, '/pages/p1')
+    assert.equal(new URL(urls[0]!, 'http://x').searchParams.get('path'), '/pages/p1')
+    setEditorResourcePath(editor, '/pages/p2')
+    assert.equal(editorResourcePath(editor), '/pages/p2')
+    await insertClipboardImages(editor, [file], editor.state.selection.from)
+    assert.equal(new URL(urls[1]!, 'http://x').searchParams.get('path'), '/pages/p2')
   } finally {
     editor.destroy()
     globalThis.fetch = prev

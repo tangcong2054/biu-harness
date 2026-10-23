@@ -59,13 +59,25 @@ function writeCachedPagePrefs(next: PagePrefs) {
   }
 }
 
-function postPagePrefs(next: PagePrefs) {
+let prefsWriteGen = 0
+
+/** 远端保存失败（网络或非 2xx）且期间没有新改动时，回滚到改动前的版式。 */
+function postPagePrefs(next: PagePrefs, previous: PagePrefs) {
   if (typeof fetch === 'undefined') return
+  const gen = ++prefsWriteGen
   void fetch('/api/profile', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ pagePrefs: next }),
-  }).catch(() => undefined)
+  })
+    .then((res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    })
+    .catch((error) => {
+      if (gen !== prefsWriteGen) return
+      console.warn('[page-prefs] save failed', error)
+      commit(previous, false)
+    })
 }
 
 let prefs: PagePrefs = typeof localStorage === 'undefined' ? { ...DEFAULT_PREFS } : readCachedPagePrefs()
@@ -80,11 +92,12 @@ function emit() {
 
 function commit(next: PagePrefs, persistRemote: boolean) {
   if (JSON.stringify(next) === JSON.stringify(prefs)) return
+  const previous = prefs
   prefs = next
   writeCachedPagePrefs(next)
   if (typeof window !== 'undefined') window.dispatchEvent(new Event('biu:page-prefs'))
   emit()
-  if (persistRemote) postPagePrefs(next)
+  if (persistRemote) postPagePrefs(next, previous)
 }
 
 export function getPagePrefs() {
@@ -134,7 +147,7 @@ export async function hydratePagePrefs() {
       commit(parsePagePrefs(data.pagePrefs, prefs), false)
       return prefs
     }
-    postPagePrefs(prefs)
+    postPagePrefs(prefs, prefs)
     return prefs
   } catch {
     return getPagePrefs()

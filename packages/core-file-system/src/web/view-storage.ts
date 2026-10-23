@@ -173,12 +173,17 @@ export function persistStarredViews(items: StarredView[]) {
   for (const fn of starredListeners) fn()
 }
 
-export function pushSavedViews(collectionPath: string, views: SavedView[]) {
-  return fetch('/api/db/saved-views', {
+/** 失败（网络错误或非 2xx，如无 resource:update 权限）要抛出，调用方据此回滚，不能静默吞掉。 */
+export async function pushSavedViews(collectionPath: string, views: SavedView[]) {
+  const res = await fetch('/api/db/saved-views', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ path: collectionPath, views }),
-  }).catch(() => undefined)
+  })
+  if (!res.ok) {
+    const data = (await res.json().catch(() => null)) as { error?: unknown } | null
+    throw new Error(typeof data?.error === 'string' && data.error ? data.error : `HTTP ${res.status}`)
+  }
 }
 
 function parseMaybeJson(value: unknown): unknown {

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import { builtinAllViewId } from '../catalog-views.ts'
-import { SavedViewsStore, clientViewFromDbRow, viewsCollection } from './saved-views.ts'
+import { SavedViewsStore, clientViewFromDbRow, parseViewColumnsInput, viewsCollection } from './saved-views.ts'
 
 test('viewsCollection lists saved views with source table', async () => {
   const store = new SavedViewsStore()
@@ -180,4 +180,12 @@ test('index collection views stay with the account that saved them', async () =>
   const bobRows = await spec.list()
   assert.deepEqual(bobRows.map((row) => row.viewId).filter((id) => id !== builtinAllViewId('/facets')), ['bob-view'])
   await assert.rejects(() => spec.remove!({ ids: ['facets::ada-view'] }), /unknown view/)
+})
+
+test('parseViewColumnsInput accepts arrays and JSON strings but not JSON fragments', () => {
+  assert.deepEqual(parseViewColumnsInput(['title', 'facet', 'title']), ['title', 'facet'])
+  assert.deepEqual(parseViewColumnsInput('["title","facet::facet::category"]'), ['title', 'facet::facet::category'])
+  assert.deepEqual(parseViewColumnsInput('title, status'), ['title', 'status'])
+  assert.throws(() => parseViewColumnsInput('["title",'), /字符串数组/)
+  assert.throws(() => parseViewColumnsInput('title"]'), /字符串数组/)
 })

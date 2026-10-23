@@ -18,15 +18,22 @@ function resultPathOf(result: unknown): string {
   return typeof path === 'string' ? path : ''
 }
 
-/** 工具路径：根目录不算；/<表> 切表，/<表>/<id> 切到该行。 */
-export function databaseRevealFromPath(path: string): DatabaseReveal | null {
+/** 第一段是表，其余原样当记录 id。组件 id 以 `/pages::` 开头，拼路径会出现 `//`，不能 filter 掉空段。 */
+export function splitResourcePath(path: string): { collection: string; recordId?: string } | null {
   const normalized = normalizeCollectionPath(path)
   if (normalized === '/') return null
-  const parts = normalized.split('/').filter(Boolean)
-  if (!parts.length) return null
-  const collection = `/${parts[0]}`
-  const recordId = parts[1]
-  return recordId ? { collection, recordId } : { collection }
+  const rest = normalized.slice(1)
+  const slash = rest.indexOf('/')
+  if (slash < 0) return { collection: `/${rest}` }
+  const name = rest.slice(0, slash)
+  if (!name) return null
+  const recordId = rest.slice(slash + 1)
+  return recordId ? { collection: `/${name}`, recordId } : { collection: `/${name}` }
+}
+
+/** 工具路径：根目录不算；/<表> 切表，/<表>/<id> 切到该行。 */
+export function databaseRevealFromPath(path: string): DatabaseReveal | null {
+  return splitResourcePath(path)
 }
 
 /** 删除后记录没了只切表；创建/读取可跟结果 path。新建视图切到来源表的该视图。 */

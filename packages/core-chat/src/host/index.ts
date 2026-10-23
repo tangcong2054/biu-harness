@@ -21,7 +21,7 @@ import {
   findEvent,
 } from '@biu/host-sessions/trajectory'
 import { deriveMessages, estimateRequestTokens, estimateToolSchemaTokens, estimateTokens, liftToolImages } from '@biu/host-sessions'
-import { readArtifactFile } from '@biu/host-sessions/artifacts'
+import { persistPastedImages, readArtifactFile, withPastedImagePicks } from '@biu/host-sessions/artifacts'
 import { collectLiveDispatchedTasks } from '@biu/host-live-sessions/usage'
 import { loadLiveDispatchTasks, registerChatInspectorRoutes } from './inspector.ts'
 import { forwardCloud } from '@biu/host-account/mirror'
@@ -1915,6 +1915,16 @@ export function apply(ctx: Context) {
           }))
           .filter((img) => img.name && img.mime && img.url)
       : []
+    // 粘贴/拖入的图片只有 data URL，agent 工具（db_asset from=）拿不到；落到会话 artifacts 并附 kind=file pick。
+    let text = payload.text ?? ''
+    if (images.length) {
+      try {
+        text = withPastedImagePicks(text, await persistPastedImages(route.params.id, images))
+      } catch {
+        if (shouldExecute) void finishCloudExecution(route.params.id)
+        return route.send(400, { error: '粘贴的图片未能保存到本地，请重试' })
+      }
+    }
     const liveContext = sanitizeLiveUiContext(payload.liveContext)
     const sendOpts = {
       ...(extraTools.length ? { extraTools } : {}),
@@ -1924,7 +1934,7 @@ export function apply(ctx: Context) {
       ...(liveContext ? { liveContext } : {}),
     }
     if (payload.kind === 'inject') {
-      agent.inject(payload.text ?? '', sendOpts)
+      agent.inject(text, sendOpts)
       return route.send(200, {
         sessionId: agent.sessionId,
         queued: true,
@@ -1932,7 +1942,7 @@ export function apply(ctx: Context) {
       })
     }
     try {
-      const turn = await agent.send(payload.text ?? '', sendOpts)
+      const turn = await agent.send(text, sendOpts)
       route.send(200, {
         sessionId: agent.sessionId,
         text: turn.text,

@@ -23,6 +23,28 @@ import {
 
 type DatabaseSync = import('node:sqlite').DatabaseSync
 
+const VIEW_COLUMNS_SHAPE = 'columns 应为字符串数组，例如 ["title","facet"]'
+
+/** db_create / db_update 的 columns：数组、JSON 数组字符串或逗号分隔都接受；不能把 JSON 碎片按逗号拆。 */
+export function parseViewColumnsInput(value: unknown): string[] {
+  if (Array.isArray(value)) return [...new Set(value.map((item) => String(item).trim()).filter(Boolean))]
+  if (typeof value !== 'string') throw new Error(VIEW_COLUMNS_SHAPE)
+  const text = value.trim()
+  if (!text) return []
+  if (text.startsWith('[')) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      throw new Error(VIEW_COLUMNS_SHAPE)
+    }
+    if (!Array.isArray(parsed)) throw new Error(VIEW_COLUMNS_SHAPE)
+    return parseViewColumnsInput(parsed)
+  }
+  if (text.includes('"') || text.includes(']')) throw new Error(VIEW_COLUMNS_SHAPE)
+  return [...new Set(text.split(',').map((item) => item.trim()).filter(Boolean))]
+}
+
 export type StoredView = Partial<SavedView> & Pick<SavedView, 'id' | 'name'> & { createdBy?: string }
 
 type ViewRow = { workspace_id: string; collection: string; payload_json: string }
@@ -190,7 +212,7 @@ export class SavedViewsStore {
       sortDir: fields.sortDir === 'desc' ? 'desc' : 'asc',
       query: typeof fields.query === 'string' ? fields.query : '',
       groupBy: typeof fields.groupBy === 'string' ? fields.groupBy : '',
-      columns: Array.isArray(fields.columns) ? fields.columns.map((item) => String(item)) : [],
+      columns: fields.columns != null ? parseViewColumnsInput(fields.columns) : [],
       ...filtersFromPatch(fields.filters),
       ...sortsFromPatch(fields.sorts, fields.sortField, fields.sortDir),
       tree: fields.tree !== false,
@@ -241,7 +263,7 @@ export class SavedViewsStore {
         ...('filters' in patch ? filtersFromPatch(patch.filters) : {}),
         ...('filterTree' in patch ? { filterTree: normalizeFilterGroup(parseJsonValue(patch.filterTree)) } : {}),
         ...('sorts' in patch ? sortsFromPatch(patch.sorts, patch.sortField ?? cur.sortField, patch.sortDir ?? cur.sortDir) : {}),
-        ...(Array.isArray(patch.columns) ? { columns: patch.columns.map((item) => String(item)) } : {}),
+        ...('columns' in patch && patch.columns != null ? { columns: parseViewColumnsInput(patch.columns) } : {}),
         ...(typeof patch.pageSize === 'number' ? { pageSize: patch.pageSize } : {}),
         ...(typeof patch.tree === 'boolean' ? { tree: patch.tree } : {}),
         ...(typeof patch.wrap === 'boolean' ? { wrap: patch.wrap } : {}),
