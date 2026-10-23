@@ -5,7 +5,7 @@ import { mkdtempSync } from 'node:fs'
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
 import { Context, Service } from 'cordis'
-import { openAndMigrateBiu, runWithAccount } from '@biu/host-plugin-loader/data-dir'
+import { openAndMigrateBiu, runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import { CollabStore } from '@biu/host-account/store'
 import * as sessionStore from '@biu/host-session-store'
 import * as sessions from './index.ts'
@@ -879,5 +879,33 @@ test('a view grant lets the other member see an inherited session', async () => 
   const bobList = await runWithAccount(bob.id, () => ctx.sessions.listSummaries())
   assert.deepEqual(bobList.map((item) => item.id), [sharedId])
   assert.equal(runWithAccount(bob.id, () => ctx.sessions.inWorkspace(sharedId)), true)
+})
+
+test('creating and forking a session records personal ownership in MySQL', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const attached: Array<{ recordId: string; ownership: string; accessMode: string }> = []
+  class AccountBridge extends Service {
+    usesMysqlAccounts() {
+      return true
+    }
+    mysql = {
+      async attachPolicy(input: { recordId: string; ownership: string; accessMode: string; collection: string }) {
+        assert.equal(input.collection, '/sessions')
+        attached.push({ recordId: input.recordId, ownership: input.ownership, accessMode: input.accessMode })
+      },
+    }
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  await ctx.plugin(AccountBridge)
+  const created = await runWithAccount('ada', () => runWithRequestWorkspace('ws-cloud', () => ctx.sessions.create('owned')))
+  const child = await runWithAccount('ada', () => runWithRequestWorkspace('ws-cloud', () => ctx.sessions.fork(created.id, 'owned-child')))
+  assert.deepEqual(attached, [
+    { recordId: created.id, ownership: 'personal', accessMode: 'private' },
+    { recordId: child.id, ownership: 'personal', accessMode: 'private' },
+  ])
 })
 

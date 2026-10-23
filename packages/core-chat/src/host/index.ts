@@ -1904,7 +1904,17 @@ export function apply(ctx: Context) {
   ctx.http.route('POST', '/api/sessions/:id/fork', async (route) => {
     try {
       if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
-      const child = await ctx.sessions.fork(route.params.id)
+      const forwarded = await forwardCloud(ctx, '/sessions', route.params.id, `/api/sessions/${route.params.id}/fork`)
+      let childId: string | undefined
+      if (forwarded) {
+        const remote = forwarded.body as { id?: string; error?: string }
+        if (forwarded.status >= 300 || !remote.id) {
+          return route.send(forwarded.status, { error: remote.error || '创建云端会话失败' })
+        }
+        childId = remote.id
+      }
+      const child = await ctx.sessions.fork(route.params.id, childId)
+      if (childId) accountRuntime(ctx)?.markRemote?.('/sessions', child.id)
       route.send(201, {
         id: child.id,
         version: child.version,

@@ -30,7 +30,7 @@ import {
 import { rebuildHealedEvents } from './session-heal.ts'
 import { sessionsCollection } from './sessions-collection.ts'
 import type { AuthorizationService } from '@biu/host-account/authorization'
-import { isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
+import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
 
 export type { SessionEvent, SessionEventBody, SessionProject, SessionRecord, SessionMascot, SessionConfig }
 export { SESSION_FORMAT_VERSION, normalizeSessionConfig, mergeSessionConfig }
@@ -469,7 +469,7 @@ export class SessionsService extends Service {
       ...(seeded ? { config: seeded } : {}),
     }
     await this.persist(record)
-    this.attachSession(record.id)
+    await this.attachNewSession(record.id)
     const database = this.ctx.get('database') as { touchActor?: (collection: string, recordId: string) => Promise<void> } | undefined
     await database?.touchActor?.('/sessions', record.id)
     return record
@@ -709,7 +709,7 @@ export class SessionsService extends Service {
       }),
     }
     await this.persist(record)
-    this.attachSession(record.id)
+    await this.attachNewSession(record.id)
     return record
   }
 
@@ -848,6 +848,52 @@ export class SessionsService extends Service {
     const workspaceId = store?.activeWorkspaceId()
     if (!store || !workspaceId) return
     store.attach(workspaceId, '/sessions', id)
+  }
+
+  /** 新建和分叉要把私人归属写进 MySQL。只挂本机 SQLite 时，重新登录后会话不在当前空间的分组里。 */
+  private async attachNewSession(id: string) {
+    const mysqlAttached = await this.attachMysqlSession(id)
+    try {
+      this.attachSession(id)
+    } catch (error) {
+      if (!mysqlAttached) throw error
+    }
+  }
+
+  private async attachMysqlSession(id: string) {
+    let account: {
+      usesMysqlAccounts?: () => boolean
+      mysql?: {
+        attachPolicy?: (input: {
+          actorId: string
+          workspaceId: string
+          collection: string
+          recordId: string
+          ownership: 'personal'
+          accessMode: 'private'
+          now: number
+        }) => Promise<void>
+      } | null
+    } | undefined
+    try {
+      account = this.ctx.get('account')
+    } catch {
+      return false
+    }
+    if (!account?.usesMysqlAccounts?.() || !account.mysql?.attachPolicy) return false
+    const actorId = currentAccountId()
+    const workspaceId = currentRequestWorkspaceId()
+    if (!actorId || !workspaceId) return false
+    await account.mysql.attachPolicy({
+      actorId,
+      workspaceId,
+      collection: '/sessions',
+      recordId: id,
+      ownership: 'personal',
+      accessMode: 'private',
+      now: Date.now(),
+    })
+    return true
   }
 
   private persistTimers = new Map<string, ReturnType<typeof setTimeout>>()
