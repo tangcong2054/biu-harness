@@ -4,7 +4,8 @@ import { Service, type Context } from 'cordis'
 import { currentAccountId, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
 import type { Database } from '@biu/type-file-system'
 import { skillsCollection } from './collection.ts'
-import { LEGACY_MIGRATED, legacySkillImports, SkillsStore, type SkillImportInput, type SkillRecord } from './store.ts'
+import { builtinSkill, builtinSkills, isBuiltinSkillId, removedBuiltins, setBuiltinRemoved } from './builtins.ts'
+import { LEGACY_MIGRATED, legacySkillImports, SkillsStore, trySkillId, type SkillImportInput, type SkillRecord } from './store.ts'
 
 export type SkillSummary = {
   id: string
@@ -116,6 +117,83 @@ export class SkillsService extends Service {
     return !ids || ids.has(id)
   }
 
+  /**
+   * 系统技能的空间键。本地 / 桌面（无鉴权）统一为 local；
+   * 云端取当前工作区，拿不到时返回 null（fail-closed）。
+   */
+  private builtinScope(): { key: string; online: false } | { key: string; online: true; accountId: string } | null {
+    try {
+      const account = this.ctx.get('account') as {
+        authorization?: { authorize?: unknown }
+        store?: { activeWorkspaceId?: () => string | null }
+      } | undefined
+      if (!account?.authorization?.authorize) return { key: 'local', online: false }
+      const workspaceId =
+        account.store?.activeWorkspaceId?.()?.trim() ||
+        String(process.env.BIU_SKILL_DEFAULT_WORKSPACE ?? '').trim()
+      const accountId = currentAccountId()
+      if (!workspaceId || !accountId) return null
+      return { key: workspaceId, online: true, accountId }
+    } catch {
+      return null
+    }
+  }
+
+  /** 云端按「空间」规则：本空间正式成员（owner/admin/member/viewer）可见，外部协作者、访客不可见。 */
+  private isWorkspaceMember(accountId: string, workspaceId: string) {
+    try {
+      const account = this.ctx.get('account') as {
+        store?: { members?: (actorId: string, workspaceId: string) => Array<{ id: string; member_kind?: string }> }
+      } | undefined
+      const members = account?.store?.members
+      if (typeof members !== 'function') return false
+      const me = members.call(account!.store, accountId, workspaceId).find((item) => item.id === accountId)
+      return Boolean(me) && (me!.member_kind ?? 'member') === 'member'
+    } catch {
+      return false
+    }
+  }
+
+  /** 当前空间可见的系统技能。 */
+  builtins(): SkillRecord[] {
+    const scope = this.builtinScope()
+    if (!scope) return []
+    if (scope.online && !this.isWorkspaceMember(scope.accountId, scope.key)) return []
+    const removed = removedBuiltins(scope.key)
+    return builtinSkills().filter((item) => !removed.has(item.id))
+  }
+
+  private requireBuiltin(id: string) {
+    if (!builtinSkill(id)) throw new Error(`unknown builtin skill: ${id}`)
+    const scope = this.builtinScope()
+    if (!scope) throw new Error('没有可用工作区，无法操作系统技能')
+    if (scope.online && !this.isWorkspaceMember(scope.accountId, scope.key)) {
+      throw new Error(`unknown builtin skill: ${id}`)
+    }
+    return scope
+  }
+
+  /** 从当前空间移除系统技能；其他空间不受影响。权限由 /skills 的 resource:delete 把关（仅空间 owner / admin）。 */
+  removeBuiltin(id: string) {
+    const scope = this.requireBuiltin(id)
+    setBuiltinRemoved(scope.key, id, true)
+    this.changed()
+    return { id, removed: true }
+  }
+
+  /** 恢复当前空间移除过的系统技能。 */
+  restoreBuiltin(id: string) {
+    const scope = this.requireBuiltin(id)
+    setBuiltinRemoved(scope.key, id, false)
+    this.changed()
+    return { id, removed: false }
+  }
+
+  /** 给 Agent 用：系统技能 + 本空间可见的普通技能。前端 /skills 表只走 list()，不含系统技能。 */
+  listAll(): SkillRecord[] {
+    return [...this.builtins(), ...this.list().filter((item) => !builtinSkill(item.id))]
+  }
+
   list(): SkillRecord[] {
     const all = this.store.list()
     const ids = this.visibleIds(all)
@@ -123,7 +201,7 @@ export class SkillsService extends Service {
   }
 
   listEnabled() {
-    return this.list().filter((skill) => skill.enabled && skill.description.trim())
+    return this.listAll().filter((skill) => skill.enabled && skill.description.trim())
   }
 
   summaries(): SkillSummary[] {
@@ -135,7 +213,9 @@ export class SkillsService extends Service {
     }))
   }
 
+  /** /skills 表的单条读取。系统技能不进表，这里一律不返回。 */
   recordOrNull(id: string) {
+    if (builtinSkill(id)) return null
     if (!this.allows(id)) return null
     return this.store.get(id)
   }
@@ -162,6 +242,11 @@ export class SkillsService extends Service {
   }
 
   record(id: string) {
+    if (builtinSkill(id)) {
+      const builtin = this.builtins().find((item) => item.id === id)
+      if (!builtin) throw new Error(`unknown skill: ${id}`)
+      return builtin
+    }
     const skill = this.store.get(id)
     if (!skill || !this.allows(id)) throw new Error(`unknown skill: ${id}`)
     return skill
@@ -180,14 +265,24 @@ export class SkillsService extends Service {
   }
 
   create(input: Parameters<SkillsStore['create']>[0]) {
+    assertNotReserved(input.id)
     const created = this.store.create(input)
+    if (isBuiltinSkillId(created.id)) {
+      this.store.remove(created.id)
+      assertNotReserved(created.id)
+    }
     this.claimOwnership(created.id)
     this.changed()
     return created
   }
 
   import(input: SkillImportInput) {
+    assertNotReserved(input.id)
     const created = this.store.import(input)
+    if (isBuiltinSkillId(created.id)) {
+      this.store.remove(created.id)
+      assertNotReserved(created.id)
+    }
     try {
       this.claimOwnership(created.id)
     } catch (error) {
@@ -243,6 +338,7 @@ export class SkillsService extends Service {
       '从 GitHub 安装技能：db_create /skills，files[] 用 {path, from} 拷整包（from 限工作区或 /tmp），不要把脚本全文塞进 content。',
       '纯正文只写 notes。额外文件用 bash 直接读写技能目录 .biu/skill/<id>/；已落盘的文件见记录的 fileList 字段。',
       'source 写上游 URL（仓库或具体 md），版权可追溯。',
+      'sys- 开头的是系统技能：只读，用 skill_read 读取，不能 db_update / db_content。空间 owner 或 admin 要求删除时用 db_action /skills/<id> remove-builtin（只从本空间移除），恢复用 restore-builtin。',
     ]
     const skills = this.listEnabled()
     const lines = skills.map((skill) => {
@@ -275,7 +371,7 @@ export function apply(ctx: Context) {
     },
     execution: 'parallel',
     execute: (args) =>
-      (args.all === true ? skills.list() : skills.summaries()).map((skill) => ({
+      (args.all === true ? skills.listAll() : skills.summaries()).map((skill) => ({
         id: skill.id,
         name: skill.name,
         description: skill.description,
@@ -355,6 +451,14 @@ export function apply(ctx: Context) {
 
 export type { SkillImportFile, SkillImportInput, SkillRecord } from './store.ts'
 export { skillRoot } from './store.ts'
+
+/** sys- 前缀保留给系统技能，用户新建 / 导入不能占用。 */
+function assertNotReserved(id: unknown) {
+  const raw = String(id ?? '').trim()
+  if (!raw) return
+  const normalized = trySkillId(raw) || raw.toLowerCase()
+  if (isBuiltinSkillId(normalized)) throw new Error(`skill id 不能以 sys- 开头（保留给系统技能）：${raw}`)
+}
 
 /** 技能文件下载用的 content-type。技能包以脚本和文本为主，够用即可。 */
 function skillFileMime(name: string) {

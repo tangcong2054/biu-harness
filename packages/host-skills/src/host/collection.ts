@@ -36,7 +36,7 @@ export function skillsCollection(skills: SkillsService): CollectionSpec {
         'SKILL.md 进正文；其它路径写进 .biu/skill/<id>/。纯正文只写 notes。' +
         'source 填上游 URL。列表 db_list /skills。改名字/说明/来源/开关 db_update。正文 db_content。删除 db_delete。' +
         '额外文件用 bash 直接读写：技能目录是 .biu/skill/<id>/，已落盘的文件见记录的 fileList 字段。' +
-        '本表只有 enable / disable 两个动作。',
+        '本表的动作：enable / disable；sys- 系统技能不在本表，用 skill_read 读取，移除 / 恢复用 remove-builtin / restore-builtin。',
       order: 50,
       icon: 'academic-cap',
     },
@@ -144,6 +144,25 @@ export function skillsCollection(skills: SkillsService): CollectionSpec {
         label: '停用',
         when: { enabled: true },
         run: (id) => skills.setEnabled(id, false),
+      },
+      {
+        id: 'remove-builtin',
+        label: '从本空间移除系统技能',
+        description:
+          '只用于 sys- 开头的系统技能：从当前空间移除，其他空间不受影响。仅空间 owner / admin 可用。普通技能请用 db_delete。',
+        for: 'agent',
+        allowMissing: true,
+        requiredAction: 'resource:delete',
+        run: (id) => skills.removeBuiltin(id),
+      },
+      {
+        id: 'restore-builtin',
+        label: '恢复系统技能',
+        description: '恢复当前空间移除过的 sys- 系统技能。仅空间 owner / admin 可用。',
+        for: 'agent',
+        allowMissing: true,
+        requiredAction: 'resource:delete',
+        run: (id) => skills.restoreBuiltin(id),
       },
     ],
   }

@@ -157,7 +157,11 @@ test('/skills rows are Skill records, not Page pointers', async () => {
   assert.equal(spec.schema.fields.source?.type, 'url')
   assert.equal(spec.schema.fields.files?.type, 'file')
   assert.equal(spec.schema.fields.fileList?.writable, false)
-  assert.equal(spec.actions?.map((item) => item.id).join(','), 'enable,disable')
+  assert.equal(spec.actions?.map((item) => item.id).join(','), 'enable,disable,remove-builtin,restore-builtin')
+  assert.deepEqual(
+    spec.actions?.filter((item) => item.id.endsWith('-builtin')).map((item) => [item.for, item.requiredAction]),
+    [['agent', 'resource:delete'], ['agent', 'resource:delete']],
+  )
 })
 
 test('import enables the skill when only the frontmatter carries a description', async () => {
@@ -345,7 +349,7 @@ test('skills only exposes enable/disable; files are read and written through the
   const { ctx } = await boot()
   const spec = (ctx.database as FakeDatabase).specs.find((item) => item.path === '/skills')!
   await spec.create!([{ title: 'Pretty', description: '画图时用', notes: '正文' }])
-  assert.deepEqual(spec.actions?.map((item) => item.id), ['enable', 'disable'])
+  assert.deepEqual(spec.actions?.map((item) => item.id), ['enable', 'disable', 'remove-builtin', 'restore-builtin'])
 
   // 与 agent 用 bash 写文件等价：直接落到 .biu/skill/<id>/ 下。
   const store = new SkillsStore()
