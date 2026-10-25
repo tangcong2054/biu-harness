@@ -1153,19 +1153,30 @@ export async function openStore(ctx: Context) {
   ctx.http.route('GET', '/api/plugins/catalog', async (route) => {
     const accountId = currentAccountId()
     const workspaceId = currentRequestWorkspaceId()
-    const account = (
-      ctx.get('account') as {
-        store?: {
-          canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): boolean
-          isMember?(accountId: string, workspaceId: string): boolean
-        }
-      } | undefined
-    )?.store
-    const canManagePackages =
-      !isOnlineRuntime() || Boolean(accountId && workspaceId && account?.isMember?.(accountId, workspaceId))
-    const plugins = (await store.list())
-      .filter((item) => !item.builtin && !store.isBuiltin(item.id))
-      .map((item) => ({
+    // 优先走账号服务的异步方法：MySQL 控制面下成员关系与安装关系只在云端，
+    // 本机 CollabStore 是空表。服务上没有这些方法时才回退到同步 store。
+    const service = ctx.get('account') as {
+      isMemberAsync?(accountId: string, workspaceId: string): Promise<boolean>
+      canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): Promise<boolean>
+      store?: {
+        canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): boolean
+        isMember?(accountId: string, workspaceId: string): boolean
+      }
+    } | undefined
+    const isMember = async () => {
+      if (!accountId || !workspaceId) return false
+      if (service?.isMemberAsync) return Boolean(await service.isMemberAsync(accountId, workspaceId))
+      return Boolean(service?.store?.isMember?.(accountId, workspaceId))
+    }
+    const canAccess = async (pluginId: string) => {
+      if (!accountId || !workspaceId) return false
+      if (service?.canAccessPlugin) return Boolean(await service.canAccessPlugin(accountId, workspaceId, pluginId))
+      return Boolean(service?.store?.canAccessPlugin?.(accountId, workspaceId, pluginId))
+    }
+    const canManagePackages = !isOnlineRuntime() || await isMember()
+    const listed = (await store.list()).filter((item) => !item.builtin && !store.isBuiltin(item.id))
+    const assigned = await Promise.all(listed.map((item) => canAccess(item.id)))
+    const plugins = listed.map((item, index) => ({
       id: item.id,
       name: item.name,
       blurb: item.blurb,
@@ -1173,7 +1184,7 @@ export async function openStore(ctx: Context) {
       hasWeb: item.hasWeb,
       hasHost: item.hasHost,
       available: item.enabled,
-      assigned: Boolean(account?.canAccessPlugin?.(accountId, workspaceId, item.id)),
+      assigned: assigned[index] === true,
       ...(canManagePackages ? { running: item.running, bytes: item.bytes, updatedAt: item.updatedAt } : {}),
     }))
     route.send(200, { plugins, canManagePackages })

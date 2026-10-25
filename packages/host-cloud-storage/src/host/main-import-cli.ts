@@ -24,6 +24,12 @@ const DEVICE_OR_EPHEMERAL_TABLES = [
   'plugin_loads',
 ] as const
 
+/**
+ * 这些表由版本化 migration 建在 MySQL 里、运行时直接读写（不是从 SQLite 搬过去的）。
+ * 导入时跳过它们的数据，但绝不能 DROP，否则重跑导入会把正在使用的锁表删掉。
+ */
+const RUNTIME_OWNED_TABLES = new Set<string>(['session_execution_leases', 'plugin_loads'])
+
 async function main() {
   if (process.env.BIU_MYSQL_IMPORT_MAIN !== '1') {
     throw new Error('refusing to import: set BIU_MYSQL_IMPORT_MAIN=1 explicitly')
@@ -48,6 +54,7 @@ async function main() {
     console.log(`MySQL: ${redactMysqlUrl(serverUrl.toString())}`)
     await runMysqlMigrations(pool, config.productDatabase, PRODUCT_MIGRATIONS)
     for (const table of DEVICE_OR_EPHEMERAL_TABLES) {
+      if (RUNTIME_OWNED_TABLES.has(table)) continue
       await pool.query(`DROP TABLE IF EXISTS \`${config.productDatabase}\`.\`${table}\``)
     }
     const mainResult = await importSqliteIntoMysql(pool, config.productDatabase, mainSnapshot, {

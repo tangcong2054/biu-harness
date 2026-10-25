@@ -27,6 +27,9 @@ import { applySnapshot, exchangeSnapshot, restoreSnapshotSafely, takeSnapshot, t
 import type { AuthorizationService, ResourceRole } from './authorization.ts'
 import { workspaceMembersCollection } from './workspace-members-collection.ts'
 
+/** 插件授权同步缓存的有效期。多实例部署下这是撤销授权的最长生效延迟。 */
+const PLUGIN_ACCESS_TTL_MS = 30_000
+
 /** 与 SQLite `CollabStore.workspaceHasPlugin` 保持一致：平台运营插件只绑定运营 admin。 */
 function mysqlPluginAllowed(accountId: string, workspaceId: string, pluginId: string) {
   if (!accountId || !workspaceId || !pluginId) return false
@@ -56,7 +59,7 @@ export class AccountService extends Service {
   authorization: AuthorizationService
   readonly mysql: MysqlAccountRepository | null
   readonly accountMode: RuntimeRepositoryMode
-  private readonly pluginAccessCache = new Map<string, boolean>()
+  private readonly pluginAccessCache = new Map<string, { allowed: boolean; at: number }>()
   replica: RecordReplica | null = null
   private db: {
     close(): void
@@ -194,8 +197,15 @@ export class AccountService extends Service {
           includeWorkspaceGrant: isRegisteredBuiltinPlugin(pluginId),
         })
       : this.store.canAccessPlugin(accountId, workspaceId, pluginId)
-    this.pluginAccessCache.set(`${accountId}\t${workspaceId}\t${pluginId}`, allowed)
+    this.rememberPluginAccess(accountId, workspaceId, pluginId, allowed)
     return allowed
+  }
+
+  /** 预热：Agent 回合开始前把这个账号在这个空间的插件授权读进同步缓存。 */
+  async warmPluginAccess(accountId: string, workspaceId: string, pluginIds: Iterable<string>) {
+    if (!this.usesMysqlAccounts() || !accountId || !workspaceId) return
+    const ids = [...new Set(pluginIds)].filter(Boolean)
+    await Promise.all(ids.map((pluginId) => this.canAccessPlugin(accountId, workspaceId, pluginId).catch(() => false)))
   }
 
   async workspaceHasPlugin(workspaceId: string, pluginId: string, accountId = '') {
@@ -210,7 +220,30 @@ export class AccountService extends Service {
 
   canAccessPluginCached(accountId: string, workspaceId: string, pluginId: string) {
     if (!this.usesMysqlAccounts()) return this.store.canAccessPlugin(accountId, workspaceId, pluginId)
-    return this.pluginAccessCache.get(`${accountId}\t${workspaceId}\t${pluginId}`) === true
+    const key = `${accountId}\t${workspaceId}\t${pluginId}`
+    const hit = this.pluginAccessCache.get(key)
+    if (!hit) return false
+    // 多实例部署下别的实例撤销了授权，本实例收不到通知；靠 TTL 收敛。
+    if (Date.now() - hit.at > PLUGIN_ACCESS_TTL_MS) {
+      this.pluginAccessCache.delete(key)
+      return false
+    }
+    return hit.allowed
+  }
+
+  private rememberPluginAccess(accountId: string, workspaceId: string, pluginId: string, allowed: boolean) {
+    this.pluginAccessCache.set(`${accountId}\t${workspaceId}\t${pluginId}`, { allowed, at: Date.now() })
+  }
+
+  /** 成员被移除、角色变更、空间删除、插件包删除后，相关授权缓存全部作废。 */
+  forgetPluginAccess(match: { accountId?: string; workspaceId?: string; pluginId?: string } = {}) {
+    for (const key of this.pluginAccessCache.keys()) {
+      const [account, workspace, plugin] = key.split('\t')
+      if (match.accountId && account !== match.accountId) continue
+      if (match.workspaceId && workspace !== match.workspaceId) continue
+      if (match.pluginId && plugin !== match.pluginId) continue
+      this.pluginAccessCache.delete(key)
+    }
   }
 
   async pluginLoadsFor(accountId: string, workspaceId: string) {
@@ -257,7 +290,8 @@ export class AccountService extends Service {
     const result = this.usesMysqlAccounts()
       ? await this.mysql!.installPluginForWorkspace(accountId, workspaceId, pluginId, version)
       : this.store.installPluginForWorkspace(accountId, workspaceId, pluginId, version)
-    this.pluginAccessCache.set(`${accountId}\t${workspaceId}\t${pluginId}`, true)
+    // 空间级授权只对内置插件生效，不能把结果直接写成 true。
+    this.forgetPluginAccess({ workspaceId, pluginId })
     return result
   }
 
@@ -265,7 +299,7 @@ export class AccountService extends Service {
     const result = this.usesMysqlAccounts()
       ? await this.mysql!.uninstallPluginFromWorkspace(accountId, workspaceId, pluginId)
       : this.store.uninstallPluginFromWorkspace(accountId, workspaceId, pluginId)
-    this.clearPluginAccessCache(workspaceId, pluginId)
+    this.forgetPluginAccess({ workspaceId, pluginId })
     return result
   }
 
@@ -273,7 +307,7 @@ export class AccountService extends Service {
     const result = this.usesMysqlAccounts()
       ? await this.mysql!.installPluginForAccount(accountId, workspaceId, pluginId, version)
       : this.store.installPluginForAccount(accountId, workspaceId, pluginId, version)
-    this.pluginAccessCache.delete(`${accountId}\t${workspaceId}\t${pluginId}`)
+    this.forgetPluginAccess({ accountId, workspaceId, pluginId })
     return result
   }
 
@@ -281,20 +315,43 @@ export class AccountService extends Service {
     const result = this.usesMysqlAccounts()
       ? await this.mysql!.uninstallPluginForAccount(accountId, workspaceId, pluginId)
       : this.store.uninstallPluginForAccount(accountId, workspaceId, pluginId)
-    this.pluginAccessCache.delete(`${accountId}\t${workspaceId}\t${pluginId}`)
+    this.forgetPluginAccess({ accountId, workspaceId, pluginId })
     return result
   }
 
-  private clearPluginAccessCache(workspaceId: string, pluginId: string) {
-    for (const key of this.pluginAccessCache.keys()) {
-      const [, ws, id] = key.split('\t')
-      if (ws === workspaceId && id === pluginId) this.pluginAccessCache.delete(key)
+  async removePluginPackage(accountId: string, pluginId: string) {
+    try {
+      if (this.usesMysqlAccounts()) return await this.mysql!.removePluginPackage(accountId, pluginId)
+      this.store.removePluginPackage(accountId, pluginId)
+    } finally {
+      this.forgetPluginAccess({ pluginId })
     }
   }
 
-  async removePluginPackage(accountId: string, pluginId: string) {
-    if (this.usesMysqlAccounts()) return this.mysql!.removePluginPackage(accountId, pluginId)
-    this.store.removePluginPackage(accountId, pluginId)
+  /** 执行租约：MySQL 控制面下存在云端，多台 Online 实例共享同一把锁。 */
+  async acquireExecutionLease(accountId: string, sessionId: string, executorId: string) {
+    if (this.usesMysqlAccounts()) return this.mysql!.acquireExecutionLease(accountId, sessionId, executorId)
+    return this.store.acquireExecutionLease(accountId, sessionId, executorId)
+  }
+
+  async renewExecutionLease(accountId: string, sessionId: string, leaseId: string) {
+    if (this.usesMysqlAccounts()) return this.mysql!.renewExecutionLease(accountId, sessionId, leaseId)
+    return this.store.renewExecutionLease(accountId, sessionId, leaseId)
+  }
+
+  async requireExecutionLease(accountId: string, sessionId: string, leaseId: string) {
+    if (this.usesMysqlAccounts()) return this.mysql!.requireExecutionLease(accountId, sessionId, leaseId)
+    this.store.requireExecutionLease(accountId, sessionId, leaseId)
+  }
+
+  async releaseExecutionLease(accountId: string, sessionId: string, leaseId: string) {
+    if (this.usesMysqlAccounts()) return this.mysql!.releaseExecutionLease(accountId, sessionId, leaseId)
+    return this.store.releaseExecutionLease(accountId, sessionId, leaseId)
+  }
+
+  async hasExecutionLease(sessionId: string) {
+    if (this.usesMysqlAccounts()) return this.mysql!.hasExecutionLease(sessionId)
+    return this.store.hasExecutionLease(sessionId)
   }
 
   isRemote(collection: string, id: string) {
@@ -1510,6 +1567,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
         const me = await mysqlActor(route)
         const body = (await route.json().catch(() => ({}))) as { name?: string }
         const deleted = await account.mysql!.deleteWorkspace(me.id, route.params.id!, String(body.name ?? ''))
+        account.forgetPluginAccess({ workspaceId: route.params.id! })
         route.send(200, {
           id: deleted.id,
           deleted: true,
@@ -1538,6 +1596,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
         if (!response.ok) throw new CollabError(payload.error || '删除云端空间失败', response.status)
       }
       const deleted = account.store.deleteWorkspace(me.id, workspaceId, confirmName)
+      account.forgetPluginAccess({ workspaceId })
       purgeSessionEvents(deleted.sessionIds)
       route.send(200, { id: deleted.id, deleted: true, activeWorkspaceId: deleted.activeWorkspaceId })
     } catch (error) {
@@ -1723,6 +1782,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
       if (account.usesMysqlAccounts()) {
         const me = await mysqlActor(route)
         await account.mysql!.removeMember(me.id, route.params.id!, route.params.accountId!)
+        account.forgetPluginAccess({ accountId: route.params.accountId!, workspaceId: route.params.id! })
         ctx.http.disconnectTenant(route.params.accountId!, route.params.id!)
         route.send(200, { members: await account.mysql!.members(me.id, route.params.id!) })
         return
@@ -1738,6 +1798,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
       ) return
       requireCollaborativeWorkspace(route.params.id!)
       account.store.removeMember(me.id, route.params.id!, route.params.accountId!)
+      account.forgetPluginAccess({ accountId: route.params.accountId!, workspaceId: route.params.id! })
       ctx.http.disconnectTenant(route.params.accountId!, route.params.id!)
       route.send(200, { members: account.store.members(me.id, route.params.id!) })
     } catch (error) {
@@ -1755,6 +1816,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
           throw new CollabError('角色只能是 owner、admin、member 或 viewer', 400)
         }
         await account.mysql!.updateMemberRole(me.id, route.params.id!, route.params.accountId!, role)
+        account.forgetPluginAccess({ accountId: route.params.accountId!, workspaceId: route.params.id! })
         route.send(200, { members: await account.mysql!.members(me.id, route.params.id!) })
         return
       }
@@ -1774,6 +1836,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
         throw new CollabError('角色只能是 owner、admin、member 或 viewer', 400)
       }
       account.store.updateMemberRole(me.id, route.params.id!, route.params.accountId!, role)
+      account.forgetPluginAccess({ accountId: route.params.accountId!, workspaceId: route.params.id! })
       route.send(200, { members: account.store.members(me.id, route.params.id!) })
     } catch (error) {
       fail(route, error)

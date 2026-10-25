@@ -1,7 +1,29 @@
 import type { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise'
+import { randomUUID } from 'node:crypto'
 import { resolveRuntimeRepositoryMode, type RuntimeRepositoryMode } from './mysql-runtime-repositories.ts'
 
 const SAFE_DATABASE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
+
+/** 与 SQLite CollabStore 相同的 409 语义；HTTP 层读 `status` 决定状态码。 */
+function leaseError(message: string) {
+  return Object.assign(new Error(message), { status: 409 })
+}
+
+/**
+ * 并发抢同一会话的租约时，另一方已经在插入，这些错误都等价于「已被占用」：
+ * - ER_DUP_ENTRY：对方先提交，主键冲突；
+ * - ER_LOCK_DEADLOCK：行还不存在时 `SELECT ... FOR UPDATE` 拿的是间隙锁，双方都能拿到，
+ *   随后各自 INSERT 互相等待，InnoDB 回滚其中一方（已在 MySQL 8 上用两个会话复现）；
+ * - ER_LOCK_WAIT_TIMEOUT：对方事务迟迟不提交。
+ */
+export function isLeaseContention(error: unknown) {
+  const code = (error as { code?: unknown } | null)?.code
+  return code === 'ER_DUP_ENTRY' || code === 'ER_LOCK_DEADLOCK' || code === 'ER_LOCK_WAIT_TIMEOUT'
+}
+
+function clampLeaseTtl(ttlMs: number) {
+  return Math.max(30_000, Math.min(5 * 60_000, ttlMs))
+}
 
 export type AccountControlMode = RuntimeRepositoryMode
 export type AccountRow = {
@@ -777,12 +799,49 @@ export class MysqlAccountRepository {
     actorId: string; workspaceId: string; collection: string; recordId: string; now: number
   }) {
     await this.requireMember(input.actorId, input.workspaceId)
-    await this.pool.query(
-      `INSERT INTO ${this.db}.record_owners
-       (workspace_id, collection, record_id, owner_id, version, updated_at)
-       VALUES (?, ?, ?, ?, 0, ?)`,
-      [input.workspaceId, input.collection, input.recordId, input.actorId, input.now],
+    const connection = await this.pool.getConnection()
+    try {
+      await connection.beginTransaction()
+      await connection.query(
+        `INSERT INTO ${this.db}.record_owners
+         (workspace_id, collection, record_id, owner_id, version, updated_at)
+         VALUES (?, ?, ?, ?, 0, ?)`,
+        [input.workspaceId, input.collection, input.recordId, input.actorId, input.now],
+      )
+      // 归属变化会改变可见性；其它实例靠 revision 发现自己的列表缓存过期了。
+      await this.bumpRevision(connection, input.workspaceId, input.collection)
+      await connection.commit()
+    } catch (error) {
+      await connection.rollback()
+      throw error
+    } finally {
+      connection.release()
+    }
+  }
+
+  /**
+   * 这些集合（以及工作区级 `*`）的授权版本号之和。任何实例改了归属 / 策略 / 授权 /
+   * 成员都会递增它，进程内缓存把它拼进 key 就能跨实例失效。
+   */
+  async authzRevision(workspaceId: string, collections: readonly string[]) {
+    const names = [...new Set(collections.filter(Boolean))]
+    if (!workspaceId) return 0
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT COALESCE(SUM(revision), 0) AS revision FROM ${this.db}.authz_revisions
+       WHERE workspace_id = ? AND collection_name IN (${['?', ...names.map(() => '?')].join(', ')})`,
+      [workspaceId, '*', ...names],
     )
+    return Number(rows[0]?.revision) || 0
+  }
+
+  /** 工作区内所有集合的授权版本号之和。派生表（回收站、合集、页面块）的可见性跨集合，用这个。 */
+  async authzWorkspaceRevision(workspaceId: string) {
+    if (!workspaceId) return 0
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT COALESCE(SUM(revision), 0) AS revision FROM ${this.db}.authz_revisions WHERE workspace_id = ?`,
+      [workspaceId],
+    )
+    return Number(rows[0]?.revision) || 0
   }
 
   async ownerWorkspaceIds(collection: string, recordId: string) {
@@ -1894,6 +1953,76 @@ export class MysqlAccountRepository {
 
   private async requireOwner(accountId: string, workspaceId: string) {
     if (await this.requireMember(accountId, workspaceId) !== 'owner') throw new Error('workspace owner required')
+  }
+
+  /** 桌面设备接管云端会话执行的租约。同一会话同一时刻只有一个执行者，跨实例可见。 */
+  async acquireExecutionLease(accountId: string, sessionId: string, executorId: string, ttlMs = 90_000, now = Date.now()) {
+    const connection = await this.pool.getConnection()
+    try {
+      await connection.beginTransaction()
+      await connection.query(
+        `DELETE FROM ${this.db}.session_execution_leases WHERE session_id = ? AND expires_at <= ?`,
+        [sessionId, now],
+      )
+      const [rows] = await connection.query<RowDataPacket[]>(
+        `SELECT executor_id FROM ${this.db}.session_execution_leases WHERE session_id = ? FOR UPDATE`,
+        [sessionId],
+      )
+      if (rows[0]) {
+        throw leaseError(`这个会话正在由 ${String(rows[0].executor_id || '另一台设备')} 运行`)
+      }
+      const leaseId = `lease_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+      const expiresAt = now + clampLeaseTtl(ttlMs)
+      await connection.query(
+        `INSERT INTO ${this.db}.session_execution_leases
+         (session_id, account_id, lease_id, executor_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+        [sessionId, accountId, leaseId, executorId.trim().slice(0, 120) || 'device', expiresAt, now],
+      )
+      await connection.commit()
+      return { leaseId, sessionId, expiresAt }
+    } catch (error) {
+      await connection.rollback()
+      if (isLeaseContention(error)) throw leaseError('这个会话正在由另一台设备运行')
+      throw error
+    } finally {
+      connection.release()
+    }
+  }
+
+  async renewExecutionLease(accountId: string, sessionId: string, leaseId: string, ttlMs = 90_000, now = Date.now()) {
+    const expiresAt = now + clampLeaseTtl(ttlMs)
+    const [result] = await this.pool.query<ResultSetHeader>(
+      `UPDATE ${this.db}.session_execution_leases SET expires_at = ?
+       WHERE session_id = ? AND account_id = ? AND lease_id = ? AND expires_at > ?`,
+      [expiresAt, sessionId, accountId, leaseId, now],
+    )
+    if (!result.affectedRows) throw leaseError('执行租约已失效')
+    return { leaseId, sessionId, expiresAt }
+  }
+
+  async requireExecutionLease(accountId: string, sessionId: string, leaseId: string, now = Date.now()) {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT lease_id FROM ${this.db}.session_execution_leases
+       WHERE session_id = ? AND account_id = ? AND lease_id = ? AND expires_at > ?`,
+      [sessionId, accountId, leaseId, now],
+    )
+    if (!rows[0]) throw leaseError('执行租约不存在或已失效')
+  }
+
+  async releaseExecutionLease(accountId: string, sessionId: string, leaseId: string) {
+    await this.pool.query(
+      `DELETE FROM ${this.db}.session_execution_leases WHERE session_id = ? AND account_id = ? AND lease_id = ?`,
+      [sessionId, accountId, leaseId],
+    )
+    return { ok: true }
+  }
+
+  async hasExecutionLease(sessionId: string, now = Date.now()) {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT 1 AS ok FROM ${this.db}.session_execution_leases WHERE session_id = ? AND expires_at > ? LIMIT 1`,
+      [sessionId, now],
+    )
+    return Boolean(rows[0])
   }
 
   private bumpRevision(connection: PoolConnection, workspaceId: string, collection: string) {

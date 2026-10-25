@@ -94,26 +94,47 @@ export class UiActionsHostService extends Service {
         socket.close(1008, 'unauthorized')
         return
       }
-      this.socketTenant.set(socket, this.resolveTenant(request, url.searchParams.get('workspaceId') ?? ''))
-      socket.on('message', (raw) => this.onMessage(socket, String(raw)))
+      // 账号服务在 MySQL 控制面下是异步的；租户解析完之前收到的消息按顺序排队。
+      const ready = this.resolveTenant(request, url.searchParams.get('workspaceId') ?? '')
+        .catch(() => ({ accountId: '', workspaceId: '' }))
+        .then((tenant) => {
+          this.socketTenant.set(socket, tenant)
+        })
+      socket.on('message', (raw) => {
+        const text = String(raw)
+        void ready.then(() => this.onMessage(socket, text))
+      })
       socket.on('close', () => this.onClose(socket))
       socket.on('error', () => this.onClose(socket))
     })
   }
 
-  private resolveTenant(request: IncomingMessage, workspaceId: string) {
+  /** 账号来自 cookie 里的会话 token；工作区来自客户端参数，必须校验成员关系，不能直接信任。 */
+  async resolveTenant(request: IncomingMessage, workspaceId: string) {
     const cookie = String(request.headers.cookie ?? '')
     const encoded = cookie
       .split(';')
       .map((part) => part.trim())
       .find((part) => part.startsWith('biu_account=') || part.startsWith('biu_legacy_account='))
     const token = encoded ? decodeURIComponent(encoded.slice(encoded.indexOf('=') + 1)) : ''
-    const accountId = (
-      this.ctx.get('account') as {
-        store?: { accountByToken?(token: string): { id: string } | null }
-      } | undefined
-    )?.store?.accountByToken?.(token)?.id ?? ''
-    return { accountId, workspaceId }
+    const account = this.ctx.get('account') as {
+      accountByToken?(token: string): Promise<{ id: string } | null>
+      isMemberAsync?(accountId: string, workspaceId: string): Promise<boolean>
+      store?: {
+        accountByToken?(token: string): { id: string } | null
+        isMember?(accountId: string, workspaceId: string): boolean
+      }
+    } | undefined
+    if (!token) return { accountId: '', workspaceId }
+    const identity = account?.accountByToken
+      ? await account.accountByToken(token)
+      : account?.store?.accountByToken?.(token)
+    const accountId = identity?.id ?? ''
+    if (!accountId || !workspaceId) return { accountId, workspaceId: accountId ? '' : workspaceId }
+    const member = account?.isMemberAsync
+      ? await account.isMemberAsync(accountId, workspaceId)
+      : account?.store?.isMember?.(accountId, workspaceId)
+    return { accountId, workspaceId: member ? workspaceId : '' }
   }
 
   bootstrap(request: IncomingMessage) {

@@ -88,6 +88,53 @@ function accountRuntime(ctx: Context) {
   }
 }
 
+type ExecutionLeases = {
+  acquire(accountId: string, sessionId: string, executorId: string): Promise<{ leaseId: string; expiresAt: number }>
+  renew(accountId: string, sessionId: string, leaseId: string): Promise<unknown>
+  require(accountId: string, sessionId: string, leaseId: string): Promise<void>
+  release(accountId: string, sessionId: string, leaseId: string): Promise<unknown>
+  has(sessionId: string): Promise<boolean>
+}
+
+/**
+ * 执行租约优先走账号服务的异步入口：MySQL 控制面下租约存在云端，多台 Online 实例共享；
+ * 只有在旧的账号服务（没有这些方法）上才退回同步的本机 store。
+ */
+function executionLeases(ctx: Context): ExecutionLeases | null {
+  let account: {
+    acquireExecutionLease?(accountId: string, sessionId: string, executorId: string): Promise<{ leaseId: string; expiresAt: number }>
+    renewExecutionLease?(accountId: string, sessionId: string, leaseId: string): Promise<unknown>
+    requireExecutionLease?(accountId: string, sessionId: string, leaseId: string): Promise<void>
+    releaseExecutionLease?(accountId: string, sessionId: string, leaseId: string): Promise<unknown>
+    hasExecutionLease?(sessionId: string): Promise<boolean>
+  } | undefined
+  try {
+    account = ctx.get('account') as typeof account
+  } catch {
+    return null
+  }
+  if (account?.acquireExecutionLease && account.renewExecutionLease && account.requireExecutionLease &&
+    account.releaseExecutionLease && account.hasExecutionLease) {
+    const service = account
+    return {
+      acquire: (a, s, e) => service.acquireExecutionLease!(a, s, e),
+      renew: (a, s, l) => service.renewExecutionLease!(a, s, l),
+      require: (a, s, l) => service.requireExecutionLease!(a, s, l),
+      release: (a, s, l) => service.releaseExecutionLease!(a, s, l),
+      has: (s) => service.hasExecutionLease!(s),
+    }
+  }
+  const store = accountRuntime(ctx)?.store
+  if (!store) return null
+  return {
+    acquire: async (a, s, e) => store.acquireExecutionLease(a, s, e),
+    renew: async (a, s, l) => store.renewExecutionLease(a, s, l),
+    require: async (a, s, l) => store.requireExecutionLease(a, s, l),
+    release: async (a, s, l) => store.releaseExecutionLease(a, s, l),
+    has: async (s) => store.hasExecutionLease(s),
+  }
+}
+
 export type { ChatMessage }
 
 export type { AgentToolMode }
@@ -1263,7 +1310,7 @@ declare module 'cordis' {
 
 export async function openSessionHttpPayload(ctx: Context, id: string, limitTurns: number) {
   const record = await ctx.sessions.get(id)
-  if (!record || !ctx.sessions.inWorkspace(id)) return { status: 404 as const, body: { error: 'unknown session' } }
+  if (!record || !(await ctx.sessions.inWorkspaceAsync(id))) return { status: 404 as const, body: { error: 'unknown session' } }
   if (databaseOf(ctx)?.facets.isDeleted('/sessions', record.id)) {
     return { status: 404 as const, body: { error: 'unknown session' } }
   }
@@ -1663,16 +1710,16 @@ export function apply(ctx: Context) {
   })
   const visibleSession = async (id: string) => {
     const record = await ctx.sessions.get(id)
-    return record && ctx.sessions.inWorkspace(id) ? record : null
+    return record && (await ctx.sessions.inWorkspaceAsync(id)) ? record : null
   }
   ctx.http.route('POST', '/api/sessions/:id/execution-lease', async (route) => {
     try {
       if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
       const accountId = currentAccountId()
-      const store = accountRuntime(ctx)?.store
-      if (!accountId || !store) return route.send(401, { error: '需要登录' })
+      const leases = executionLeases(ctx)
+      if (!accountId || !leases) return route.send(401, { error: '需要登录' })
       const body = (await route.json().catch(() => ({}))) as { executorId?: string }
-      route.send(201, store.acquireExecutionLease(accountId, route.params.id, String(body.executorId ?? 'device')))
+      route.send(201, await leases.acquire(accountId, route.params.id, String(body.executorId ?? 'device')))
     } catch (error) {
       const status = Number((error as { status?: number }).status) || 400
       route.send(status, { error: error instanceof Error ? error.message : String(error) })
@@ -1681,10 +1728,10 @@ export function apply(ctx: Context) {
   ctx.http.route('PATCH', '/api/sessions/:id/execution-lease', async (route) => {
     try {
       const accountId = currentAccountId()
-      const store = accountRuntime(ctx)?.store
-      if (!accountId || !store) return route.send(401, { error: '需要登录' })
+      const leases = executionLeases(ctx)
+      if (!accountId || !leases) return route.send(401, { error: '需要登录' })
       const body = (await route.json().catch(() => ({}))) as { leaseId?: string }
-      route.send(200, store.renewExecutionLease(accountId, route.params.id, String(body.leaseId ?? '')))
+      route.send(200, await leases.renew(accountId, route.params.id, String(body.leaseId ?? '')))
     } catch (error) {
       const status = Number((error as { status?: number }).status) || 400
       route.send(status, { error: error instanceof Error ? error.message : String(error) })
@@ -1693,10 +1740,10 @@ export function apply(ctx: Context) {
   ctx.http.route('DELETE', '/api/sessions/:id/execution-lease', async (route) => {
     try {
       const accountId = currentAccountId()
-      const store = accountRuntime(ctx)?.store
-      if (!accountId || !store) return route.send(401, { error: '需要登录' })
+      const leases = executionLeases(ctx)
+      if (!accountId || !leases) return route.send(401, { error: '需要登录' })
       const body = (await route.json().catch(() => ({}))) as { leaseId?: string }
-      route.send(200, store.releaseExecutionLease(accountId, route.params.id, String(body.leaseId ?? '')))
+      route.send(200, await leases.release(accountId, route.params.id, String(body.leaseId ?? '')))
     } catch (error) {
       route.send(400, { error: error instanceof Error ? error.message : String(error) })
     }
@@ -1705,17 +1752,17 @@ export function apply(ctx: Context) {
     try {
       if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
       const accountId = currentAccountId()
-      const store = accountRuntime(ctx)?.store
-      if (!accountId || !store) return route.send(401, { error: '需要登录' })
+      const leases = executionLeases(ctx)
+      if (!accountId || !leases) return route.send(401, { error: '需要登录' })
       const body = (await route.json().catch(() => ({}))) as { leaseId?: string; record?: SessionRecord }
-      store.requireExecutionLease(accountId, route.params.id, String(body.leaseId ?? ''))
+      await leases.require(accountId, route.params.id, String(body.leaseId ?? ''))
       if (!body.record || body.record.id !== route.params.id || !Array.isArray(body.record.events)) {
         return route.send(400, { error: '无效的会话记录' })
       }
       const record = { ...body.record }
       delete record.project
       await ctx.sessions.replace(record)
-      store.releaseExecutionLease(accountId, route.params.id, String(body.leaseId ?? ''))
+      await leases.release(accountId, route.params.id, String(body.leaseId ?? ''))
       route.send(200, { ok: true, eventCount: record.events.length })
     } catch (error) {
       const status = Number((error as { status?: number }).status) || 400
@@ -1975,7 +2022,7 @@ export function apply(ctx: Context) {
       liveContext?: unknown
     }
     if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
-    if (isOnlineRuntime() && accountRuntime(ctx)?.store?.hasExecutionLease(route.params.id)) {
+    if (isOnlineRuntime() && (await executionLeases(ctx)?.has(route.params.id))) {
       return route.send(409, { error: '这个会话正在桌面设备上运行' })
     }
     const shouldExecute = payload.kind !== 'inject' || ctx.agents.isBusy(route.params.id)

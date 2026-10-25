@@ -147,6 +147,34 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
     assert.equal(updated.status, 200)
     assert.equal(captured.some((item) => item.url === '/api/db/update' && item.workspaceId === 'cloud-ws'), true)
 
+    // 记录 id 自带斜杠（内置视图 / 页面块）也必须转发到云端，不能静默写进本机库。
+    captured.length = 0
+    const slashView = await fetch(`${origin}/api/db/update`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ path: '/views/pages::builtin-all:/pages', patch: { name: '全部' } }),
+    })
+    assert.equal(slashView.status, 200)
+    assert.equal(
+      captured.some((item) => item.url === '/api/db/update' && item.body.path === '/views/pages::builtin-all:/pages'),
+      true,
+    )
+    captured.length = 0
+    const slashContent = await fetch(`${origin}/api/db/content`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ path: '/page-blocks//pages::p1::b1', value: 'block' }),
+    })
+    assert.equal(slashContent.status, 200)
+    assert.equal(
+      captured.some((item) => item.url === '/api/db/content' && item.body.path === '/page-blocks//pages::p1::b1'),
+      true,
+    )
+    captured.length = 0
+    const slashRead = await fetch(`${origin}/api/db/content?path=${encodeURIComponent('/views/pages::builtin-all:/pages')}`, { headers })
+    assert.equal(slashRead.status, 200)
+    assert.equal(captured.some((item) => item.url.startsWith('/api/db/content') && item.method === 'GET'), true)
+
     captured.length = 0
     const written = await fetch(`${origin}/api/db/content`, {
       method: 'POST',

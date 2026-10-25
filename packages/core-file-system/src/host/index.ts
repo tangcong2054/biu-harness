@@ -85,7 +85,7 @@ import {
   type ContentCommand,
 } from './content-edit.ts'
 import { currentSessionId } from '@biu/host-sessions/scope'
-import { databaseRevealForTool, normalizeCollectionPath } from '../paths.ts'
+import { databaseRevealForTool, normalizeCollectionPath, splitResourcePath } from '../paths.ts'
 import { matchListFilterRecord, normalizeSorts, sortRecordsBy } from '../query-logic.ts'
 import { AgentDbCompact } from './agent-payload.ts'
 
@@ -305,21 +305,18 @@ function publicCollection(item: CollectionSpec): CollectionInfo {
 }
 
 function splitPath(path: string): string[] {
-  // page-block 记录 id 自身以集合路径开头（如 /pages::p1::b1），
-  // 因此完整记录路径天然包含双斜杠：/page-blocks//pages::p1::b1。
-  // 必须在通用 normalize 折叠斜杠前保留这个 record id。
-  if (path.startsWith('/page-blocks//')) {
-    const recordId = `/${path.slice('/page-blocks//'.length)}`.trim()
-    if (recordId !== '/') return ['page-blocks', recordId]
-  }
-  const normalized = normalizeCollectionPath(path)
-  if (normalized === '/') return []
-  const parts = normalized.slice(1).split('/').filter(Boolean)
-  if (parts[0] === 'views' && parts.length > 2) {
-    return ['views', parts.slice(1).join('/')]
-  }
-  return parts
+  // 第一段是集合，其余原样当记录 id。记录 id 可能自带斜杠：页面块 / 组件以集合路径开头
+  // （/page-blocks//pages::p1::b1），内置视图 id 里也有 `/`（/views/pages::builtin-all:/pages）。
+  // 不能用 split('/').filter(Boolean)：那会吃掉前导空段或把 id 切成多段。
+  const target = splitResourcePath(path)
+  if (!target) return []
+  const name = target.collection.slice(1)
+  if (!name) return []
+  return target.recordId ? [name, target.recordId] : [name]
 }
+
+/** 这些表的可见性取决于别的集合（回收站、合集、页面块、事件），缓存要看整个工作区的授权版本。 */
+const CROSS_COLLECTION_SCOPES = new Set(['/trash', '/facets', '/page-blocks', '/events'])
 
 function isOperationsMetadata(path: string) {
   const normalized = normalizeCollectionPath(path)
@@ -1429,7 +1426,9 @@ export class DatabaseService extends Service implements Database {
     const workspaceId = currentRequestWorkspaceId()
     if (!workspaceId) return null
     const target = this.scopeTarget(collection, String(row.id ?? ''), row)
-    const key = this.mysqlScopeKey(workspaceId, target.collection, target.id)
+    // 可见性是按账号算的（私有 / 受限记录只给 owner），key 必须带账号，
+    // 否则同空间里 A 算出的结果会被 B 直接复用。
+    const key = this.mysqlVisibleKey(workspaceId, currentAccountId(), target.collection, target.id)
     if (!this.mysqlVisible.has(key)) return null
     return this.mysqlVisible.get(key) === true
   }
@@ -1590,7 +1589,7 @@ export class DatabaseService extends Service implements Database {
   }
 
   /** 并发的分组页共用一次授权和排序。组筛选、$scope 在内存里切。 */
-  private visibleSortedCollectionRows(
+  private async visibleSortedCollectionRows(
     spec: CollectionSpec,
     query: CollectionListQuery,
     sortField: string,
@@ -1599,10 +1598,7 @@ export class DatabaseService extends Service implements Database {
     overlay: boolean,
   ) {
     const load = specListQuery(query)
-    const actor = this.authorization()?.currentActor()
-    const actorKey = actor
-      ? `${actor.workspaceId}\t${actor.accountId}`
-      : `${this.collabStore()?.activeWorkspaceId() ?? ''}\t${currentAccountId()}`
+    const actorKey = await this.listCacheActorKey(spec.path)
     const rules = normalizeSorts(sorts, sortField, sortDir)
     const key = `${spec.path}\t${load.trash ? 1 : 0}\t${load.q ?? ''}\t${overlay ? 1 : 0}\t${JSON.stringify(load.filter ?? {})}\t${(load.ids ?? []).join(',')}\t${JSON.stringify(rules)}\t${actorKey}`
     const cached = this.visibleCache.get(key)
@@ -1613,6 +1609,39 @@ export class DatabaseService extends Service implements Database {
       if (gen === this.visibleGen) this.visibleCache.set(key, pack)
       return pack
     })
+  }
+
+  /**
+   * 列表缓存里代表「谁在看、看的是哪个版本」的那一段。
+   * MySQL 控制面：工作区取请求上下文（本机 store 是空表），并拼上云端授权版本号——
+   * 任何实例改了归属 / 策略 / 授权 / 成员都会让这里变化，从而跨实例失效。
+   */
+  private async listCacheActorKey(collection: string) {
+    const account = this.mysqlAccount() as {
+      usesMysqlAccounts?: () => boolean
+      mysql?: {
+        authzRevision?: (workspaceId: string, collections: readonly string[]) => Promise<number>
+        authzWorkspaceRevision?: (workspaceId: string) => Promise<number>
+      } | null
+    } | undefined
+    if (account?.usesMysqlAccounts?.()) {
+      const workspaceId = currentRequestWorkspaceId()
+      const accountId = currentAccountId()
+      let revision = 0
+      try {
+        revision = CROSS_COLLECTION_SCOPES.has(collection)
+          ? await account.mysql?.authzWorkspaceRevision?.(workspaceId) ?? 0
+          : await account.mysql?.authzRevision?.(workspaceId, [collection]) ?? 0
+      } catch {
+        // 读不到版本号就不要命中缓存：用一个唯一值让本次重新计算。
+        revision = -Date.now()
+      }
+      return `${workspaceId}\t${accountId}\tr${revision}`
+    }
+    const actor = this.authorization()?.currentActor()
+    return actor
+      ? `${actor.workspaceId}\t${actor.accountId}`
+      : `${this.collabStore()?.activeWorkspaceId() ?? ''}\t${currentAccountId()}`
   }
 
   private async visibleSortedCollectionRowsNow(
@@ -1631,6 +1660,10 @@ export class DatabaseService extends Service implements Database {
     const extraScans = auth && actor ? this.preloadRelatedCollections(spec.path, rows, auth, actor) : []
     try {
       const mysql = await this.loadMysqlScopes(spec.path, rows)
+      if (mysql && spec.path === '/facets') {
+        // 合集目录的可见性取决于它贴到的源记录；先按当前账号把这些源记录的云端可见性读进来。
+        await this.loadMysqlFacetTargets(rows.map((row) => String(row.id ?? '')))
+      }
       const visible = sortRecords(this.visibleRecords(spec.path, rows), sortField, sortDir, sorts)
       return this.partitionVisibleRows(spec.path, visible, mysql)
     } finally {
@@ -1640,6 +1673,20 @@ export class DatabaseService extends Service implements Database {
         }
       }
     }
+  }
+
+  private async loadMysqlFacetTargets(facetIds: string[]) {
+    const byCollection = new Map<string, DbRecord[]>()
+    for (const facetId of facetIds) {
+      if (!facetId) continue
+      for (const item of this.facets.collect(facetId).items) {
+        if (item.collection === '/facets') continue
+        const rows = byCollection.get(item.collection) ?? []
+        rows.push({ id: item.id } as DbRecord)
+        byCollection.set(item.collection, rows)
+      }
+    }
+    for (const [collection, rows] of byCollection) await this.loadMysqlScopes(collection, rows)
   }
 
   private async loadMysqlScopes(collection: string, rows: DbRecord[]) {
@@ -1669,13 +1716,20 @@ export class DatabaseService extends Service implements Database {
       if (!known || !workspaceId || !member || !accountId) continue
       const key = this.mysqlScopeKey(workspaceId, target.collection, target.id)
       this.mysqlScopes.set(key, resolveRecordScope(target.collection, target.id, sources))
-      this.mysqlVisible.set(key, mysqlRecordVisible(target.collection, target.id, sources, accountId))
+      this.mysqlVisible.set(
+        this.mysqlVisibleKey(workspaceId, accountId, target.collection, target.id),
+        mysqlRecordVisible(target.collection, target.id, sources, accountId),
+      )
     }
     return true
   }
 
   private mysqlScopeKey(workspaceId: string, collection: string, id: string) {
     return `${this.visibleGen}\t${workspaceId}\t${collection}\t${id}`
+  }
+
+  private mysqlVisibleKey(workspaceId: string, accountId: string, collection: string, id: string) {
+    return `${this.visibleGen}\t${workspaceId}\t${accountId}\t${collection}\t${id}`
   }
 
   /** `undefined` 表示这条列表不是 MySQL 拆分；`null` 表示已拆分但没有归属。 */
@@ -2116,6 +2170,7 @@ export class DatabaseService extends Service implements Database {
   async collectFacet(id: string) {
     await this.prepareMetadata()
     const found = this.facets.collect(id)
+    await this.loadMysqlFacetTargets([id])
     const labels = new Map(this.collectionsList().map((spec) => [spec.path, spec.label ?? spec.id]))
     return {
       facet: found.facet,
@@ -4004,13 +4059,14 @@ export function apply(ctx: Context) {
   })
   ctx.http.route('GET', '/api/db/content', async (route) => {
     const path = route.query.get('path') || '/'
-    const parts = path.split('/').filter(Boolean)
-    if (parts.length === 2) {
+    // 记录 id 可能自带斜杠（页面块、视图），只要能解析出记录就尝试转发，不能按段数判断。
+    const target = splitResourcePath(path)
+    if (target?.recordId) {
       const search = route.query.toString()
       const forwarded = await forwardCloud(
         ctx,
-        `/${parts[0]}`,
-        parts[1]!,
+        target.collection,
+        target.recordId,
         search ? `/api/db/content?${search}` : '/api/db/content',
         { method: 'GET' },
       )
@@ -4025,9 +4081,9 @@ export function apply(ctx: Context) {
     try {
       const body = (await route.json()) as { path?: string; value?: unknown; version?: unknown }
       const path = String(body?.path ?? '')
-      const parts = path.split('/').filter(Boolean)
-      if (parts.length === 2) {
-        const forwarded = await forwardCloud(ctx, `/${parts[0]}`, parts[1]!, '/api/db/content', { body })
+      const target = splitResourcePath(path)
+      if (target?.recordId) {
+        const forwarded = await forwardCloud(ctx, target.collection, target.recordId, '/api/db/content', { body })
         if (forwarded) {
           if (forwarded.status < 300) {
             try {
@@ -4059,12 +4115,12 @@ export function apply(ctx: Context) {
     try {
       const body = (await route.json()) as { path?: string; content?: unknown }
       const path = String(body?.path ?? '')
-      const parts = path.split('/').filter(Boolean)
-      if (parts.length === 2) {
-        const forwarded = await forwardCloud(ctx, `/${parts[0]}`, parts[1]!, '/api/db/update', { body })
+      const target = splitResourcePath(path)
+      if (target?.recordId) {
+        const forwarded = await forwardCloud(ctx, target.collection, target.recordId, '/api/db/update', { body })
         if (forwarded) {
           const value = (forwarded.body as { value?: { id?: string } } | null)?.value
-          if (forwarded.status < 300 && value?.id) await cacheCloudRecords(`/${parts[0]}`, [value])
+          if (forwarded.status < 300 && value?.id) await cacheCloudRecords(target.collection, [value])
           route.send(forwarded.status, forwarded.body)
           return
         }

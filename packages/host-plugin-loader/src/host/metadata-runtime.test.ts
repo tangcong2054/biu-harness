@@ -87,4 +87,35 @@ describe('SqliteMetadataRuntime', () => {
     expect(repository.rows.has('shares')).toBe(false)
     db.close()
   })
+
+  test('writes from another instance become visible after the reload window', async () => {
+    const previous = process.env.BIU_METADATA_RELOAD_MS
+    process.env.BIU_METADATA_RELOAD_MS = '50'
+    const db = new DatabaseSync(':memory:')
+    db.exec(`CREATE TABLE record_meta (
+      collection TEXT NOT NULL, record_id TEXT NOT NULL, emoji TEXT,
+      PRIMARY KEY(collection, record_id)
+    )`)
+    const repository = new MemoryRepository()
+    repository.rows.set('record_meta', [{ workspace_id: 'ws-a', collection: '/pages', record_id: 'p1', emoji: '🌱' }])
+    const runtime = new SqliteMetadataRuntime('mysql', repository, () => db, ['record_meta'])
+    const emoji = () => (db.prepare('SELECT emoji FROM record_meta WHERE record_id = ?').get('p1') as { emoji?: string })?.emoji
+    try {
+      await runWithRequestWorkspace('ws-a', async () => {
+        await runtime.prepare()
+        expect(emoji()).toBe('🌱')
+        // 另一台实例直接写了 MySQL。
+        repository.rows.set('record_meta', [{ workspace_id: 'ws-a', collection: '/pages', record_id: 'p1', emoji: '🌳' }])
+        await runtime.prepare()
+        expect(emoji()).toBe('🌱')
+        await new Promise((resolve) => setTimeout(resolve, 70))
+        await runtime.prepare()
+        expect(emoji()).toBe('🌳')
+      })
+    } finally {
+      if (previous === undefined) delete process.env.BIU_METADATA_RELOAD_MS
+      else process.env.BIU_METADATA_RELOAD_MS = previous
+      db.close()
+    }
+  })
 })

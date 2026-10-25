@@ -206,6 +206,42 @@ test('online MCP enforces workspace credentials, tool allowlists, viewer writes,
   }
 }, 20000)
 
+test('online MCP info checks membership through the async account service (MySQL control plane)', async () => {
+  const previous = process.env.BIU_ONLINE
+  process.env.BIU_ONLINE = '1'
+  const ctx = new Context()
+  // MySQL 控制面：成员关系只在云端，本机 store 是空表（isMember 恒 false）。
+  class MysqlAccount extends Service {
+    store = { isMember: () => false, accountByToken: () => null }
+    async accountByToken(token: string) {
+      return token === 'web-token' ? { id: 'bob' } : null
+    }
+    async isMemberAsync(accountId: string, workspaceId: string) {
+      return accountId === 'bob' && workspaceId === 'ws-a'
+    }
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  const ready = new Promise<number>((resolve) => ctx.on('http/ready', ({ port }) => resolve(port)))
+  await ctx.plugin(MysqlAccount)
+  await ctx.plugin(http, { port: 0, host: '127.0.0.1', sharePort: 0 })
+  await ctx.plugin(tools)
+  await ctx.plugin(mcp)
+  const port = await ready
+  try {
+    const ok = await fetch(`http://127.0.0.1:${port}/api/mcp/info`, {
+      headers: { Authorization: 'Bearer web-token', 'X-Biu-Workspace-Id': 'ws-a' },
+    })
+    assert.equal(ok.status, 200)
+    assert.equal(((await ok.json()) as { workspaceId?: string }).workspaceId, 'ws-a')
+  } finally {
+    await ctx.fiber.dispose()
+    if (previous === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previous
+  }
+}, 20000)
+
 test('single online listener exposes token-gated MCP', async () => {
   const ctx = new Context()
   const localP = new Promise<number>((resolve) => ctx.on('http/ready', ({ port }) => resolve(port)))

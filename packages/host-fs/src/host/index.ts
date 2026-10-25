@@ -63,13 +63,14 @@ export class FsService extends Service {
 
   async onlineSessionRootAsync(sessionId: string) {
     const requested = currentRequestWorkspaceId().trim()
-    let workspaceId = requested
+    let workspaceId = requested || this.sessionWorkspaces.get(sessionId) || ''
     if (!workspaceId) {
       const account = this.ctx.get('account') as {
         tenantForRecord?(collection: string, recordId: string): Promise<{ workspaceId?: string } | null>
       } | undefined
       workspaceId = String((await account?.tenantForRecord?.('/sessions', sessionId))?.workspaceId ?? '').trim()
     }
+    this.rememberSessionWorkspace(sessionId, workspaceId)
     const root = join(
       this.onlineWorkspacesRoot(),
       `workspace-${encodeURIComponent(workspaceId || '_unassigned')}`,
@@ -96,6 +97,7 @@ export class FsService extends Service {
   private workspaceIdForSession(sessionId: string) {
     let account:
       | {
+          usesMysqlAccounts?(): boolean
           tenantForRecord?(
             collection: string,
             recordId: string,
@@ -114,15 +116,45 @@ export class FsService extends Service {
       account = undefined
     }
     const requested = currentRequestWorkspaceId().trim()
-    if (requested) return requested
-    // MySQL tenant lookup is asynchronous. Never fall through to the SQLite
-    // store in that mode; background callers must establish workspace scope.
-    if (account?.tenantForRecord) return ''
-    const ownedWorkspaceId = String(
-      account?.store?.tenantForRecord?.('/sessions', sessionId)?.workspaceId ?? '',
-    ).trim()
-    if (ownedWorkspaceId) return ownedWorkspaceId
+    if (requested) {
+      this.rememberSessionWorkspace(sessionId, requested)
+      return requested
+    }
+    // 会话归属不会变：异步路径（或带请求工作区的调用）解析过一次后，同步入口直接复用。
+    const known = this.sessionWorkspaces.get(sessionId)
+    if (known) return known
+    // MySQL 控制面下归属只在云端，同步读本机 SQLite 只会拿到空表，不能回退。
+    // SQLite 控制面下 AccountService 也有异步 tenantForRecord，但本机 store 就是权威，可以同步读。
+    if (!account?.usesMysqlAccounts?.()) {
+      const ownedWorkspaceId = String(
+        account?.store?.tenantForRecord?.('/sessions', sessionId)?.workspaceId ?? '',
+      ).trim()
+      if (ownedWorkspaceId) {
+        this.rememberSessionWorkspace(sessionId, ownedWorkspaceId)
+        return ownedWorkspaceId
+      }
+    }
+    if (!this.warnedUnassigned.has(sessionId)) {
+      this.warnedUnassigned.add(sessionId)
+      try {
+        this.ctx.logger('fs').warn(
+          'session %s has no resolved workspace; files fall back to _unassigned (call effectiveRootAsync first)',
+          sessionId,
+        )
+      } catch {
+        /* logger 不可用时不影响文件读写 */
+      }
+    }
     return ''
+  }
+
+  private readonly sessionWorkspaces = new Map<string, string>()
+  private readonly warnedUnassigned = new Set<string>()
+
+  private rememberSessionWorkspace(sessionId: string, workspaceId: string) {
+    if (!sessionId || !workspaceId) return
+    this.sessionWorkspaces.set(sessionId, workspaceId)
+    this.warnedUnassigned.delete(sessionId)
   }
 
   private ensureRoot(root: string) {

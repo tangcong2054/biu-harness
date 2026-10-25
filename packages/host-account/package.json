@@ -11,6 +11,7 @@
     "./replica": "./src/host/replica.ts",
     "./mirror": "./src/host/mirror.ts",
     "./authorization": "./src/host/authorization.ts",
+    "./record-scope": "./src/host/record-scope.ts",
     "./workspace-members-collection": "./src/host/workspace-members-collection.ts"
   },
   "peerDependencies": {

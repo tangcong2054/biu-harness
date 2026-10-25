@@ -153,6 +153,11 @@ export class ToolsService extends Service {
     this.ctx.emit('hub/change')
   }
 
+  /** 当前注册了工具的商店插件 id。用于在异步上下文里预热插件授权缓存。 */
+  storePluginIds() {
+    return [...new Set(this.pluginIds.values())]
+  }
+
   private visible(name: string) {
     const pluginId = this.pluginIds.get(this.resolveName(name))
     if (pluginId && currentAccountId()) {

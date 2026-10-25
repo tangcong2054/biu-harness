@@ -524,6 +524,23 @@ export const PRODUCT_MIGRATIONS: readonly MysqlMigration[] = [
        ADD PRIMARY KEY (workspace_id, \`key\`)`,
     ],
   },
+  {
+    version: 12,
+    name: 'session_execution_leases',
+    statements: [
+      // 桌面设备接管云端会话执行时的租约。放在 MySQL 里，多台 Online 实例才能看到同一把锁。
+      `CREATE TABLE IF NOT EXISTS session_execution_leases (
+        session_id VARCHAR(128) NOT NULL,
+        account_id VARCHAR(64) NOT NULL,
+        lease_id VARCHAR(64) NOT NULL,
+        executor_id VARCHAR(120) NOT NULL DEFAULT 'device',
+        expires_at BIGINT NOT NULL,
+        created_at BIGINT NOT NULL,
+        PRIMARY KEY (session_id),
+        KEY session_execution_leases_expiry (expires_at)
+      ) ${MYSQL_TABLE}`,
+    ],
+  },
 ]
 
 export const OPERATIONS_MIGRATIONS: readonly MysqlMigration[] = [

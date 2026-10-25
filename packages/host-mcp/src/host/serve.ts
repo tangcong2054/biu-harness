@@ -234,10 +234,15 @@ export function applyHostServer(ctx: Context) {
       const workspaceId = currentRequestWorkspaceId()
       if (!accountId) return route.send(401, { error: '需要登录' })
       if (!workspaceId) return route.send(400, { error: '需要空间' })
-      const store = (
-        ctx.get('account') as { store?: { isMember?(accountId: string, workspaceId: string): boolean } } | undefined
-      )?.store
-      if (!store?.isMember?.(accountId, workspaceId)) return route.send(403, { error: '不在这个空间' })
+      const account = ctx.get('account') as {
+        isMemberAsync?(accountId: string, workspaceId: string): Promise<boolean>
+        store?: { isMember?(accountId: string, workspaceId: string): boolean }
+      } | undefined
+      // MySQL 控制面下成员关系只在云端；同步 store 读到的是本机空表。
+      const member = account?.isMemberAsync
+        ? await account.isMemberAsync(accountId, workspaceId)
+        : account?.store?.isMember?.(accountId, workspaceId)
+      if (!member) return route.send(403, { error: '不在这个空间' })
       const { token: _token, clients: _clients, ...safe } = payload()
       return route.send(200, { ...safe, token: '', online: true, workspaceId })
     }

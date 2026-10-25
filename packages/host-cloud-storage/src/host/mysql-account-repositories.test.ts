@@ -29,7 +29,7 @@ integration('MySQL account/workspace/authz integration', () => {
   beforeAll(async () => {
     pool = createPool({ uri: mysqlUrl!, connectionLimit: 2 })
     await pool.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`)
-    for (const migration of PRODUCT_MIGRATIONS.filter((item) => item.version >= 8 && item.version <= 10)) {
+    for (const migration of PRODUCT_MIGRATIONS.filter((item) => (item.version >= 8 && item.version <= 10) || item.version === 12)) {
       for (const statement of migration.statements) {
         await pool.query(statement.replaceAll('CREATE TABLE IF NOT EXISTS ', `CREATE TABLE IF NOT EXISTS \`${database}\`.`)
           .replaceAll('ALTER TABLE ', `ALTER TABLE \`${database}\`.`))
@@ -216,5 +216,30 @@ integration('MySQL account/workspace/authz integration', () => {
     await accounts.uninstallPluginForAccount('acc_owner', 'ws_a', 'plugin-a', now)
     expect(await accounts.canAccessPlugin('acc_owner', 'ws_a', 'plugin-a')).toBe(false)
     expect(await accounts.pluginLoadsFor('acc_owner', 'ws_a')).toEqual([])
+  })
+
+  it('claiming a record bumps the authz revision other instances key their caches on', async () => {
+    const now = Date.now()
+    const before = await accounts.authzRevision('ws_a', ['/pages'])
+    const wide = await accounts.authzWorkspaceRevision('ws_a')
+    await accounts.claimRecord({ actorId: 'acc_owner', workspaceId: 'ws_a', collection: '/pages', recordId: 'page_rev', now })
+    expect(await accounts.authzRevision('ws_a', ['/pages'])).toBeGreaterThan(before)
+    expect(await accounts.authzWorkspaceRevision('ws_a')).toBeGreaterThan(wide)
+  })
+
+  it('execution leases are exclusive per session and expire', async () => {
+    const now = Date.now()
+    const lease = await accounts.acquireExecutionLease('acc_owner', 'sess_1', 'laptop', 60_000, now)
+    expect(await accounts.hasExecutionLease('sess_1', now)).toBe(true)
+    await expect(accounts.acquireExecutionLease('acc_member', 'sess_1', 'desktop', 60_000, now)).rejects.toMatchObject({ status: 409 })
+    await accounts.renewExecutionLease('acc_owner', 'sess_1', lease.leaseId, 60_000, now)
+    await accounts.requireExecutionLease('acc_owner', 'sess_1', lease.leaseId, now)
+    await expect(accounts.requireExecutionLease('acc_member', 'sess_1', lease.leaseId, now)).rejects.toMatchObject({ status: 409 })
+    // 过期后别人可以接管。
+    const later = now + 10 * 60_000
+    expect(await accounts.hasExecutionLease('sess_1', later)).toBe(false)
+    const next = await accounts.acquireExecutionLease('acc_member', 'sess_1', 'desktop', 60_000, later)
+    await accounts.releaseExecutionLease('acc_member', 'sess_1', next.leaseId)
+    expect(await accounts.hasExecutionLease('sess_1', later)).toBe(false)
   })
 })

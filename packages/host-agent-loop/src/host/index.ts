@@ -136,6 +136,14 @@ export class AgentLoop implements AgentRunner {
       if (!member) {
         throw new Error('Agent 回合缺少当前工作区成员的账号身份')
       }
+      // 工具可见性在同步路径里只读插件授权缓存；服务重启后缓存是空的，
+      // 不预热会把这个账号已安装的商店插件工具全部藏起来。
+      const warm = (account as { warmPluginAccess?(a: string, w: string, ids: Iterable<string>): Promise<void> } | undefined)
+        ?.warmPluginAccess
+      const tools = this.ctx.tools as { storePluginIds?(): string[] } | undefined
+      if (warm && tools?.storePluginIds) {
+        await warm.call(account, accountId, workspaceId, tools.storePluginIds()).catch(() => undefined)
+      }
     }
     return runWithAccount(accountId, () => runWithRequestWorkspace(workspaceId, () => this.runScoped(claimed)))
   }

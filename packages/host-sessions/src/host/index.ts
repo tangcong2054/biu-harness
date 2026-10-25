@@ -30,6 +30,7 @@ import {
 import { rebuildHealedEvents } from './session-heal.ts'
 import { sessionsCollection } from './sessions-collection.ts'
 import type { AuthorizationService } from '@biu/host-account/authorization'
+import { mysqlRecordVisible, type ScopePolicy, type ScopeSource } from '@biu/host-account/record-scope'
 import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
 
 export type { SessionEvent, SessionEventBody, SessionProject, SessionRecord, SessionMascot, SessionConfig }
@@ -735,6 +736,9 @@ export class SessionsService extends Service {
 
   /** 没有协同账号时全部可见；有当前工作区时只留下本区会话，未认领的旧会话只在「本机」出现。 */
   inWorkspace(id: string, record?: { id?: unknown }) {
+    // MySQL 控制面下成员关系与归属都不在本机 SQLite，同步判定只会读到空表。
+    // 宁可不给：调用方必须改用 inWorkspaceAsync / listSummaries。
+    if (this.mysqlAccount()) return false
     const authorization = this.authorization()
     const actor = authorization?.currentActor()
     if (authorization && actor) {
@@ -759,6 +763,77 @@ export class SessionsService extends Service {
     return this.recordReadable(id)
   }
 
+  /** 与 inWorkspace 同义；MySQL 控制面下按云端成员关系与归属判定。 */
+  async inWorkspaceAsync(id: string, record?: { id?: unknown }) {
+    if (!this.mysqlAccount()) return this.inWorkspace(id, record)
+    const visible = await this.mysqlVisibleSessions([id])
+    return visible.has(id) || this.viewAccess(id, record)
+  }
+
+  /**
+   * 当前账号在当前工作区能看见哪些会话。
+   * 记录必须在这个工作区有归属（策略或 owner），且对当前账号不是别人的私有记录。
+   * 缺账号、缺工作区、不是成员时一律返回空集合（fail-closed）。
+   */
+  private async mysqlVisibleSessions(ids: string[]) {
+    const out = new Set<string>()
+    const mysql = this.mysqlAccount()
+    const accountId = currentAccountId()
+    const workspaceId = currentRequestWorkspaceId()
+    if (!mysql || !accountId || !workspaceId || !ids.length) return out
+    if (!(await mysql.membership(accountId, workspaceId))) return out
+    const sources = new Map<string, ScopeSource>()
+    const load = async (collection: string) => {
+      if (sources.has(collection)) return
+      const loaded = await mysql.collectionScopeSources(workspaceId, collection)
+      sources.set(collection, { policies: loaded.policies, owners: new Set(loaded.owners) })
+    }
+    await load('/sessions')
+    const own = sources.get('/sessions')!
+    for (const id of ids) {
+      const policy = own.policies[id]
+      if (!policy && !own.owners.has(id)) continue
+      // 继承到别的集合时把父集合也读进来，否则会把继承记录当成无策略。
+      let current: ScopePolicy | undefined = policy
+      let guard = 0
+      while (current?.accessMode === 'inherit' && current.parentRecordId && guard < 16) {
+        const parent: string = current.parentCollection || '/sessions'
+        await load(parent)
+        current = sources.get(parent)?.policies[current.parentRecordId]
+        guard += 1
+      }
+      if (mysqlRecordVisible('/sessions', id, sources, accountId)) out.add(id)
+    }
+    return out
+  }
+
+  private mysqlAccount() {
+    let account: {
+      usesMysqlAccounts?: () => boolean
+      mysql?: {
+        membership?: (accountId: string, workspaceId: string) => Promise<unknown>
+        collectionScopeSources?: (
+          workspaceId: string,
+          collection: string,
+        ) => Promise<{ policies: Record<string, ScopePolicy>; owners: string[] }>
+      } | null
+    } | undefined
+    try {
+      account = this.ctx.get('account') as typeof account
+    } catch {
+      return null
+    }
+    const mysql = account?.usesMysqlAccounts?.() ? account.mysql : null
+    if (!mysql?.membership || !mysql.collectionScopeSources) return null
+    return mysql as {
+      membership: (accountId: string, workspaceId: string) => Promise<unknown>
+      collectionScopeSources: (
+        workspaceId: string,
+        collection: string,
+      ) => Promise<{ policies: Record<string, ScopePolicy>; owners: string[] }>
+    }
+  }
+
   private recordReadable(id: string) {
     const store = this.collabStore()
     if (!store || typeof store.canReadRecord !== 'function') return true
@@ -766,7 +841,11 @@ export class SessionsService extends Service {
   }
 
   async listSummaries() {
-    const items = (await this.ctx.sessionStore.listSummaries()).filter((item) => this.inWorkspace(item.id, item))
+    const all = await this.ctx.sessionStore.listSummaries()
+    const mysqlVisible = this.mysqlAccount() ? await this.mysqlVisibleSessions(all.map((item) => item.id)) : null
+    const items = all.filter((item) =>
+      mysqlVisible ? mysqlVisible.has(item.id) || this.viewAccess(item.id, item) : this.inWorkspace(item.id, item),
+    )
     const out = []
     for (const item of items) {
       let next = item

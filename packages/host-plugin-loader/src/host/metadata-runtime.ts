@@ -12,6 +12,15 @@ export type MetadataRepository = {
 
 type DatabaseSync = import('node:sqlite').DatabaseSync
 
+/**
+ * 同一工作区的元数据多久从 MySQL 重读一次。多实例部署下别的实例写入的视图 / 合集 /
+ * 分享，本实例最晚在这个时间后看到。设为 0 表示每次 prepare 都重读。
+ */
+function reloadAfterMs() {
+  const raw = Number(process.env.BIU_METADATA_RELOAD_MS)
+  return Number.isFinite(raw) && raw >= 0 ? raw : 15_000
+}
+
 function identifier(value: string) {
   if (!/^[a-z][a-z0-9_]*$/i.test(value)) throw new Error(`unsafe metadata table: ${value}`)
   return `"${value}"`
@@ -20,6 +29,7 @@ function identifier(value: string) {
 export class SqliteMetadataRuntime {
   private activeWorkspace = ''
   private prepared = false
+  private loadedAt = 0
   private pending: Promise<void> = Promise.resolve()
   /** 本地表被改过的次数。从 MySQL 装回内存时用来丢掉过期快照。 */
   private revision = 0
@@ -36,7 +46,7 @@ export class SqliteMetadataRuntime {
     if (this.mode !== 'mysql' || !this.repository) return
     const workspaceId = currentRequestWorkspaceId().trim()
     if (!workspaceId) throw new Error('MySQL metadata runtime requires a workspace')
-    if (this.prepared && this.activeWorkspace === workspaceId) {
+    if (this.prepared && this.activeWorkspace === workspaceId && Date.now() - this.loadedAt < reloadAfterMs()) {
       await this.flush()
       return
     }
@@ -66,6 +76,7 @@ export class SqliteMetadataRuntime {
       database.exec('COMMIT')
       this.activeWorkspace = workspaceId
       this.prepared = true
+      this.loadedAt = Date.now()
     } catch (error) {
       database.exec('ROLLBACK')
       throw error
