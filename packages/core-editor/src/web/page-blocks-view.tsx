@@ -179,13 +179,27 @@ export function PageBlockStage({
     if (recordTitle) parsed.title = recordTitle
     setData(parsed)
   }, [packed, recordTitle])
+  const [saveError, setSaveError] = useState('')
+  const writeGen = useRef(0)
   const update = (patch: Record<string, unknown>, opts?: { replace?: boolean }) => {
+    const previous = data
     const next = mergeLiveBlockData(data, patch, { replace: opts?.replace, title: recordTitle })
     setData(next)
     const toWrite = persistBlockDataPatch(next, patch)
     publishData(next)
-    if (onChange) onChange(toWrite)
-    else void writeBlockData(recordId, toWrite)
+    if (onChange) {
+      onChange(toWrite)
+      return
+    }
+    const gen = ++writeGen.current
+    setSaveError('')
+    void writeBlockData(recordId, toWrite).catch((error: unknown) => {
+      // 只回滚最后一次写入；中间又有新写入时交给新写入决定最终状态。
+      if (gen !== writeGen.current) return
+      setData(previous)
+      publishData(previous)
+      setSaveError(error instanceof Error ? error.message : String(error))
+    })
   }
   const hostRef = useRef<HTMLDivElement | null>(null)
   useLayoutEffect(() => bindPageBlockPlugin(hostRef.current, plugin), [plugin, kind, View, packed])
@@ -203,6 +217,12 @@ export function PageBlockStage({
       data-biu-label={spec?.label || kind || undefined}
       data-testid="page-block-stage"
     >
+      {saveError ? (
+        <div className="page-block-save-error" role="alert" data-biu-ignore>
+          <span>插件内容没有保存成功，已恢复为上一次的状态：{saveError}</span>
+          <button type="button" onClick={() => setSaveError('')}>知道了</button>
+        </div>
+      ) : null}
       {View ? (
         <View data={data} update={update} writable={writable} />
       ) : (
@@ -295,15 +315,28 @@ function BlockCard({
   const pageLabel = pageLabelOf(row, pageName)
   const kindLabel = spec?.label || kind
 
+  const [titleError, setTitleError] = useState('')
   const commitTitle = () => {
     const next = draft.trim()
     if (next === title) return
     setDraft(next || title)
-    if (next && next !== title) void writeBlockTitle(String(row.id), next)
+    if (!next || next === title) return
+    setTitleError('')
+    void writeBlockTitle(String(row.id), next).catch((error: unknown) => {
+      // 改名没落库：输入框回到服务端的标题，并说明原因。
+      setDraft(title)
+      setTitleError(error instanceof Error ? error.message : String(error))
+    })
   }
 
   return (
     <article className="page-blocks-view-card" data-testid="page-blocks-view-card">
+      {titleError ? (
+        <div className="page-block-save-error" role="alert">
+          <span>标题没有保存成功：{titleError}</span>
+          <button type="button" onClick={() => setTitleError('')}>知道了</button>
+        </div>
+      ) : null}
       <div className="page-blocks-view-head">
         <input
           className="page-blocks-view-title"

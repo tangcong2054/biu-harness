@@ -9,12 +9,9 @@ import { runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader
 import { openStore } from './store.ts'
 
 /**
- * `/api/plugins/catalog` 直接读 `ctx.get('account').store`（同步的 CollabStore）。
- * MySQL 控制面下插件安装关系只在云端，本机库是空的，于是：
- *  - `assigned` 恒为 false；
- *  - `canManagePackages` 用同步 `isMember` 判定，同样恒为 false。
- * 这个路由是插件商店「是否已安装 / 能否启用」的数据源；问题类型与上游一致：
- * 存储换了，但这一处仍按旧存储读取。
+ * `/api/plugins/catalog` 以前只读 `ctx.get('account').store`（同步的 CollabStore）。
+ * MySQL 控制面下插件安装关系与成员关系只在云端，本机库是空的，于是 `assigned` 与
+ * `canManagePackages` 恒为 false。现在路由优先走账号服务的异步方法。
  */
 
 const dirs: string[] = []
@@ -135,14 +132,16 @@ test('catalog reports the viewer install state from the cloud control plane', as
     assert.equal(result.status, 200)
     const row = result.body?.plugins.find((item: { id: string; assigned?: boolean }) => item.id === 'demo')
     assert.ok(row, 'demo plugin should be listed')
+    // 云端控制面说这个账号在当前空间装了 demo，catalog 就必须报 assigned。
+    assert.equal(row.assigned, true)
+    assert.equal(result.body?.canManagePackages, true)
 
-    // 期望：云端控制面说这个账号在当前空间装了 demo，catalog 就该把 assigned 报成 true。
-    if (row.assigned === true) return
-
-    // 现状：路由只取 `ctx.get('account').store`（同步读本机 SQLite），MySQL 控制面下
-    // 这个对象上没有 `canAccessPlugin`，`assigned` 恒为 false。
-    // 修好 store.ts 的 catalog 路由后删掉这段，上面的 `return` 就成了硬断言。
-    assert.equal(row.assigned, false, 'KNOWN-BUG 已修复：请删掉这段 pending 标记，改回硬断言 true')
+    // 不在这个空间：assigned 为 false。
+    const outsider = await runWithAccount('acc_bob', () =>
+      runWithRequestWorkspace('ws_a', () => callCatalog(handlers)),
+    )
+    const outsiderRow = outsider.body?.plugins.find((item: { id: string; assigned?: boolean }) => item.id === 'demo')
+    assert.equal(outsiderRow?.assigned, false)
   } finally {
     if (previousPluginDir === undefined) delete process.env.BIU_PLUGIN_DIR
     else process.env.BIU_PLUGIN_DIR = previousPluginDir

@@ -85,14 +85,26 @@ function n1(v: unknown) {
   return Number.isFinite(n) ? n : 0
 }
 
-async function getJson(url: string) {
-  const res = await fetch(url)
-  return (await res.json()) as Record<string, any>
+/** HTTP 失败（5xx、非 JSON、鉴权失败）也要落到 `{ ok:false, error }`，不能让界面静默停在旧数据上。 */
+async function readResult(res: Response): Promise<Record<string, any>> {
+  const body = (await res.json().catch(() => null)) as Record<string, any> | null
+  if (!res.ok) return { ...(body ?? {}), ok: false, error: String(body?.error ?? `HTTP ${res.status}`) }
+  if (!body || typeof body !== 'object') return { ok: false, error: '服务返回的不是 JSON' }
+  return body
 }
-
+async function getJson(url: string) {
+  try {
+    return await readResult(await fetch(url))
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
 async function postJson(url: string, body: unknown) {
-  const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
-  return (await res.json()) as Record<string, any>
+  try {
+    return await readResult(await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }))
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
 }
 
 function View(props: BlockProps) {

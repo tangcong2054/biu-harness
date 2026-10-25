@@ -28,6 +28,7 @@ if (typeof document !== 'undefined') {
 .mcp-tool-toggle.is-on{color:var(--dsw-ok,#22c55e);border-color:color-mix(in srgb,var(--dsw-ok,#22c55e) 40%,transparent);background:color-mix(in srgb,var(--dsw-ok,#22c55e) 12%,transparent)}
 .mcp-tool-toggle.is-deny.is-on{color:var(--dsw-danger);border-color:color-mix(in srgb,var(--dsw-danger) 40%,transparent);background:color-mix(in srgb,var(--dsw-danger) 12%,transparent)}
 .mcp-tools-empty{margin:0;font-size:13px;color:var(--dsw-label-3)}
+.mcp-tools-error{display:block;margin:0 0 6px;font-size:12px;color:var(--dsw-danger,#c0392b)}
 `
   if (!document.getElementById(id)) document.head.appendChild(style)
 }

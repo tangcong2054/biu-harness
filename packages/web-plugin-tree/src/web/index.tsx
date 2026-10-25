@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { Context } from 'cordis'
 import type { SlotProps } from '@biu/web-slots'
 import { bindSnapshot, type Snapshot } from '@biu/web-snapshot'
@@ -16,8 +17,20 @@ function PluginTree(props: SlotProps) {
   const useSnapshot = props.useSnapshot as ReturnType<typeof bindSnapshot>
   const setEnabled = props.setEnabled as (id: string, enabled: boolean) => Promise<void>
   const snap = useSnapshot((state: Snapshot) => state.plugins)
+  const [error, setError] = useState('')
+  const toggle = (id: string, enabled: boolean) => {
+    setError('')
+    void setEnabled(id, enabled).catch((reason: unknown) => {
+      setError(reason instanceof Error ? reason.message : String(reason))
+    })
+  }
   return (
     <div className="flex flex-col gap-4">
+      {error ? (
+        <p className="settings-muted m-0 px-2" role="alert" data-testid="plugin-toggle-error">
+          插件开关没有生效：{error}
+        </p>
+      ) : null}
       {SECTIONS.map((section) => {
         const rows = snap.filter((plugin) => plugin.layer === section.layer)
         if (!rows.length) return null
@@ -46,7 +59,7 @@ function PluginTree(props: SlotProps) {
                         type="button"
                         aria-label={plugin.enabled ? `关闭 ${plugin.name}` : `打开 ${plugin.name}`}
                         aria-checked={plugin.enabled}
-                        onClick={() => void setEnabled(plugin.id, !plugin.enabled)}
+                        onClick={() => toggle(plugin.id, !plugin.enabled)}
                       />
                     ) : null}
                   </span>

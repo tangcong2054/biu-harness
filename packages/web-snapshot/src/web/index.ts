@@ -128,13 +128,18 @@ export class SnapshotService extends Service {
     }
   }
 
+  /** 失败（非 2xx：核心层不能卸载、无权限……）时抛出，不能把错误响应体当快照合并进状态。 */
   async setEnabled(id: string, enabled: boolean) {
     const res = await fetch(`/api/plugins/${id}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ enabled }),
     })
-    this.replace(await res.json())
+    const body = (await res.json().catch(() => null)) as (Partial<Snapshot> & { error?: unknown }) | null
+    if (!res.ok || !body) {
+      throw new Error(typeof body?.error === 'string' && body.error ? body.error : `HTTP ${res.status}`)
+    }
+    this.replace(body)
   }
 
   private replace(next: Partial<Snapshot>) {

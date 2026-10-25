@@ -15,10 +15,15 @@ export type ContentEditRow = {
 
 export const INSPECTOR_REVEAL_EVENT = 'biu:inspector-reveal'
 
+/** 第一段是表，其余原样当记录 id。组件 / 页面块 id 自带前导斜杠（`/pages::p1::b1`），不能 filter 掉空段。 */
 export function recordParts(path: string) {
-  const parts = path.split('/').filter(Boolean)
-  if (parts.length < 2) return null
-  return { collection: `/${parts[0]}`, recordId: parts.slice(1).join('/') }
+  const raw = String(path ?? '').trim()
+  const rest = raw.startsWith('/') ? raw.slice(1) : raw
+  const slash = rest.indexOf('/')
+  if (slash <= 0) return null
+  const recordId = rest.slice(slash + 1)
+  if (!recordId) return null
+  return { collection: `/${rest.slice(0, slash)}`, recordId }
 }
 
 export function contentEditLabel(file: ContentEditRow, files: ContentEditRow[]) {

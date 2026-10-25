@@ -38,25 +38,60 @@ export function loadFacets(_collectionPath?: string): CollectionSchemaPack[] {
   }
 }
 
-export function persistFacets(facets: CollectionSchemaPack[], _collectionPath?: string) {
-  const next = parseFacets(facets)
+export const FACETS_SAVE_FAILED_EVENT = 'fsdb:facets-save-failed'
+
+let facetsWriteGen = 0
+
+function applyFacetsLocally(next: CollectionSchemaPack[]) {
   memory = next
   try {
     localStorage.setItem(FACETS_KEY, JSON.stringify(next))
   } catch {
     /* ignore */
   }
-  void fetch('/api/db/facets', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ facets: next }),
-  }).catch(() => undefined)
   emit()
   try {
     window.dispatchEvent(new Event('fsdb:change'))
   } catch {
     /* ignore */
   }
+}
+
+/**
+ * 先切界面再保存。保存失败（网络错误或非 2xx）且期间没有更新的写入时，
+ * 回滚到修改前的分面并广播失败事件，不能让界面停在服务端没有的配置上。
+ * 返回是否保存成功；同步调用方可以忽略返回值。
+ */
+export function persistFacets(facets: CollectionSchemaPack[], _collectionPath?: string): Promise<boolean> {
+  const previous = loadFacets()
+  const next = parseFacets(facets)
+  const gen = ++facetsWriteGen
+  applyFacetsLocally(next)
+  const request = typeof fetch === 'function'
+    ? fetch('/api/db/facets', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ facets: next }),
+      })
+    : Promise.reject(new Error('fetch unavailable'))
+  return request
+    .then(async (res) => {
+      if (res.ok) return true
+      const data = (await res.json().catch(() => null)) as { error?: unknown } | null
+      throw new Error(typeof data?.error === 'string' && data.error ? data.error : `HTTP ${res.status}`)
+    })
+    .catch((error: unknown) => {
+      if (gen !== facetsWriteGen) return false
+      applyFacetsLocally(previous)
+      const message = error instanceof Error ? error.message : String(error)
+      console.warn('[facets] save failed', message)
+      try {
+        window.dispatchEvent(new CustomEvent(FACETS_SAVE_FAILED_EVENT, { detail: { error: message } }))
+      } catch {
+        /* ignore */
+      }
+      return false
+    })
 }
 
 export async function pullFacets(_collectionPath?: string) {

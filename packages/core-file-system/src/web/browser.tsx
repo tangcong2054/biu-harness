@@ -156,7 +156,7 @@ import { SchemaChips, SchemaFieldEditor, schemaTagTone } from './schema-field.ts
 import { CellPop, cellUsesPop } from './cell-pop.tsx'
 import { CellPopDraft } from './cell-pop-draft.tsx'
 import { FieldValuePop } from './field-value-pop.tsx'
-import { loadFacets, pullFacets, subscribeFacets } from './facet-catalog.ts'
+import { FACETS_SAVE_FAILED_EVENT, loadFacets, pullFacets, subscribeFacets } from './facet-catalog.ts'
 import { FilterQueryMenu, SortQueryMenu } from './query-menus.tsx'
 import {
   collectQueryFields,
@@ -764,6 +764,15 @@ export function CollectionBrowser({
   const viewsRef = useRef<SavedView[]>([])
   const viewsWriteGenRef = useRef(new Map<string, number>())
   const [viewsSaveError, setViewsSaveError] = useState('')
+  const [facetsSaveError, setFacetsSaveError] = useState('')
+  useEffect(() => {
+    const onFailed = (event: Event) => {
+      const detail = (event as CustomEvent<{ error?: string }>).detail
+      setFacetsSaveError(String(detail?.error || '保存失败'))
+    }
+    window.addEventListener(FACETS_SAVE_FAILED_EVENT, onFailed)
+    return () => window.removeEventListener(FACETS_SAVE_FAILED_EVENT, onFailed)
+  }, [])
   const skipPersistGen = useRef(0)
   const activeViewIdRef = useRef<string | null>(null)
   const syncViewsRef = useRef<() => Promise<void>>(async () => {})
@@ -3443,6 +3452,14 @@ export function CollectionBrowser({
               <div className="fsdb-views-error" role="alert" title={viewsSaveError}>
                 <span>视图没有保存成功，已恢复为上一次的状态。</span>
                 <button type="button" onClick={() => setViewsSaveError('')}>
+                  知道了
+                </button>
+              </div>
+            ) : null}
+            {facetsSaveError ? (
+              <div className="fsdb-views-error" role="alert" title={facetsSaveError}>
+                <span>标签 / 属性没有保存成功，已恢复为上一次的状态。</span>
+                <button type="button" onClick={() => setFacetsSaveError('')}>
                   知道了
                 </button>
               </div>

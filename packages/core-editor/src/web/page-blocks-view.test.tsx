@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { Context } from 'cordis'
 import { PageEditorService } from './service.ts'
-import { parsePageBlockRowData, PageBlocksView, PageBlockContent, openSourcePage, openBlockInInspector, pageLabelOf, pageNameFromRecord, mergeLiveBlockData, persistBlockDataPatch } from './page-blocks-view.tsx'
+import { parsePageBlockRowData, PageBlocksView, PageBlockContent, PageBlockStage, openSourcePage, openBlockInInspector, pageLabelOf, pageNameFromRecord, mergeLiveBlockData, persistBlockDataPatch } from './page-blocks-view.tsx'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -135,4 +135,47 @@ test('page-block detail content paints the registered View', () => {
   )
   assert.ok(container.querySelector('[data-testid="page-blocks-detail"]'))
   assert.equal(container.querySelector('[data-testid="html-detail"]')?.textContent, '<i>detail</i>')
+})
+
+test('block data that fails to save rolls back and tells the user', async () => {
+  const ctx = new Context()
+  new PageEditorService(ctx)
+  ctx.pageEditor.registerBlock({
+    kind: 'counter',
+    plugin: 'counter-block',
+    label: '计数',
+    View: ({ data, update }) => (
+      <button type="button" data-testid="counter" onClick={() => update({ n: Number(data.n ?? 0) + 1 })}>
+        {String(data.n ?? 0)}
+      </button>
+    ),
+  })
+  vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, statusText: 'Forbidden', json: async () => ({ error: '只读成员' }) })))
+  const { container, findByRole } = render(
+    <PageBlockStage row={{ id: 'p1::c1', title: '计数', blockKind: 'counter', plugin: 'counter-block', data: '{"n":1}' }} />,
+  )
+  const button = () => container.querySelector('[data-testid="counter"]') as HTMLButtonElement
+  assert.equal(button().textContent, '1')
+  fireEvent.click(button())
+  assert.equal(button().textContent, '2')
+  const alert = await findByRole('alert')
+  assert.match(alert.textContent ?? '', /只读成员/)
+  assert.equal(button().textContent, '1')
+})
+
+test('block title that fails to save goes back to the stored title', async () => {
+  const ctx = new Context()
+  new PageEditorService(ctx)
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo) => {
+    if (String(input).includes('/api/db/update')) return { ok: false, statusText: 'Forbidden', json: async () => ({ error: '只读成员' }) }
+    return { ok: true, json: async () => ({}) }
+  }))
+  const { container, findByRole } = render(
+    <PageBlocksView path="/page-blocks" rows={[{ id: 'p1::a1', title: '刊头', blockKind: 'html', data: '{}' }]} onOpen={() => {}} />,
+  )
+  const title = container.querySelector('[data-testid="page-blocks-view-title"]') as HTMLInputElement
+  fireEvent.change(title, { target: { value: '新刊头' } })
+  fireEvent.blur(title)
+  assert.match((await findByRole('alert')).textContent ?? '', /只读成员/)
+  assert.equal((container.querySelector('[data-testid="page-blocks-view-title"]') as HTMLInputElement).value, '刊头')
 })

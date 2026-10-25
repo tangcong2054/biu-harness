@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   ArrowPathIcon,
   BoltIcon,
@@ -202,23 +202,43 @@ export function ScriptPane({ record }: FsDetailPaneProps) {
   const [mode, setMode] = useState(() => inferTriggerMode(trigger.cron ?? ''))
   const [fields, setFields] = useState(() => spawnCronFields(trigger.cron ?? ''))
   const [addOpen, setAddOpen] = useState(false)
+  const [saveError, setSaveError] = useState('')
+  // 数字输入是非受控的（defaultValue），回滚时靠换 key 让它们重新挂载。
+  const [resetTick, setResetTick] = useState(0)
+  const writeGen = useRef(0)
 
-  useEffect(() => {
+  /** 回到服务端最后一次确认的状态（record 就是它）。 */
+  const resetFromRecord = () => {
     setEnabled(Boolean(trigger.enabled))
     setCron(trigger.cron ?? '')
     setAt(trigger.at ? formatDueInput(trigger.at) : '')
     setOn(Array.isArray(trigger.on) ? trigger.on : [])
     setMode(inferTriggerMode(trigger.cron ?? ''))
     setFields(spawnCronFields(trigger.cron ?? ''))
+  }
+
+  useEffect(() => {
+    resetFromRecord()
     setAddOpen(false)
+    setSaveError('')
   }, [record.id, record.updatedAt])
 
-  const save = (patch: Record<string, unknown>) => void patchRecord(record.id, { trigger: patch })
+  /** 先改界面再保存；保存失败且期间没有更新的写入时，回滚并提示。 */
+  const save = (patch: Record<string, unknown>) => {
+    const gen = ++writeGen.current
+    setSaveError('')
+    void patchRecord(record.id, { trigger: patch }).catch((error: unknown) => {
+      if (gen !== writeGen.current) return
+      resetFromRecord()
+      setResetTick((tick) => tick + 1)
+      setSaveError(error instanceof Error ? error.message : String(error))
+    })
+  }
   const hasAuto = Boolean(cron || at || on.length)
   const show = enabled || hasAuto
 
   return (
-    <div className="tasks-detail-pane">
+    <div className="tasks-detail-pane" key={resetTick}>
       <div className="tasks-field tasks-l-field tasks-automation">
         <div className="tasks-auto-head">
           <span className="tasks-auto-title">
@@ -239,6 +259,11 @@ export function ScriptPane({ record }: FsDetailPaneProps) {
             </span>
           </label>
         </div>
+        {saveError ? (
+          <div className="tasks-auto-error" role="alert">
+            自动触发没有保存成功，已恢复为上一次的设置：{saveError}
+          </div>
+        ) : null}
         {show ? (
           <>
             <div className="tasks-auto-summary">

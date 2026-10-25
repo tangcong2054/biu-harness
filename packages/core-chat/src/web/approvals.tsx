@@ -37,6 +37,11 @@ type ContextEstimate = {
   ratio: number
 }
 
+async function responseError(res: Response) {
+  const data = (await res.json().catch(() => null)) as { error?: unknown } | null
+  return typeof data?.error === 'string' && data.error ? data.error : `HTTP ${res.status}`
+}
+
 function parseContextEstimate(data: unknown): ContextEstimate | null {
   const raw = data as { estimatedTokens?: unknown; contextWindowTokens?: unknown } | null
   const num = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null)
@@ -225,6 +230,7 @@ export function ApprovalsRail(props: SlotProps) {
   const [agentMode, setAgentMode] = useState<AgentMode>('standard')
   const [modeBusy, setModeBusy] = useState(false)
   const [clearBusy, setClearBusy] = useState(false)
+  const [actionError, setActionError] = useState('')
   const [agentMenuOpen, setAgentMenuOpen] = useState(false)
   const [approvalMenuOpen, setApprovalMenuOpen] = useState(false)
   const agentMenuRef = useRef<HTMLDivElement>(null)
@@ -270,15 +276,21 @@ export function ApprovalsRail(props: SlotProps) {
   async function setMode(next: AgentMode) {
     if (next === agentMode || modeBusy) return
     setModeBusy(true)
+    setActionError('')
     try {
       const res = await fetch('/api/chat/config', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ agentMode: next }),
       })
-      if (!res.ok) return
+      if (!res.ok) {
+        setActionError(`Agent 模式没有切换成功：${await responseError(res)}`)
+        return
+      }
       const data = (await res.json()) as { agentMode?: string }
       setAgentMode(parseAgentMode(data.agentMode))
+    } catch (error) {
+      setActionError(`Agent 模式没有切换成功：${error instanceof Error ? error.message : String(error)}`)
     } finally {
       setModeBusy(false)
     }
@@ -290,11 +302,17 @@ export function ApprovalsRail(props: SlotProps) {
     
     if (!sessionId || clearBusy) return
     setClearBusy(true)
+    setActionError('')
     try {
       const res = await fetch(`/api/sessions/${sessionId}/clear-context`, { method: 'POST' })
-      if (!res.ok) return
+      if (!res.ok) {
+        setActionError(`上下文没有清空：${await responseError(res)}`)
+        return
+      }
       // 后台校对拉取最新事件，使新插入的日志记录立即出现在会话视图中。
       await sessionView.load(sessionId, { view: 'chat', wait: false })
+    } catch (error) {
+      setActionError(`上下文没有清空：${error instanceof Error ? error.message : String(error)}`)
     } finally {
       setClearBusy(false)
     }
@@ -302,6 +320,12 @@ export function ApprovalsRail(props: SlotProps) {
 
   return (
     <div className="w-full space-y-2">
+      {actionError ? (
+        <div className="dock-action-error" role="alert" data-testid="dock-action-error">
+          <span>{actionError}</span>
+          <button type="button" onClick={() => setActionError('')}>知道了</button>
+        </div>
+      ) : null}
       {approvals.length ? (
         <div className="dock-approval-hint" role="status">
           {approvals.map((item) => (

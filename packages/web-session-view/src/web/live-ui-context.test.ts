@@ -1,6 +1,16 @@
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
-import { captureLiveUiContext } from './live-ui-context.ts'
+import { captureLiveUiContext, focusFromRoute } from './live-ui-context.ts'
+
+test('focusFromRoute keeps record ids that start with a slash', () => {
+  const blockId = '/pages::p1::b1'
+  assert.equal(
+    focusFromRoute(`/database/${encodeURIComponent('/page-blocks')}/record/${encodeURIComponent(blockId)}`).path,
+    '/page-blocks//pages::p1::b1',
+  )
+  assert.equal(focusFromRoute(`/database/${encodeURIComponent('/pages')}/record/p1`).path, '/pages/p1')
+  assert.equal(focusFromRoute('/somewhere/else').path, undefined)
+})
 
 test('captureLiveUiContext snapshots the main session', () => {
   const live = captureLiveUiContext({

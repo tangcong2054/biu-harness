@@ -25,7 +25,7 @@ import { chromeIcon } from './chrome-icon.ts'
 import { applyNoticeClick, noticeIdOf } from './notice-open.ts'
 import { readMainDataRoute } from '@biu/core-file-system/main-data-route'
 import { persistTheme, readTheme, type ThemeMode } from './theme.ts'
-import { persistWorkspaceProfile, useWorkspaceProfile } from '@biu/public-ui'
+import { persistWorkspaceProfile, readWorkspaceProfile, useWorkspaceProfile } from '@biu/public-ui'
 import { LayoutPrefsMenu } from '@biu/core-file-system/layout-prefs-menu'
 import { getPagePrefs, hydratePagePrefs, subscribePageWidth } from '@biu/core-file-system/page-width'
 
@@ -77,7 +77,16 @@ async function readAvatarFile(file: File) {
 function WorkspaceMemberProfile() {
   const profile = useWorkspaceProfile()
   const [name, setName] = useState(profile.name)
+  const [saveError, setSaveError] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
+  /** 保存失败时资料已回滚；这里把名字输入框也拉回去并说明原因。 */
+  const saveProfile = (next: { name: string; avatar: string }) => {
+    setSaveError('')
+    void persistWorkspaceProfile(next).catch((error: unknown) => {
+      setName(readWorkspaceProfile().name)
+      setSaveError(error instanceof Error ? error.message : String(error))
+    })
+  }
 
   useEffect(() => {
     setName(profile.name)
@@ -91,6 +100,11 @@ function WorkspaceMemberProfile() {
         <p className="settings-muted settings-account-lead">
           头像和空间昵称只用于当前空间，不会修改全局账号。
         </p>
+        {saveError ? (
+          <p className="settings-account-error" role="alert" data-testid="settings-account-error">
+            资料没有保存成功，已恢复为修改前：{saveError}
+          </p>
+        ) : null}
       </header>
       <div className="settings-account-row">
         <div className="settings-account-copy">
@@ -120,7 +134,7 @@ function WorkspaceMemberProfile() {
               type="button"
               className="settings-account-clear"
               data-testid="settings-account-clear-avatar"
-              onClick={() => void persistWorkspaceProfile({ name: name.trim(), avatar: '' })}
+              onClick={() => saveProfile({ name: name.trim(), avatar: '' })}
             >
               移除
             </button>
@@ -137,7 +151,7 @@ function WorkspaceMemberProfile() {
             event.target.value = ''
             if (!file) return
             void readAvatarFile(file).then((avatar) => {
-              void persistWorkspaceProfile({ name: name.trim(), avatar })
+              saveProfile({ name: name.trim(), avatar })
             })
           }}
         />
@@ -158,7 +172,7 @@ function WorkspaceMemberProfile() {
           data-testid="settings-account-name"
           onChange={(event) => setName(event.target.value)}
           onBlur={() => {
-            void persistWorkspaceProfile({ name: name.trim(), avatar: profile.avatar })
+            saveProfile({ name: name.trim(), avatar: profile.avatar })
           }}
           onKeyDown={(event) => {
             if (event.key === 'Enter') event.currentTarget.blur()
@@ -460,8 +474,10 @@ export function ShellSettingsAccount() {
                     type="button"
                     className="settings-account-action"
                     onClick={() => {
+                      setMessage('')
                       void accountFetch(token, `/api/account/sessions/${encodeURIComponent(String(session.id))}`, { method: 'DELETE' })
                         .then(loadSessions)
+                        .catch((error) => setMessage(`没有退出这台设备：${error instanceof Error ? error.message : String(error)}`))
                     }}
                   >
                     移除
@@ -891,6 +907,7 @@ export function ShellWorkspaceSwitcher({ onWorkspaceSettings }: { onWorkspaceSet
   const [creating, setCreating] = useState(false)
   const [creatingLocation, setCreatingLocation] = useState<'device' | 'cloud' | null>(null)
   const [createError, setCreateError] = useState('')
+  const [cloudError, setCloudError] = useState('')
   const [localAccount, setLocalAccount] = useState('')
   const [hostOnline, setHostOnline] = useState(false)
   const [cloudAccounts, setCloudAccounts] = useState<Array<{ id: string; email?: string; name?: string; origin?: string; active?: boolean }>>([])
@@ -1053,6 +1070,7 @@ export function ShellWorkspaceSwitcher({ onWorkspaceSettings }: { onWorkspaceSet
               <span>{hostOnline && creatingLocation ? '正在创建…' : '创建新空间'}</span>
             </button>
             {hostOnline && createError ? <p className="shell-workspace-create-error" role="alert">{createError}</p> : null}
+            {cloudError ? <p className="shell-workspace-create-error" role="alert" data-testid="shell-workspace-cloud-error">{cloudError}</p> : null}
             <button
               type="button"
               className="shell-workspace-menu-action"
@@ -1106,9 +1124,10 @@ export function ShellWorkspaceSwitcher({ onWorkspaceSettings }: { onWorkspaceSet
                       return
                     }
                     const token = readAccountToken()
+                    setCloudError('')
                     void accountFetch(token, '/api/account/cloud', { method: 'DELETE' })
                       .then(() => window.dispatchEvent(new Event(ACCOUNT_EVENT)))
-                      .catch(() => undefined)
+                      .catch((error) => setCloudError(`没有退出在线账号：${error instanceof Error ? error.message : String(error)}`))
                   }}
                 >
                   <ArrowRightStartOnRectangleIcon aria-hidden />
@@ -1149,6 +1168,7 @@ export function ShellWorkspaceSwitcher({ onWorkspaceSettings }: { onWorkspaceSet
               className={`shell-workspace-menu-item${item.active ? ' is-active' : ''}`}
               onClick={() => {
                 const token = readAccountToken()
+                setCloudError('')
                 void accountFetch(token, '/api/account/cloud/active', {
                   method: 'POST',
                   body: JSON.stringify({ remoteAccountId: item.id, origin: item.origin }),
@@ -1157,7 +1177,7 @@ export function ShellWorkspaceSwitcher({ onWorkspaceSettings }: { onWorkspaceSet
                     setCloudMenuOpen(false)
                     window.dispatchEvent(new Event(ACCOUNT_EVENT))
                   })
-                  .catch(() => undefined)
+                  .catch((error) => setCloudError(`没有切换到这个在线账号：${error instanceof Error ? error.message : String(error)}`))
               }}
             >
               <CloudIcon aria-hidden className="shell-workspace-menu-icon" />

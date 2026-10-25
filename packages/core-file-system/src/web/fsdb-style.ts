@@ -461,6 +461,7 @@ const CSS = `
 .fsdb-banner-mine{position:relative;min-width:0}
 .fsdb-banner-mine-del{position:absolute;top:4px;right:4px;z-index:2;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;margin:0;border:0;border-radius:6px;padding:0;background:rgba(0,0,0,.55);color:#F0EFED;opacity:0;cursor:pointer}
 .fsdb-banner-mine:hover .fsdb-banner-mine-del,.fsdb-banner-mine:focus-within .fsdb-banner-mine-del{opacity:1}
+.fsdb-banner-mine-error{margin:0 0 6px;font-size:12px;color:var(--dsw-danger,#c0392b)}
 .fsdb-banner-mine-del:hover{background:rgba(0,0,0,.78)}
 .fsdb-banner-create{display:flex;align-items:center;justify-content:center;height:56px;border:1px dashed var(--dsw-border)!important;color:var(--dsw-label-2)!important;text-align:center;line-height:1.3}
 .fsdb-tag-collect{display:flex;flex:none;min-width:0;width:100%;min-height:320px}

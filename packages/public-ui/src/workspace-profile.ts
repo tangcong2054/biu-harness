@@ -74,12 +74,20 @@ export async function hydrateWorkspaceProfile() {
   }
 }
 
+let profileWriteGen = 0
+
+/**
+ * 先切界面再保存。网络错误或非 2xx（无权限、会话过期）时，若期间没有更新的写入，
+ * 回滚到修改前的资料并抛出，调用方据此提示——不能让界面显示「已保存」而服务端还是旧值。
+ */
 export async function persistWorkspaceProfile(next: WorkspaceProfile) {
+  const previous = readWorkspaceProfile()
   const saved = writeWorkspaceProfile(next)
   const token = accountToken()
   if (!token) return saved
+  const gen = ++profileWriteGen
   try {
-    await fetch('/api/account/workspace-profile', {
+    const res = await fetch('/api/account/workspace-profile', {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -87,8 +95,13 @@ export async function persistWorkspaceProfile(next: WorkspaceProfile) {
       },
       body: JSON.stringify(saved),
     })
-  } catch {
-    /* memory copy is enough for this session */
+    if (!res.ok) {
+      const data = (await res.json().catch(() => null)) as { error?: unknown } | null
+      throw new Error(typeof data?.error === 'string' && data.error ? data.error : `HTTP ${res.status}`)
+    }
+  } catch (error) {
+    if (gen === profileWriteGen) writeWorkspaceProfile(previous)
+    throw error instanceof Error ? error : new Error(String(error))
   }
   return saved
 }

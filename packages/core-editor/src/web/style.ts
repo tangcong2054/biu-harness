@@ -33,6 +33,8 @@ export const PAGE_EDITOR_STYLE = `
 .page-editor .page-block.ProseMirror-selectednode{outline:none;box-shadow:none}
 .page-editor .ProseMirror[contenteditable=false] .ProseMirror-selectednode{outline:none;box-shadow:none;background:transparent}
 .page-editor .page-block[data-page-block=excalidraw]{outline:none;box-shadow:none;border:0;border-radius:8px}
+.page-block-save-error{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 8px;padding:6px 10px;border-radius:8px;font-size:12px;color:var(--dsw-danger,#c0392b);background:color-mix(in srgb,var(--dsw-danger,#c0392b) 10%,transparent)}
+.page-block-save-error button{flex:none;border:0;background:transparent;color:inherit;font:inherit;cursor:pointer;text-decoration:underline}
 .page-editor .page-block-missing{display:flex;flex-direction:column;gap:0;padding:12px 14px;border:1px dashed var(--dsw-border);border-radius:8px;color:var(--dsw-label-3);font-size:13px}
 .page-editor .page-block-missing-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 0 10px;margin:0 0 10px;border-bottom:1px solid var(--dsw-border)}
 .page-editor .page-block-missing-id{font-family:var(--font-mono);font-weight:600;color:var(--dsw-label)}

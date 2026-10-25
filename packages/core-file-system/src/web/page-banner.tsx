@@ -265,6 +265,7 @@ function BannerGallery({
 }) {
   const [mine, setMine] = useState<GalleryItem[]>([])
   const [mineTick, setMineTick] = useState(0)
+  const [mineError, setMineError] = useState('')
   const hideTip = useRef(0)
   const [tip, setTip] = useState<{
     title: string
@@ -348,6 +349,7 @@ function BannerGallery({
         })}
         <section className="fsdb-banner-pop-sec">
           <h3>我的</h3>
+          {mineError ? <p className="fsdb-banner-mine-error" role="alert">{mineError}</p> : null}
           <div className="fsdb-banner-pop-grid">
             {mineOfTab.map((item) => (
               <div key={item.id} className="fsdb-banner-mine">
@@ -370,6 +372,7 @@ function BannerGallery({
                   onClick={(event) => {
                     event.preventDefault()
                     event.stopPropagation()
+                    setMineError('')
                     void readJson<{ ok?: boolean }>('/api/db/banner-gallery', {
                       method: 'POST',
                       headers: { 'content-type': 'application/json' },
@@ -377,6 +380,8 @@ function BannerGallery({
                     }).then(() => {
                       setMine((prev) => prev.filter((entry) => entry.id !== item.id))
                       setMineTick((n) => n + 1)
+                    }).catch((error: unknown) => {
+                      setMineError(`背景没有删除：${error instanceof Error ? error.message : String(error)}`)
                     })
                   }}
                 >

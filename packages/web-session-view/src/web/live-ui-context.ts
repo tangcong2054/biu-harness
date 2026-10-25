@@ -45,13 +45,15 @@ function inspectorTabLabelFromDom(tabId?: string) {
   return leaf || undefined
 }
 
-function focusFromRoute(pathname?: string) {
+export function focusFromRoute(pathname?: string) {
   if (!pathname) return {}
   const match = pathname.match(DATABASE_RECORD)
   if (!match?.[1] || !match[2]) return {}
   const collection = decodeCollectionSeg(match[1])
   const recordId = decodeURIComponent(match[2])
-  const path = `${collection.replace(/\/$/, '')}/${recordId}`.replace(/\/{2,}/g, '/')
+  // 只去掉集合名末尾的斜杠；记录 id 可能自带前导斜杠（页面块 `/pages::p1::b1`），
+  // 压缩连续斜杠会让 Agent 拿到一条不存在的焦点路径。
+  const path = `${collection.replace(/\/+$/, '')}/${recordId}`
   return { path, title: undefined as string | undefined }
 }
 

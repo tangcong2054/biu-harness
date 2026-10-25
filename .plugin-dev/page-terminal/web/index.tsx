@@ -1119,6 +1119,7 @@ function SettingsPanel({ onClose }: { onClose: () => void }) {
   const [state, setState] = React2.useState<{
     loading: boolean
     error?: string
+    saveError?: string
     settings?: Record<string, number>
     limits?: Record<string, { min: number; max: number }>
     sessions?: number
@@ -1147,17 +1148,30 @@ function SettingsPanel({ onClose }: { onClose: () => void }) {
     return () => window.removeEventListener('keydown', onKey, true)
   }, [onClose])
 
+  const writeGen = React2.useRef(0)
+  /** 先改界面再保存；失败（含非 2xx）时回到保存前的值并提示，不能把错误响应当成新设置。 */
   const patch = (key: string, value: number) => {
-    setState((cur) => ({ ...cur, settings: { ...(cur.settings ?? {}), [key]: value } }))
+    const previous = state.settings
+    const gen = ++writeGen.current
+    setState((cur) => ({ ...cur, saveError: undefined, settings: { ...(cur.settings ?? {}), [key]: value } }))
     fetch('/api/page-terminal/settings', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ [key]: value }),
     })
-      .then((res) => res.json())
+      .then(async (res) => {
+        const data = (await res.json().catch(() => null)) as { settings?: Record<string, number>; sessions?: number; error?: string } | null
+        if (!res.ok || !data?.settings) throw new Error(data?.error || `HTTP ${res.status}`)
+        return data
+      })
       .then((data) => setState((cur) => ({ ...cur, settings: data.settings, sessions: data.sessions })))
-      .catch(() => {
-        // 忽略：下次打开会重读。
+      .catch((error: unknown) => {
+        if (gen !== writeGen.current) return
+        setState((cur) => ({
+          ...cur,
+          settings: previous,
+          saveError: error instanceof Error ? error.message : String(error),
+        }))
       })
   }
 
@@ -1230,6 +1244,9 @@ function SettingsPanel({ onClose }: { onClose: () => void }) {
           <span style={{ color: 'var(--dsw-label-3, rgba(242,241,237,0.45))' }}>{state.sessions} 个后台会话</span>
         ) : null}
       </div>
+      {state.saveError ? (
+        <div role="alert" style={{ padding: '4px 0', color: '#ff6369' }}>没有保存，已恢复：{state.saveError}</div>
+      ) : null}
       {state.error ? (
         <div style={{ padding: '6px 0', color: '#ff6369' }}>读取失败：{state.error}</div>
       ) : (
