@@ -3,6 +3,9 @@ import { TAG_TONE_ROSE } from '@biu/public-ui'
 export const PAGE_EDITOR_STYLE = `
 .page-editor{position:relative;overflow:visible;min-width:0;width:100%;padding:6px 0 48px;padding-left:0;color:var(--dsw-label);font-family:var(--font-sans);font-size:var(--fsdb-body-size,15px);line-height:var(--fsdb-body-leading,1.7);letter-spacing:-.003em}
 .page-editor.is-source{font-family:var(--font-mono);font-size:14px;letter-spacing:0}
+.page-editor-upload-error{position:sticky;top:8px;z-index:5;display:flex;align-items:center;gap:8px;margin:0 0 8px;padding:6px 10px;border:1px solid color-mix(in srgb,var(--dsw-danger,#b42318) 35%,transparent);border-radius:8px;background:color-mix(in srgb,var(--dsw-danger,#b42318) 8%,var(--dsw-bg,#fff));color:var(--dsw-danger,#b42318);font-size:13px;line-height:1.5}
+.page-editor-upload-error span{flex:1;min-width:0}
+.page-editor-upload-error button{flex:none;border:0;background:transparent;color:inherit;font-size:16px;line-height:1;cursor:pointer;padding:0 2px}
 .page-source{min-width:0;width:100%}
 .page-source .cm-editor{background:transparent}
 .page-source .cm-focused{outline:none}

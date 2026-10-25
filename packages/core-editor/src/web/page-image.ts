@@ -59,23 +59,90 @@ export async function uploadPageImage(file: File, resourcePath?: string) {
   return body.href || `/api/db/file/${encodeURIComponent(name)}`
 }
 
-function insertSrc(editor: Editor, src: string, pos: number) {
-  if (editor.isDestroyed || !src) return
-  editor.chain().focus().insertContentAt(pos, { type: 'image', attrs: { src, alt: '' } }).run()
+/**
+ * 一次事务插入多张图：顺序由 fragment 保证。
+ * 不能逐张 insertContentAt(at++)：图片是块级节点，插在文本块内部会劈开段落，
+ * 实际落点比 at 大 1，手算 +1 会让下一张插到上一张之前（顺序反转）。
+ * insertContentAt 解析成功即返回 true，放不下时 ProseMirror 静默 no-op，
+ * 所以用文档实际变化判断是否真的插进去了。
+ */
+function insertImages(editor: Editor, srcList: string[], pos: number) {
+  if (editor.isDestroyed || !srcList.length) return false
+  const at = Math.min(Math.max(0, pos), editor.state.doc.content.size)
+  const before = editor.state.doc.content.size
+  editor
+    .chain()
+    .focus()
+    .insertContentAt(at, srcList.map((src) => ({ type: 'image', attrs: { src, alt: '' } })))
+    .run()
+  return editor.state.doc.content.size > before
 }
 
+export type ImageUploadFailure = { name: string; error: string }
+
+/** 上传失败的提示由编辑器组件订阅；这里只负责报告，不碰 UI。 */
+const uploadFailureHandlers = new WeakMap<Editor, (failures: ImageUploadFailure[]) => void>()
+
+export function onImageUploadFailure(editor: Editor, handler: ((failures: ImageUploadFailure[]) => void) | undefined) {
+  if (handler) uploadFailureHandlers.set(editor, handler)
+  else uploadFailureHandlers.delete(editor)
+}
+
+const UPLOAD_CONCURRENCY = 4
+
+function reportFailures(editor: Editor, failures: ImageUploadFailure[]) {
+  if (!failures.length) return
+  const handler = uploadFailureHandlers.get(editor)
+  if (handler) handler(failures)
+  else console.warn('[page-image] 图片上传失败', failures)
+}
+
+/** 并发上传（最多 4 张同时），按原顺序一次插入成功的图片；失败的汇总后通知编辑器。 */
 export async function insertClipboardImages(editor: Editor, files: File[], pos: number) {
-  let at = pos
-  for (const file of files) {
-    try {
-      const src = await uploadPageImage(file, editorResourcePath(editor))
-      if (editor.isDestroyed) return
-      insertSrc(editor, src, at)
-      at += 1
-    } catch {
-      /* skip failed upload */
+  const resourcePath = editorResourcePath(editor)
+  const results: Array<{ src: string } | { error: string }> = new Array(files.length)
+  let next = 0
+  const worker = async () => {
+    while (next < files.length) {
+      const index = next++
+      try {
+        results[index] = { src: await uploadPageImage(files[index]!, resourcePath) }
+      } catch (error) {
+        results[index] = { error: error instanceof Error ? error.message : String(error) }
+      }
     }
   }
+  await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, files.length) }, worker))
+  const failures: ImageUploadFailure[] = []
+  const uploaded: string[] = []
+  results.forEach((result, index) => {
+    const name = files[index]?.name || `图片 ${index + 1}`
+    if ('src' in result) uploaded.push(result.src)
+    else failures.push({ name, error: result.error || '上传失败' })
+  })
+  if (editor.isDestroyed) {
+    // 编辑器已销毁：插不进去了，但失败仍要留痕，避免彻底静默。
+    if (failures.length) console.warn('[page-image] 编辑器已关闭，图片上传失败', failures)
+    return { inserted: 0, failures }
+  }
+  const ok = insertImages(editor, uploaded, pos)
+  if (!ok && uploaded.length) {
+    // 落点放不下块级图片（代码块、表格单元格等）：上传成功但正文没变，仍按失败提示。
+    results.forEach((result, index) => {
+      if ('src' in result) failures.push({ name: files[index]?.name || `图片 ${index + 1}`, error: '当前位置无法插入图片' })
+    })
+  }
+  reportFailures(editor, failures)
+  return { inserted: ok ? uploaded.length : 0, failures }
+}
+
+export function imageUploadFailureText(failures: ImageUploadFailure[]) {
+  if (!failures.length) return ''
+  const first = failures[0]!
+  const reason = first.error ? `：${first.error}` : ''
+  return failures.length === 1
+    ? `图片「${first.name}」上传失败${reason}`
+    : `${failures.length} 张图片上传失败（如「${first.name}」${reason}）`
 }
 
 export function stripPastedDataImages(html: string) {

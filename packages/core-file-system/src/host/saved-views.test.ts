@@ -189,3 +189,97 @@ test('parseViewColumnsInput accepts arrays and JSON strings but not JSON fragmen
   assert.throws(() => parseViewColumnsInput('["title",'), /字符串数组/)
   assert.throws(() => parseViewColumnsInput('title"]'), /字符串数组/)
 })
+
+test('同一毫秒批量新建视图不撞 id；任一行不合法时整批不写入', async () => {
+  const store = new SavedViewsStore()
+  const tables = () => [{ path: '/tasks', id: 'tasks', kind: 'collection' as const, label: 'Task', view: { moduleId: 'tasks', route: '/tasks', title: 'Task' } }]
+  const spec = viewsCollection(store, tables)
+  const realNow = Date.now
+  Date.now = () => 1_700_000_000_000
+  try {
+    const created = await spec.create!([
+      { tablePath: '/tasks', title: 'A' },
+      { tablePath: '/tasks', title: 'B' },
+      { tablePath: '/tasks', title: 'C' },
+    ])
+    const ids = created.map((row) => String(row.viewId))
+    assert.equal(new Set(ids).size, 3)
+    assert.deepEqual(ids, ['1700000000000', '1700000000001', '1700000000002'])
+
+    await assert.rejects(
+      async () => spec.create!([{ tablePath: '/tasks', title: 'D' }, { tablePath: '/missing', title: 'E' }]),
+      /unknown collection/,
+    )
+    await assert.rejects(
+      async () => spec.create!([{ tablePath: '/tasks', viewId: 'dup' }, { tablePath: '/tasks', viewId: 'dup' }]),
+      /view exists: dup/,
+    )
+    const titles = (await spec.list()).filter((row) => row.tablePath === '/tasks' && !String(row.viewId).startsWith('__')).map((row) => row.title)
+    assert.deepEqual(titles.filter((t) => t !== '全部Task').sort(), ['A', 'B', 'C'])
+  } finally {
+    Date.now = realNow
+  }
+})
+
+test('批量删除视图遇到不存在的 id 时一个都不删', async () => {
+  const store = new SavedViewsStore()
+  store.replace('/tasks', [
+    { id: 'v1', name: 'V1', mode: 'table', sortField: 'id', sortDir: 'asc', filters: {}, columns: [], query: '' },
+    { id: 'v2', name: 'V2', mode: 'table', sortField: 'id', sortDir: 'asc', filters: {}, columns: [], query: '' },
+  ])
+  const spec = viewsCollection(store, () => [{ path: '/tasks', id: 'tasks', kind: 'collection', label: 'Task', view: { moduleId: 'tasks', route: '/tasks', title: 'Task' } }])
+  await assert.rejects(async () => spec.remove!({ ids: ['tasks::v1', 'tasks::nope'] }), /unknown view: tasks::nope/)
+  assert.deepEqual(store.viewsFor('/tasks').map((view) => view.id).filter((id) => !id.startsWith('__')), ['v1', 'v2'])
+  assert.deepEqual(await spec.remove!({ ids: ['tasks::v1', 'tasks::v2'] }), ['tasks::v1', 'tasks::v2'])
+  assert.deepEqual(store.viewsFor('/tasks').map((view) => view.id).filter((id) => !id.startsWith('__')), [])
+})
+
+test('跨表批量新建落盘失败时，内存与磁盘一起回滚', async () => {
+  const store = new SavedViewsStore().open(':memory:')
+  const tables = () => [
+    { path: '/tasks', id: 'tasks', kind: 'collection' as const, label: 'Task', view: { moduleId: 'tasks', route: '/tasks', title: 'Task' } },
+    { path: '/notes', id: 'notes', kind: 'collection' as const, label: 'Note', view: { moduleId: 'notes', route: '/notes', title: 'Note' } },
+  ]
+  const spec = viewsCollection(store, tables)
+  const inner = store as unknown as { db: { exec: (sql: string) => void } }
+  const realExec = inner.db.exec.bind(inner.db)
+  let fail = false
+  inner.db.exec = (sql: string) => {
+    if (fail && sql === 'COMMIT') throw new Error('disk full')
+    realExec(sql)
+  }
+  try {
+    fail = true
+    await assert.rejects(
+      async () => spec.create!([{ tablePath: '/tasks', title: 'A' }, { tablePath: '/notes', title: 'B' }]),
+      /disk full/,
+    )
+  } finally {
+    inner.db.exec = realExec
+  }
+  assert.deepEqual(store.viewsFor('/tasks'), [])
+  assert.deepEqual(store.viewsFor('/notes'), [])
+  const titles = (await spec.list()).map((row) => row.title)
+  assert.deepEqual(titles.filter((item) => item === 'A' || item === 'B'), [])
+})
+
+test('索引表上没有归属的历史视图可见也可删', async () => {
+  const store = new SavedViewsStore()
+  store.replace('/facets', [
+    { id: 'legacy', name: '历史视图', mode: 'table', sortField: 'id', sortDir: 'asc', filters: {}, columns: [], query: '' },
+    { id: 'mine', name: '我的', mode: 'table', sortField: 'id', sortDir: 'asc', filters: {}, columns: [], query: '', createdBy: 'acc_1' },
+    { id: 'others', name: '别人的', mode: 'table', sortField: 'id', sortDir: 'asc', filters: {}, columns: [], query: '', createdBy: 'acc_2' },
+  ] as never)
+  assert.deepEqual(store.viewsFor('/facets', 'acc_1').map((view) => view.id), ['legacy', 'mine'])
+  const spec = viewsCollection(
+    store,
+    () => [{ path: '/facets', id: 'facets', kind: 'collection', label: '合集', view: { moduleId: 'facets', route: '/facets', title: '合集' } }],
+    () => 'acc_1',
+  )
+  const listed = (await spec.list()).map((row) => row.viewId)
+  assert.equal(listed.includes('legacy'), true)
+  assert.equal(listed.includes('others'), false)
+  assert.deepEqual(await spec.remove!({ ids: ['facets::legacy'] }), ['facets::legacy'])
+  assert.deepEqual(store.viewsFor('/facets', 'acc_1').map((view) => view.id), ['mine'])
+  await assert.rejects(async () => spec.remove!({ ids: ['facets::others'] }), /unknown view/)
+})

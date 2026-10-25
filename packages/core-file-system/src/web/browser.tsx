@@ -150,7 +150,7 @@ import { savedViewRecordPath } from '../paths.ts'
 import { findViewNeighbor, indexOnPage } from './view-adjacent.ts'
 import { TABLE_ROW_PX, TABLE_WRAP_ROW_PX, TABLE_WINDOW_OVERSCAN, tableWindowSlice } from './table-window.ts'
 import { markPaintedListReady, rememberPreviewTotal, resetPaintedListReady, viewTotalKey } from './sidebar-preview.ts'
-import { catalogLockFilters, isReadOnlyViewId, mergeTableViews, parseBuiltinScopeViewId, stubBuiltinBlockKindView, viewsForScope, type DataScope } from '../catalog-views.ts'
+import { catalogLockFilters, freshViewId, isReadOnlyViewId, mergeTableViews, parseBuiltinScopeViewId, stubBuiltinBlockKindView, viewsForScope, type DataScope } from '../catalog-views.ts'
 import { SAVED_VIEW_EVENT, showRecordInInspector } from './inspector-db-route.ts'
 import { SchemaChips, SchemaFieldEditor, schemaTagTone } from './schema-field.tsx'
 import { CellPop, cellUsesPop } from './cell-pop.tsx'
@@ -1948,7 +1948,7 @@ export function CollectionBrowser({
         ? viewsForScope(allListed, effectiveScope)
         : allListed
     const view: SavedView = {
-      id: `${Date.now()}`,
+      id: freshViewId([...stored, ...allListed]),
       name: uniqueViewName('新视图', listed),
       mode: 'table',
       sortField: 'title',
@@ -1975,11 +1975,12 @@ export function CollectionBrowser({
   }
 
   function copyView(source?: SavedView) {
+    const id = freshViewId([...views, ...loadViews(collectionPath)])
     commitView(
       source
-        ? { ...source, id: `${Date.now()}`, name: uniqueViewName(`${source.name} 副本`), builtin: false }
+        ? { ...source, id, name: uniqueViewName(`${source.name} 副本`), builtin: false }
         : {
-            id: `${Date.now()}`,
+            id,
             name: uniqueViewName(`${activeView?.name ?? title} 副本`),
             mode,
             sortField,

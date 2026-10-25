@@ -750,11 +750,22 @@ export class PluginStoreService extends Service {
   }
 
   /** 彻底删除：安装产物和沙箱一起删。回收站清空走这条。 */
-  async destroy(id: string) {
+  /** destroy 的前置校验；批量删除时先对全部 id 调用，避免删到一半才报错。 */
+  assertDestroyable(id: string) {
     if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
     if (id === 'platform-operations') throw new Error('不能删除平台运营插件')
     if (this.isBuiltin(id)) throw new Error(`cannot delete built-in plugin: ${id}`)
     if (isOnlineRuntime()) throw new Error('线上不能删除其他账号共用的插件包，请使用卸载')
+    const installed = this.pluginPath(id)
+    const sandbox = this.sandboxPath(id)
+    const present =
+      (isPathInside(this.pluginDir, installed) && existsSync(installed)) ||
+      (isPathInside(this.sandboxDir, sandbox) && existsSync(sandbox))
+    if (!present) throw new Error(`unknown plugin: ${id}`)
+  }
+
+  async destroy(id: string) {
+    this.assertDestroyable(id)
     await this.uninstall(id)
     const installed = this.pluginPath(id)
     if (isPathInside(this.pluginDir, installed) && existsSync(installed)) {

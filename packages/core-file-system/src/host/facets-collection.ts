@@ -167,10 +167,18 @@ export function facetsCollection(
       return fromEntry(pack.id, store.stampCounts()[pack.id] ?? 0)
     },
     remove: (query) => {
-      const ids = query.ids ?? []
-      for (const id of ids) {
+      const ids = [...new Set((query.ids ?? []).map((id) => String(id ?? '').trim()).filter(Boolean))]
+      // 先校验全部，任一不合法时一个都不删。
+      // store.get 按 id 或 label 命中，removeFacet 只按 id，所以要用查到的真实 id 去删，
+      // 否则传 label 时会校验通过、删 0 行，还报成功。
+      const targets = ids.map((id) => {
         if (parseStampRecordId(id)) throw new Error(`cannot delete collected row: ${id}`)
-        if (!store.removeFacet(id)) throw new Error(`unknown 合集: ${id}`)
+        const pack = store.get(id)
+        if (!pack) throw new Error(`unknown 合集: ${id}`)
+        return { id, facetId: pack.id }
+      })
+      for (const { id, facetId } of targets) {
+        if (!store.removeFacet(facetId)) throw new Error(`unknown 合集: ${id}`)
       }
       return ids
     },

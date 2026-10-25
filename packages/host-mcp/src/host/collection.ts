@@ -199,11 +199,7 @@ export function mcpCollection(mcp: McpService): CollectionSpec {
       return out
     },
     update: async (id, patch) => applyPatch(mcp, id, patch),
-    remove: async (query) => {
-      const ids = (query.ids ?? []).filter(Boolean)
-      for (const id of ids) await mcp.remove(id)
-      return ids
-    },
+    remove: async (query) => mcp.removeMany((query.ids ?? []).filter(Boolean)),
     actions: [
       {
         id: 'enable',

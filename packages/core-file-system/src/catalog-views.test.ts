@@ -28,6 +28,7 @@ import {
   stubBuiltinScopeView,
   viewsForScope,
 } from './catalog-views.ts'
+import { freshViewId } from './catalog-views.ts'
 
 test('scoped builtin views preserve their base view and lock data ownership', () => {
   const base = builtinAllView({ path: '/pages', label: '页面' })
@@ -203,4 +204,14 @@ test('each registered page block kind gets a builtin view', () => {
     { blockKind: 'terminal' },
   )
   assert.deepEqual(catalogLockFilters('mine', [{ id: 'mine', builtin: false, filters: { blockKind: 'html' } }]), {})
+})
+
+test('freshViewId 同一毫秒顺延，不与已有视图撞 id', () => {
+  assert.equal(freshViewId([], 100), '100')
+  assert.equal(freshViewId([{ id: '100' }, { id: '101' }], 100), '102')
+})
+
+test('freshViewId 对异常入参也能返回可用 id', () => {
+  assert.match(freshViewId([], Number.NaN), /^\d+$/)
+  assert.match(freshViewId([], 'x' as unknown as number), /^\d+$/)
 })
