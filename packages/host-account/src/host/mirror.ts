@@ -101,9 +101,13 @@ function accountOf(ctx: Context) {
   }
 }
 
-function sessionVisible(ctx: Context, id: string, record?: { id?: unknown }) {
+async function sessionVisible(ctx: Context, id: string, record?: { id?: unknown }) {
   try {
-    const sessions = ctx.get('sessions') as { inWorkspace?: (id: string, record?: { id?: unknown }) => boolean } | undefined
+    const sessions = ctx.get('sessions') as {
+      inWorkspace?: (id: string, record?: { id?: unknown }) => boolean
+      inWorkspaceAsync?: (id: string, record?: { id?: unknown }) => Promise<boolean>
+    } | undefined
+    if (typeof sessions?.inWorkspaceAsync === 'function') return await sessions.inWorkspaceAsync(id, record)
     if (typeof sessions?.inWorkspace === 'function') return sessions.inWorkspace(id, record)
   } catch {
     /* 没有会话服务时按存储里的全部导出，测试走这条 */
@@ -148,7 +152,7 @@ export async function takeSnapshot(ctx: Context, options?: SnapshotOptions): Pro
   if (store) {
     let loadedCount = 0
     for (const item of await store.listSummaries()) {
-      if (!sessionVisible(ctx, item.id, item)) continue
+      if (!(await sessionVisible(ctx, item.id, item))) continue
       sessionIds.push(item.id)
       const updatedAt = Number(item.updatedAt) || 0
       if (since > 0 && updatedAt > 0 && updatedAt <= since) continue
