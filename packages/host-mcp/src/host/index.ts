@@ -1,4 +1,5 @@
 import { Service, type Context } from 'cordis'
+import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
 import { mcpCollection } from './collection.ts'
 import { McpConnection, type McpToolInfo } from './client.ts'
 import { applyHostServer } from './serve.ts'
@@ -55,6 +56,8 @@ type ServerState = {
   connection?: McpConnection
   connectedAt: number
   builtin: boolean
+  generation?: number
+  opening?: Promise<void>
 }
 
 function echoState(): ServerState {
@@ -69,38 +72,115 @@ function echoState(): ServerState {
 }
 
 export class McpService extends Service {
-  private servers = new Map<string, ServerState>()
-  private configPath: string
+  private scopes = new Map<string, Map<string, ServerState>>()
 
   constructor(ctx: Context) {
     super(ctx, 'mcp')
-    this.configPath = mcpConfigPath()
-    this.servers.set('echo', echoState())
     ctx.effect(() => () => void this.closeAll(), 'mcp.dispose-all')
     ctx.inject(['database'], (inner) => {
       inner.database.register(mcpCollection(this))
     })
   }
 
-  /** 读 .biu/mcp.json 并连上所有 enabled 的 server。连接失败只记在行上，不拖住启动。 */
-  async restore() {
-    for (const config of readMcpConfig(this.configPath)) {
+  private scope() {
+    const accountId = currentAccountId()
+    const account = this.ctx.get('account') as {
+      usesMysqlAccounts?(): boolean
+      store?: {
+        isMember?(accountId: string, workspaceId: string): boolean
+        activeWorkspaceId?(): string | null
+      }
+    } | undefined
+    const store = account?.store
+    if (!accountId && !isOnlineRuntime() && !store) return 'local'
+    if (account?.usesMysqlAccounts?.()) {
+      // MySQL 控制面：成员关系不在本机 SQLite。请求工作区只由 HTTP 鉴权 / Agent 回合
+      // 在 isMemberAsync 校验通过后注入，这里不能再回退到 activeWorkspaceId。
+      const workspaceId = currentRequestWorkspaceId()
+      if (!accountId || !workspaceId) throw new Error('MCP 操作需要当前账号的工作区成员身份')
+      return workspaceId
+    }
+    const workspaceId = currentRequestWorkspaceId() || (accountId ? store?.activeWorkspaceId?.() : '')
+    if (!accountId || !workspaceId || !store?.isMember?.(accountId, workspaceId)) {
+      throw new Error('MCP 操作需要当前账号的工作区成员身份')
+    }
+    return workspaceId
+  }
+
+  private get servers() {
+    const key = this.scope()
+    let servers = this.scopes.get(key)
+    if (servers) return servers
+    servers = new Map<string, ServerState>([['echo', echoState()]])
+    this.scopes.set(key, servers)
+    for (const config of readMcpConfig(mcpConfigPath(undefined, key === 'local' ? '' : key))) {
       if (config.id === 'echo') continue
-      this.servers.set(config.id, {
-        config,
-        status: 'idle',
-        error: '',
-        tools: [],
-        connectedAt: 0,
-        builtin: false,
+      servers.set(config.id, {
+        config, status: 'idle', error: '', tools: [], connectedAt: 0, builtin: false,
       })
     }
+    // 每个工作区首次访问时独立连接；不把其他工作区的 MCP 清单/连接带过来。
+    for (const state of servers.values()) {
+      if (!state.builtin && state.config.enabled && !incompleteReason(state.config)) {
+        state.opening = this.connectInScope(key, state)
+        void state.opening.catch(() => undefined)
+      }
+    }
+    return servers
+  }
+
+  private async connectInScope(key: string, state: ServerState) {
+    if (state.connection) return
+    if (state.status === 'connecting') return state.opening
+    const generation = state.generation = (state.generation ?? 0) + 1
+    state.status = 'connecting'
+    state.error = ''
     this.changed()
-    const pending = [...this.servers.values()]
-      // 草稿行（字段还没填齐）不去连，留在 idle 等用户补完。
+    try {
+      const connection = await McpConnection.open(state.config)
+      if (this.scopes.get(key)?.get(state.config.id) !== state || state.generation !== generation) {
+        await connection.close()
+        return
+      }
+      connection.onClosed((reason) => {
+        if (state.connection !== connection) return
+        state.connection = undefined
+        state.status = 'error'
+        state.error = reason || 'mcp server closed'
+        state.tools = []
+        this.changed()
+      })
+      state.connection = connection
+      const tools = await connection.listTools()
+      if (state.generation !== generation) {
+        await connection.close()
+        return
+      }
+      state.tools = tools
+      state.status = 'ready'
+      state.connectedAt = Date.now()
+      state.error = ''
+    } catch (error) {
+      if (state.generation !== generation) return
+      state.status = 'error'
+      state.error = String(error instanceof Error ? error.message : error)
+      state.tools = []
+      const connection = state.connection
+      state.connection = undefined
+      await connection?.close()
+      this.changed()
+      throw error
+    }
+    this.changed()
+  }
+
+  /** 只有无账号的本机模式在启动时连接全局配置；工作区首次被访问时独立加载。 */
+  async restore() {
+    if (isOnlineRuntime() || this.ctx.get('account')) return
+    const servers = this.servers
+    await Promise.all([...servers.values()]
       .filter((state) => !state.builtin && state.config.enabled && !incompleteReason(state.config))
-      .map((state) => this.connect(state.config.id).catch(() => undefined))
-    await Promise.all(pending)
+      .map((state) => state.opening?.catch(() => undefined)))
   }
 
   private changed() {
@@ -120,7 +200,8 @@ export class McpService extends Service {
 
   private persist() {
     const servers = [...this.servers.values()].filter((state) => !state.builtin).map((state) => state.config)
-    writeMcpConfig(servers, this.configPath)
+    const key = this.scope()
+    writeMcpConfig(servers, mcpConfigPath(undefined, key === 'local' ? '' : key))
   }
 
   async connect(id: string) {
@@ -134,40 +215,16 @@ export class McpService extends Service {
       throw new Error(`mcp server not configured yet: ${id} — ${missing}`)
     }
     if (state.connection) await this.disconnect(id)
-    state.status = 'connecting'
-    state.error = ''
-    this.changed()
-    try {
-      const connection = await McpConnection.open(state.config)
-      connection.onClosed((reason) => {
-        // server 连上之后自己退出：留下痕迹，等下次显式 connect 再拉起。
-        if (state.connection !== connection) return
-        state.connection = undefined
-        state.status = 'error'
-        state.error = reason || 'mcp server closed'
-        state.tools = []
-        this.changed()
-      })
-      state.connection = connection
-      state.tools = await connection.listTools()
-      state.status = 'ready'
-      state.connectedAt = Date.now()
-      state.error = ''
-    } catch (error) {
-      state.status = 'error'
-      state.error = String(error instanceof Error ? error.message : error)
-      state.tools = []
-      state.connection = undefined
-      this.changed()
-      throw error
-    }
-    this.changed()
+    state.status = 'idle'
+    state.opening = this.connectInScope(this.scope(), state)
+    await state.opening
     return this.row(state)
   }
 
   async disconnect(id: string) {
     const state = this.require(id)
     if (state.builtin) throw new Error('cannot disconnect built-in echo server')
+    state.generation = (state.generation ?? 0) + 1
     await state.connection?.close()
     state.connection = undefined
     state.tools = []
@@ -177,13 +234,13 @@ export class McpService extends Service {
     return this.row(state)
   }
 
-  /** 挂载/覆盖一台 server，落盘到 .biu/mcp.json。enabled 时立刻连。 */
+  /** 挂载/覆盖一台 server，在线模式写入当前工作区的配置；单机写入 .biu/mcp.json。 */
   async upsert(raw: Record<string, unknown> & { id: string }) {
     const config = normalizeServerConfig(raw.id, raw)
     if (!config) throw new Error(`invalid mcp server config: ${raw.id}`)
     if (config.id === 'echo') throw new Error('echo is reserved for the built-in server')
     const existing = this.servers.get(config.id)
-    if (existing?.connection) await this.disconnect(config.id)
+    if (existing) await this.disconnect(config.id)
     this.servers.set(config.id, {
       config,
       status: 'idle',
@@ -221,6 +278,7 @@ export class McpService extends Service {
     const config = normalizeServerConfig(wanted, { ...state.config, id: wanted })
     if (!config) throw new Error(`invalid mcp server id: ${nextId}`)
     const wasConnected = Boolean(state.connection)
+    state.generation = (state.generation ?? 0) + 1
     await state.connection?.close()
     this.servers.delete(id)
     this.servers.set(wanted, {
@@ -276,6 +334,7 @@ export class McpService extends Service {
   async remove(id: string) {
     const state = this.require(id)
     if (state.builtin) throw new Error('cannot remove built-in echo server')
+    state.generation = (state.generation ?? 0) + 1
     await state.connection?.close()
     this.servers.delete(id)
     this.persist()
@@ -393,13 +452,26 @@ export class McpService extends Service {
     if (!toolAllowed(state.config.tools, name)) {
       throw new Error(`mcp tool disabled by server config: ${serverId}/${name}`)
     }
-    if (!state.connection) throw new Error(`mcp server not connected: ${serverId} (${state.error || state.status})`)
+    if (state.status === 'connecting') await state.opening
+    // 连接中工作区配置可能被另一个请求删除/替换；发起调用前重新校验。
+    if (this.require(serverId) !== state) {
+      throw new Error(`mcp server not available in this workspace: ${serverId}`)
+    }
+    if (!state.connection || !state.config.enabled) {
+      throw new Error(`mcp server not connected: ${serverId} (${state.error || state.status})`)
+    }
     return state.connection.callTool(name, args)
   }
 
   private async closeAll() {
-    for (const state of this.servers.values()) await state.connection?.close()
-    this.servers.clear()
+    for (const servers of this.scopes.values()) {
+      for (const state of servers.values()) {
+        state.generation = (state.generation ?? 0) + 1
+        await state.connection?.close()
+      }
+      servers.clear()
+    }
+    this.scopes.clear()
   }
 }
 
@@ -452,7 +524,7 @@ export function apply(ctx: Context) {
   ctx.tools.register({
     name: 'mcp_add_stdio',
     description:
-      '挂载 stdio MCP 服务（command + args），写入 .biu/mcp.json 后重启仍在。远端服务器请用 /mcp 表的 add 动作填 url。',
+      '挂载 stdio MCP 服务（command + args），在线模式写入当前工作区配置，单机写入 .biu/mcp.json，重启后保留。远端服务器请用 /mcp 表填写 url。',
     parameters: {
       type: 'object',
       properties: {

@@ -1836,8 +1836,10 @@ export function ShellSettingsAppearance() {
   }, [])
 
   const pick = (next: ThemeMode) => {
-    persistTheme(next)
     setTheme(next)
+    void persistTheme(next).then((ok) => {
+      if (!ok) setTheme(readTheme())
+    })
   }
 
   return (

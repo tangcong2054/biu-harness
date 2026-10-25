@@ -500,53 +500,6 @@ function OptionMatrix({
           markdown: toMarkdown(dataRef.current),
         }),
       },
-      set_matrix: {
-        description: '批量更新方案矩阵数据',
-        risk: 'write',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            title: { type: 'string' },
-            options: { type: 'array' },
-            criteria: { type: 'array' },
-            scores: { type: 'object' },
-            scale: { type: 'number' },
-          },
-        },
-        run: (args: Record<string, unknown>) => {
-          if (!writableRef.current) throw new Error('方案矩阵当前为只读态')
-          const allowed = ['title', 'options', 'criteria', 'scores', 'scale']
-          const patch = Object.fromEntries(Object.entries(args).filter(([key]) => allowed.includes(key)))
-          updateRef.current(patch)
-          return patch
-        },
-      },
-      set_score: {
-        description: '设置一个方案在一个维度上的评分',
-        risk: 'write',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            option: { type: 'string' },
-            criterion: { type: 'string' },
-            value: { type: 'number' },
-          },
-          required: ['option', 'criterion', 'value'],
-        },
-        run: ({ option, criterion, value }: Record<string, unknown>) => {
-          if (!writableRef.current) throw new Error('方案矩阵当前为只读态')
-          const current = dataRef.current.scores ?? {}
-          const next = {
-            ...current,
-            [String(option)]: {
-              ...(current[String(option)] ?? {}),
-              [String(criterion)]: Number(value),
-            },
-          }
-          updateRef.current({ scores: next })
-          return { option, criterion, value }
-        },
-      },
     },
   }), [])
 

@@ -587,23 +587,6 @@ function CodeRunnerBlock({ data, update, writable }: BlockProps) {
       output: outputRef.current,
     }),
     actions: {
-      set_code: {
-        description: '设置代码内容',
-        risk: 'write',
-        inputSchema: {
-          type: 'object',
-          properties: { code: { type: 'string' } },
-          required: ['code'],
-        },
-        run: ({ code }: { code?: unknown }) => {
-          if (!writableRef.current) throw new Error('代码块当前为只读态')
-          const value = String(code ?? '')
-          editorRef.current?.setText(value)
-          setLocalCode(value)
-          updateRef.current({ code: value })
-          return { code: value }
-        },
-      },
       run: {
         description: '运行当前代码',
         risk: 'submit',

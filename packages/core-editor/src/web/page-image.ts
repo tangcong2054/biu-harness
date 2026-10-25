@@ -33,9 +33,22 @@ function safeAssetFileName(name: string) {
   return base || `image-${Date.now()}.png`
 }
 
-export async function uploadPageImage(file: File) {
+/** 上传接口要按记录鉴权（resource:update），编辑器要记住自己正在编辑哪条记录。 */
+const editorResourcePaths = new WeakMap<Editor, string>()
+
+export function setEditorResourcePath(editor: Editor, path: string | undefined) {
+  if (path) editorResourcePaths.set(editor, path)
+  else editorResourcePaths.delete(editor)
+}
+
+export function editorResourcePath(editor: Editor) {
+  return editorResourcePaths.get(editor)
+}
+
+export async function uploadPageImage(file: File, resourcePath?: string) {
   const hint = `${Date.now()}-${safeAssetFileName(file.name)}`
-  const res = await fetch(`/api/db/file/hash/${encodeURIComponent(hint)}`, {
+  const query = resourcePath ? `?path=${encodeURIComponent(resourcePath)}` : ''
+  const res = await fetch(`/api/db/file/hash/${encodeURIComponent(hint)}${query}`, {
     method: 'PUT',
     headers: { 'content-type': file.type || 'application/octet-stream' },
     body: file,
@@ -55,7 +68,7 @@ export async function insertClipboardImages(editor: Editor, files: File[], pos: 
   let at = pos
   for (const file of files) {
     try {
-      const src = await uploadPageImage(file)
+      const src = await uploadPageImage(file, editorResourcePath(editor))
       if (editor.isDestroyed) return
       insertSrc(editor, src, at)
       at += 1

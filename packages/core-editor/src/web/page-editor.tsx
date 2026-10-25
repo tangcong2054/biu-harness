@@ -9,6 +9,7 @@ import type { Editor } from '@tiptap/core'
 import { Selection } from '@tiptap/pm/state'
 import type { FsContentProps } from '@biu/type-file-system/ui'
 import { pageEditorExtensions } from './kit.ts'
+import { setEditorResourcePath } from './page-image.ts'
 import { PageBlockHandle } from './page-block-handle.tsx'
 import { editorHostIsLive } from './editor-live.ts'
 import { FOCUS_RECORD_CONTENT, FOCUS_RECORD_TITLE, handleContentTitleNav, shouldLeaveContentForTitle, focusRecordTitleNear, isDocStartSelection } from './title-content-nav.ts'
@@ -288,7 +289,7 @@ function TableBar({ editor }: { editor: Editor }) {
   )
 }
 
-export function PageEditor({ record, value, writable, onChange, path }: FsContentProps) {
+export function PageEditor({ record, value, writable, onChange, path, status = 'ready' }: FsContentProps) {
   const source = usePageSourceMode(record.id)
   const saved = useRef(asMarkdown(value))
   const sourceMode = useRef(source)
@@ -392,7 +393,8 @@ export function PageEditor({ record, value, writable, onChange, path }: FsConten
     if (!editor || editor.isDestroyed) return
     const md = asMarkdown(value)
     if (hydratedId.current !== record.id) {
-      if (value == null) return
+      // 只有正文确实到了（status=ready，空正文也算）才接管；加载中/失败不进入编辑态。
+      if (status !== 'ready') return
       saved.current = md
       hydratedId.current = record.id
       editor.commands.setContent(md, { contentType: 'markdown', emitUpdate: false })
@@ -431,11 +433,17 @@ export function PageEditor({ record, value, writable, onChange, path }: FsConten
       return
     }
     paint(md)
-  }, [editor, record.id, value])
+  }, [editor, record.id, value, status])
 
   useEffect(() => () => {
     if (remoteTimer.current) clearTimeout(remoteTimer.current)
   }, [])
+
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return
+    setEditorResourcePath(editor, path || undefined)
+    return () => setEditorResourcePath(editor, undefined)
+  }, [editor, path])
 
   useEffect(() => {
     if (!editor || editor.isDestroyed || source) return

@@ -204,8 +204,17 @@ integration('MySQL account/workspace/authz integration', () => {
       hasWeb: true, hasHost: true, manifest: { id: 'plugin-a' },
     }, now)
     await accounts.installPluginForWorkspace('acc_owner', 'ws_a', 'plugin-a', 'v1', now)
+    // 空间级授权只对内置插件生效；普通插件必须按账号安装。
+    expect(await accounts.canAccessPlugin('acc_owner', 'ws_a', 'plugin-a')).toBe(false)
+    expect(await accounts.canAccessPlugin('acc_owner', 'ws_a', 'plugin-a', { includeWorkspaceGrant: true })).toBe(true)
+    expect(await accounts.isApprovedPluginPackage('plugin-a', 'v1')).toBe(true)
+    expect(await accounts.isApprovedPluginPackage('plugin-a', 'other')).toBe(false)
+    await accounts.installPluginForAccount('acc_owner', 'ws_a', 'plugin-a', 'v1', now)
     expect(await accounts.canAccessPlugin('acc_owner', 'ws_a', 'plugin-a')).toBe(true)
     await accounts.setPluginLoad('acc_owner', 'ws_a', 'plugin-a', true, now)
     expect(await accounts.pluginLoadsFor('acc_owner', 'ws_a')).toEqual(['plugin-a'])
+    await accounts.uninstallPluginForAccount('acc_owner', 'ws_a', 'plugin-a', now)
+    expect(await accounts.canAccessPlugin('acc_owner', 'ws_a', 'plugin-a')).toBe(false)
+    expect(await accounts.pluginLoadsFor('acc_owner', 'ws_a')).toEqual([])
   })
 })

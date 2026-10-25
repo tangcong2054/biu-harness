@@ -1,19 +1,11 @@
 import type { CollectionInfo, CollectionListQuery, CollectionSpec, DbRecord } from '@biu/type-file-system'
-import { recordBuiltinValues, REQUIRED_RECORD_FIELDS } from '@biu/type-file-system'
+import { parseAtomicFields, recordBuiltinValues, REQUIRED_RECORD_FIELDS } from '@biu/type-file-system'
 import { FacetStore, slugFacetId } from './facets-store.ts'
 import { normalizeCollectionPath } from '../paths.ts'
 
+/** 非法 JSON / 非法类型直接报错，不能静默变成 [] 把已有属性清空。 */
 function parseFields(raw: unknown) {
-  if (Array.isArray(raw)) return raw
-  if (typeof raw === 'string' && raw.trim()) {
-    try {
-      const parsed = JSON.parse(raw) as unknown
-      return Array.isArray(parsed) ? parsed : []
-    } catch {
-      return []
-    }
-  }
-  return []
+  return parseAtomicFields(raw)
 }
 
 export function stampRecordId(collection: string, recordId: string) {

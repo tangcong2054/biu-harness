@@ -934,10 +934,10 @@ export class DatabaseService extends Service implements Database {
     const rows = await spec.list(query)
     const listed = !query.ids?.length ? rows : rows.filter((row) => query.ids!.includes(row.id))
     const hidden = this.facets.deletedIds(spec.path)
-    const builtinPlugin = (row: { builtin?: unknown }) => spec.path === '/plugins' && row.builtin === true
+    const builtinShared = (row: { id?: unknown; builtin?: unknown }) => this.builtinShared(spec.path, row)
     return query.trash
-      ? listed.filter((row) => hidden.has(row.id) && !builtinPlugin(row))
-      : listed.filter((row) => !hidden.has(row.id) || builtinPlugin(row))
+      ? listed.filter((row) => hidden.has(row.id) && !builtinShared(row))
+      : listed.filter((row) => !hidden.has(row.id) || builtinShared(row))
   }
 
   /** 只装饰当前页，避免为整张表逐行读取 owner、view grant 和人物信息。 */
@@ -1045,6 +1045,17 @@ export class DatabaseService extends Service implements Database {
     return membership.active === membership.home
   }
 
+  private installedPluginVisible(id: string, accountId: string, workspaceId: string) {
+    if (!id || !accountId || !workspaceId) return false
+    const account = this.mysqlAccount() as { usesMysqlAccounts?: () => boolean; canAccessPluginCached?: (a: string, w: string, p: string) => boolean } | undefined
+    // MySQL 控制面：插件列表先经 store.list() 逐条 canAccessPlugin 预热，这里只读同步缓存。
+    if (account?.usesMysqlAccounts?.()) return account.canAccessPluginCached?.(accountId, workspaceId, id) === true
+    const store = this.collabStore() as (WorkspaceFiles & {
+      canAccessPlugin?: (accountId: string, workspaceId: string, pluginId: string) => boolean
+    }) | undefined
+    return store?.canAccessPlugin?.(accountId, workspaceId, id) === true
+  }
+
   private visibleRecords<T extends { id?: unknown; pageId?: unknown; collection?: unknown; sessionId?: unknown; sourceId?: unknown; tablePath?: unknown }>(
     collection: string,
     rows: T[],
@@ -1053,6 +1064,10 @@ export class DatabaseService extends Service implements Database {
     const authorization = this.authorization()
     const actor = authorization?.currentActor()
     const keep = <R extends T>(row: R, sqliteAllows: () => boolean) => {
+      // 已按账号·空间安装的插件包跨空间复用：记录归属在别的空间也要可见，不能被 MySQL 归属否决。
+      if (collection === '/plugins' && actor?.type === 'account' && 'pluginPath' in row &&
+        (action === 'resource:read' || action === 'resource:list') &&
+        this.installedPluginVisible(String(row.id ?? ''), actor.accountId, actor.workspaceId)) return true
       const mysql = this.mysqlVisibility(collection, row)
       if (mysql != null) return mysql
       return sqliteAllows()
@@ -1062,9 +1077,12 @@ export class DatabaseService extends Service implements Database {
         if (collection === '/plugin-catalog' || collection === '/plugin-reviews' || isOperationsMetadata(collection)) {
           return action === 'resource:read' || action === 'resource:list'
         }
-        if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
+        if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) {
           return action === 'resource:read' || action === 'resource:list'
         }
+        if (collection === '/plugins' && actor.type === 'account' && 'pluginPath' in row &&
+          (action === 'resource:read' || action === 'resource:list') &&
+          this.installedPluginVisible(String(row.id ?? ''), actor.accountId, actor.workspaceId)) return true
         const target = this.scopeTarget(collection, String(row.id ?? ''), row)
         const resource = {
           type: 'record' as const,
@@ -1089,7 +1107,7 @@ export class DatabaseService extends Service implements Database {
       if (collection === '/plugin-catalog' || collection === '/plugin-reviews' || isOperationsMetadata(collection)) {
         return action === 'resource:read' || action === 'resource:list'
       }
-      if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
+      if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) {
         return action === 'resource:read' || action === 'resource:list'
       }
       const target = this.scopeTarget(collection, String(row.id ?? ''), row)
@@ -1127,7 +1145,11 @@ export class DatabaseService extends Service implements Database {
     const actor = authorization?.currentActor()
     if (!authorization || !actor) return rows
     return rows.filter((row) => {
-      if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) return scope === 'shared'
+      if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) return scope === 'shared'
+      if (collection === '/plugins' && actor.type === 'account' && 'pluginPath' in row &&
+        this.installedPluginVisible(String(row.id ?? ''), actor.accountId, actor.workspaceId)) {
+        return scope === 'personal'
+      }
       const target = this.scopeTarget(collection, String(row.id ?? ''), row)
       return authorization.scopeCurrent({
         type: 'record',
@@ -1304,6 +1326,12 @@ export class DatabaseService extends Service implements Database {
     return record?.builtin === true || isRegisteredBuiltinPlugin(id)
   }
 
+  /** 内置 echo 无需记录归属；与内置插件一样供各工作区只读自检。 */
+  private builtinShared(collection: string, record: { id?: unknown; builtin?: unknown }) {
+    return (collection === '/plugins' && record.builtin === true)
+      || (collection === '/mcp' && record.id === 'echo' && record.builtin === true)
+  }
+
   private assertLiveRecord(
     spec: CollectionSpec,
     id: string,
@@ -1318,9 +1346,15 @@ export class DatabaseService extends Service implements Database {
       ) return Promise.resolve()
       return Promise.reject(new Error('permission denied: INSUFFICIENT_PERMISSION'))
     }
-    if (this.builtinPlugin(spec, id, record)) {
+    if (this.builtinPlugin(spec, id, record as { builtin?: unknown } | undefined)
+      || (spec.path === '/mcp' && id === 'echo' && (record as { builtin?: unknown } | undefined)?.builtin === true)) {
       if (action === 'resource:read' || action === 'resource:list') return Promise.resolve()
       return Promise.reject(new Error('permission denied: INSUFFICIENT_PERMISSION'))
+    }
+    if (spec.path === '/plugins' && (action === 'resource:read' || action === 'resource:list')) {
+      const actor = this.authorization()?.currentActor()
+      if (actor?.type === 'account' && record && 'pluginPath' in record &&
+        this.installedPluginVisible(id, actor.accountId, actor.workspaceId)) return Promise.resolve()
     }
     if (this.facets.isDeleted(spec.path, id)) return Promise.reject(new Error(`unknown record: ${spec.path}/${id}`))
     return this.finishAssertLiveRecord(spec, id, action, record)
@@ -1520,13 +1554,13 @@ export class DatabaseService extends Service implements Database {
     q: string,
     overlay = true,
   ) {
-    const key = `${spec.path}\t${query.trash ? 1 : 0}\t${q}\t${overlay ? 1 : 0}\t${JSON.stringify(query.filter ?? {})}\t${(query.ids ?? []).join(',')}`
+    const key = `${spec.path}\t${query.trash ? 1 : 0}\t${q}\t${overlay ? 1 : 0}\t${JSON.stringify(query.filter ?? {})}\t${(query.ids ?? []).join(',')}\t${currentAccountId()}\t${currentRequestWorkspaceId()}`
     return shareInflight(this.inflightMatches, key, () => this.matchCollectionRowsNow(spec, query, filter, q, overlay))
   }
 
   private scanCollectionRows(spec: CollectionSpec, query: CollectionListQuery, overlay: boolean) {
     const load = specListQuery(query)
-    const key = `${spec.path}\t${load.trash ? 1 : 0}\t${load.q ?? ''}\t${overlay ? 1 : 0}\t${JSON.stringify(load.filter ?? {})}\t${(load.ids ?? []).join(',')}`
+    const key = `${spec.path}\t${load.trash ? 1 : 0}\t${load.q ?? ''}\t${overlay ? 1 : 0}\t${JSON.stringify(load.filter ?? {})}\t${(load.ids ?? []).join(',')}\t${currentAccountId()}\t${currentRequestWorkspaceId()}`
     return shareInflight(this.inflightScans, key, () => this.scanCollectionRowsNow(spec, load, overlay))
   }
 
@@ -1677,8 +1711,13 @@ export class DatabaseService extends Service implements Database {
     const workspace: DbRecord[] = []
     const shared: DbRecord[] = []
     for (const row of rows) {
-      if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
+      if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) {
         shared.push(row)
+        continue
+      }
+      if (collection === '/plugins' && actor.type === 'account' && 'pluginPath' in row &&
+        this.installedPluginVisible(String(row.id ?? ''), actor.accountId, actor.workspaceId)) {
+        personal.push(row)
         continue
       }
       const target = this.scopeTarget(collection, String(row.id ?? ''), row)
@@ -1770,6 +1809,11 @@ export class DatabaseService extends Service implements Database {
       const http = this.ctx.get('http') as { broadcast?: (type: string, payload: unknown) => void } | undefined
       http?.broadcast?.(DATABASE_CHANNEL, { ts: Date.now() })
     })
+  }
+
+  /** 外部集合直接写入存储后调用，失效列表缓存并通知所有客户端。 */
+  collectionChanged() {
+    this.bump()
   }
 
   private bump() {
@@ -2090,7 +2134,7 @@ export class DatabaseService extends Service implements Database {
     const withPeople = this.applyPersonOverlay(spec, withFacet)
     const withMeta = this.applyMetaOverlay(spec, withPeople)
     if (isSystemCollection(spec.path) || isIndexCollection(spec.path)) return withMeta
-    if (spec.path === '/plugins' && row.builtin === true) return { ...withMeta, shareScope: '共享', shareRole: '阅读' }
+    if (this.builtinShared(spec.path, row)) return { ...withMeta, shareScope: '共享', shareRole: '阅读' }
     const stored = this.ownershipOf(spec.path, String(row.id ?? ''))
     return {
       ...withMeta,
@@ -2738,7 +2782,7 @@ export class DatabaseService extends Service implements Database {
       if (!spec) continue
       const record = await spec.get(row.record_id)
       if (!record) continue
-      if (row.collection === '/plugins' && (record as { builtin?: unknown }).builtin === true) continue
+      if (this.builtinShared(row.collection, record as { id?: unknown; builtin?: unknown })) continue
       const authorization = this.authorization()
       const actor = authorization?.currentActor()
       if (authorization && actor) {
@@ -2780,8 +2824,12 @@ export class DatabaseService extends Service implements Database {
     const record = loaded ?? (action.allowMissing ? { id: parts[1]! } : null)
     if (!record) throw new Error(`unknown record: ${spec.path}/${parts[1]}`)
     const personalLoad = spec.path === '/plugins' && (actionId === 'start' || actionId === 'stop')
-    const pluginAuthor = spec.path === '/plugins' && (actionId === 'sandbox' || actionId === 'pack')
-    if (pluginAuthor) {
+    const cachedInstall = spec.path === '/plugins' &&
+      (actionId === 'install' || (actionId === 'pack' && record.pluginPath && record.installed !== true))
+    const pluginAuthor = spec.path === '/plugins' && (actionId === 'sandbox' || (actionId === 'pack' && !cachedInstall))
+    if (cachedInstall) {
+      await this.requirePath(spec.path, 'resource:read')
+    } else if (pluginAuthor) {
       await this.requirePath(spec.path, 'resource:read')
       if (loaded) {
         const owner = this.recordOwner(spec.path, record.id)
@@ -2798,7 +2846,7 @@ export class DatabaseService extends Service implements Database {
     if (spec.path === '/plugins' && actionId === 'sandbox' && !this.recordOwner(spec.path, parts[1]!)) {
       await this.attachWorkspaceRecord(spec.path, parts[1]!, { ownership: 'personal', accessMode: 'private' })
     }
-    if (spec.path === '/plugins' && (actionId === 'sandbox' || actionId === 'pack')) {
+    if (pluginAuthor) {
       await this.stampActor(spec.path, parts[1]!)
     }
     const next = (await spec.get(parts[1]!)) ?? record
@@ -4625,15 +4673,49 @@ export function apply(ctx: Context) {
   ctx.http.route('GET', '/api/doc/file/:name', serveDbFile)
   ctx.http.route('PUT', '/api/doc/file/:name', putDbFile)
   ctx.http.route('POST', '/api/db/action', async (route) => {
+    let path = ''
+    let action = ''
+    const started = Date.now()
     try {
       const body = (await route.json()) as { path?: string; action?: string; args?: unknown }
+      path = String(body?.path ?? '')
+      action = String(body?.action ?? '')
       const extra =
         body?.args && typeof body.args === 'object' && !Array.isArray(body.args)
           ? (body.args as Record<string, unknown>)
           : undefined
-      route.send(200, await db.action(String(body?.path ?? ''), String(body?.action ?? ''), extra))
+      const result = await db.action(path, action, extra)
+      logPluginAction(ctx, path, action, started, true)
+      route.send(200, result)
     } catch (error) {
+      logPluginAction(ctx, path, action, started, false, error)
       route.send(400, { error: String(error) })
     }
   })
+}
+
+const PLUGIN_ACTION_COLLECTIONS = new Set(['/plugin-catalog', '/plugins'])
+
+function logField(value: unknown, max = 200) {
+  return String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, max)
+}
+
+/** 插件动作审计日志：只记录路径、动作、身份和结果，不记录 args 与凭证。 */
+function logPluginAction(ctx: Context, path: string, action: string, started: number, ok: boolean, error?: unknown) {
+  const [, collection = '', recordId = ''] = /^(\/[^/]+)(?:\/(.*))?$/.exec(path) ?? []
+  if (!PLUGIN_ACTION_COLLECTIONS.has(collection)) return
+  const entry = JSON.stringify({
+    event: 'plugin.action',
+    collection,
+    recordId: logField(recordId, 80),
+    action: logField(action, 40),
+    accountId: currentAccountId(),
+    workspaceId: currentRequestWorkspaceId(),
+    ok,
+    ms: Date.now() - started,
+    ...(ok ? {} : { error: logField(error instanceof Error ? error.message : error) }),
+  })
+  const logger = ctx.logger('plugin-action')
+  if (ok) logger.info(entry)
+  else logger.warn(entry)
 }

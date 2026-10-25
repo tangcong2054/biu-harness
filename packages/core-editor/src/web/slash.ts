@@ -8,7 +8,7 @@ import { slashMayOpen } from './editor-live.ts'
 import { createPageBlockId } from './page-block.ts'
 import { defaultPageBlockTitle } from '../page-block-fence.ts'
 import { BASIC_BLOCK_TYPE, getPageEditor, type SlashInsert } from './service.ts'
-import { uploadPageImage } from './page-image.ts'
+import { editorResourcePath, uploadPageImage } from './page-image.ts'
 
 export type SlashItem = {
   id: string
@@ -125,7 +125,7 @@ export const SLASH_ITEMS: SlashItem[] = [
     aliases: ['image', 'img', 'pic', '图片', 'photo'],
     command: ({ editor, range }) => {
       editor.chain().focus().deleteRange(range).run()
-      pickLocalImageSrc().then((src) => {
+      pickLocalImageSrc(editorResourcePath(editor)).then((src) => {
         if (!src || editor.isDestroyed) return
         editor.chain().focus().setImage({ src, alt: '' }).run()
       })
@@ -164,7 +164,7 @@ export const SLASH_ITEMS: SlashItem[] = [
   },
 ]
 
-function pickLocalImageSrc() {
+function pickLocalImageSrc(resourcePath?: string) {
   return new Promise<string>((resolve) => {
     const input = document.createElement('input')
     input.type = 'file'
@@ -175,9 +175,12 @@ function pickLocalImageSrc() {
         resolve('')
         return
       }
-      void uploadPageImage(file)
+      void uploadPageImage(file, resourcePath)
         .then(resolve)
-        .catch(() => resolve(''))
+        .catch((error) => {
+          console.warn('[page-image] upload failed', error)
+          resolve('')
+        })
     })
     input.addEventListener('cancel', () => resolve(''))
     input.click()

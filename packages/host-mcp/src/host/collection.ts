@@ -1,4 +1,5 @@
 import { recordBuiltinValues, REQUIRED_RECORD_FIELDS, type CollectionSpec, type DbRecord } from '@biu/type-file-system'
+import { isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
 import { envToList, headersToList, listToEnv, listToHeaders, type McpServerConfig } from './config.ts'
 import type { McpServerRow, McpService } from './index.ts'
 
@@ -94,6 +95,7 @@ function connectionPatch(patch: Record<string, unknown>) {
 }
 
 export function mcpCollection(mcp: McpService): CollectionSpec {
+  const location = () => isOnlineRuntime() ? '当前工作区的 MCP 配置' : '.biu/mcp.json'
   const list = () =>
     mcp.listServers().map((row) => asRecord(row, row.builtin ? undefined : mcp.configOf(row.id), mcp.catalog(row.id)))
   const find = (id: string) => list().find((row) => row.id === id) ?? null
@@ -111,12 +113,12 @@ export function mcpCollection(mcp: McpService): CollectionSpec {
       route: '/mcp',
       title: 'MCP',
       blurb:
-        '这是 MCP 服务器表（外部工具来源），不是插件（插件在 /plugins）也不是代理（代理在 /sessions）。真源是 .biu/mcp.json，格式与 Cursor / Claude Desktop 的 mcpServers 一致。' +
+        `这是 MCP 服务器表（外部工具来源），不是插件（插件在 /plugins）也不是代理（代理在 /sessions）。真源是${location()}，格式与 Cursor / Claude Desktop 的 mcpServers 一致。` +
         'Biu 自己也作为 MCP 服务端对外：设置 → MCP 或本机 GET /api/mcp/info 拿局域网 url + Bearer token。' +
         'MCP 挂在分享口（默认 0.0.0.0），局域网其它电脑可以调；工作台 API 仍只在本机。' +
         '一行 = 一台服务器；它提供的工具不会各自变成独立工具，Agent 统一用 mcp_list 看清单、mcp_call 调用。' +
         '新建一行会得到一台停用的 stdio 草稿（名字 new-server），把 command / args 填好再打开「已启用」即可；' +
-        'title 就是 .biu/mcp.json 的 key，改它等于重命名。远端服务器把 transport 改成 http 或 sse 并填 url。' +
+        `title 就是${location()}中的 key，改它等于重命名。远端服务器把 transport 改成 http 或 sse 并填 url。` +
         'env 一项一个 KEY=VALUE，headers 一项一个 Name: Value。工具选择改「仅允许 / 禁用」两列，或在详情清单里勾。' +
         '本表动作只留启用 / 停用（改 enabled 并连上或断开）和删除。挂载用新建行或 mcp_add_stdio，清单用 mcp_list。' +
         'status=error 时看 error 列，stdio 服务器那里会带上子进程 stderr。builtin 的 echo 行只用于自检，不能改。',
@@ -133,7 +135,7 @@ export function mcpCollection(mcp: McpService): CollectionSpec {
           type: 'string',
           label: '服务器',
           writable: true,
-          description: '就是 .biu/mcp.json 里的 key，改它等于重命名这台服务器',
+          description: `就是${location()}中的 key，改它等于重命名这台服务器`,
         },
         transport: {
           type: 'select',
@@ -207,7 +209,7 @@ export function mcpCollection(mcp: McpService): CollectionSpec {
         id: 'enable',
         label: '启用',
         when: { builtin: false, enabled: false },
-        description: '把 .biu/mcp.json 里的 enabled 置为 true 并立刻连接。',
+        description: `把${location()}中的 enabled 置为 true 并立刻连接。`,
         run: (id) => mcp.setEnabled(id, true),
       },
       {
@@ -221,9 +223,9 @@ export function mcpCollection(mcp: McpService): CollectionSpec {
         id: 'uninstall',
         label: '删除',
         tone: 'danger',
-        confirm: '确定删除这台 MCP 服务器？配置会从 .biu/mcp.json 移除。',
+        confirm: `确定删除这台 MCP 服务器？配置会从${location()}中移除。`,
         when: { builtin: false },
-        description: '断开连接并从 .biu/mcp.json 删掉这台服务器。只想临时停用请用停用。',
+        description: `断开连接并从${location()}中删掉这台服务器。只想临时停用请用停用。`,
         run: (id) => mcp.remove(id),
       },
     ],

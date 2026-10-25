@@ -3450,6 +3450,15 @@ html.dark .tool-call-status.is-fail {
   z-index: 30;
 }
 
+.chat-overlay-panel [data-testid^="chat-overlay-resize-"] {
+  z-index: 40;
+  pointer-events: auto;
+}
+
+.chat-overlay-panel [data-testid="chat-overlay-resize-n"] {
+  height: 10px;
+}
+
 .chat-overlay-layout {
   position: relative;
   z-index: 12;
@@ -4694,6 +4703,22 @@ html.dark .app-side-bar .chat-session-row-star:not(.is-on) svg {
   color: #d9730d;
 }
 
+.project-chip-context-fill {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.project-chip-context-fill-bar {
+  position: absolute;
+  inset-inline: 0;
+  bottom: 0;
+  background: color-mix(in srgb, #d9730d 28%, transparent);
+  transition: height 0.2s ease;
+}
+
 .project-chip.project-chip-pick-toggle:hover:not(:disabled),
 .project-chip.project-chip-pick-toggle.is-active,
 .project-chip.project-chip-pick-toggle.is-active:hover:not(:disabled),
@@ -4786,6 +4811,10 @@ html.dark .app-side-bar .chat-session-row-star:not(.is-on) svg {
   left: 100%;
   bottom: calc(100% + 6px);
   transform: none;
+}
+
+.project-chip-clear-ctx[data-dock-tip][data-dock-tip-at]::after {
+  left: 0;
 }
 
 

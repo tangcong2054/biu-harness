@@ -13,16 +13,26 @@ import {
   CollabError,
   CollabStore,
   DEFAULT_SESSION_MS,
+  OPERATIONS_ADMIN_ACCOUNT_ID,
+  OPERATIONS_WORKSPACE_ID,
   controlPlaneHashPassword,
   controlPlaneId,
   controlPlaneInviteToken,
   controlPlaneTokenHash,
   controlPlaneVerifyPassword,
+  isRegisteredBuiltinPlugin,
 } from './store.ts'
 import { httpRemote, RecordReplica } from './replica.ts'
 import { applySnapshot, exchangeSnapshot, restoreSnapshotSafely, takeSnapshot, type MirrorSnapshot } from './mirror.ts'
 import type { AuthorizationService, ResourceRole } from './authorization.ts'
 import { workspaceMembersCollection } from './workspace-members-collection.ts'
+
+/** 与 SQLite `CollabStore.workspaceHasPlugin` 保持一致：平台运营插件只绑定运营 admin。 */
+function mysqlPluginAllowed(accountId: string, workspaceId: string, pluginId: string) {
+  if (!accountId || !workspaceId || !pluginId) return false
+  if (pluginId !== 'platform-operations') return true
+  return workspaceId === OPERATIONS_WORKSPACE_ID && accountId === OPERATIONS_ADMIN_ACCOUNT_ID
+}
 
 export type { Actor, Action, ResourceRef, ResourceRole, WorkspaceRole, Decision } from './authorization.ts'
 
@@ -179,10 +189,23 @@ export class AccountService extends Service {
 
   async canAccessPlugin(accountId: string, workspaceId: string, pluginId: string) {
     const allowed = this.usesMysqlAccounts()
-      ? await this.mysql!.canAccessPlugin(accountId, workspaceId, pluginId)
+      ? mysqlPluginAllowed(accountId, workspaceId, pluginId) &&
+        await this.mysql!.canAccessPlugin(accountId, workspaceId, pluginId, {
+          includeWorkspaceGrant: isRegisteredBuiltinPlugin(pluginId),
+        })
       : this.store.canAccessPlugin(accountId, workspaceId, pluginId)
     this.pluginAccessCache.set(`${accountId}\t${workspaceId}\t${pluginId}`, allowed)
     return allowed
+  }
+
+  async workspaceHasPlugin(workspaceId: string, pluginId: string, accountId = '') {
+    if (this.usesMysqlAccounts()) return this.canAccessPlugin(accountId, workspaceId, pluginId)
+    return this.store.workspaceHasPlugin(workspaceId, pluginId, accountId)
+  }
+
+  async isApprovedPluginPackage(pluginId: string, version: string) {
+    if (this.usesMysqlAccounts()) return this.mysql!.isApprovedPluginPackage(pluginId, version)
+    return this.store.isApprovedPluginPackage(pluginId, version)
   }
 
   canAccessPluginCached(accountId: string, workspaceId: string, pluginId: string) {
@@ -201,7 +224,12 @@ export class AccountService extends Service {
   }
 
   async setPluginLoad(accountId: string, workspaceId: string, pluginId: string, loaded: boolean) {
-    if (this.usesMysqlAccounts()) return this.mysql!.setPluginLoad(accountId, workspaceId, pluginId, loaded)
+    if (this.usesMysqlAccounts()) {
+      if (loaded && !mysqlPluginAllowed(accountId, workspaceId, pluginId)) throw new Error('plugin is not assigned')
+      return this.mysql!.setPluginLoad(accountId, workspaceId, pluginId, loaded, Date.now(), {
+        includeWorkspaceGrant: isRegisteredBuiltinPlugin(pluginId),
+      })
+    }
     this.store.setPluginLoad(accountId, workspaceId, pluginId, loaded)
   }
 
@@ -237,8 +265,31 @@ export class AccountService extends Service {
     const result = this.usesMysqlAccounts()
       ? await this.mysql!.uninstallPluginFromWorkspace(accountId, workspaceId, pluginId)
       : this.store.uninstallPluginFromWorkspace(accountId, workspaceId, pluginId)
+    this.clearPluginAccessCache(workspaceId, pluginId)
+    return result
+  }
+
+  async installPluginForAccount(accountId: string, workspaceId: string, pluginId: string, version = '') {
+    const result = this.usesMysqlAccounts()
+      ? await this.mysql!.installPluginForAccount(accountId, workspaceId, pluginId, version)
+      : this.store.installPluginForAccount(accountId, workspaceId, pluginId, version)
     this.pluginAccessCache.delete(`${accountId}\t${workspaceId}\t${pluginId}`)
     return result
+  }
+
+  async uninstallPluginForAccount(accountId: string, workspaceId: string, pluginId: string) {
+    const result = this.usesMysqlAccounts()
+      ? await this.mysql!.uninstallPluginForAccount(accountId, workspaceId, pluginId)
+      : this.store.uninstallPluginForAccount(accountId, workspaceId, pluginId)
+    this.pluginAccessCache.delete(`${accountId}\t${workspaceId}\t${pluginId}`)
+    return result
+  }
+
+  private clearPluginAccessCache(workspaceId: string, pluginId: string) {
+    for (const key of this.pluginAccessCache.keys()) {
+      const [, ws, id] = key.split('\t')
+      if (ws === workspaceId && id === pluginId) this.pluginAccessCache.delete(key)
+    }
   }
 
   async removePluginPackage(accountId: string, pluginId: string) {

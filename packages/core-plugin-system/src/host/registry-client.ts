@@ -220,6 +220,10 @@ export class PluginRegistryClient {
     return this.transport.search(q, tag, this.token())
   }
 
+  searchPublic() {
+    return this.transport.search('', '')
+  }
+
   detail(id: string) {
     return this.transport.detail(id, this.token())
   }
@@ -241,7 +245,9 @@ export class PluginRegistryClient {
       const installedForWorkspace = await this.store.isInstalledForCurrentWorkspace(row.id)
       flags[row.id] = {
         remoteCodeVersion: row.codeVersion,
+        remoteUpdatedAt: row.updatedAt,
         localCodeVersion,
+        localUpdatedAt: local?.updatedAt ?? 0,
         cached: Boolean(local),
         installed: installedForWorkspace,
         updateAvailable: Boolean(installedForWorkspace && local && owned && localCodeVersion && localCodeVersion !== row.codeVersion),
@@ -252,22 +258,49 @@ export class PluginRegistryClient {
     return flags
   }
 
-  async install(id: string, version?: string) {
+  private async requireOlderOverwriteConfirmation(
+    id: string,
+    localVersion: string | undefined,
+    remoteVersion: string,
+    remoteUpdatedAt: number,
+    confirmation?: { confirmOlder?: boolean; localCodeVersion?: string; remoteCodeVersion?: string },
+  ) {
+    if (!localVersion || localVersion === remoteVersion) return
+    const localUpdatedAt = await this.store.installedUpdatedAt(id)
+    if (!localUpdatedAt || (remoteUpdatedAt && localUpdatedAt <= remoteUpdatedAt)) return
+    const currentVersion = await hashInstalledPluginCode(this.store.pluginPath(id)) ?? localVersion
+    if (confirmation?.confirmOlder === true
+      && confirmation.localCodeVersion === currentVersion
+      && confirmation.remoteCodeVersion === remoteVersion) return
+    throw new Error(`本地插件更新时间晚于商店版本，覆盖可能丢失较新的修改；请确认后重试：${id}`)
+  }
+
+  async install(id: string, version?: string, confirmation?: { confirmOlder?: boolean; localCodeVersion?: string; remoteCodeVersion?: string }) {
     const token = this.token()
     const detail = await this.transport.detail(id, token)
     if (!detail) throw new Error(`unknown registry plugin: ${id}`)
     const codeVersion = String(version ?? '').trim() || detail.codeVersion
+    const local = (await this.store.list()).find((row) => row.id === id)
+    const origin = this.store.originOf(id)
+    if (local?.codeVersion === codeVersion && origin?.registryId === (detail.registryId || this.registryId) &&
+      origin.ownerId === detail.ownerId && await this.store.isApprovedCachedVersion(id, codeVersion)) {
+      return this.store.installCached(id)
+    }
+    const remoteUpdatedAt = codeVersion === detail.codeVersion ? detail.updatedAt : 0
+    await this.requireOlderOverwriteConfirmation(id, local?.codeVersion, codeVersion, remoteUpdatedAt, confirmation)
     const bundle = await this.transport.bundle(id, codeVersion, token)
     if (!bundle) throw new Error(`unknown registry version: ${id}@${codeVersion}`)
     return this.store.installBundle(bundle)
   }
 
-  async update(id: string) {
+  async update(id: string, confirmation?: { confirmOlder?: boolean; localCodeVersion?: string; remoteCodeVersion?: string }) {
     const token = this.token()
     const detail = await this.transport.detail(id, token)
     if (!detail) throw new Error(`unknown registry plugin: ${id}`)
     const local = (await this.store.list()).find((row) => row.id === id)
+    if (!(await this.store.isInstalledForCurrentWorkspace(id))) throw new Error(`plugin not installed for current account: ${id}`)
     if (local?.codeVersion === detail.codeVersion) return { id, updated: false, codeVersion: detail.codeVersion }
+    await this.requireOlderOverwriteConfirmation(id, local?.codeVersion, detail.codeVersion, detail.updatedAt, confirmation)
     const bundle = await this.transport.bundle(id, detail.codeVersion, token)
     if (!bundle) throw new Error(`unknown registry version: ${id}@${detail.codeVersion}`)
     const installed = await this.store.installBundle(bundle)
@@ -278,8 +311,22 @@ export class PluginRegistryClient {
     return this.store.uninstall(id)
   }
 
+  /** 本机（当前账号）在商店里的发布者身份。 */
+  ownerId() {
+    return ownerIdForToken(this.token())
+  }
+
+  /** 没发布过的插件谁都能上架；已发布过的只有拿着同一把发布密钥的人能更新。 */
+  canPublish(id: string) {
+    if (id === 'platform-operations') return false
+    const origin = this.store.originOf(id)
+    if (!origin?.ownerId) return true
+    return origin.ownerId === ownerIdForToken(this.token())
+  }
+
   async publish(id: string) {
     if (id === 'platform-operations') throw new Error('平台运营插件只留在运营端，不上传到插件商店')
+    if (!this.canPublish(id)) throw new Error('这个插件是别人发布的，只有发布者本人能更新到商店')
     if (existsSync(join(this.store.sandboxPath(id), 'manifest.json'))) await this.store.pack(id)
     const dir = this.store.pluginPath(id)
     if (!existsSync(join(dir, 'manifest.json'))) throw new Error(`plugin is not packed: ${id}`)

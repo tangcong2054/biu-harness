@@ -36,6 +36,8 @@ export type SessionEventBody =
         outputTokens: number
         totalTokens?: number
         cacheReadTokens?: number
+        /** 此次模型调用使用的上下文窗口大小；仅用于显示该次请求的实际占用，不是累计消耗。 */
+        contextWindowTokens?: number
         /** 本次 LLM 输入中「历史 turn」占比（0..1）；由 agent-loop 在 derive 时统计挂载。curPct=1-histPct，无需单独存储。 */
         histPct?: number
       }

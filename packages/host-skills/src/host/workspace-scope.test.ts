@@ -121,10 +121,10 @@ test('没有账号服务时（本地 / 桌面）保持全部可见', async () =>
 
 test('云端但拿不到工作区时 fail-closed', async () => {
   const ctx = await boot({ workspaceId: '', visible: new Set(['mine']) })
-  const { mine, other } = await seed(ctx)
+  // 有账号但没有工作区：认领失败，导入回滚，不留下无归属技能。
+  await assert.rejects(() => seed(ctx), /没有可用工作区/)
   assert.deepEqual(runWithAccount('acc_test', () => ctx.skills.list()), [])
-  assert.deepEqual(runWithAccount('acc_test', () => ctx.skills.list()), [])
-  assert.notEqual(mine.id, other.id)
+  assert.equal(ctx.skills.recordOrNull('mine'), null)
 })
 
 test('BIU_SKILL_DEFAULT_WORKSPACE 可兜底', async () => {

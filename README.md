@@ -694,7 +694,7 @@ Also: `npm run dev:host` and `npm run dev:web`.
 | `BIU_CONTEXT_HARD_RATIO` | `0.8` | hard per-request context fraction; keeps complete recent turns and rejects locally if the current turn still cannot fit |
 | `BIU_COMPACT_MAX_OUTPUT` | `4096` | maximum output tokens for an automatic compaction summary |
 | `CTX_BUDGET` | unset | legacy stricter messages cap; `0` no longer disables model context safety |
-| `TENCENT_TOKEN_PLAN_TPM` | `3000000` | per-model Tencent Token Plan TPM; `api.lkeap.cloud.tencent.com/plan/*` is queued in a process-wide rolling 60-second window |
+| `TENCENT_TOKEN_PLAN_TPM` | `3000000` | per-model Tencent Token Plan TPM; `api.lkeap.cloud.tencent.com/plan/*` and postpaid `tokenhub.tencentmaas.com` are queued in a process-wide rolling 60-second window |
 | `TENCENT_TOKEN_PLAN_TPM_HEADROOM` | `0.9` | local Token Plan safety factor for tokenizer estimation differences |
 | `BIU_LLM_LOG_DIR` | `.biu/logs` | JSONL directory for LLM throttling diagnostics; API keys, message bodies, and tool arguments are never recorded |
 | `BIU_LLM_LOG_MAX_BYTES` | `10485760` | per-day LLM log rotation threshold (10MB) |

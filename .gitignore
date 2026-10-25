@@ -39,6 +39,7 @@ web/**/*.js.map
 .plugin-dev/cdb-*/
 .plugin-dev/dbbrain-*/
 .plugin-dev/websql/
+.plugin-dev/mcp-probe/
 
 # 页面数据已迁入 .biu；保留 .page/ 以免旧工作区误提交
 .page/

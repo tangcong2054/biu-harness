@@ -1,6 +1,7 @@
 import { Service, type Context } from 'cordis'
 import type { AssistantReply, ChatOptions, LlmClient, LlmConfig, LlmMessage, LlmUsage } from '@biu/host-llm'
 import { runWithSession } from '@biu/host-sessions/scope'
+import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime, runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import { estimateTokens, fitMessagesToTokenBudget, liftToolImages } from '@biu/host-sessions'
 import { runWithToolPolicy, runWithToolProgress, type AgentToolMode } from '@biu/host-tools'
 import {
@@ -109,6 +110,37 @@ export class AgentLoop implements AgentRunner {
   }
 
   async run(claimed: ClaimedInput[]): Promise<AgentTurn> {
+    // 有账号的 Agent（含非 BIU_ONLINE 模式）始终由会话持久化归属确定 MCP 工作区，
+    // 后台队列可以没有请求 workspace，但绝不能用会话 owner 替代缺失的账号身份。
+    let accountId = currentAccountId()
+    let workspaceId = currentRequestWorkspaceId()
+    if (isOnlineRuntime() || accountId) {
+      // 走 account 服务的异步入口：MySQL 控制面下归属与成员关系都不在本机 SQLite。
+      const account = this.ctx.get('account') as {
+        tenantForRecord?(collection: string, id: string): Promise<{ workspaceId: string; accountId: string } | null>
+        isMemberAsync?(accountId: string, workspaceId: string): Promise<boolean>
+        store?: {
+          tenantForRecord?(collection: string, id: string): { workspaceId: string; accountId: string } | null
+          isMember?(accountId: string, workspaceId: string): boolean
+        }
+      } | undefined
+      const tenant = account?.tenantForRecord
+        ? await account.tenantForRecord('/sessions', this.sessionId)
+        : account?.store?.tenantForRecord?.('/sessions', this.sessionId)
+      if (!tenant?.workspaceId || !tenant.accountId) throw new Error('Agent 会话缺少工作区归属，MCP 不可用')
+      if (workspaceId && workspaceId !== tenant.workspaceId) throw new Error('Agent 会话不属于当前工作区')
+      workspaceId = tenant.workspaceId
+      const member = accountId && (account?.isMemberAsync
+        ? await account.isMemberAsync(accountId, workspaceId)
+        : account?.store?.isMember?.(accountId, workspaceId))
+      if (!member) {
+        throw new Error('Agent 回合缺少当前工作区成员的账号身份')
+      }
+    }
+    return runWithAccount(accountId, () => runWithRequestWorkspace(workspaceId, () => this.runScoped(claimed)))
+  }
+
+  private async runScoped(claimed: ClaimedInput[]): Promise<AgentTurn> {
     let extras = [
       ...new Set(claimed.flatMap((item) => item.extraTools ?? []).map((name) => name.trim()).filter(Boolean)),
     ]
@@ -289,15 +321,17 @@ export class AgentLoop implements AgentRunner {
 
       let rawMessages = await liftToolImages(session.deriveMessages(this.sessionId), this.sessionId)
       let inputComp = session.statInputComposition(this.sessionId)
+      let contextWindowTokens: number | undefined
       const attachUsage = (usage?: LlmUsage) =>
         usage !== undefined
-          ? { ...usage, histPct: inputComp.histPct }
+          ? { ...usage, histPct: inputComp.histPct, ...(contextWindowTokens ? { contextWindowTokens } : {}) }
           : undefined
       let reply: AssistantReply
       try {
         if (this.signal.aborted) throw new Error('cancelled')
         const tools = this.ctx.tools.schemas()
         const policy = resolveContextPolicy(this.config, tools)
+        contextWindowTokens = policy.contextWindowTokens
         const messageTokens = messageTokenTotal(rawMessages)
         const nonSystemMessages = rawMessages.filter((message) => message.role !== 'system').length
         if (

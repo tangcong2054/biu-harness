@@ -84,6 +84,21 @@ test('import 自动把技能认领到当前工作区', async () => {
   }
 })
 
+test('认领失败时目录导入报错并清理未归属技能', async () => {
+  const { ctx, cleanup } = await boot()
+  try {
+    const account = ctx.get('account') as { store: { claim: (...args: string[]) => unknown } }
+    account.store.claim = () => { throw new Error('不在这个空间') }
+    await assert.rejects(() => runWithAccount('acc_test', () => ctx.skills.import({
+      name: 'verify-denied',
+      files: [{ path: 'SKILL.md', content: '---\nname: verify-denied\n---\n正文' }],
+    })), /不在这个空间/)
+    assert.equal(ctx.skills.list().some((skill) => skill.id === 'verify-denied'), false)
+  } finally {
+    cleanup()
+  }
+})
+
 test('create 自动把技能认领到当前工作区', async () => {
   const { ctx, claims, cleanup } = await boot()
   try {

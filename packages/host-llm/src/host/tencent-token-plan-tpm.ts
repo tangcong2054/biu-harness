@@ -141,12 +141,18 @@ export class TencentTokenPlanTpmLimiter {
   }
 }
 
+/** 腾讯云后付费（TokenHub）与 Token Plan 共用同一套 TPM 调度，只是不限 /plan 路径。 */
+export const TENCENT_TOKEN_PLAN_HOSTS = ['api.lkeap.cloud.tencent.com'] as const
+export const TENCENT_POSTPAID_HOSTS = ['tokenhub.tencentmaas.com'] as const
+
 export function isTencentTokenPlan(config: LlmConfig) {
   if (config.endpointId === 'token-plan') return true
   try {
     const url = new URL(config.baseUrl ?? '')
+    const host = url.hostname.toLowerCase()
+    if (TENCENT_POSTPAID_HOSTS.some((name) => host === name)) return true
     return (
-      url.hostname.toLowerCase() === 'api.lkeap.cloud.tencent.com' &&
+      TENCENT_TOKEN_PLAN_HOSTS.some((name) => host === name) &&
       /^\/plan(?:\/|$)/i.test(url.pathname)
     )
   } catch {

@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from 'cordis'
+import { runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import * as tools from '@biu/host-tools'
 import * as mcp from './index.ts'
 
@@ -22,6 +23,8 @@ beforeEach(() => {
 
 afterEach(() => {
   delete process.env.BIU_MCP_CONFIG
+  delete process.env.BIU_ONLINE
+  delete process.env.BIU_HOME
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -118,6 +121,34 @@ test('disconnect keeps config, connect brings it back', async () => {
   assert.equal(row?.toolCount, 3)
 
   await ctx.mcp.remove('mini')
+}, 30000)
+
+test('online two workspaces own independent live MCP connections with the same server id', async () => {
+  process.env.BIU_ONLINE = '1'
+  process.env.BIU_HOME = dir
+  const ctx = new Context()
+  ctx.provide('account', { store: { isMember: (account: string, workspace: string) =>
+    account === 'acc_test' && ['ws_alpha', 'ws_beta'].includes(workspace) } })
+  await ctx.plugin(tools)
+  await ctx.plugin(mcp)
+  const scoped = <T>(workspace: string, fn: () => T) =>
+    runWithAccount('acc_test', () => runWithRequestWorkspace(workspace, fn))
+  try {
+    await scoped('ws_alpha', () => ctx.mcp.upsert({ id: 'mini', command: process.execPath, args: [SERVER] }))
+    assert.deepEqual(scoped('ws_beta', () => ctx.mcp.serverIds()), ['echo'])
+    await scoped('ws_beta', () => ctx.mcp.upsert({ id: 'mini', command: process.execPath, args: [SERVER],
+      tools: { allow: ['read_file'] } }))
+    assert.equal(scoped('ws_alpha', () => ctx.mcp.listTools('mini').length), 3)
+    assert.equal(scoped('ws_beta', () => ctx.mcp.listTools('mini').length), 1)
+    await assert.rejects(() => scoped('ws_beta', () => ctx.mcp.call('mini', 'write_file', {})), /disabled by server config/)
+    const result = await scoped('ws_alpha', () => ctx.mcp.call('mini', 'write_file', {})) as { content: Array<{ text: string }> }
+    assert.equal(result.content[0]?.text, 'write_file:{}')
+  } finally {
+    await scoped('ws_alpha', () => ctx.mcp.remove('mini'))
+    await scoped('ws_beta', () => ctx.mcp.remove('mini'))
+    delete process.env.BIU_ONLINE
+    delete process.env.BIU_HOME
+  }
 }, 30000)
 
 test('a server that fails to start lands as error with its stderr, not a hang', async () => {

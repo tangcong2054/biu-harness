@@ -511,28 +511,6 @@ function ApiPlaygroundBlock({ data, update, writable }: BlockProps) {
         : null,
     }),
     actions: {
-      set_request: {
-        description: '设置请求方法、URL 和可选 Body；鉴权 Header 请用户在页面手动填写',
-        risk: 'write',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            method: { type: 'string', enum: METHODS },
-            url: { type: 'string' },
-            body: { type: 'string' },
-          },
-        },
-        run: (args: Record<string, unknown>) => {
-          if (!writableRef.current) throw new Error('API Playground 当前为只读态')
-          const patch: Record<string, string> = {}
-          if (typeof args.method === 'string') patch.method = args.method
-          if (typeof args.url === 'string') patch.url = args.url
-          if (typeof args.body === 'string') patch.body = args.body
-          setForm((prev) => ({ ...prev, ...patch }))
-          updateRef.current(patch)
-          return patch
-        },
-      },
       send: {
         description: '发送当前 API 请求',
         risk: 'submit',

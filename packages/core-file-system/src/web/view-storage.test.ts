@@ -49,11 +49,29 @@ test('browser view memory is isolated by workspace', () => {
   sessionStorage.removeItem('biu.workspaceId')
 })
 
-test('index all views do not group by share', () => {
+test('builtin all views default to no grouping; index tables never group by share', () => {
   const all = builtinAllView({ path: '/page-blocks', label: '组件' })
   assert.equal(all.groupBy, '')
   assert.equal(withViewDisplay('/page-blocks', { ...all, groupBy: 'shareScope' }).groupBy, '')
-  assert.equal(builtinAllView({ path: '/tasks', label: '任务' }).groupBy, 'shareScope')
+  assert.equal(builtinAllView({ path: '/plugin-catalog', label: '插件商店' }).groupBy, '')
+  assert.equal(builtinAllView({ path: '/tasks', label: '任务' }).groupBy, '')
+  assert.equal(builtinAllView({ path: '/pages', label: '页面' }).groupBy, '')
+  const tasks = builtinAllView({ path: '/tasks', label: '任务' })
+  const mem: Record<string, string> = {}
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => mem[key] ?? null,
+      setItem: (key: string, value: string) => {
+        mem[key] = value
+      },
+      removeItem: (key: string) => {
+        delete mem[key]
+      },
+    },
+  })
+  persistViewDisplay('/tasks', tasks.id, { groupBy: 'shareScope' })
+  assert.equal(withViewDisplay('/tasks', tasks).groupBy, 'shareScope')
 })
 
 test('views collection still resolves catalog stubs from the route', () => {

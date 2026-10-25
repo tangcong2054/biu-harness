@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { Context } from 'cordis'
+import { runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import * as tools from '@biu/host-tools'
 import * as mcp from './index.ts'
 import { incompleteReason, listToEnv, listToHeaders, parseMcpConfig, serializeMcpConfig, toolAllowed } from './config.ts'
@@ -17,6 +18,8 @@ beforeEach(() => {
 
 afterEach(() => {
   delete process.env.BIU_MCP_CONFIG
+  delete process.env.BIU_ONLINE
+  delete process.env.BIU_HOME
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -226,6 +229,61 @@ test('env / headers survive the round trip through their table form', () => {
   // token 里带逗号不能被当成分隔符切开。
   assert.deepEqual(listToEnv(['LIST=a,b,c']), { LIST: 'a,b,c' })
   assert.deepEqual(listToHeaders(['Authorization: Bearer x,y', 'Bad']), { Authorization: 'Bearer x,y' })
+})
+
+test('online MCP configuration and agent tool calls are isolated by workspace', async () => {
+  process.env.BIU_ONLINE = '1'
+  process.env.BIU_HOME = dir
+  const ctx = new Context()
+  ctx.provide('account', { store: { isMember: (accountId: string, workspaceId: string) =>
+    accountId === 'acc_member' && ['ws_first', 'ws_second'].includes(workspaceId) } })
+  await ctx.plugin(tools)
+  await ctx.plugin(mcp)
+  const inWorkspace = <T>(id: string, fn: () => T) =>
+    runWithAccount('acc_member', () => runWithRequestWorkspace(id, fn))
+  await inWorkspace('ws_first', () => ctx.mcp.upsert({ id: 'shared', command: 'first-server', enabled: false }))
+  await inWorkspace('ws_second', () => ctx.mcp.upsert({ id: 'shared', command: 'second-server', enabled: false }))
+  assert.equal(inWorkspace('ws_first', () => ctx.mcp.configOf('shared').command), 'first-server')
+  assert.equal(inWorkspace('ws_second', () => ctx.mcp.configOf('shared').command), 'second-server')
+  await inWorkspace('ws_first', () => ctx.mcp.upsert({ id: 'only-first', command: 'noop', enabled: false }))
+  assert.equal(inWorkspace('ws_second', () => ctx.mcp.listServers().some((s) => s.id === 'only-first')), false)
+  const firstServers = await inWorkspace('ws_first', () => ctx.tools.invoke('mcp_servers')) as Array<{ id: string }>
+  const secondServers = await inWorkspace('ws_second', () => ctx.tools.invoke('mcp_servers')) as Array<{ id: string }>
+  assert.deepEqual(firstServers.map((s) => s.id), ['echo', 'only-first', 'shared'])
+  assert.deepEqual(secondServers.map((s) => s.id), ['echo', 'shared'])
+  await assert.rejects(() => inWorkspace('ws_second', () => ctx.tools.invoke('mcp_list', { server: 'only-first' })), /unknown mcp server/)
+  await assert.rejects(() => inWorkspace('ws_second', () => ctx.tools.invoke('mcp_call', {
+    server: 'only-first', name: 'anything', arguments: {},
+  })), /unknown mcp server/)
+  assert.deepEqual(inWorkspace('ws_first', () => ctx.mcp.serverIds()), ['echo', 'only-first', 'shared'])
+  assert.deepEqual(inWorkspace('ws_second', () => ctx.mcp.serverIds()), ['echo', 'shared'])
+  const firstPath = inWorkspace('ws_first', () => mcp.mcpConfigPath(dir))
+  const secondPath = inWorkspace('ws_second', () => mcp.mcpConfigPath(dir))
+  assert.notEqual(firstPath, secondPath)
+  assert.equal(parseMcpConfig(JSON.parse(readFileSync(firstPath, 'utf8'))).length, 2)
+  assert.equal(parseMcpConfig(JSON.parse(readFileSync(secondPath, 'utf8'))).length, 1)
+  await assert.rejects(() => ctx.tools.invoke('mcp_call', { server: 'echo', name: 'mcp_echo' }), /工作区成员身份/)
+  assert.throws(() => inWorkspace('ws_third', () => ctx.mcp.listServers()), /工作区成员身份/)
+})
+
+test('authenticated workspace MCP stays isolated even when BIU_ONLINE is unset', async () => {
+  process.env.BIU_HOME = dir
+  const ctx = new Context()
+  ctx.provide('account', { store: {
+    isMember: (accountId: string, workspaceId: string) => accountId === 'acc_member' && ['ws_first', 'ws_second'].includes(workspaceId),
+    activeWorkspaceId: () => 'ws_first',
+  } })
+  await ctx.plugin(tools)
+  await ctx.plugin(mcp)
+  const scoped = <T>(workspaceId: string, fn: () => T) =>
+    runWithAccount('acc_member', () => runWithRequestWorkspace(workspaceId, fn))
+  await scoped('ws_first', () => ctx.mcp.upsert({ id: 'only-first', command: 'unused', enabled: false }))
+  assert.deepEqual(scoped('ws_first', () => ctx.mcp.serverIds()), ['echo', 'only-first'])
+  assert.deepEqual(scoped('ws_second', () => ctx.mcp.serverIds()), ['echo'])
+  assert.equal(readFileSync(scoped('ws_first', () => mcp.mcpConfigPath(dir)), 'utf8').includes('only-first'), true)
+  // 直接调 agent 工具也不能读取另一个工作区的 MCP，且无账号时不能回退到全局配置。
+  await assert.rejects(() => scoped('ws_second', () => ctx.tools.invoke('mcp_call', { server: 'only-first', name: 'any' })), /unknown mcp server/)
+  await assert.rejects(() => ctx.tools.invoke('mcp_servers'), /工作区成员身份/)
 })
 
 test('mcp table only keeps enable, disable, and uninstall actions', () => {

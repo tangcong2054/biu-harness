@@ -327,7 +327,7 @@ test('sandbox/pack live on the plugins collection, not as tools', () => {
     initSandbox: async () => ({ id: 'x', sandboxPath: '/tmp/x' }),
   } as Store)
   const ids = spec.actions?.map((item) => item.id) ?? []
-  assert.deepEqual(ids, ['sandbox', 'start', 'stop', 'pack', 'publish', 'update', 'uninstall'])
+  assert.deepEqual(ids, ['sandbox', 'start', 'stop', 'pack', 'install', 'publish', 'update', 'uninstall'])
   const sandbox = spec.actions?.find((item) => item.id === 'sandbox')
   const pack = spec.actions?.find((item) => item.id === 'pack')
   assert.equal(spec.actions?.find((item) => item.id === 'create'), undefined)

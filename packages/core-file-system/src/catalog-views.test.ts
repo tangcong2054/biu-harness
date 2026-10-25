@@ -117,7 +117,7 @@ test('every registered table gets a read-only 全部xx view', () => {
     { id: builtinAllViewId('/sessions'), name: '假的', mode: 'table', sortField: 'id', sortDir: 'asc', filters: {}, columns: [] },
     { id: 'mine', name: '置顶', mode: 'table', sortField: 'id', sortDir: 'asc', filters: {}, columns: [] },
   ])
-  assert.equal(all.groupBy, 'shareScope')
+  assert.equal(all.groupBy, '')
   assert.deepEqual(merged.slice(0, 1).map((view) => view.name), ['全部会话'])
   assert.equal(merged.some((view) => view.name === '私人会话'), false)
   assert.equal(merged.filter((view) => view.id === builtinAllViewId('/sessions')).length, 1)

@@ -68,21 +68,6 @@ function useHtmlBlockActions(
         risk: 'read',
         run: () => ({ kind, html: stateRef.current.html }),
       },
-      set_html: {
-        description: '替换当前 HTML 源码',
-        risk: 'write',
-        inputSchema: {
-          type: 'object',
-          properties: { html: { type: 'string' } },
-          required: ['html'],
-        },
-        run: ({ html: next }: { html?: unknown }) => {
-          if (!stateRef.current.writable) throw new Error('HTML 块当前为只读态')
-          const value = String(next ?? '')
-          updateRef.current({ html: value })
-          return { updated: true, chars: value.length }
-        },
-      },
       start_presentation: {
         description: '打开 HTML 全屏放映',
         risk: 'navigate',

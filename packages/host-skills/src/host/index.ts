@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Service, type Context } from 'cordis'
-import { currentAccountId, currentRequestWorkspaceId } from '@biu/host-plugin-loader/data-dir'
+import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
+import type { Database } from '@biu/type-file-system'
 import { skillsCollection } from './collection.ts'
 import { LEGACY_MIGRATED, legacySkillImports, SkillsStore, type SkillImportInput, type SkillRecord } from './store.ts'
 
@@ -54,11 +55,14 @@ export class SkillsService extends Service {
 
   private changed() {
     this.ctx.emit('hub/change')
+    let database: Database | undefined
     try {
-      this.ctx.emit('database/change')
+      database = this.ctx.get('database') as Database | undefined
     } catch {
-      // File System 尚未挂载时不影响仓库本身。
+      // 启动期数据库尚未注册时仍通知订阅者。
     }
+    if (database?.collectionChanged) database.collectionChanged()
+    else this.ctx.emit('database/change')
   }
 
   private account(): SkillAccount | undefined {
@@ -107,11 +111,17 @@ export class SkillsService extends Service {
    * 文件只落在运行目录的磁盘上；Online 没有 record_owners 时，列表会把它当成私有记录藏起来。
    */
   private async claimOwnership(id: string) {
-    const account = this.account()
-    const workspaceId = this.workspaceId()
     const actorId = currentAccountId()
-    if (!workspaceId || !actorId || !account) return
-    const mysql = account.usesMysqlAccounts?.() ? account.mysql : undefined
+    // 启动期的 legacy 迁移没有账号上下文，跳过即可（后续由使用者在页面里认领）。
+    if (!actorId) return
+    const account = this.account()
+    const mysql = account?.usesMysqlAccounts?.() ? account.mysql : undefined
+    if (!mysql?.claimRecord && !account?.store?.claim) {
+      if (isOnlineRuntime()) throw new Error('无法认领 Skill：缺少账号服务')
+      return
+    }
+    const workspaceId = this.workspaceId()
+    if (!workspaceId) throw new Error('没有可用工作区，无法认领 Skill')
     if (mysql?.claimRecord) {
       const owners = await mysql.ownerWorkspaceIds('/skills', id)
       if (owners.some((owner) => owner !== workspaceId)) {
@@ -129,11 +139,7 @@ export class SkillsService extends Service {
       this.rememberOwned(workspaceId, id)
       return
     }
-    try {
-      account.store?.claim?.(actorId, workspaceId, '/skills', id)
-    } catch {
-      // 已归属其它空间 / 非成员时保留已落盘的文件。
-    }
+    account!.store!.claim!(actorId, workspaceId, '/skills', id)
   }
 
   /**
@@ -263,7 +269,12 @@ export class SkillsService extends Service {
 
   async import(input: SkillImportInput) {
     const created = this.store.import(input)
-    await this.claimOwnership(created.id)
+    try {
+      await this.claimOwnership(created.id)
+    } catch (error) {
+      this.store.remove(created.id)
+      throw error
+    }
     this.changed()
     return created
   }
@@ -276,7 +287,7 @@ export class SkillsService extends Service {
         if (!(id && this.store.get(id))) {
           try {
             const created = this.store.import(entry.input)
-            void this.claimOwnership(created.id)
+            void this.claimOwnership(created.id).catch(() => undefined)
             migrated += 1
           } catch {
             // 已存在或目录不合法就跳过。

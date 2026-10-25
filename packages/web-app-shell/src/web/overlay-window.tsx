@@ -134,7 +134,7 @@ export function OverlayChatWindow({
   }
 
   const handles: Array<{ key: string; className: string; edge: ResizeEdge }> = [
-    { key: 'n', className: 'absolute inset-x-8 top-0 h-1.5 cursor-n-resize', edge: { north: true } },
+    { key: 'n', className: 'absolute inset-x-8 top-0 h-2.5 cursor-n-resize', edge: { north: true } },
     { key: 's', className: 'absolute inset-x-2 bottom-0 h-1.5 cursor-s-resize', edge: { south: true } },
     { key: 'e', className: 'absolute inset-y-8 right-0 w-1.5 cursor-e-resize', edge: { east: true } },
     { key: 'w', className: 'absolute inset-y-2 left-0 w-1.5 cursor-w-resize', edge: { west: true } },
@@ -163,7 +163,7 @@ export function OverlayChatWindow({
       {handles.map((item) => (
         <div
           key={item.key}
-          className={`${item.className} z-10`}
+          className={`${item.className} z-40`}
           data-testid={`chat-overlay-resize-${item.key}`}
           onPointerDown={startResize(item.edge)}
         />

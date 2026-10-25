@@ -210,7 +210,8 @@ export function builtinAllView(table: TableRef): SavedView {
     ...builtinViewLayout(),
     filters: {},
     columns: [],
-    groupBy: path === '/page-blocks' || path === '/facets' ? '' : 'shareScope',
+    // 默认不分组；需要按分享看时由用户在视图里自己选（会记在本机的显示覆盖里）。
+    groupBy: '',
     wrap: false,
     truncate: true,
     query: '',

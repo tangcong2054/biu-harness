@@ -45,6 +45,18 @@ test('detects Tencent Token Plan by endpoint id or official URL', () => {
   )
 })
 
+test('detects Tencent postpaid (TokenHub) so it shares the same TPM limiter', () => {
+  const postpaid = { ...tokenPlanConfig, endpointId: 'custom-mvhss174', baseUrl: 'https://tokenhub.tencentmaas.com/v1' }
+  assert.equal(isTencentTokenPlan(postpaid), true)
+  assert.equal(isTencentTokenPlan({ ...postpaid, baseUrl: 'https://TOKENHUB.tencentmaas.com/v1' }), true)
+  // 不是 /plan 路径的 lkeap 普通入口仍然不算，避免误伤
+  assert.equal(
+    isTencentTokenPlan({ ...tokenPlanConfig, endpointId: undefined, baseUrl: 'https://api.lkeap.cloud.tencent.com/v1' }),
+    false,
+  )
+  assert.equal(isTencentTokenPlan({ ...postpaid, baseUrl: 'https://tokenhub.tencentmaas.com.evil.test/v1' }), false)
+})
+
 test('resolves Tencent Token Plan TPM settings safely', () => {
   assert.equal(resolveTencentTokenPlanTpm({}), DEFAULT_TENCENT_TOKEN_PLAN_TPM)
   assert.equal(resolveTencentTokenPlanTpm({ TENCENT_TOKEN_PLAN_TPM: '5000000' }), 5_000_000)

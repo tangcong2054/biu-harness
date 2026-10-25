@@ -128,3 +128,55 @@ test('grouped table fetch no longer uses a mixed 200-row page', () => {
   assert.match(browser, /count = group\.total \?\? group\.rows\.length/)
   assert.match(browser, /group\.total != null \? group\.rows/)
 })
+
+test('multi-value grouping keeps duplicates in buckets but dedupes the flat item list', async () => {
+  const tagSchema: CollectionSchema = {
+    labelField: 'title',
+    fields: {
+      ...REQUIRED_RECORD_FIELDS,
+      title: { type: 'string' },
+      labels: { type: 'multi-select', enum: ['a', 'b', 'c'] },
+    },
+  }
+  const shared = { id: 'p1', title: 'shared', labels: ['a', 'b', 'c'] }
+  const only = { id: 'p2', title: 'only-b', labels: ['b'] }
+  const list = async (input: { filters?: Record<string, unknown> }): Promise<ListPage> => {
+    const raw = JSON.stringify(input.filters ?? {})
+    if (raw.includes('$tree')) return { items: [], total: 0, schema: tagSchema }
+    if (!input.filters || raw === '{}') return { items: [shared], total: 2, schema: tagSchema }
+    if (raw.includes('"a"')) return { items: [shared], total: 1, schema: tagSchema }
+    if (raw.includes('"b"')) return { items: [shared, only], total: 2, schema: tagSchema }
+    if (raw.includes('"c"')) return { items: [shared], total: 1, schema: tagSchema }
+    return { items: [], total: 0, schema: tagSchema }
+  }
+  const page = await listGroupedCollection({ path: '/pages', groupBy: 'labels', schema: tagSchema, pageSize: 20, list })
+  assert.ok(page)
+  assert.deepEqual(
+    page!.buckets.map((item) => [item.key, item.rows.map((row) => row.id)]),
+    [
+      ['a', ['p1']],
+      ['b', ['p1', 'p2']],
+      ['c', ['p1']],
+    ],
+  )
+  assert.deepEqual(
+    page!.items.map((row) => row.id),
+    ['p1', 'p2'],
+  )
+  // 各组 total 相加是 1+2+1=4，真实记录只有 2 条
+  assert.equal(page!.total, 2)
+})
+
+test('single-value grouping keeps summing bucket totals without an extra request', async () => {
+  let calls = 0
+  const list = async (input: { filters?: Record<string, unknown> }): Promise<ListPage> => {
+    calls += 1
+    const status = String(input.filters?.status ?? '')
+    if (status === 'todo') return { items: [{ id: 't1', status: 'todo' }], total: 3, schema }
+    if (status === 'done') return { items: [{ id: 'x1', status: 'done' }], total: 2, schema }
+    return { items: [], total: 0, schema }
+  }
+  const page = await listGroupedCollection({ path: '/tasks', groupBy: 'status', schema, pageSize: 20, list })
+  assert.equal(page!.total, 5)
+  assert.equal(calls, 4)
+})

@@ -1456,17 +1456,101 @@ export class MysqlAccountRepository {
     }))
   }
 
-  async canAccessPlugin(accountId: string, workspaceId: string, pluginId: string) {
+  /**
+   * 插件按账号·空间安装：普通插件只认 account 授权；空间级授权只对内置插件生效。
+   * 是否内置由调用方判定（插件注册表在 host-account 层）。
+   */
+  async canAccessPlugin(
+    accountId: string,
+    workspaceId: string,
+    pluginId: string,
+    options: { includeWorkspaceGrant?: boolean } = {},
+  ) {
+    if (!accountId || !workspaceId || !pluginId) return false
     const [rows] = await this.pool.query<RowDataPacket[]>(
       `SELECT 1 AS ok FROM ${this.db}.workspace_members m
        JOIN ${this.db}.plugin_assignments p ON p.workspace_id = m.workspace_id
        WHERE m.account_id = ? AND m.workspace_id = ? AND p.plugin_id = ?
-         AND ((p.subject_type = 'workspace' AND p.subject_id = p.workspace_id)
-           OR (p.subject_type = 'account' AND p.subject_id = m.account_id))
+         AND ((p.subject_type = 'account' AND p.subject_id = m.account_id)
+           OR (? = 1 AND p.subject_type = 'workspace' AND p.subject_id = p.workspace_id))
        LIMIT 1`,
-      [accountId, workspaceId, pluginId],
+      [accountId, workspaceId, pluginId, options.includeWorkspaceGrant ? 1 : 0],
     )
     return Boolean(rows[0])
+  }
+
+  async isApprovedPluginPackage(pluginId: string, version: string) {
+    if (!pluginId || !version) return false
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT 1 AS ok FROM ${this.db}.plugin_packages
+       WHERE id = ? AND version = ? AND trust_state = 'approved' LIMIT 1`,
+      [pluginId, version],
+    )
+    return Boolean(rows[0])
+  }
+
+  async installPluginForAccount(actorId: string, workspaceId: string, pluginId: string, version = '', now = Date.now()) {
+    await this.requireMember(actorId, workspaceId)
+    const [approved] = await this.pool.query<RowDataPacket[]>(
+      `SELECT 1 AS ok FROM ${this.db}.plugin_packages WHERE id = ? AND trust_state = 'approved' LIMIT 1`,
+      [pluginId],
+    )
+    if (!approved[0]) throw new Error('插件未安装或尚未批准')
+    const connection = await this.pool.getConnection()
+    try {
+      await connection.beginTransaction()
+      await connection.query(
+        `INSERT INTO ${this.db}.plugin_assignments
+         (workspace_id, plugin_id, plugin_version, subject_type, subject_id, created_by, created_at)
+         VALUES (?, ?, ?, 'account', ?, ?, ?)
+         ON DUPLICATE KEY UPDATE plugin_version = VALUES(plugin_version),
+         created_by = VALUES(created_by), created_at = VALUES(created_at)`,
+        [workspaceId, pluginId, version, actorId, actorId, now],
+      )
+      await connection.query(
+        `INSERT INTO ${this.db}.plugin_audit_log
+         (account_id, workspace_id, plugin_id, action, detail_json, created_at)
+         VALUES (?, ?, ?, 'assignment.grant', ?, ?)`,
+        [actorId, workspaceId, pluginId, JSON.stringify({ subject: { type: 'account', id: actorId } }), now],
+      )
+      await connection.commit()
+    } catch (error) {
+      await connection.rollback()
+      throw error
+    } finally {
+      connection.release()
+    }
+  }
+
+  /** 只摘掉当前账号在当前空间的安装与加载，不影响同空间其他成员。 */
+  async uninstallPluginForAccount(actorId: string, workspaceId: string, pluginId: string, now = Date.now()) {
+    await this.requireMember(actorId, workspaceId)
+    const connection = await this.pool.getConnection()
+    try {
+      await connection.beginTransaction()
+      await connection.query(
+        `DELETE FROM ${this.db}.plugin_loads WHERE workspace_id = ? AND account_id = ? AND plugin_id = ?`,
+        [workspaceId, actorId, pluginId],
+      )
+      const [removed] = await connection.query<ResultSetHeader>(
+        `DELETE FROM ${this.db}.plugin_assignments
+         WHERE workspace_id = ? AND plugin_id = ? AND subject_type = 'account' AND subject_id = ?`,
+        [workspaceId, pluginId, actorId],
+      )
+      if (!removed.affectedRows) throw new Error('插件授权不存在')
+      await connection.query(
+        `INSERT INTO ${this.db}.plugin_audit_log
+         (account_id, workspace_id, plugin_id, action, detail_json, created_at)
+         VALUES (?, ?, ?, 'assignment.revoke', ?, ?)`,
+        [actorId, workspaceId, pluginId, JSON.stringify({ subject: { type: 'account', id: actorId } }), now],
+      )
+      await connection.commit()
+    } catch (error) {
+      await connection.rollback()
+      throw error
+    } finally {
+      connection.release()
+    }
   }
 
   async pluginLoadsFor(accountId: string, workspaceId: string) {
@@ -1485,10 +1569,17 @@ export class MysqlAccountRepository {
     return rows.map((row) => String(row.plugin_id))
   }
 
-  async setPluginLoad(accountId: string, workspaceId: string, pluginId: string, loaded: boolean, now = Date.now()) {
+  async setPluginLoad(
+    accountId: string,
+    workspaceId: string,
+    pluginId: string,
+    loaded: boolean,
+    now = Date.now(),
+    options: { includeWorkspaceGrant?: boolean } = {},
+  ) {
     await this.requireMember(accountId, workspaceId)
     if (loaded) {
-      if (!(await this.canAccessPlugin(accountId, workspaceId, pluginId))) throw new Error('plugin is not assigned')
+      if (!(await this.canAccessPlugin(accountId, workspaceId, pluginId, options))) throw new Error('plugin is not assigned')
       await this.pool.query(
         `INSERT INTO ${this.db}.plugin_loads (workspace_id, account_id, plugin_id, loaded_at)
          VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE loaded_at = VALUES(loaded_at)`,

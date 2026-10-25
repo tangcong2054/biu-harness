@@ -58,7 +58,7 @@ curl http://127.0.0.1:3141/api/api-playground/health
 
 | 动作 | risk | 说明 |
 |---|---|---|
-| `set_request` | write | 设置 `method` / `url` / `body`（鉴权 Header 请人手动填） |
+请求参数 `method` / `url` / `body` 通过页面块配置修改；鉴权 Header 请用户在页面手动填写。
 | `send` | submit | 发送当前请求 |
 | `read_response` | read | 读最近一次响应（含 `ok` / `status` / `ms` / `bytes` / `body`） |
 | `set_format` | write | 响应体展示：`formatted`（美化 JSON）或 `raw`（原始文本） |

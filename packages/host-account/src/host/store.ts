@@ -1435,18 +1435,19 @@ export class CollabStore {
   }
 
   workspaceHasPlugin(workspaceId: string, pluginId: string, accountId = '') {
-    if (!workspaceId || !pluginId) return false
+    if (!workspaceId || !pluginId || !accountId) return false
+    if (pluginId === 'platform-operations' &&
+      (workspaceId !== OPERATIONS_WORKSPACE_ID || accountId !== OPERATIONS_ADMIN_ACCOUNT_ID)) return false
+    const builtin = isRegisteredBuiltinPlugin(pluginId)
     const row = this.db
       .prepare(
         `SELECT 1 AS ok FROM plugin_assignments
          WHERE workspace_id = ? AND plugin_id = ?
-           AND (
-             (subject_type = 'workspace' AND subject_id = ?)
-             OR (subject_type = 'account' AND subject_id = ?)
-           )
+           AND ((subject_type = 'account' AND subject_id = ?)
+             OR (? = 1 AND subject_type = 'workspace' AND subject_id = ?))
          LIMIT 1`,
       )
-      .get(workspaceId, pluginId, workspaceId, accountId) as { ok?: number } | undefined
+      .get(workspaceId, pluginId, accountId, builtin ? 1 : 0, workspaceId) as { ok?: number } | undefined
     return Boolean(row)
   }
 
@@ -1627,6 +1628,24 @@ export class CollabStore {
     if (!removed.changes) throw new CollabError('插件授权不存在', 404)
     this.auditPlugin(actorId, workspaceId, pluginId, 'assignment.revoke', { subject }, now)
     return { workspaceId, pluginId, subjectType: subject.type, subjectId: subject.id }
+  }
+
+  isApprovedPluginPackage(pluginId: string, version: string) {
+    if (!pluginId || !version) return false
+    return Boolean(this.db.prepare(
+      `SELECT 1 FROM plugin_packages WHERE id = ? AND version = ? AND trust_state = 'approved' LIMIT 1`,
+    ).get(pluginId, version))
+  }
+
+  installPluginForAccount(actorId: string, workspaceId: string, pluginId: string, pluginVersion = '') {
+    return this.grantPluginAssignment(actorId, workspaceId, pluginId, { type: 'account', id: actorId }, pluginVersion)
+  }
+
+  uninstallPluginForAccount(actorId: string, workspaceId: string, pluginId: string) {
+    const result = this.revokePluginAssignment(actorId, workspaceId, pluginId, { type: 'account', id: actorId })
+    this.db.prepare('DELETE FROM plugin_loads WHERE workspace_id = ? AND account_id = ? AND plugin_id = ?')
+      .run(workspaceId, actorId, pluginId)
+    return result
   }
 
   installPluginForWorkspace(actorId: string, workspaceId: string, pluginId: string, pluginVersion = '') {

@@ -47,7 +47,8 @@ function asInstalledRecord(row: StoreListing, store: PluginStoreService): DbReco
     blurb: row.blurb,
     tags: row.tags,
     ...withOfficial(row),
-    installed: true,
+    // 空间卸载后磁盘目录还在，installed 以 store 给出的空间视角为准。
+    installed: row.installed !== false,
     pluginPath: store.pluginPath(row.id),
     enabled: row.enabled,
     running: row.running,
@@ -122,13 +123,25 @@ export function pluginsCollection(store: PluginStoreService, registry?: PluginRe
     return [...ids]
       .sort()
       .map((id) => {
-        const row = mergeLifecycle(byInstalled.get(id), bySandbox.get(id), store)
+        const listing = byInstalled.get(id)
+        const row = mergeLifecycle(listing, bySandbox.get(id), store)
+        // 只有"已安装 + 自己发布的（或商店里还没人占这个 id）"才给发布按钮，
+        // 避免点了才被商店或记录权限打成 permission denied。
+        // installed 要在 omitEmpty 抹掉 false 之前看原始 listing。
+        const remoteOwner = String(flags[id]?.ownerId ?? '')
+        const ownedRemotely = !remoteOwner || remoteOwner === registry?.ownerId?.()
+        const publishable = Boolean(
+          registry && listing && listing.installed !== false && ownedRemotely && registry.canPublish(id),
+        )
+        const rowWithPublish = publishable ? { ...row, canPublish: true } : row
         const flag = flags[id]
-        if (!flag) return row
+        if (!flag) return rowWithPublish
         return omitEmpty({
-          ...row,
+          ...rowWithPublish,
           remoteCodeVersion: flag.remoteCodeVersion,
+          remoteUpdatedAt: flag.remoteUpdatedAt,
           localCodeVersion: flag.localCodeVersion,
+          localUpdatedAt: flag.localUpdatedAt,
           updateAvailable: flag.updateAvailable,
           idConflict: flag.idConflict,
         })
@@ -198,7 +211,10 @@ export function pluginsCollection(store: PluginStoreService, registry?: PluginRe
         codeVersion: { type: 'string', label: '代码版本' },
         remoteCodeVersion: { type: 'string', label: '商店版本' },
         localCodeVersion: { type: 'string', label: '本地版本' },
+        localUpdatedAt: { type: 'datetime', label: '本地安装包更新时间' },
+        remoteUpdatedAt: { type: 'datetime', label: '商店更新时间' },
         updateAvailable: { type: 'boolean', label: '可更新' },
+        canPublish: { type: 'boolean', label: '可发布' },
         idConflict: { type: 'boolean', label: 'ID 冲突' },
         headless: { type: 'boolean', label: '无头' },
         shellWidth: { type: 'number', label: '窗口宽' },
@@ -265,15 +281,27 @@ export function pluginsCollection(store: PluginStoreService, registry?: PluginRe
         id: 'pack',
         label: '安装',
         when: { sandbox: true },
-        description: PLUGIN_PACK_DESCRIPTION,
+        description: `${PLUGIN_PACK_DESCRIPTION} 若宿主已有批准的同 ID 安装包且本人尚未安装，只为本人在当前空间建立安装关系，不重复打包。`,
         requiredAction: 'resource:read',
         parameters: { type: 'object', description: PLUGIN_PACK_DESCRIPTION, properties: {} },
-        run: async (id) => store.pack(id),
+        run: async (id, record) => record.pluginPath && record.installed !== true
+          ? store.installCached(id)
+          : store.pack(id),
+      },
+      {
+        id: 'install',
+        label: '安装',
+        when: { installed: false, sandbox: false },
+        description: '使用宿主已缓存且经过批准的插件包，为当前账号在当前空间安装；不覆盖其他人的代码。',
+        requiredAction: 'resource:read',
+        run: async (id) => store.installCached(id),
       },
       {
         id: 'publish',
         label: '发布到商店',
-        when: { installed: true },
+        // canPublish 由列表按"已安装 + 自己的插件（或全新 id）"算出，没配商店时不会给出。
+        // builtin 插件记录对非只读操作一律 permission denied，按钮必须收掉。
+        when: { installed: true, canPublish: true, builtin: false },
         description: '把 .plugin/<id>/ 的打包结果上传到插件商店。有沙箱时先 pack。同一把本机发布密钥才能更新已占用的 id。',
         run: async (id) => {
           if (!registry) throw new Error('plugin registry is not configured')
@@ -284,19 +312,31 @@ export function pluginsCollection(store: PluginStoreService, registry?: PluginRe
         id: 'update',
         label: '从商店更新',
         when: { updateAvailable: true },
-        description: '下载商店最新版覆盖 .plugin/<id>/。正在运行时会重新挂载。',
-        run: async (id) => {
+        description: '下载商店最新版覆盖 .plugin/<id>/；本地包较新时先经用户确认，再传 confirmOlder、localCodeVersion、remoteCodeVersion 重试。正在运行时会重新挂载。',
+        parameters: {
+          type: 'object',
+          properties: {
+            confirmOlder: { type: 'boolean', description: '用户确认用较旧商店包覆盖本地插件时填 true' },
+            localCodeVersion: { type: 'string', description: '确认时本地插件的 codeVersion' },
+            remoteCodeVersion: { type: 'string', description: '确认时商店目标插件的 codeVersion' },
+          },
+        },
+        run: async (id, _record, args = {}) => {
           if (!registry) throw new Error('plugin registry is not configured')
-          return registry.update(id)
+          return registry.update(id, {
+            confirmOlder: args.confirmOlder === true,
+            localCodeVersion: typeof args.localCodeVersion === 'string' ? args.localCodeVersion : undefined,
+            remoteCodeVersion: typeof args.remoteCodeVersion === 'string' ? args.remoteCodeVersion : undefined,
+          })
         },
       },
       {
         id: 'uninstall',
         label: '卸载',
         tone: 'danger',
-        confirm: '确定卸载这个插件？已安装的代码会被删掉。',
+        confirm: '确定卸载这个插件？线上只会移除你在当前空间的安装，其他成员不受影响。',
         when: { installed: true, builtin: false },
-        description: '删除 .plugin/<id>/。沙箱 .plugin-dev/<id>/ 还在的话行不会消失，只是 installed 变 false。',
+        description: '线上只移除当前账号在当前空间的安装；本地单机模式删除 .plugin/<id>/。',
         requiredAction: 'resource:delete',
         run: async (id) => {
           await store.uninstall(id)

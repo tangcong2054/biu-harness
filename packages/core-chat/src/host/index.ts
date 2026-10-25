@@ -20,8 +20,8 @@ import {
   buildTrajectoryWindow,
   findEvent,
 } from '@biu/host-sessions/trajectory'
-import { estimateTokens, liftToolImages } from '@biu/host-sessions'
-import { readArtifactFile } from '@biu/host-sessions/artifacts'
+import { deriveMessages, estimateRequestTokens, estimateToolSchemaTokens, estimateTokens, liftToolImages } from '@biu/host-sessions'
+import { persistPastedImages, readArtifactFile, withPastedImagePicks } from '@biu/host-sessions/artifacts'
 import { collectLiveDispatchedTasks } from '@biu/host-live-sessions/usage'
 import { loadLiveDispatchTasks, registerChatInspectorRoutes } from './inspector.ts'
 import { forwardCloud } from '@biu/host-account/mirror'
@@ -424,7 +424,7 @@ function mergeCustomEndpoints(saved: Partial<ChatConfig> | null): LlmEndpointDef
       provider,
       note: typeof raw.note === 'string' ? raw.note : undefined,
       placeholder: typeof raw.placeholder === 'string' ? raw.placeholder : 'sk-…',
-      builtin: false,
+      builtin: raw.builtin === true,
     })
   }
   return out
@@ -665,7 +665,7 @@ export class ChatService extends Service {
         hint: hint(this.config.apiKeys[ep.id] ?? ''),
         placeholder: ep.placeholder ?? 'sk-…',
         note: ep.note,
-        builtin: ep.builtin !== false && ep.group !== 'custom',
+        builtin: ep.builtin === true,
       })),
       modelCatalog: models.map((m) => ({
         ...m,
@@ -1860,6 +1860,23 @@ export function apply(ctx: Context) {
       toolsTokens: toolsSchemaTokens,
     })
   })
+  // 预计下一次请求的上下文占用：按 agent-loop 同一口径（压缩点后的投影消息 + 工具 schema）本地估算，非供应商实测。
+  ctx.http.route('GET', '/api/sessions/:id/context-estimate', async (route) => {
+    const record = await visibleSession(route.params.id)
+    if (!record) return route.send(404, { error: 'unknown session' })
+    const tools = ctx.tools.schemas()
+    const messages = await liftToolImages(deriveMessages(record.events), record.id)
+    const toolSchemaTokens = estimateToolSchemaTokens(tools)
+    const estimatedTokens = estimateRequestTokens(messages, tools)
+    const llm = chat.resolveLlm(record.id)
+    route.send(200, {
+      id: record.id,
+      estimatedTokens,
+      messageTokens: Math.max(0, estimatedTokens - toolSchemaTokens),
+      toolSchemaTokens,
+      contextWindowTokens: llm.contextWindowTokens ?? 200_000,
+    })
+  })
   ctx.http.route('PUT', '/api/sessions/:id/project', async (route) => {
     if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
     if (isOnlineRuntime()) {
@@ -1984,6 +2001,16 @@ export function apply(ctx: Context) {
           }))
           .filter((img) => img.name && img.mime && img.url)
       : []
+    // 粘贴/拖入的图片只有 data URL，agent 工具（db_asset from=）拿不到；落到会话 artifacts 并附 kind=file pick。
+    let text = payload.text ?? ''
+    if (images.length) {
+      try {
+        text = withPastedImagePicks(text, await persistPastedImages(route.params.id, images))
+      } catch {
+        if (shouldExecute) void finishCloudExecution(route.params.id)
+        return route.send(400, { error: '粘贴的图片未能保存到本地，请重试' })
+      }
+    }
     const liveContext = sanitizeLiveUiContext(payload.liveContext)
     const sendOpts = {
       ...(extraTools.length ? { extraTools } : {}),
@@ -1993,7 +2020,7 @@ export function apply(ctx: Context) {
       ...(liveContext ? { liveContext } : {}),
     }
     if (payload.kind === 'inject') {
-      agent.inject(payload.text ?? '', sendOpts)
+      agent.inject(text, sendOpts)
       return route.send(200, {
         sessionId: agent.sessionId,
         queued: true,
@@ -2001,7 +2028,7 @@ export function apply(ctx: Context) {
       })
     }
     try {
-      const turn = await agent.send(payload.text ?? '', sendOpts)
+      const turn = await agent.send(text, sendOpts)
       route.send(200, {
         sessionId: agent.sessionId,
         text: turn.text,

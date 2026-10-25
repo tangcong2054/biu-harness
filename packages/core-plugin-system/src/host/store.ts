@@ -42,6 +42,8 @@ export type StoreListing = {
   tags: string[]
   author: string
   authorUrl: string
+  /** 当前空间视角下的安装状态。磁盘上有 .plugin/<id>/ 只是"物理存在"，空间卸载后应为 false。 */
+  installed?: boolean
   enabled: boolean
   running: boolean
   bytes: number
@@ -188,7 +190,9 @@ export type PluginOrigin = { registryId: string; ownerId: string }
 
 export type RemoteFlag = {
   remoteCodeVersion: string
+  remoteUpdatedAt: number
   localCodeVersion: string
+  localUpdatedAt: number
   cached: boolean
   installed: boolean
   updateAvailable: boolean
@@ -336,6 +340,10 @@ export class PluginStoreService extends Service {
         ensurePluginOwnerAssignments?(pluginId: string): Promise<number>
         installPluginForWorkspace?(accountId: string, workspaceId: string, pluginId: string, version?: string): Promise<unknown>
         uninstallPluginFromWorkspace?(accountId: string, workspaceId: string, pluginId: string): Promise<unknown>
+        installPluginForAccount?(accountId: string, workspaceId: string, pluginId: string, version?: string): Promise<unknown>
+        uninstallPluginForAccount?(accountId: string, workspaceId: string, pluginId: string): Promise<unknown>
+        isApprovedPluginPackage?(pluginId: string, version: string): Promise<boolean>
+        workspaceHasPlugin?(workspaceId: string, pluginId: string, accountId?: string): Promise<boolean>
         removePluginPackage?(accountId: string, pluginId: string): Promise<void>
         store?: {
           canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): boolean
@@ -346,8 +354,9 @@ export class PluginStoreService extends Service {
           isMember?(accountId: string, workspaceId: string): boolean
           activeWorkspaceId?(): string | null
           workspaceHasPlugin?(workspaceId: string, pluginId: string, accountId?: string): boolean
-          installPluginForWorkspace?(accountId: string, workspaceId: string, pluginId: string, version?: string): unknown
-          uninstallPluginFromWorkspace?(accountId: string, workspaceId: string, pluginId: string): unknown
+          installPluginForAccount?(accountId: string, workspaceId: string, pluginId: string, version?: string): unknown
+          isApprovedPluginPackage?(pluginId: string, version: string): boolean
+          uninstallPluginForAccount?(accountId: string, workspaceId: string, pluginId: string): unknown
           ensurePluginOwnerAssignments?(pluginId: string): number
           recordPluginPackage?(accountId: string, input: Record<string, unknown>): void
           syncInstalledPluginPackage?(input: Record<string, unknown>): boolean
@@ -397,7 +406,7 @@ export class PluginStoreService extends Service {
   async isInstalledForCurrentWorkspace(id: string) {
     const accountId = currentAccountId()
     const workspaceId = this.currentWorkspaceId()
-    if (!accountId || !workspaceId) return existsSync(join(this.pluginPath(id), 'manifest.json'))
+    if (!accountId || !workspaceId) return !isOnlineRuntime() && existsSync(join(this.pluginPath(id), 'manifest.json'))
     const account = this.accountStore()
     return account?.canAccessPlugin
       ? Boolean(await account.canAccessPlugin(accountId, workspaceId, id))
@@ -419,6 +428,12 @@ export class PluginStoreService extends Service {
 
   pluginPath(id: string) {
     return join(this.pluginDir, id)
+  }
+
+  /** 即将被商店覆盖的安装目录时间，不混入沙箱；每次重新读取磁盘避免列表缓存过期。 */
+  async installedUpdatedAt(id: string) {
+    const dir = this.pluginPath(id)
+    return existsSync(join(dir, 'manifest.json')) ? (await pluginDirStats(dir)).updatedAt : 0
   }
 
   sandboxPath(id: string) {
@@ -529,7 +544,7 @@ export class PluginStoreService extends Service {
         : account?.isMember?.(accountId, workspaceId)
     )
     if (member) {
-      await account.installPluginForWorkspace?.(accountId, workspaceId, manifest.id, codeVersion)
+      await account.installPluginForAccount?.(accountId, workspaceId, manifest.id, codeVersion)
     }
     // 运行中才重新挂载；挂载失败不能留在运行中。
     if (this.isEnabled(manifest.id)) {
@@ -621,6 +636,7 @@ export class PluginStoreService extends Service {
       items.push({
         ...manifest,
         ...(manifest.builtin || this.isBuiltin(manifest.id) ? { builtin: true } : {}),
+        installed: true,
         enabled,
         running: running.has(manifest.id),
         bytes: stats.bytes,
@@ -643,7 +659,13 @@ export class PluginStoreService extends Service {
     const workspaceId = this.currentWorkspaceId()
     if (!accountId || !workspaceId) return items
     const loaded = new Set(await this.accountStore()?.pluginLoadsFor?.(accountId, workspaceId) ?? [])
-    return items.map((item) => ({ ...item, enabled: loaded.has(item.id), running: loaded.has(item.id) }))
+    return Promise.all(items.map(async (item) => {
+      // 线上卸载只摘掉当前空间的安装关系，.plugin/<id>/ 仍留在磁盘上；
+      // 所以 installed 必须按空间安装关系算，否则卸载后"运行/发布到商店"还会亮着。
+      const installed = await this.isInstalledForCurrentWorkspace(item.id)
+      const active = installed && loaded.has(item.id)
+      return { ...item, installed, enabled: active, running: active }
+    }))
   }
 
   private hasBundle(dir: string | null) {
@@ -737,7 +759,7 @@ export class PluginStoreService extends Service {
     this.invalidateList()
   }
 
-  /** 卸载：有账号上下文时只移除当前 Workspace 安装关系；无租户时沿用本地物理卸载。 */
+  /** 卸载：线上只移除当前账号在当前 Workspace 的安装关系；本地单机模式物理卸载。 */
   async uninstall(id: string) {
     if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
     if (id === 'platform-operations') throw new Error('不能卸载平台运营插件')
@@ -750,13 +772,13 @@ export class PluginStoreService extends Service {
         : account?.isMember?.(accountId, workspaceId)
     )
     if (member) {
-      await account.uninstallPluginFromWorkspace?.(accountId, workspaceId, id)
+      await account.uninstallPluginForAccount?.(accountId, workspaceId, id)
       const still = (await account.loadedPluginIds?.())?.includes(id)
       if (!still) await this.hub().drop(id)
       this.invalidateList()
       return
     }
-    if (isOnlineRuntime()) await this.requireWorkspaceMember()
+    if (isOnlineRuntime()) throw new Error('线上卸载需要当前账号及空间')
     await this.hub().drop(id)
     this.setEnabled(id, false)
     const dest = this.pluginPath(id)
@@ -778,6 +800,7 @@ export class PluginStoreService extends Service {
     if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
     if (id === 'platform-operations') throw new Error('不能删除平台运营插件')
     if (this.isBuiltin(id)) throw new Error(`cannot delete built-in plugin: ${id}`)
+    if (isOnlineRuntime()) throw new Error('线上不能删除其他账号共用的插件包，请使用卸载')
     await this.uninstall(id)
     const installed = this.pluginPath(id)
     if (isPathInside(this.pluginDir, installed) && existsSync(installed)) {
@@ -813,8 +836,41 @@ export class PluginStoreService extends Service {
     }
   }
 
+  async isApprovedCachedVersion(id: string, version: string) {
+    if (!currentAccountId() && !isOnlineRuntime()) return true
+    return (await this.accountStore()?.isApprovedPluginPackage?.(id, version)) === true
+  }
+
+  /** 已缓存且经过批准的包只建立当前账号在当前空间的安装关系，不重新打包共享代码。 */
+  async installCached(id: string) {
+    if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
+    if (isOnlineRuntime()) await this.requireWorkspaceMember()
+    const dir = this.pluginPath(id)
+    if (!existsSync(join(dir, 'manifest.json'))) throw new Error(`plugin is not packed: ${id}`)
+    const codeVersion = await hashInstalledPluginCode(dir)
+    if (!codeVersion) throw new Error(`plugin bundle has no code: ${id}`)
+    const account = this.accountStore()
+    const accountId = currentAccountId()
+    const workspaceId = this.currentWorkspaceId()
+    if (accountId || isOnlineRuntime()) {
+      const member = accountId && workspaceId && (
+        account?.isMemberAsync
+          ? await account.isMemberAsync(accountId, workspaceId)
+          : account?.isMember?.(accountId, workspaceId)
+      )
+      if (!member) throw new Error('需要登录并加入当前空间')
+      if (!account.installPluginForAccount || !(await account.isApprovedPluginPackage?.(id, codeVersion))) {
+        throw new Error(`plugin package is not approved: ${id}@${codeVersion}`)
+      }
+      await account.installPluginForAccount(accountId, workspaceId, id, codeVersion)
+    }
+    this.invalidateList()
+    return { id, codeVersion }
+  }
+
   /** 把商店里的打包结果写入 .plugin/<id>/。来源对不上且本地已有同 id 时拒绝覆盖。 */
   async installBundle(bundle: InstalledBundle) {
+    if (isOnlineRuntime()) await this.requireWorkspaceMember()
     const id = String(bundle.id ?? '').trim()
     if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
     const manifestText = bundle.files?.['manifest.json']
@@ -878,7 +934,7 @@ export class PluginStoreService extends Service {
         : account?.isMember?.(accountId, workspaceId)
     )
     if (member) {
-      await account.installPluginForWorkspace?.(accountId, workspaceId, id, codeVersion)
+      await account.installPluginForAccount?.(accountId, workspaceId, id, codeVersion)
     }
     if (wasRunning) await this.mountFromDisk(packedManifest, dest)
     return { id, codeVersion, remounted: wasRunning }

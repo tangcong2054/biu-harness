@@ -46,3 +46,18 @@ test('hydrateTheme applies the host profile without localStorage', async () => {
     globalThis.fetch = originalFetch
   }
 })
+
+test('persistTheme rolls back when the profile save fails', async () => {
+  applyTheme('light')
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response('{"error":"forbidden"}', { status: 403 })) as typeof fetch
+  try {
+    const pending = persistTheme('dark')
+    assert.equal(readTheme(), 'dark')
+    assert.equal(await pending, false)
+    assert.equal(readTheme(), 'light')
+    assert.equal(document.documentElement.classList.contains('light'), true)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
