@@ -17,6 +17,11 @@ const HISTORY_OUT_LINES = 10 // 每条命令最多保留的输出行数
 const HISTORY_OUT_CHARS = 600 // 单条输出字符上限，防止撑爆 markdown
 const OUTPUT_SETTLE_MS = 600 // 输出安静这么久，就认为这条命令跑完了
 const PICK_SELECTION_CHARS = 12_000 // 避免超大终端选区撑爆 agent 上下文
+const SNAPSHOT_LINES = 200 // 画面快照最多保留的行数（会话丢失后只读回显用）
+const SNAPSHOT_CHARS = 6_000 // 快照字符上限，写在块数据里，不能把 markdown 撑太大
+const SNAPSHOT_SETTLE_MS = 1_500 // 输出安静这么久才存一次快照，避免频繁改块数据
+/** 与 host 的 SESSION_GONE_CODE 一致：attach 时会话已不存在。 */
+const SESSION_GONE_CODE = 4404
 
 type HistoryEntry = { cmd: string; at: number; out?: string }
 
@@ -280,7 +285,7 @@ function buryAuxiliaryNodes(root: HTMLElement) {
 }
 
 // v6 supersedes pt-xterm-style-v5 without restoring its IME-breaking position overrides.
-const STYLE_ID = 'pt-xterm-style-v6'
+const STYLE_ID = 'pt-xterm-style-v8'
 const STYLE_CSS = `
 .pt-card{
   display:flex;flex-direction:column;overflow:hidden;
@@ -295,6 +300,16 @@ const STYLE_CSS = `
   font:12px/1 ui-sans-serif,system-ui,sans-serif;user-select:none;
 }
 .pt-title{color:rgba(242,241,237,.78);font-weight:600;letter-spacing:-.01em}
+.pt-badge{padding:2px 6px;border-radius:4px;background:rgba(255,178,36,.12);color:#ffb224;font-size:11px}
+.pt-restart{height:22px;padding:0 8px;border:1px solid rgba(255,255,255,.14);border-radius:6px;background:transparent;color:rgba(242,241,237,.85);font:inherit;cursor:pointer}
+.pt-restart:hover{background:rgba(255,255,255,.06)}
+.pt-snapshot{
+  margin:0;min-height:0;overflow:auto;box-sizing:border-box;
+  padding:9px 8px 5px 10px;background:#191919;color:rgba(240,239,237,.72);
+  font:12px/1.18 "SF Mono",Menlo,Monaco,Consolas,monospace;
+  white-space:pre-wrap;word-break:break-all;overscroll-behavior:contain;
+  user-select:text;-webkit-user-select:text;cursor:text;
+}
 .pt-history{border-bottom:1px solid rgba(255,255,255,.06);background:#161616}
 .pt-mount{position:absolute;inset:0;overflow:hidden;box-sizing:border-box;overscroll-behavior:contain}
 .pt-pick-layer{display:none;position:absolute;inset:0;z-index:30;background:transparent;pointer-events:none}
@@ -457,12 +472,22 @@ function TerminalSurface({
   height,
   history,
   onHistory,
+  snapshot,
+  onSnapshot,
+  attach,
+  onGone,
   sessionKey,
   fill,
 }: {
   height: number
   history: HistoryEntry[]
   onHistory: (next: HistoryEntry[]) => void
+  /** 上次保存的画面纯文本；会话丢失时以只读方式回显。 */
+  snapshot: string
+  onSnapshot: (text: string) => void
+  /** 只连已有会话；会话不存在时不起新 shell，转为只读。 */
+  attach: boolean
+  onGone: () => void
   /** 后端会话键：同一个块刷新/切页都能连回同一个 shell。 */
   sessionKey: string
   /** 放大时撑满容器，而不是固定高度。 */
@@ -473,6 +498,11 @@ function TerminalSurface({
   const mount = useRef<HTMLDivElement | null>(null)
   const pickLayer = useRef<HTMLDivElement | null>(null)
   const instance = useRef<Terminal | null>(null)
+  // effect 只跑一次，回调走 ref 拿最新值，避免闭包里是旧的 update。
+  const onSnapshotRef = useRef(onSnapshot)
+  onSnapshotRef.current = onSnapshot
+  const onGoneRef = useRef(onGone)
+  onGoneRef.current = onGone
 
   useLayoutEffect(() => {
     const paneEl = pane.current
@@ -493,6 +523,41 @@ function TerminalSurface({
     let selectionSub: { dispose(): void } | undefined
     let scrollSub: { dispose(): void } | undefined
     let outTimer: number | undefined
+    let snapshotTimer: number | undefined
+    let lastSnapshot = snapshot
+    /** 收到过 PTY 数据才算真的连上了，才允许用当前画面覆盖快照。 */
+    let live = false
+
+    /** 读 xterm 缓冲区（含 scrollback）的纯文本尾部。 */
+    const readScreen = () => {
+      if (!term) return ''
+      const buffer = term.buffer.active
+      const lines: string[] = []
+      const start = Math.max(0, buffer.length - SNAPSHOT_LINES)
+      for (let i = start; i < buffer.length; i += 1) {
+        lines.push(buffer.getLine(i)?.translateToString(true) ?? '')
+      }
+      while (lines.length && !lines[lines.length - 1].trim()) lines.pop()
+      const text = lines.join('\n')
+      return text.length > SNAPSHOT_CHARS ? text.slice(-SNAPSHOT_CHARS) : text
+    }
+
+    const saveSnapshot = () => {
+      if (snapshotTimer) {
+        window.clearTimeout(snapshotTimer)
+        snapshotTimer = undefined
+      }
+      if (!live || !term) return
+      const text = readScreen()
+      if (!text || text === lastSnapshot) return
+      lastSnapshot = text
+      onSnapshotRef.current(text)
+    }
+
+    const scheduleSnapshot = () => {
+      if (snapshotTimer) window.clearTimeout(snapshotTimer)
+      snapshotTimer = window.setTimeout(saveSnapshot, SNAPSHOT_SETTLE_MS)
+    }
 
     const historyRef = [...history]
     let pendingLine = ''
@@ -666,6 +731,7 @@ function TerminalSurface({
         socket = new WebSocket(
           `${protocol}//${location.host}/ws/page-terminal` +
             `?cols=${term.cols}&rows=${term.rows}&session=${encodeURIComponent(sessionKey)}` +
+            (attach ? '&attach=1' : '') +
             // 与宿主 readWorkspaceId() 一致：sessionStorage 为空时回退 localStorage（新标签页 / 新窗口场景）。
             `&workspaceId=${encodeURIComponent(
               sessionStorage.getItem('biu.workspaceId') || localStorage.getItem('biu.workspaceId') || '',
@@ -680,12 +746,23 @@ function TerminalSurface({
         socket.addEventListener('message', (event) => {
           decodePtyChunk(event.data, (chunk) => {
             if (!chunk || disposed || !term) return
-            term.write(chunk, syncPickSelection)
+            live = true
+            term.write(chunk, () => {
+              syncPickSelection()
+              scheduleSnapshot()
+            })
             recordOutput(chunk)
           })
         })
         socket.addEventListener('close', (event) => {
-          if (disposed || event.code === 1000 || !term) return
+          if (disposed || !term) return
+          if (event.code === SESSION_GONE_CODE) {
+            // 会话已不在：不起新 shell，交给外层切成只读历史。
+            onGoneRef.current()
+            return
+          }
+          saveSnapshot()
+          if (event.code === 1000) return
           const why = event.reason?.trim() || `code ${event.code}`
           term.write(`\r\n\x1b[31m终端未能启动：${why}\x1b[0m\r\n`, syncPickSelection)
         })
@@ -726,6 +803,14 @@ function TerminalSurface({
     return () => {
       disposed = true
       if (outTimer) window.clearTimeout(outTimer)
+      // 切页 / 块卸载时把还没落盘的快照补一次；页面整体刷新时这里不保证执行，靠防抖兜底。
+      if (snapshotTimer) {
+        try {
+          saveSnapshot()
+        } catch {
+          // 编辑器可能已销毁。
+        }
+      }
       cancelAnimationFrame(frame)
       cancelAnimationFrame(secondFrame)
       intersection?.disconnect()
@@ -1268,11 +1353,26 @@ function PageTerminal({
     ? presentation.detached || presentation.mode === 'sidebar'
     : legacyZoom.zoomed || popout
   const sessionKey = typeof data.sid === 'string' && data.sid ? data.sid : ''
+  /** 块加载时就带着的 sid：用它连接时只接旧会话（attach），不存在就转只读。
+      新插入的块 / 点「新开会话」换的 sid 不在此列，正常起 shell。 */
+  const initialSid = React.useRef(sessionKey).current
+  const attach = Boolean(initialSid) && sessionKey === initialSid
+  /** 会话丢失后切成只读；点「新开会话」才换 sid 起新 shell。 */
+  const [gone, setGone] = React.useState(false)
   useEffect(() => {
     if (sessionKey || !writable) return
     const sid = `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
     update({ sid })
   }, [sessionKey, writable, update])
+
+  const snapshot = typeof data.snapshot === 'string' ? data.snapshot : ''
+  const restart = () => {
+    if (!writable) return
+    const sid = `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+    setGone(false)
+    // 旧快照保留在只读区作为上一段记录意义不大，新会话起来后会被新画面覆盖。
+    update({ sid })
+  }
 
   React.useEffect(() => {
     if (!settingsOpen) return
@@ -1314,7 +1414,13 @@ function PageTerminal({
     >
       <header className="pt-head">
         <span className="pt-title">终端</span>
+        {gone ? <span className="pt-badge">只读 · 会话已结束</span> : null}
         <span style={{ flex: 1 }} />
+        {gone && writable ? (
+          <button type="button" className="pt-restart" onClick={restart}>
+            新开会话
+          </button>
+        ) : null}
         <div ref={settingsWrap} style={{ position: 'relative', flex: '0 0 auto' }}>
           <IconButton label="设置" active={settingsOpen} onClick={() => setSettingsOpen((v) => !v)}>
             <GearIcon />
@@ -1343,11 +1449,25 @@ function PageTerminal({
         writable={writable}
         onClear={() => update({ history: [] })}
       />
-      {sessionKey ? (
+      {gone ? (
+        <ReadonlySnapshot
+          text={snapshot}
+          height={height}
+          fill={presentation ? presentation.mode === 'sidebar' : legacyZoom.zoomed || popout}
+        />
+      ) : sessionKey ? (
         <TerminalSurface
+          // effect 只在挂载时建连；换 sid（新开会话）要整体重挂。
+          key={sessionKey}
           height={height}
           history={history}
           onHistory={(next) => update({ history: next })}
+          snapshot={snapshot}
+          onSnapshot={(text) => {
+            if (writable) update({ snapshot: text })
+          }}
+          attach={attach}
+          onGone={() => setGone(true)}
           sessionKey={sessionKey}
           fill={presentation ? presentation.mode === 'sidebar' : legacyZoom.zoomed || popout}
         />
@@ -1356,6 +1476,53 @@ function PageTerminal({
   )
 
   return body
+}
+
+function ReadonlySnapshot({ text, height, fill }: { text: string; height: number; fill?: boolean }) {
+  const ref = useRef<HTMLDivElement | null>(null)
+  useLayoutEffect(() => {
+    // 和终端一样默认停在最底部。
+    if (ref.current) ref.current.scrollTop = ref.current.scrollHeight
+  }, [text])
+  // 不用 <pre>：编辑器的 `.page-editor .tiptap pre` 代码块样式会套上来（浅色底、边框、圆角）。
+  // 页面块外层带 draggable="true"（节点 spec.draggable），在里面拖鼠标会变成拖整块而不是选字；
+  // 按下时临时摘掉祖先的 draggable，松开再还原。
+  const allowTextSelect = (event: React.MouseEvent) => {
+    // 块外层 mousedown 会把整块设为节点选中，清掉文字选区；拦住它才能选中复制。
+    event.stopPropagation()
+    if (event.button !== 0) return
+    const restored: HTMLElement[] = []
+    for (let el = ref.current?.parentElement; el; el = el.parentElement) {
+      if (el.getAttribute('draggable') === 'true') {
+        el.setAttribute('draggable', 'false')
+        restored.push(el)
+      }
+    }
+    if (!restored.length) return
+    const restore = () => {
+      for (const el of restored) el.setAttribute('draggable', 'true')
+      window.removeEventListener('mouseup', restore, true)
+      window.removeEventListener('blur', restore)
+    }
+    window.addEventListener('mouseup', restore, true)
+    window.addEventListener('blur', restore)
+  }
+  return (
+    <div
+      ref={ref}
+      className="pt-snapshot"
+      data-testid="page-terminal-snapshot"
+      onMouseDown={allowTextSelect}
+      onDragStart={(event) => {
+        event.preventDefault()
+        event.stopPropagation()
+      }}
+      onWheel={(event) => event.stopPropagation()}
+      style={{ height: fill ? undefined : height, flex: fill ? 1 : undefined }}
+    >
+      {text || '（没有保存的终端画面）'}
+    </div>
+  )
 }
 
 function TerminalMinimized({ data }: { data: Record<string, unknown> }) {
