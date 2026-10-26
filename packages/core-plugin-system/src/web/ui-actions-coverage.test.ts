@@ -8,6 +8,7 @@ const explicit = new Set([
   'api-playground',
   'arena-rogue',
   'cdb-errorlog',
+  'cdb-logs',
   'cdb-processlist',
   'cdb-slowlog',
   'dbbrain-limit',
