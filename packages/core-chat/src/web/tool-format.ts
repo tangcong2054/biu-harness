@@ -1,3 +1,5 @@
+import { TODO_TOOL_NAME, todoProgress, tryParseTodoArgs } from '@biu/type-session'
+
 export type DiffLine = { type: 'add' | 'remove' | 'equal'; text: string }
 
 export type ParsedToolCall =
@@ -625,6 +627,13 @@ export function toolSummary(parsed: ParsedToolCall, fallback: string): string {
       return compactJsonSummary(inner) || parsed.tool
     }
     case 'raw':
+      if (parsed.label === TODO_TOOL_NAME) {
+        const items = tryParseTodoArgs(parsed.raw)
+        if (items) {
+          const { done, total, current } = todoProgress(items)
+          return clip(`${done}/${total}${current ? ` · ${current.content}` : ''}`)
+        }
+      }
       return compactJsonSummary(fallback) || '…'
   }
 }
@@ -644,7 +653,7 @@ export function toolTitle(parsed: ParsedToolCall, name: string): string {
     case 'mcp':
       return parsed.tool
     case 'raw':
-      return name
+      return name === TODO_TOOL_NAME ? 'Todo' : name
   }
 }
 
