@@ -236,8 +236,24 @@ export function pluginsCollection(store: PluginStoreService, registry?: PluginRe
       })()
     },
     remove: async (query) => {
-      const ids = query.ids ?? []
-      for (const id of ids) await store.destroy(id)
+      const ids = [...new Set((query.ids ?? []).map((id) => String(id ?? '').trim()).filter(Boolean))]
+      // 先校验全部，任一不能删时一个都不删。
+      for (const id of ids) store.assertDestroyable(id)
+      // 删除要动磁盘，做不到全有或全无：中途失败时把已删掉的列进报错，让调用方知道停在哪。
+      const done: string[] = []
+      for (const id of ids) {
+        try {
+          await store.destroy(id)
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          throw new Error(
+            done.length
+              ? `删除插件 ${id} 失败：${reason}（已删除：${done.join('、')}）`
+              : `删除插件 ${id} 失败：${reason}`,
+          )
+        }
+        done.push(id)
+      }
       return ids
     },
     actions: [

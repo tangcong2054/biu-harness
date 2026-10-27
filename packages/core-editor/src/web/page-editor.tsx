@@ -9,7 +9,7 @@ import type { Editor } from '@tiptap/core'
 import { Selection } from '@tiptap/pm/state'
 import type { FsContentProps } from '@biu/type-file-system/ui'
 import { pageEditorExtensions } from './kit.ts'
-import { setEditorResourcePath } from './page-image.ts'
+import { imageUploadFailureText, onImageUploadFailure, setEditorResourcePath } from './page-image.ts'
 import { PageBlockHandle } from './page-block-handle.tsx'
 import { editorHostIsLive } from './editor-live.ts'
 import { FOCUS_RECORD_CONTENT, FOCUS_RECORD_TITLE, handleContentTitleNav, shouldLeaveContentForTitle, focusRecordTitleNear, isDocStartSelection } from './title-content-nav.ts'
@@ -309,6 +309,7 @@ export function PageEditor({ record, value, writable, onChange, path, status = '
   const [findQuery, setFindQuery] = useState('')
   const [findIndex, setFindIndex] = useState(0)
   const [findTotal, setFindTotal] = useState(0)
+  const [uploadError, setUploadError] = useState('')
 
   const editor = useEditor(
     {
@@ -444,6 +445,18 @@ export function PageEditor({ record, value, writable, onChange, path, status = '
     setEditorResourcePath(editor, path || undefined)
     return () => setEditorResourcePath(editor, undefined)
   }, [editor, path])
+
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return
+    onImageUploadFailure(editor, (failures) => setUploadError(imageUploadFailureText(failures)))
+    return () => onImageUploadFailure(editor, undefined)
+  }, [editor])
+
+  useEffect(() => {
+    if (!uploadError) return
+    const timer = setTimeout(() => setUploadError(''), 8000)
+    return () => clearTimeout(timer)
+  }, [uploadError])
 
   useEffect(() => {
     if (!editor || editor.isDestroyed || source) return
@@ -657,6 +670,14 @@ export function PageEditor({ record, value, writable, onChange, path, status = '
       onKeyDownCapture={onEditorHotkey}
     >
       {findBar}
+      {uploadError ? (
+        <div className="page-editor-upload-error" role="alert" data-testid="page-image-upload-error">
+          <span>{uploadError}</span>
+          <button type="button" aria-label="关闭提示" onClick={() => setUploadError('')}>
+            ×
+          </button>
+        </div>
+      ) : null}
       <EditorContent editor={editor} />
       {writable !== false ? <PageBlockHandle editor={editor} /> : null}
       {writable !== false ? <Bubble editor={editor} onSendChat={sendToChat} /> : null}

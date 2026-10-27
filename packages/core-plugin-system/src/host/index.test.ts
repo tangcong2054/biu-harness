@@ -438,3 +438,68 @@ test('codeVersion hashes host.js and web.js together', async () => {
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('成员打包 + 运行后重新打包：hub 里的 web 换成新 ?v=，前端会重新加载', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-member-repack-'))
+  const previous = process.env.BIU_ONLINE
+  try {
+    const ctx = new Context()
+    const hub = stubHub(ctx)
+    const loads = new Set<string>()
+    const emitted: string[] = []
+    const realEmit = ctx.emit.bind(ctx)
+    ;(ctx as unknown as { emit: (name: string, ...args: unknown[]) => unknown }).emit = (name: string, ...args: unknown[]) => {
+      emitted.push(name)
+      return (realEmit as (name: string, ...args: unknown[]) => unknown)(name, ...args)
+    }
+    ;(ctx as unknown as { get(name: string): unknown }).get = (name: string) =>
+      name === 'account'
+        ? {
+            store: {
+              isMember: (accountId: string) => accountId === 'ada',
+              installPluginForAccount: () => undefined,
+              setPluginLoad: (_a: string, _w: string, id: string, on: boolean) => (on ? loads.add(id) : loads.delete(id)),
+              loadedPluginIds: () => [...loads],
+              pluginLoadsFor: () => [...loads],
+              canAccessPlugin: () => true,
+            },
+          }
+        : undefined
+    const store = new PluginStoreService(ctx, join(dir, '.plugin'), join(dir, 'store.json'), join(dir, '.plugin-dev')).open()
+    await store.initSandbox({ id: 'blocky', name: '块', blurb: '页面块', headless: true, webJs: 'export const v = 1\n' })
+    const asAda = <T>(fn: () => Promise<T>) => runWithAccount('ada', () => runWithRequestWorkspace('ws', fn))
+
+    // 第一次：打包 + 运行
+    await asAda(() => store.pack('blocky'))
+    assert.equal(hub.forks.has('blocky'), false)
+    await asAda(() => store.openPlugin('blocky'))
+    const firstWeb = hub.forks.get('blocky')?.web
+    assert.match(String(firstWeb), /web\.js\?v=/)
+    assert.equal(emitted.includes('hub/change'), true)
+
+    // 改代码后重新打包：成员分支不写 store.json 的 enabled，也必须重新挂载
+    await writeFile(join(dir, '.plugin-dev', 'blocky', 'web', 'index.tsx'), 'export const v = 2\n')
+    await asAda(() => store.pack('blocky'))
+    const repackedWeb = hub.forks.get('blocky')?.web
+    assert.notEqual(repackedWeb, firstWeb)
+
+    // 再点运行：hub 里已有这一行且版本一致，不重复挂载
+    const adoptedBefore = hub.adopted.length
+    await asAda(() => store.openPlugin('blocky'))
+    assert.equal(hub.adopted.length, adoptedBefore)
+
+    // 磁盘上的代码变了但 hub 还是旧版本（例如别的进程打的包）：运行时补挂载
+    await writeFile(join(dir, '.plugin', 'blocky', 'web.js'), 'export const v = 3\n')
+    await asAda(() => store.openPlugin('blocky'))
+    assert.notEqual(hub.forks.get('blocky')?.web, repackedWeb)
+    assert.equal(hub.adopted.length, adoptedBefore + 1)
+
+    // 桌面模式下成员加载的插件，web.js 也要能读到（不能只认 store.json 的 enabled）
+    process.env.BIU_ONLINE = '0'
+    assert.match(await asAda(() => store.readInstalledFile('blocky', 'web.js')), /v = 3/)
+  } finally {
+    if (previous === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})

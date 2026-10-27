@@ -395,3 +395,39 @@ test('publish is only offered for plugins the viewer can publish', async () => {
   assert.equal(rows.find((row) => row.id === 'mine')?.canPublish, true)
   assert.equal(rows.find((row) => row.id === 'theirs')?.canPublish, undefined)
 })
+
+test('批量删除插件：先校验全部，不存在或内置时一个都不删', async () => {
+  const destroyed: string[] = []
+  const present = new Set(['a', 'b'])
+  const spec = pluginsCollection(stubStore({
+    assertDestroyable: (id: string) => {
+      if (id === 'platform-operations') throw new Error('不能删除平台运营插件')
+      if (!present.has(id)) throw new Error(`unknown plugin: ${id}`)
+    },
+    destroy: async (id: string) => {
+      destroyed.push(id)
+      present.delete(id)
+    },
+  }))
+  await assert.rejects(async () => spec.remove!({ ids: ['a', 'missing'] }), /unknown plugin: missing/)
+  await assert.rejects(async () => spec.remove!({ ids: ['a', 'platform-operations'] }), /平台运营插件/)
+  assert.deepEqual(destroyed, [])
+  assert.deepEqual(await spec.remove!({ ids: ['a', 'b', 'a'] }), ['a', 'b'])
+  assert.deepEqual(destroyed, ['a', 'b'])
+})
+
+test('批量删除插件：删除阶段失败时报错里带上已删掉的', async () => {
+  const destroyed: string[] = []
+  const spec = pluginsCollection(stubStore({
+    assertDestroyable: () => {},
+    destroy: async (id: string) => {
+      if (id === 'b') throw new Error('EBUSY')
+      destroyed.push(id)
+    },
+  }))
+  await assert.rejects(
+    async () => spec.remove!({ ids: ['a', 'b', 'c'] }),
+    (error: Error) => /删除插件 b 失败：EBUSY/.test(error.message) && /已删除：a/.test(error.message),
+  )
+  assert.deepEqual(destroyed, ['a'])
+})

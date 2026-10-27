@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 import { dirname, join, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { Service, type Context, type Plugin } from 'cordis'
-import type { CatalogEntry } from '@biu/host-hub'
+import { HUB_CHANGE, type CatalogEntry } from '@biu/host-hub'
 import {
   buildStoreManifest,
   bundleStoreEntry,
@@ -547,7 +547,10 @@ export class PluginStoreService extends Service {
       await account.installPluginForAccount?.(accountId, workspaceId, manifest.id, codeVersion)
     }
     // 运行中才重新挂载；挂载失败不能留在运行中。
-    if (this.isEnabled(manifest.id)) {
+    // 「运行中」要和 installBundle 一个口径：账号成员走的是加载记录（setPluginLoad），
+    // 不写 store.json 的 enabled；只看 isEnabled 会漏掉 Agent 打包的插件，
+    // 结果 hub 里的 web 还是旧 ?v=，前端不重新 import，slash 里也就看不到新块。
+    if (this.isRunning(manifest.id)) {
       try {
         await this.mountFromDisk(manifest, dest)
       } catch (error) {
@@ -557,6 +560,15 @@ export class PluginStoreService extends Service {
       }
     }
     return { id: manifest.id, sandboxPath: sandbox, pluginPath: dest }
+  }
+
+  /** 插件当前是否在运行：本地 enabled、任一账号的加载记录，或 hub 里已挂上。 */
+  private isRunning(id: string) {
+    return (
+      this.isEnabled(id) ||
+      Boolean(this.accountStore()?.loadedPluginIds?.().includes(id)) ||
+      this.hub().snapshot().plugins.some((row) => row.id === id && (row.enabled || row.state === 'active'))
+    )
   }
 
   /** 空间成员看得到 .plugin-dev；实例草稿权限仍单独放行。 */
@@ -690,9 +702,16 @@ export class PluginStoreService extends Service {
     const hit = await this.findPluginDir(id)
     if (!hit) throw new Error(`unknown store plugin: ${id}`)
     const manifest = await readManifest(hit)
-    const running = this.hub().snapshot().plugins.some((row) => row.id === manifest.id)
-    if (!running) await this.mountFromDisk(manifest, hit)
+    const row = this.hub().snapshot().plugins.find((item) => item.id === manifest.id)
+    // 已挂上但磁盘上的代码已经换了（重新打包过）：照样重新挂载，
+    // 让 hub 里的 web 带上新 ?v=，前端才会卸掉旧模块、重新 import 并 registerBlock。
+    const stale = row ? (row as { web?: string }).web !== this.webUrlFor(manifest.id, hit, await hashInstalledPluginCode(hit)) : false
+    if (!row || stale) await this.mountFromDisk(manifest, hit)
     return manifest
+  }
+
+  private webUrlFor(id: string, dir: string, codeVersion: string | null | undefined) {
+    return existsSync(join(dir, 'web.js')) ? storeWebUrl(id, codeVersion ?? undefined) : undefined
   }
 
   async openPlugin(id: string) {
@@ -717,6 +736,8 @@ export class PluginStoreService extends Service {
       }
       await account.setPluginLoad?.(accountId, workspaceId, id, true)
       this.invalidateList()
+      // 加载记录变了，前端快照的过滤结果也跟着变；hub 行可能没变（已挂上），这里补一次通知。
+      this.ctx.emit(HUB_CHANGE)
       return (await this.list()).find((item) => item.id === id)
     }
     const hit = await this.ensurePacked(id)
@@ -796,11 +817,22 @@ export class PluginStoreService extends Service {
   }
 
   /** 彻底删除：安装产物和沙箱一起删。回收站清空走这条。 */
-  async destroy(id: string) {
+  /** destroy 的前置校验；批量删除时先对全部 id 调用，避免删到一半才报错。 */
+  assertDestroyable(id: string) {
     if (!isSafeId(id)) throw new Error(`invalid plugin id: ${id}`)
     if (id === 'platform-operations') throw new Error('不能删除平台运营插件')
     if (this.isBuiltin(id)) throw new Error(`cannot delete built-in plugin: ${id}`)
     if (isOnlineRuntime()) throw new Error('线上不能删除其他账号共用的插件包，请使用卸载')
+    const installed = this.pluginPath(id)
+    const sandbox = this.sandboxPath(id)
+    const present =
+      (isPathInside(this.pluginDir, installed) && existsSync(installed)) ||
+      (isPathInside(this.sandboxDir, sandbox) && existsSync(sandbox))
+    if (!present) throw new Error(`unknown plugin: ${id}`)
+  }
+
+  async destroy(id: string) {
+    this.assertDestroyable(id)
     await this.uninstall(id)
     const installed = this.pluginPath(id)
     if (isPathInside(this.pluginDir, installed) && existsSync(installed)) {
@@ -1066,7 +1098,7 @@ export class PluginStoreService extends Service {
       if (!accountId || !workspaceId || !allowed) {
         throw new Error('not found')
       }
-    } else if (!this.isEnabled(id)) throw new Error('not found')
+    } else if (!this.isRunning(id)) throw new Error('not found')
     const hit = await this.findPluginDir(id)
     if (!hit) throw new Error('not found')
     const path = join(hit, file)

@@ -3,6 +3,7 @@ import type { AssistantReply, ChatOptions, LlmClient, LlmConfig, LlmMessage, Llm
 import { runWithSession } from '@biu/host-sessions/scope'
 import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime, runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import { estimateTokens, fitMessagesToTokenBudget, liftToolImages } from '@biu/host-sessions'
+import { TODO_TOOL_NAME } from '@biu/type-session'
 import { runWithToolPolicy, runWithToolProgress, type AgentToolMode } from '@biu/host-tools'
 import {
   buildAutoCompactMessages,
@@ -11,6 +12,7 @@ import {
   resolveContextPolicy,
   type ContextPolicy,
 } from './context-policy.ts'
+import { registerTodoTool, todoReminder, todoTurnState, todoUnfinishedReminder, withReminder } from './todo.ts'
 
 /** 工具结果写入事件日志( tool/result )时统一上限字符数；超长裁剪，避免上下文被单次工具输出撑爆。 */
 export const MAX_TOOL_RESULT_CHARS = 16_000
@@ -307,6 +309,10 @@ export class AgentLoop implements AgentRunner {
       }, 48)
     }
 
+    const todoNudged = { done: false }
+    let todoEndReminded = false
+    let pendingReminder: string | undefined
+
     for (let step = 0; ; step++) {
       if (this.signal.aborted) {
         await flushChunks()
@@ -367,9 +373,18 @@ export class AgentLoop implements AgentRunner {
           )
         }
 
-        reply = await this.llm.chat(fitted.messages, tools, this.signal, {
+        const todoEnabled = tools.some((tool) => tool.function?.name === TODO_TOOL_NAME)
+        const reminder =
+          pendingReminder ??
+          (todoEnabled && step > 0
+            ? todoReminder(todoTurnState(session.peek(this.sessionId)?.events ?? []), step, todoNudged)
+            : undefined)
+        pendingReminder = undefined
+        const requestMessages = withReminder(fitted.messages, reminder)
+
+        reply = await this.llm.chat(requestMessages, tools, this.signal, {
           estimatedTotalTokens: projectedRequestTokens(
-            fitted.messages,
+            requestMessages,
             tools,
             policy.outputReserveTokens,
           ),
@@ -416,6 +431,16 @@ export class AgentLoop implements AgentRunner {
           ...(usage ? { usage } : {}),
         })
         await session.append(this.sessionId, { type: 'step/end', turn, step })
+        // 清单还有未完成项：每回合最多追问一次，避免死循环。
+        if (!todoEndReminded && !this.signal.aborted) {
+          const items = todoTurnState(session.peek(this.sessionId)?.events ?? []).items
+          const unfinished = items ? todoUnfinishedReminder(items) : undefined
+          if (unfinished) {
+            todoEndReminded = true
+            pendingReminder = unfinished
+            continue
+          }
+        }
         await session.append(this.sessionId, { type: 'turn/end', turn, reason: 'complete' })
         this.ctx.emit('agent/status', { sessionId: this.sessionId, status: 'idle', step })
         return { text: final, steps }
@@ -582,4 +607,5 @@ export const inject = ['llm', 'tools', 'sessions', 'systemPrompt']
 
 export function apply(ctx: Context) {
   new AgentLoopService(ctx)
+  registerTodoTool(ctx)
 }

@@ -86,6 +86,18 @@ export function isReadOnlyViewId(id: string) {
   return isBuiltinAllViewId(id) || isBuiltinCatalogViewId(id) || isBuiltinTagViewId(id) || isBuiltinBlockKindViewId(id) || isBuiltinScopeViewId(id) || isBuiltinMemberViewId(id)
 }
 
+/**
+ * 新视图 id：沿用时间戳格式；同一毫秒内连续新建或撞上已有 id 时顺延，保证唯一。
+ * 内置 id 都带非数字前缀，不会和数字时间戳相撞，所以只需躲开 views 里已有的。
+ */
+export function freshViewId(views: ReadonlyArray<{ id: string }>, now = Date.now()) {
+  const taken = new Set(views.map((view) => String(view.id)))
+  let candidate = Number(now)
+  if (!Number.isFinite(candidate)) candidate = Date.now()
+  while (taken.has(String(candidate))) candidate += 1
+  return String(candidate)
+}
+
 const MEMBER_VIEWS = [
   { kind: 'member', name: '空间成员' },
   { kind: 'external', name: '外部成员' },

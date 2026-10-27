@@ -25,6 +25,7 @@ import { ImageThumbs } from './image-thumbs.tsx'
 import { collectClipboardImages, collectImageFiles } from './clipboard-images.ts'
 import { revealOverlayThread, isComposerFocusPending } from '@biu/web-app-shell/chat-overlay'
 import { shouldNavigateToSession } from './composer-nav.ts'
+import { currentTurnTodos, TodoPanel } from './todo-panel.tsx'
 
 /** 按键不驱动受控 value；仅防抖更新发送按钮可用态，避免每个字符打穿 React 渲染。 */
 const INPUT_DEBOUNCE_MS = 120
@@ -209,6 +210,8 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
   const inbox = useSessionView((state) => state.inbox)
   const sessionId = useSessionView((state) => state.sessionId)
   const goal = useSessionView((state) => state.sessions.find((item) => item.id === state.sessionId)?.goal)
+  const events = useSessionView((state) => state.events)
+  const todos = useMemo(() => currentTurnTodos(events), [events])
   const sessionView = props.sessionView as SessionViewService
   const pick = props.pick as PickService | undefined
   const { refs: pickRefs } = usePickState(pick)
@@ -865,6 +868,7 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
           </div>
         </div>
       ) : null}
+      {todos?.length ? <TodoPanel items={todos} running={pending} /> : null}
       {inbox.length > 0 ? (
         <div className="composer-inbox" aria-label="排队中">
           <div className="composer-inbox-head">排队中 · {inbox.length}</div>

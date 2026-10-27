@@ -65,6 +65,9 @@ const DEFAULT_SETTINGS = {
 }
 type Settings = typeof DEFAULT_SETTINGS
 
+/** attach 模式下会话已不存在（host 重启 / 被淘汰 / shell 退出）。4000-4999 为应用自定义关闭码。 */
+export const SESSION_GONE_CODE = 4404
+
 const SETTINGS_LIMITS = {
   maxSessions: { min: 1, max: 200 },
   bufferKB: { min: 64, max: 4096 },
@@ -389,8 +392,14 @@ export function apply(ctx: Ctx) {
     const rows = dim(q.get('rows'), 20, 5, 400)
     // 块的 id 作为会话键：同一块刷新/切页/重开都能连回同一个 shell。
     const key = String(q.get('session') ?? '').trim() || `anon-${++seq}`
+    // attach=1：只接已有会话，不存在就拒绝，由前端转成只读历史，而不是悄悄起一个新 shell。
+    const attachOnly = q.get('attach') === '1'
 
     let session = pool.get(key)
+    if (!session && attachOnly) {
+      socket.close(SESSION_GONE_CODE, 'session gone')
+      return
+    }
     // 已有会话：尺寸可能因重新布局而不同，按新尺寸对齐(并触发 shell 重绘)。
     if (session) {
       try {

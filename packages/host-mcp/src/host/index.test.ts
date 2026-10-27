@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, test } from 'vitest'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { Context } from 'cordis'
 import { runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import * as tools from '@biu/host-tools'
 import * as mcp from './index.ts'
-import { incompleteReason, listToEnv, listToHeaders, parseMcpConfig, serializeMcpConfig, toolAllowed } from './config.ts'
+import { incompleteReason, listToEnv, listToHeaders, parseMcpConfig, serializeMcpConfig, toolAllowed, writeMcpConfig } from './config.ts'
 
 let dir = ''
 
@@ -164,6 +164,46 @@ test('echo is reserved and cannot be overwritten by upsert', async () => {
   await assert.rejects(() => ctx.mcp.upsert({ id: 'echo', command: 'noop' }), /reserved/)
 })
 
+test('损坏的 mcp.json 不会被回写覆盖，修好后自动恢复', async () => {
+  const broken = '{ "mcpServers": { "keep": { "command": "noop" } '
+  writeFileSync(process.env.BIU_MCP_CONFIG!, broken)
+  const ctx = await boot()
+  assert.deepEqual(ctx.mcp.serverIds(), ['echo'])
+  assert.throws(() => ctx.mcp.draft(), /无法读取/)
+  await assert.rejects(() => ctx.mcp.upsert({ id: 'other', command: 'noop', enabled: false }), /无法读取/)
+  assert.equal(readFileSync(process.env.BIU_MCP_CONFIG!, 'utf8'), broken)
+
+  writeFileSync(
+    process.env.BIU_MCP_CONFIG!,
+    JSON.stringify({ mcpServers: { keep: { command: 'noop', enabled: false } } }),
+  )
+  assert.deepEqual(ctx.mcp.serverIds(), ['echo', 'keep'])
+  assert.equal(ctx.mcp.draft().id, 'new-server')
+  const onDisk = parseMcpConfig(JSON.parse(readFileSync(process.env.BIU_MCP_CONFIG!, 'utf8')) as unknown)
+  assert.deepEqual(onDisk.map((item) => item.id), ['keep', 'new-server'])
+})
+
+test('不存在或为空的 mcp.json 视为空配置', async () => {
+  writeFileSync(process.env.BIU_MCP_CONFIG!, '  \n')
+  const ctx = await boot()
+  assert.deepEqual(ctx.mcp.serverIds(), ['echo'])
+  assert.equal(ctx.mcp.draft().id, 'new-server')
+})
+
+test('批量删除遇到非法 id 时一个都不删', async () => {
+  writeFileSync(
+    process.env.BIU_MCP_CONFIG!,
+    JSON.stringify({ mcpServers: { a: { command: 'noop', enabled: false }, b: { command: 'noop', enabled: false } } }),
+  )
+  const ctx = await boot()
+  await assert.rejects(() => ctx.mcp.removeMany(['a', 'missing']), /unknown mcp server: missing/)
+  await assert.rejects(() => ctx.mcp.removeMany(['a', 'echo']), /built-in/)
+  assert.deepEqual(ctx.mcp.serverIds(), ['a', 'b', 'echo'].sort())
+  assert.deepEqual(await ctx.mcp.removeMany(['a', 'b', 'a']), ['a', 'b'])
+  assert.deepEqual(ctx.mcp.serverIds(), ['echo'])
+  assert.deepEqual(parseMcpConfig(JSON.parse(readFileSync(process.env.BIU_MCP_CONFIG!, 'utf8')) as unknown), [])
+})
+
 test('draft(): a new row lands disabled, persisted, and says what it needs', async () => {
   const ctx = await boot()
   const row = ctx.mcp.draft()
@@ -294,4 +334,52 @@ test('mcp table only keeps enable, disable, and uninstall actions', () => {
   for (const id of ['add', 'connect', 'disconnect', 'refresh', 'list_tools', 'select']) {
     assert.doesNotMatch(src, new RegExp(`id: '${id}'`), id)
   }
+})
+
+test('writeMcpConfig 原子落盘：不留临时文件，失败时不损坏原文件', () => {
+  const path = join(dir, 'atomic.json')
+  const servers = parseMcpConfig({ mcpServers: { a: { command: 'noop', enabled: false } } })
+  writeMcpConfig(servers, path)
+  const first = readFileSync(path, 'utf8')
+  assert.deepEqual(parseMcpConfig(JSON.parse(first) as unknown).map((item) => item.id), ['a'])
+  assert.deepEqual(readdirSync(dir).filter((name) => name.endsWith('.tmp')), [])
+
+  // 目标是目录时 rename 必然失败：原文件内容必须保持不变，且不留临时文件。
+  const blocked = join(dir, 'blocked.json')
+  mkdirSync(blocked, { recursive: true })
+  assert.throws(() => writeMcpConfig([], blocked))
+  assert.deepEqual(readdirSync(dir).filter((name) => name.endsWith('.tmp')), [])
+  assert.equal(readFileSync(path, 'utf8'), first)
+})
+
+test('外部修改 mcp.json 会被感知，不必重启；自己的写入不会触发重连', async () => {
+  writeFileSync(process.env.BIU_MCP_CONFIG!, JSON.stringify({ mcpServers: { a: { command: 'noop', enabled: false } } }))
+  const ctx = await boot()
+  assert.deepEqual(ctx.mcp.serverIds(), ['a', 'echo'])
+
+  // 外部（编辑器 / 另一个进程）直接改文件
+  writeFileSync(
+    process.env.BIU_MCP_CONFIG!,
+    JSON.stringify({ mcpServers: { a: { command: 'noop', enabled: false }, b: { command: 'noop', enabled: false } } }),
+  )
+  assert.deepEqual(ctx.mcp.serverIds(), ['a', 'b', 'echo'])
+
+  writeFileSync(process.env.BIU_MCP_CONFIG!, JSON.stringify({ mcpServers: { b: { command: 'noop', enabled: false } } }))
+  assert.deepEqual(ctx.mcp.serverIds(), ['b', 'echo'])
+
+  // 自己写入之后，内存里的状态对象应保持同一个（没有被当成外部改动而重建）
+  await ctx.mcp.upsert({ id: 'c', command: 'noop', enabled: false })
+  const snapshot = ctx.mcp.serverIds()
+  assert.deepEqual(snapshot, ['b', 'c', 'echo'])
+  assert.deepEqual(ctx.mcp.serverIds(), snapshot)
+})
+
+test('配置损坏时写操作报配置错误，而不是「服务器不存在」', async () => {
+  writeFileSync(process.env.BIU_MCP_CONFIG!, JSON.stringify({ mcpServers: { keep: { command: 'noop', enabled: false } } }))
+  const ctx = await boot()
+  assert.deepEqual(ctx.mcp.serverIds(), ['echo', 'keep'])
+  writeFileSync(process.env.BIU_MCP_CONFIG!, '{ "mcpServers": ')
+  await assert.rejects(() => ctx.mcp.setEnabled('keep', true), /无法读取/)
+  await assert.rejects(() => ctx.mcp.removeMany(['keep']), /无法读取/)
+  await assert.rejects(() => ctx.mcp.rename('keep', 'other'), /无法读取/)
 })

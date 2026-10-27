@@ -1,4 +1,5 @@
 import { Service, type Context } from 'cordis'
+import { statSync } from 'node:fs'
 import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
 import { mcpCollection } from './collection.ts'
 import { McpConnection, type McpToolInfo } from './client.ts'
@@ -73,6 +74,10 @@ function echoState(): ServerState {
 
 export class McpService extends Service {
   private scopes = new Map<string, Map<string, ServerState>>()
+  /** 配置文件读失败的作用域 → 错误信息。存在时禁止回写。 */
+  private loadErrors = new Map<string, string>()
+  /** 作用域 → 上次读到的配置文件指纹，用于发现外部修改。 */
+  private stamps = new Map<string, string>()
 
   constructor(ctx: Context) {
     super(ctx, 'mcp')
@@ -107,21 +112,77 @@ export class McpService extends Service {
     return workspaceId
   }
 
+  /** 配置文件指纹（mtime:size），用于发现外部修改后重新读盘。 */
+  private fileStamp(path: string) {
+    try {
+      const info = statSync(path)
+      return `${info.mtimeMs}:${info.size}`
+    } catch {
+      return 'none'
+    }
+  }
+
   private get servers() {
     const key = this.scope()
-    let servers = this.scopes.get(key)
-    if (servers) return servers
-    servers = new Map<string, ServerState>([['echo', echoState()]])
+    const cached = this.scopes.get(key)
+    let path = ''
+    try {
+      path = mcpConfigPath(undefined, key === 'local' ? '' : key)
+    } catch (error) {
+      // 拿不到工作区上下文：和「文件坏了」区分开，不要用那句提示误导用户。
+      if (cached) return cached
+      throw error
+    }
+    const stamp = this.fileStamp(path)
+    if (cached && !this.loadErrors.has(key) && this.stamps.get(key) === stamp) return cached
+    let configs: McpServerConfig[]
+    try {
+      configs = readMcpConfig(path)
+    } catch (error) {
+      // 配置文件坏了：只保留内置 echo，并记下错误；写操作会被 assertWritable 拦住，不回写覆盖原文件。
+      const message = error instanceof Error ? error.message : String(error)
+      if (this.loadErrors.get(key) !== message) {
+        try {
+          this.ctx.logger('mcp').warn(message)
+        } catch {
+          console.warn(message)
+        }
+      }
+      this.loadErrors.set(key, message)
+      this.stamps.set(key, stamp)
+      if (cached) return cached
+      const fallback = new Map<string, ServerState>([['echo', echoState()]])
+      this.scopes.set(key, fallback)
+      return fallback
+    }
+    // 读成功：清掉错误标记并按文件重建（之前读失败的占位、或文件被外部改过）。
+    this.loadErrors.delete(key)
+    this.stamps.set(key, stamp)
+    const servers = new Map<string, ServerState>([['echo', echoState()]])
     this.scopes.set(key, servers)
-    for (const config of readMcpConfig(mcpConfigPath(undefined, key === 'local' ? '' : key))) {
+    for (const config of configs) {
       if (config.id === 'echo') continue
+      const prev = cached?.get(config.id)
+      // 配置没变的沿用原连接，避免外部改动别的服务器时把正在跑的子进程一起重启。
+      if (prev && !prev.builtin && JSON.stringify(prev.config) === JSON.stringify(config)) {
+        servers.set(config.id, prev)
+        continue
+      }
       servers.set(config.id, {
         config, status: 'idle', error: '', tools: [], connectedAt: 0, builtin: false,
       })
     }
+    // 被外部删掉或改掉的服务器：关掉旧连接，别留下孤儿子进程。
+    for (const [id, state] of cached ?? []) {
+      if (state.builtin || servers.get(id) === state) continue
+      state.generation = (state.generation ?? 0) + 1
+      const connection = state.connection
+      state.connection = undefined
+      void connection?.close().catch(() => undefined)
+    }
     // 每个工作区首次访问时独立连接；不把其他工作区的 MCP 清单/连接带过来。
     for (const state of servers.values()) {
-      if (!state.builtin && state.config.enabled && !incompleteReason(state.config)) {
+      if (!state.builtin && !state.connection && state.status !== 'connecting' && state.config.enabled && !incompleteReason(state.config)) {
         state.opening = this.connectInScope(key, state)
         void state.opening.catch(() => undefined)
       }
@@ -194,14 +255,28 @@ export class McpService extends Service {
 
   private require(id: string) {
     const state = this.servers.get(id)
-    if (!state) throw new Error(`unknown mcp server: ${id}`)
-    return state
+    if (state) return state
+    // 配置读不出来时，别用「服务器不存在」误导调用方（Agent 会以为已经删掉了）。
+    const error = this.loadErrors.get(this.scope())
+    if (error) throw new Error(error)
+    throw new Error(`unknown mcp server: ${id}`)
+  }
+
+  /** 写操作前调用：配置文件读不了时拒绝修改，避免内存里的空表覆盖原文件。 */
+  private assertWritable() {
+    void this.servers
+    const error = this.loadErrors.get(this.scope())
+    if (error) throw new Error(error)
   }
 
   private persist() {
+    this.assertWritable()
     const servers = [...this.servers.values()].filter((state) => !state.builtin).map((state) => state.config)
     const key = this.scope()
-    writeMcpConfig(servers, mcpConfigPath(undefined, key === 'local' ? '' : key))
+    const path = mcpConfigPath(undefined, key === 'local' ? '' : key)
+    writeMcpConfig(servers, path)
+    // 记下自己写出来的指纹，别把自己的写入当成外部改动而重连一轮。
+    this.stamps.set(key, this.fileStamp(path))
   }
 
   async connect(id: string) {
@@ -239,6 +314,7 @@ export class McpService extends Service {
     const config = normalizeServerConfig(raw.id, raw)
     if (!config) throw new Error(`invalid mcp server config: ${raw.id}`)
     if (config.id === 'echo') throw new Error('echo is reserved for the built-in server')
+    this.assertWritable()
     const existing = this.servers.get(config.id)
     if (existing) await this.disconnect(config.id)
     this.servers.set(config.id, {
@@ -257,6 +333,7 @@ export class McpService extends Service {
   async setEnabled(id: string, enabled: boolean) {
     const state = this.require(id)
     if (state.builtin) throw new Error('built-in echo server is always enabled')
+    this.assertWritable()
     state.config = { ...state.config, enabled }
     this.persist()
     if (!enabled) return this.disconnect(id)
@@ -272,6 +349,7 @@ export class McpService extends Service {
   async rename(id: string, nextId: string) {
     const state = this.require(id)
     if (state.builtin) throw new Error('cannot rename the built-in echo server')
+    this.assertWritable()
     const wanted = String(nextId ?? '').trim()
     if (wanted === id) return this.row(state)
     if (this.servers.has(wanted)) throw new Error(`mcp server already exists: ${wanted}`)
@@ -304,6 +382,7 @@ export class McpService extends Service {
   async patchConfig(id: string, patch: Partial<McpServerConfig>) {
     const state = this.require(id)
     if (state.builtin) throw new Error('cannot edit the built-in echo server')
+    this.assertWritable()
     const before = state.config
     const merged = normalizeServerConfig(id, { ...before, ...patch, id })
     if (!merged) throw new Error(`invalid mcp server config: ${id}`)
@@ -325,6 +404,7 @@ export class McpService extends Service {
   setToolFilter(id: string, filter: unknown) {
     const state = this.require(id)
     if (state.builtin) throw new Error('cannot filter the built-in echo server')
+    this.assertWritable()
     state.config = { ...state.config, tools: normalizeToolFilter(filter) }
     this.persist()
     this.changed()
@@ -332,14 +412,28 @@ export class McpService extends Service {
   }
 
   async remove(id: string) {
-    const state = this.require(id)
-    if (state.builtin) throw new Error('cannot remove built-in echo server')
-    state.generation = (state.generation ?? 0) + 1
-    await state.connection?.close()
-    this.servers.delete(id)
+    await this.removeMany([id])
+    return { id, removed: true }
+  }
+
+  /** 批量删除：先校验全部 id，再一起删除并只写一次配置；任一 id 不合法时一个都不删。 */
+  async removeMany(ids: readonly string[]) {
+    const unique = [...new Set(ids.map((id) => String(id ?? '').trim()).filter(Boolean))]
+    const states = unique.map((id) => {
+      const state = this.require(id)
+      if (state.builtin) throw new Error('cannot remove built-in echo server')
+      return state
+    })
+    this.assertWritable()
+    for (const state of states) {
+      state.generation = (state.generation ?? 0) + 1
+      await state.connection?.close().catch(() => undefined)
+      state.connection = undefined
+    }
+    for (const id of unique) this.servers.delete(id)
     this.persist()
     this.changed()
-    return { id, removed: true }
+    return unique
   }
 
   /** 重新拉取工具清单（server 端热更新了工具时用）。 */
@@ -354,6 +448,7 @@ export class McpService extends Service {
 
   /** 界面「新建」用：先落一行停用的 stdio 草稿，字段在表格里慢慢填。 */
   draft() {
+    this.assertWritable()
     let id = 'new-server'
     for (let n = 2; this.servers.has(id); n++) id = `new-server-${n}`
     const config = normalizeServerConfig(id, { transport: 'stdio', command: '', enabled: false })
@@ -472,6 +567,8 @@ export class McpService extends Service {
       servers.clear()
     }
     this.scopes.clear()
+    this.loadErrors.clear()
+    this.stamps.clear()
   }
 }
 

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { currentAccountId, currentRequestWorkspaceId, dataHome, dataPath, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
 
@@ -180,17 +180,56 @@ export function serializeMcpConfig(servers: readonly McpServerConfig[]) {
   return { mcpServers: bag }
 }
 
-export function readMcpConfig(path = mcpConfigPath()): McpServerConfig[] {
-  try {
-    return parseMcpConfig(JSON.parse(readFileSync(path, 'utf8')) as unknown)
-  } catch {
-    return []
+/** 配置文件存在但读不了 / 解析不了。调用方必须停止回写，否则会把用户配置覆盖成空。 */
+export class McpConfigReadError extends Error {
+  constructor(readonly path: string, reason: string) {
+    super(`MCP 配置文件无法读取（${path}）：${reason}。为避免覆盖原配置，已暂停写入；修好文件后会自动恢复。`)
+    this.name = 'McpConfigReadError'
   }
 }
 
+/** 文件不存在或为空时返回 []；其他错误抛 McpConfigReadError。 */
+export function readMcpConfig(path = mcpConfigPath()): McpServerConfig[] {
+  let text: string
+  try {
+    text = readFileSync(path, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return []
+    throw new McpConfigReadError(path, error instanceof Error ? error.message : String(error))
+  }
+  if (!text.trim()) return []
+  try {
+    return parseMcpConfig(JSON.parse(text) as unknown)
+  } catch (error) {
+    throw new McpConfigReadError(path, error instanceof Error ? error.message : String(error))
+  }
+}
+
+/**
+ * 原子写入：先写同目录临时文件再 rename 覆盖，避免 writeFileSync 先截断后写入时被中断，
+ * 留下 0 字节或半截文件（0 字节会被当成「空配置」而失去保护，直接覆盖掉用户配置）。
+ */
 export function writeMcpConfig(servers: readonly McpServerConfig[], path = mcpConfigPath()) {
   mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, `${JSON.stringify(serializeMcpConfig(servers), null, 2)}\n`, 'utf8')
+  const text = `${JSON.stringify(serializeMcpConfig(servers), null, 2)}\n`
+  const temp = `${path}.${process.pid}.${Date.now().toString(36)}.tmp`
+  try {
+    const handle = openSync(temp, 'w', 0o600)
+    try {
+      writeFileSync(handle, text, 'utf8')
+      fsyncSync(handle)
+    } finally {
+      closeSync(handle)
+    }
+    renameSync(temp, path)
+  } catch (error) {
+    try {
+      rmSync(temp, { force: true })
+    } catch {
+      /* 临时文件清理失败不影响结果 */
+    }
+    throw error
+  }
 }
 
 function matches(pattern: string, name: string) {
