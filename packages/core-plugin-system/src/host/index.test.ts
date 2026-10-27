@@ -503,3 +503,33 @@ test('成员打包 + 运行后重新打包：hub 里的 web 换成新 ?v=，前�
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('账号服务的 loadedPluginIds 为异步时，运行中的 web.js 仍可读取', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-async-load-'))
+  const previous = process.env.BIU_ONLINE
+  process.env.BIU_ONLINE = '0'
+  try {
+    const ctx = new Context()
+    stubHub(ctx)
+    ;(ctx as unknown as { get(name: string): unknown }).get = (name: string) =>
+      name === 'account'
+        ? {
+            canAccessPlugin: async () => true,
+            loadedPluginIds: async () => ['blocky'],
+            store: {
+              loadedPluginIds: () => ['blocky'],
+            },
+          }
+        : undefined
+    const pluginDir = join(dir, '.plugin')
+    const store = new PluginStoreService(ctx, pluginDir, join(dir, 'store.json'), join(dir, '.plugin-dev')).open()
+    await mkdir(join(pluginDir, 'blocky'), { recursive: true })
+    await writeFile(join(pluginDir, 'blocky', 'manifest.json'), `${JSON.stringify({ id: 'blocky', name: '块' })}\n`)
+    await writeFile(join(pluginDir, 'blocky', 'web.js'), 'export const v = 1\n')
+    assert.match(await store.readInstalledFile('blocky', 'web.js'), /v = 1/)
+  } finally {
+    if (previous === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})

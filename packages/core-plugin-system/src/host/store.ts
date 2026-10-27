@@ -550,7 +550,7 @@ export class PluginStoreService extends Service {
     // 「运行中」要和 installBundle 一个口径：账号成员走的是加载记录（setPluginLoad），
     // 不写 store.json 的 enabled；只看 isEnabled 会漏掉 Agent 打包的插件，
     // 结果 hub 里的 web 还是旧 ?v=，前端不重新 import，slash 里也就看不到新块。
-    if (this.isRunning(manifest.id)) {
+    if (await this.isRunning(manifest.id)) {
       try {
         await this.mountFromDisk(manifest, dest)
       } catch (error) {
@@ -562,13 +562,18 @@ export class PluginStoreService extends Service {
     return { id: manifest.id, sandboxPath: sandbox, pluginPath: dest }
   }
 
-  /** 插件当前是否在运行：本地 enabled、任一账号的加载记录，或 hub 里已挂上。 */
-  private isRunning(id: string) {
-    return (
-      this.isEnabled(id) ||
-      Boolean(this.accountStore()?.loadedPluginIds?.().includes(id)) ||
-      this.hub().snapshot().plugins.some((row) => row.id === id && (row.enabled || row.state === 'active'))
-    )
+  /** 插件当前是否在运行：本地 enabled、hub 里已挂上，或任一账号的加载记录。 */
+  private async isRunning(id: string) {
+    if (this.isEnabled(id)) return true
+    if (this.hub().snapshot().plugins.some((row) => row.id === id && (row.enabled || row.state === 'active'))) return true
+    // 账号服务上的 loadedPluginIds 是 async。当成同步数组调用 .includes 会抛错，
+    // 读 web.js 的接口被吃成 404，前端 import 失败，斜杠里就没有这个块。
+    try {
+      const loaded = await this.accountStore()?.loadedPluginIds?.()
+      return Array.isArray(loaded) && loaded.includes(id)
+    } catch {
+      return false
+    }
   }
 
   /** 空间成员看得到 .plugin-dev；实例草稿权限仍单独放行。 */
@@ -1098,7 +1103,7 @@ export class PluginStoreService extends Service {
       if (!accountId || !workspaceId || !allowed) {
         throw new Error('not found')
       }
-    } else if (!this.isRunning(id)) throw new Error('not found')
+    } else if (!(await this.isRunning(id))) throw new Error('not found')
     const hit = await this.findPluginDir(id)
     if (!hit) throw new Error('not found')
     const path = join(hit, file)
