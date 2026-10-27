@@ -110,6 +110,12 @@ import {
 } from './fsdb-cells.tsx'
 import { ShareButton, SharePanel, ShareRoleDetail, ShareScopeDetail } from './share-popover.tsx'
 import { ensureFsdbStyle } from './fsdb-style.ts'
+import {
+  currentDeliverSessionId,
+  deliverSessionChoices,
+  refreshDeliverSessionList,
+  type DeliverSessionChoices,
+} from './deliver-session.ts'
 import { workspaceColumnsForLocation } from './workspace-columns.ts'
 import { RecordDetail } from './record-detail.tsx'
 import { PageBanner } from './page-banner.tsx'
@@ -782,6 +788,7 @@ export function CollectionBrowser({
     | { kind: 'rename'; view: SavedView }
     | { kind: 'delete'; view: SavedView }
     | { kind: 'action'; row: DbRecord; action: CollectionActionInfo }
+    | { kind: 'deliver'; row: DbRecord; action: CollectionActionInfo }
     | { kind: 'alert'; title: string; body: string }
     | { kind: 'delete-record'; row: DbRecord }
     | { kind: 'delete-records'; ids: string[] }
@@ -793,6 +800,9 @@ export function CollectionBrowser({
   const [bulkEditRaw, setBulkEditRaw] = useState('')
   const [bulkFacetIds, setBulkFacetIds] = useState<string[]>([])
   const [dlgError, setDlgError] = useState('')
+  const [deliverChoices, setDeliverChoices] = useState<DeliverSessionChoices | null>(null)
+  const [deliverLoading, setDeliverLoading] = useState(false)
+  const deliverGen = useRef(0)
   const crumbRef = useRef<HTMLElement>(null)
   const viewRef = useRef<HTMLDivElement>(null)
   const toolbarRef = useRef<HTMLDivElement>(null)
@@ -2118,7 +2128,129 @@ export function CollectionBrowser({
       && localUpdatedAt > 0 && remoteUpdatedAt > 0 && localUpdatedAt > remoteUpdatedAt)
   }
 
+  function closeDeliver() {
+    deliverGen.current += 1
+    setDeliverLoading(false)
+    setDeliverChoices(null)
+    setDlg(null)
+  }
+
+  async function openDeliverPicker(row: DbRecord, action: CollectionActionInfo) {
+    const gen = ++deliverGen.current
+    setDlgError('')
+    setDeliverChoices(null)
+    setDeliverLoading(true)
+    setDlg({ kind: 'deliver', row, action })
+    try {
+      const body = await readJson<{
+        sessions?: Array<{
+          id?: string
+          title?: string
+          busy?: boolean
+          updatedAt?: number
+          project?: { name?: string; path?: string }
+        }>
+      }>('/api/sessions')
+      if (gen !== deliverGen.current) return
+      const sessions = (body.sessions ?? [])
+        .filter((item) => item.id)
+        .map((item) => ({
+          id: item.id!,
+          title: item.title?.trim() || '未命名会话',
+          busy: item.busy,
+          updatedAt: item.updatedAt ?? 0,
+          projectPath: item.project?.path?.trim() || undefined,
+          projectName: item.project?.name?.trim() || undefined,
+        }))
+      setDeliverChoices(deliverSessionChoices(sessions, currentDeliverSessionId()))
+    } catch (err) {
+      if (gen !== deliverGen.current) return
+      setDlgError(err instanceof Error ? err.message : String(err))
+    } finally {
+      if (gen === deliverGen.current) setDeliverLoading(false)
+    }
+  }
+
+  async function beginDeliver(row: DbRecord, action: CollectionActionInfo) {
+    let target = row
+    if (!String(row.assigneeSessionId ?? '').trim()) {
+      try {
+        const data = await readJson<{ value?: DbRecord }>(`/api/db/read?path=${encodeURIComponent(`${dataPath}/${row.id}`)}`)
+        if (data.value) target = { ...row, ...data.value }
+      } catch {
+        /* 读不到整行时仍打开选择 */
+      }
+    }
+    if (String(target.assigneeSessionId ?? '').trim()) {
+      await executeAction(target, action)
+      return
+    }
+    await openDeliverPicker(target, action)
+  }
+
+  async function deliverToSession(row: DbRecord, sessionId: string, projectPath = '') {
+    if (actingRef.current) return
+    actingRef.current = true
+    setActing(true)
+    closeDeliver()
+    try {
+      let targetId = sessionId
+      if (!targetId) {
+        const created = await readJson<{ id?: string }>('/api/sessions', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({}),
+        })
+        if (!created.id) throw new Error('无法创建会话')
+        targetId = created.id
+        if (projectPath) {
+          await readJson(`/api/sessions/${encodeURIComponent(targetId)}/project`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ path: projectPath }),
+          })
+        }
+        void refreshDeliverSessionList()
+      }
+      const updated = await readJson<{ value?: DbRecord }>('/api/db/update', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: `${dataPath}/${row.id}`, content: { assignee: targetId } }),
+      })
+      if (updated.value) {
+        const next = updated.value
+        const merge = (item: DbRecord) => (item.id === next.id ? { ...item, ...next, banner: next.banner ?? null } : item)
+        mapListedRecords(merge)
+        setDetailRow((prev) => (prev?.id === next.id ? { ...prev, ...next, banner: next.banner ?? null } : prev))
+      }
+      await readJson('/api/db/action', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          path: `${dataPath}/${row.id}`,
+          action: 'deliver',
+          args: { wait: false },
+        }),
+      })
+      showNotice('派工成功')
+      quietUntil.current = Date.now() + 800
+      window.setTimeout(() => {
+        quietUntil.current = 0
+        void reloadRef.current()
+      }, 800)
+    } catch (err) {
+      setDlg({ kind: 'alert', title: '派工失败', body: err instanceof Error ? err.message : String(err) })
+    } finally {
+      actingRef.current = false
+      setActing(false)
+    }
+  }
+
   async function runAction(row: DbRecord, action: CollectionActionInfo) {
+    if (collectionPath === '/tasks' && action.id === 'deliver') {
+      void beginDeliver(row, action)
+      return
+    }
     if (overwritesNewerPlugin(row, action)) {
       setDlg({ kind: 'action', row, action: {
         ...action,
@@ -4252,6 +4384,52 @@ export function CollectionBrowser({
             ) : (
               <p>还没有合集。先到合集库里建一个，再回来贴。</p>
             )
+          }
+        />
+      ) : null}
+      {dlg?.kind === 'deliver' ? (
+        <AppDialog
+          title={deliverChoices?.projectName ? `派工到「${deliverChoices.projectName}」` : '选择执行会话'}
+          confirm={deliverChoices?.projectName ? '在此项目新建' : '新建会话'}
+          disabled={deliverLoading || acting}
+          onCancel={() => {
+            if (acting) return
+            closeDeliver()
+          }}
+          onConfirm={() => {
+            void deliverToSession(dlg.row, '', deliverChoices?.projectPath ?? '')
+          }}
+          error={dlgError}
+          onClearError={() => setDlgError('')}
+          body={
+            <div className="fsdb-deliver">
+              <p className="fsdb-deliver-hint">
+                {deliverChoices?.projectName
+                  ? '选择这个项目里的会话，任务会发给它并开始执行。'
+                  : '当前会话没有绑定项目。可以选择已有会话，或新建一个。'}
+              </p>
+              {deliverLoading ? <p className="fsdb-deliver-hint">正在读取会话…</p> : null}
+              {!deliverLoading && deliverChoices && !deliverChoices.sessions.length ? (
+                <p className="fsdb-deliver-hint">还没有可派工的会话。</p>
+              ) : null}
+              {deliverChoices?.sessions.length ? (
+                <ul className="fsdb-deliver-list">
+                  {deliverChoices.sessions.map((item) => (
+                    <li key={item.id}>
+                      <button
+                        type="button"
+                        className="fsdb-deliver-item"
+                        disabled={acting || deliverLoading}
+                        onClick={() => void deliverToSession(dlg.row, item.id)}
+                      >
+                        <span className="fsdb-deliver-title">{item.title}</span>
+                        {item.busy ? <span className="fsdb-deliver-busy">进行中</span> : null}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
           }
         />
       ) : null}

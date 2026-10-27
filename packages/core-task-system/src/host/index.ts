@@ -1019,8 +1019,9 @@ export function computeTurnUsage(
 
 /**
  * 进度超时判定。
- * 距最近一次 report（无 report 时以 assignedAt 为基线）超过 reportIntervalSec、不在冷却窗口内、
- * 且本轮追问次数未达 MAX_REPORT_PROMPTS 时，应再追一次。次数用尽后停，避免把执行会话问死。
+ * 执行会话这一回合还没结束时不问、也不判失败：汇报一般在回合末尾才提交。
+ * 回合结束后，从「最近一次 report」和「最近一次回合结束」里较晚的时刻起算；
+ * 超过 reportIntervalSec、不在冷却窗口内、且本轮追问次数未达 MAX_REPORT_PROMPTS 时再追一次。
  */
 export const DEFAULT_REPORT_INTERVAL_SEC = 60
 /** 同一段未汇报窗口内最多追问几次。 */
@@ -1040,7 +1041,50 @@ export type PromptProgressVerdict = {
   intervalMs: number
 }
 
-export function shouldPromptProgress(row: TaskRow, nowTs: number): PromptProgressVerdict {
+/** 执行会话回合是否还开着，以及最近一次回合的起止时间。只看 turn/start、turn/end。 */
+export type AssigneeActivity = {
+  turnOpen: boolean
+  turnStartedAt: number | null
+  turnEndedAt: number | null
+}
+
+export function assigneeActivity(events: SessionEventLite[] | undefined): AssigneeActivity {
+  let turnOpen = false
+  let turnStartedAt: number | null = null
+  let turnEndedAt: number | null = null
+  for (const event of events ?? []) {
+    if (event.type === 'turn/start') {
+      turnOpen = true
+      turnStartedAt = typeof event.ts === 'number' ? event.ts : null
+    } else if (event.type === 'turn/end') {
+      turnOpen = false
+      turnStartedAt = null
+      if (typeof event.ts === 'number') turnEndedAt = event.ts
+    }
+  }
+  return { turnOpen, turnStartedAt, turnEndedAt }
+}
+
+/** 这次追问落在某个尚未结束、或当时仍开着的回合里。那种询问不能算「没回应」。 */
+export function promptFellInsideTurn(events: SessionEventLite[] | undefined, promptAt: number): boolean {
+  let openStart: number | null = null
+  for (const event of events ?? []) {
+    if (event.type === 'turn/start') {
+      openStart = typeof event.ts === 'number' ? event.ts : null
+    } else if (event.type === 'turn/end') {
+      const end = typeof event.ts === 'number' ? event.ts : null
+      if (openStart != null && promptAt >= openStart && (end == null || promptAt <= end)) return true
+      openStart = null
+    }
+  }
+  return openStart != null && promptAt >= openStart
+}
+
+export function shouldPromptProgress(
+  row: TaskRow,
+  nowTs: number,
+  activity?: AssigneeActivity,
+): PromptProgressVerdict {
   const none: PromptProgressVerdict = { shouldPrompt: false, shouldFail: false, overdueSec: 0, intervalMs: 0 }
   if (row.status === 'done' || row.status === 'failed') return none
   if (!row.assignedAt) return none
@@ -1048,14 +1092,17 @@ export function shouldPromptProgress(row: TaskRow, nowTs: number): PromptProgres
   if (row.creator?.kind !== 'agent' || !row.creator.sessionId) return none
   const intervalSec = normalizeReportIntervalSec(row.reportIntervalSec)
   const intervalMs = intervalSec * 1000
+  // 回合还没结束，任务完成与否还看不到。
+  if (activity?.turnOpen) return { ...none, intervalMs }
   const lastReportTs = row.reports?.length ? row.reports[row.reports.length - 1].ts : row.assignedAt
+  const silenceFrom = activity?.turnEndedAt != null ? Math.max(lastReportTs, activity.turnEndedAt) : lastReportTs
   const count = Math.max(0, Math.round(Number(row.reportPromptCount) || 0))
-  const overdueSec = Math.max(1, Math.floor((nowTs - lastReportTs) / 1000))
+  const overdueSec = Math.max(1, Math.floor((nowTs - silenceFrom) / 1000))
+  if (nowTs - silenceFrom <= intervalMs) return { shouldPrompt: false, shouldFail: false, overdueSec: 0, intervalMs }
   if (count >= MAX_REPORT_PROMPTS) {
     if (row.lastReportPromptAt != null && nowTs - row.lastReportPromptAt < intervalMs) return none
     return { shouldPrompt: false, shouldFail: true, overdueSec, intervalMs }
   }
-  if (nowTs - lastReportTs <= intervalMs) return { shouldPrompt: false, shouldFail: false, overdueSec: 0, intervalMs }
   if (row.lastReportPromptAt != null && nowTs - row.lastReportPromptAt < intervalMs) {
     return { shouldPrompt: false, shouldFail: false, overdueSec: 0, intervalMs }
   }
@@ -1657,16 +1704,44 @@ export async function apply(ctx: Context) {
   }
 
   /**
-   * 进度超时判定（纯函数，便于单测）：
-   * 对已派发（assignee 有 sessionId 且 assignedAt 非空）、非 done 的任务，
-   * 距最近一次 task_report（无 report 时以 assignedAt 为基线）超过 reportIntervalSec 且不在追问冷却(距上次追问
-   * lastReportPromptAt 不足 reportIntervalSec)内时，应触发一次进程追问。
-   * 返回 null 表示不应追问；否则返回是否追问 + 已超时秒数 + 冷却/间隔毫秒。
+   * 进度超时：执行会话回合还没结束时不问、不判失败。
+   * 回合中误记的追问次数清掉。回合结束后再按 reportIntervalSec 重新计沉默。
    */
   async function promptForProgress(row: TaskRow): Promise<void> {
     try {
       const nowTs = now()
-      const verdict = shouldPromptProgress(row, nowTs)
+      const sessionId = row.assignee?.sessionId
+      let activity: AssigneeActivity | undefined
+      if (sessionId) {
+        let busy = false
+        try {
+          const agents = (host as { agents?: { isBusy?: (id: string) => boolean } }).agents
+          busy = Boolean(agents?.isBusy?.(sessionId))
+        } catch {
+          busy = false
+        }
+        let record = host.sessions?.peek(sessionId)
+        const preliminary = shouldPromptProgress(row, nowTs)
+        if (!record && host.sessions?.get && (busy || preliminary.shouldPrompt || preliminary.shouldFail)) {
+          try {
+            record = await host.sessions.get(sessionId)
+          } catch {
+            record = undefined
+          }
+        }
+        if (record) activity = assigneeActivity(record.events)
+        if (
+          record &&
+          row.reportPromptCount > 0 &&
+          row.lastReportPromptAt != null &&
+          promptFellInsideTurn(record.events, row.lastReportPromptAt)
+        ) {
+          await tasks.update(row.id, { reportPromptCount: 0, lastReportPromptAt: null })
+          row = { ...row, reportPromptCount: 0, lastReportPromptAt: null }
+        }
+        if (busy || activity?.turnOpen) return
+      }
+      const verdict = shouldPromptProgress(row, nowTs, activity)
       if (verdict.shouldFail) {
         if (row.status === 'failed') return
         await tasks.update(row.id, { status: 'failed' })
@@ -1686,7 +1761,7 @@ export async function apply(ctx: Context) {
       if (!host.sessions?.sendMessage) return
       const used = Math.max(0, Math.round(Number(row.reportPromptCount) || 0))
       const nextCount = used + 1
-      const text = `【任务进度询问】${row.title}\n任务 id：${row.id}\n任务已派发 ${verdict.overdueSec} 秒仍未收到汇报（第 ${nextCount}/${MAX_REPORT_PROMPTS} 次询问）。请问当前进展？`
+      const text = `【任务进度询问】${row.title}\n任务 id：${row.id}\n已经 ${verdict.overdueSec} 秒没有进度汇报（第 ${nextCount}/${MAX_REPORT_PROMPTS} 次询问）。请问当前进展？`
       const sender = { type: 'session' as const, sessionId: creatorSessionId }
       host.sessions.sendMessage(assigneeSessionId, text, { wait: false, sender }).catch(() => {
         /* 发送失败：保留 lastReportPromptAt 未更新，下轮可重试 */

@@ -5,7 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { Context } from 'cordis'
-import { buildDeliverText, coerceAssigneeArg, computeBlocked, computeBlockedBy, computeNextTriggerAt, computeTurnUsage, defaultTrigger, depsSatisfied, deriveExecution, deriveExecutionFromReports, MAX_REPORT_PROMPTS, normalizeTrigger, parseCron, reportBackToCreator, shouldPromptProgress, sumReportUsage, TasksService } from './index.ts'
+import { assigneeActivity, buildDeliverText, coerceAssigneeArg, computeBlocked, computeBlockedBy, computeNextTriggerAt, computeTurnUsage, defaultTrigger, depsSatisfied, deriveExecution, deriveExecutionFromReports, MAX_REPORT_PROMPTS, normalizeTrigger, parseCron, promptFellInsideTurn, reportBackToCreator, shouldPromptProgress, sumReportUsage, TasksService } from './index.ts'
 
 test('tasks sqlite crud and status move', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'tasks-'))
@@ -614,6 +614,57 @@ test('shouldPromptProgress: after max nags without a report, mark fail instead o
     const late = shouldPromptProgress(tasks.get(a.id)!, t1 + 6_000)
     assert.equal(late.shouldPrompt, false)
     assert.equal(late.shouldFail, true)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('shouldPromptProgress waits out an open assignee turn', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tasks-'))
+  const path = join(dir, 'tasks.sqlite')
+  try {
+    const ctx = new Context()
+    const tasks = new TasksService(ctx, path).open()
+    const a = tasks.create({
+      title: 'A',
+      creator: { kind: 'agent', sessionId: 'boss', name: 'Boss' },
+      assignee: { kind: 'agent', sessionId: 'worker', name: 'Worker' },
+      reportIntervalSec: 60,
+    })
+    const started = a.assignedAt!
+    tasks.update(a.id, { lastReportPromptAt: started + 60_000, reportPromptCount: MAX_REPORT_PROMPTS })
+    const open = assigneeActivity([
+      { type: 'turn/start', turn: 1, ts: started },
+    ])
+    assert.equal(open.turnOpen, true)
+    const during = shouldPromptProgress(tasks.get(a.id)!, started + 240_000, open)
+    assert.equal(during.shouldPrompt, false)
+    assert.equal(during.shouldFail, false)
+    const endedAt = started + 180_000
+    const closed = assigneeActivity([
+      { type: 'turn/start', turn: 1, ts: started },
+      { type: 'turn/end', turn: 1, reason: 'complete', ts: endedAt },
+    ])
+    assert.equal(closed.turnOpen, false)
+    assert.equal(closed.turnEndedAt, endedAt)
+    tasks.update(a.id, { lastReportPromptAt: null, reportPromptCount: 0 })
+    // 回合刚结束：从结束时刻重新等一个间隔
+    const justEnded = shouldPromptProgress(tasks.get(a.id)!, endedAt + 30_000, closed)
+    assert.equal(justEnded.shouldPrompt, false)
+    assert.equal(justEnded.shouldFail, false)
+    const ask = shouldPromptProgress(tasks.get(a.id)!, endedAt + 61_000, closed)
+    assert.equal(ask.shouldPrompt, true)
+    assert.equal(ask.shouldFail, false)
+    tasks.update(a.id, { lastReportPromptAt: started + 60_000, reportPromptCount: MAX_REPORT_PROMPTS })
+    const later = shouldPromptProgress(tasks.get(a.id)!, endedAt + 61_000, closed)
+    assert.equal(later.shouldPrompt, false)
+    assert.equal(later.shouldFail, true)
+    const events = [
+      { type: 'turn/start', turn: 1, ts: started },
+      { type: 'turn/end', turn: 1, reason: 'complete', ts: endedAt },
+    ]
+    assert.equal(promptFellInsideTurn(events, started + 60_000), true)
+    assert.equal(promptFellInsideTurn(events, endedAt + 60_000), false)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

@@ -26,6 +26,7 @@ import { pageBlocksChrome } from './page-blocks-chrome.ts'
 import { viewsForRegisteredCollection } from './collection-nav.ts'
 import { builtinAllViewId } from '../catalog-views.ts'
 import { normalizeCollectionPath } from '../paths.ts'
+import { bindDeliverSessionSource } from './deliver-session.ts'
 
 type SlotsService = {
   place: (slot: string, view: unknown, opts: { key: string; order?: number; props?: () => Record<string, unknown> }) => { dispose?: () => unknown }
@@ -269,6 +270,16 @@ export function apply(ctx: Context) {
       facetsUi.dispose()
       blocksUi.dispose()
     }
+  })
+  ctx.inject(['sessionView'], (inner) => {
+    const view = inner.get('sessionView') as {
+      get: () => { sessionId?: string | null }
+      refreshSessions?: () => Promise<void>
+    }
+    return bindDeliverSessionSource(
+      () => view.get().sessionId ?? '',
+      () => view.refreshSessions?.() ?? Promise.resolve(),
+    )
   })
   ctx.inject(['pageEditor'], (inner) => {
     const editor = inner.get('pageEditor') as {
