@@ -360,15 +360,16 @@ export function splitReplyForDisplay(node: Extract<ChatNode, { kind: 'reply' }>)
 
 function ReplyActions({
   text,
-  turn,
+  replyId,
   onFork,
 }: {
   text: string
-  turn?: number
-  onFork: (turn?: number) => void | Promise<void>
+  replyId: string
+  onFork: (replyId: string) => void | Promise<void>
 }) {
   const [copied, setCopied] = useState(false)
   const [forkBusy, setForkBusy] = useState(false)
+  const [forkError, setForkError] = useState('')
 
   async function copy() {
     if (!text.trim()) return
@@ -384,8 +385,11 @@ function ReplyActions({
   async function fork() {
     if (forkBusy) return
     setForkBusy(true)
+    setForkError('')
     try {
-      await onFork(turn)
+      await onFork(replyId)
+    } catch (error) {
+      setForkError(error instanceof Error ? error.message : String(error))
     } finally {
       setForkBusy(false)
     }
@@ -418,6 +422,7 @@ function ReplyActions({
           </>
         ) : null}
       </div>
+      {forkError ? <div role="alert" className="text-xs text-(--dsw-danger)">{forkError}</div> : null}
     </>
   )
 }
@@ -634,7 +639,7 @@ function NodeView({
   detailsOpen?: boolean
   onToggleDetails?: (replyId: string) => void
   onInspect: (callId: string) => void
-  onFork: (turn?: number) => void | Promise<void>
+  onFork: (replyId: string) => void | Promise<void>
   sessions?: SessionListItem[]
   dispatchTasks?: import('@biu/web-session-view').DispatchedTaskRow[]
   sessionId?: string
@@ -701,7 +706,7 @@ function NodeView({
         </div>
         {!streaming && node.endReason !== 'cancelled' ? (
           <div className="chat-reply-actions-row">
-            <ReplyActions text={node.copyText} turn={node.turn} onFork={onFork} />
+            <ReplyActions text={node.copyText} replyId={node.id} onFork={onFork} />
           </div>
         ) : null}
       </div>
@@ -727,7 +732,7 @@ export const ChatNodeList = memo(function ChatNodeList({
 }: {
   nodes: ChatNode[]
   onInspect: (callId: string) => void
-  onFork: (turn?: number) => void | Promise<void>
+  onFork: (replyId: string) => void | Promise<void>
   sessions?: SessionListItem[]
   dispatchedTasksByTurn?: Record<
     string,
@@ -863,8 +868,10 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
     [sessionView],
   )
 
-  const onFork = useCallback((untilTurn?: number) => {
-    return sessionView.forkCurrent({ untilTurn }).then((id) => {
+  const onFork = useCallback((replyId: string) => {
+    const match = /^r-(\d+)$/.exec(replyId)
+    if (!match) return Promise.reject(new Error('无法定位选中的回复，不能分叉会话'))
+    return sessionView.forkCurrent({ untilSeq: Number(match[1]) }).then((id) => {
       navigate(`/s/${id}`)
     })
   }, [sessionView, navigate])

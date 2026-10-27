@@ -1146,3 +1146,29 @@ test('未登录不请求会话和审批，登录后再拉', async () => {
   assert.equal(calls.some((call) => call.url.includes('/api/approvals')), true)
   localStorage.removeItem('biu.account.token')
 })
+
+test('forkCurrent sends the selected reply seq instead of a full-copy request', async () => {
+  let sent: RequestInit | undefined
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    if (url.endsWith('/api/sessions/s1/fork')) {
+      sent = init
+      return { ok: true, status: 201, json: async () => ({ id: 's2' }) } as Response
+    }
+    if (url.endsWith('/api/sessions/s2')) {
+      return { ok: true, status: 200, json: async () => ({ id: 's2', events: [], hasMore: false }) } as Response
+    }
+    if (url.includes('/api/approvals')) {
+      return { ok: true, status: 200, json: async () => ({ mode: 'auto', pending: [] }) } as Response
+    }
+    return { ok: true, status: 200, json: async () => ({ sessions: [] }) } as Response
+  }) as typeof fetch
+  const ctx = new Context()
+  await ctx.plugin(sessionView)
+  const view = ctx.sessionView as SessionViewService
+  view.ingest('s1', { type: 'session/open', version: 1, seq: 0, ts: 1 })
+  await view.forkCurrent({ untilSeq: 4 })
+  assert.equal(sent?.method, 'POST')
+  assert.deepEqual(JSON.parse(String(sent?.body)), { untilSeq: 4 })
+  await assert.rejects(() => view.forkCurrent({ untilSeq: Number.NaN }), /无法定位选中的回复/)
+})

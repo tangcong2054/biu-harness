@@ -1185,14 +1185,20 @@ declare module 'cordis' {
   }
 }
 
-/**
- * 从 fork 请求体里取「截断到哪个回合」。
- * 没有请求体（旧前端、脚本）、格式不对、或不是正整数时返回 undefined，即保持原来的整段复制。
- */
-export function forkTurnFromBody(body: unknown): number | undefined {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return undefined
-  const value = Number((body as { untilTurn?: unknown }).untilTurn)
-  return Number.isFinite(value) && value > 0 ? value : undefined
+/** 旧客户端不带请求体时保持全量复制；显式传了截点但无效时必须报错，不能悄悄全量复制。 */
+export function forkOptionsFromBody(body: unknown): { untilSeq?: number; untilTurn?: number } | undefined {
+  if (body == null) return undefined
+  if (typeof body !== 'object' || Array.isArray(body)) throw new Error('invalid fork cutoff')
+  const { untilSeq, untilTurn } = body as { untilSeq?: unknown; untilTurn?: unknown }
+  if (untilSeq !== undefined) {
+    if (!Number.isSafeInteger(untilSeq) || (untilSeq as number) < 0) throw new Error('invalid fork reply seq')
+    return { untilSeq: untilSeq as number }
+  }
+  if (untilTurn !== undefined) {
+    if (!Number.isSafeInteger(untilTurn) || (untilTurn as number) <= 0) throw new Error('invalid fork turn')
+    return { untilTurn: untilTurn as number }
+  }
+  throw new Error('fork cutoff required')
 }
 
 export async function openSessionHttpPayload(ctx: Context, id: string, limitTurns: number) {
@@ -1855,10 +1861,9 @@ export function apply(ctx: Context) {
   ctx.http.route('POST', '/api/sessions/:id/fork', async (route) => {
     try {
       if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
-      // 兼容不带请求体的调用（旧前端、脚本）：json() 可能解析成 null。
-      const body = await route.json().catch(() => null)
-      const untilTurn = forkTurnFromBody(body)
-      const child = await ctx.sessions.fork(route.params.id, undefined, untilTurn ? { untilTurn } : undefined)
+      // 仅空请求体沿用全量 fork；有 body 却解析失败或截点不合法时不能静默回退。
+      const body = await route.json()
+      const child = await ctx.sessions.fork(route.params.id, undefined, forkOptionsFromBody(body))
       route.send(201, {
         id: child.id,
         version: child.version,

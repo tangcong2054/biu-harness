@@ -12,6 +12,7 @@ import * as sessions from './index.ts'
 import { SESSION_FORMAT_VERSION, deriveMessages, applyContextBudget, estimateRequestTokens, estimateTokens, fitMessagesToTokenBudget, statInputComposition } from './index.ts'
 import type { SessionEvent } from './index.ts'
 import type { LlmMessage } from '@biu/host-llm'
+import { projectNodes } from '../../../web-session-view/src/web/session-project.ts'
 
 test('creating a session stamps createdBy through the database service', async () => {
   const ctx = new Context()
@@ -917,8 +918,8 @@ test('fork untilTurn keeps only up to that turn end', async () => {
   const full = await ctx.sessions.fork(parent.id)
   assert.equal(full.events.length, total)
 
-  // 回合不存在时不截断
-  assert.equal((await ctx.sessions.fork(parent.id, undefined, { untilTurn: 99 })).events.length, total)
+  // 显式指定了找不到的截点，不能悄悄复制完整会话。
+  await assert.rejects(() => ctx.sessions.fork(parent.id, undefined, { untilTurn: 99 }), /fork turn end not found/)
   // 父会话不受影响
   assert.equal((await ctx.sessions.require(parent.id)).events.length, total)
 })
@@ -932,4 +933,63 @@ test('fork does not inherit the parent pinned state or tags', async () => {
   const child = await ctx.sessions.fork(parent.id)
   assert.equal(child.config?.pinned, undefined)
   assert.deepEqual(child.config?.tags, undefined)
+})
+
+test('fork by projected reply id keeps that reply and excludes later turns', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const source = await ctx.sessions.create()
+  for (const turn of [1, 2, 3]) {
+    await ctx.sessions.append(source.id, { type: 'turn/start', turn })
+    await ctx.sessions.append(source.id, { type: 'user/message', text: `ask ${turn}`, kind: 'wake' })
+    await ctx.sessions.append(source.id, { type: 'step/start', turn, step: 0 })
+    await ctx.sessions.append(source.id, { type: 'assistant/message', text: `reply ${turn}` })
+    await ctx.sessions.append(source.id, { type: 'turn/end', turn, reason: 'complete' })
+  }
+  const events = (await ctx.sessions.require(source.id)).events
+  const replies = projectNodes(events as unknown as Parameters<typeof projectNodes>[0]).filter((node) => node.kind === 'reply')
+  assert.equal(replies.length, 3)
+  const middle = replies[1]!
+  const seq = Number(middle.id.slice(2))
+  assert.equal(Number.isSafeInteger(seq), true)
+  const child = await ctx.sessions.fork(source.id, undefined, { untilSeq: seq })
+  assert.deepEqual(child.events.filter((event) => event.type === 'turn/end').map((event) => event.turn), [1, 2])
+  assert.equal(child.events.some((event) => event.type === 'user/message' && event.text === 'ask 3'), false)
+  assert.equal(child.events.at(-1)?.type, 'turn/end')
+  await assert.rejects(() => ctx.sessions.fork(source.id, undefined, { untilSeq: 999 }), /fork reply not found/)
+})
+
+test('fork legacy replies without turn numbers uses the next user boundary', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const source = await ctx.sessions.create()
+  await ctx.sessions.append(source.id, { type: 'user/message', text: 'first', kind: 'wake' })
+  const reply = await ctx.sessions.append(source.id, { type: 'assistant/message', text: 'answer 1' })
+  await ctx.sessions.append(source.id, { type: 'user/message', text: 'second', kind: 'wake' })
+  await ctx.sessions.append(source.id, { type: 'assistant/message', text: 'answer 2' })
+  const events = (await ctx.sessions.require(source.id)).events
+  const firstReply = projectNodes(events as unknown as Parameters<typeof projectNodes>[0]).find((node) => node.kind === 'reply')
+  assert.equal(firstReply?.turn, undefined)
+  assert.equal(firstReply?.id, `r-${reply.seq}`)
+  const child = await ctx.sessions.fork(source.id, undefined, { untilSeq: reply.seq })
+  assert.deepEqual(child.events.filter((event) => event.type === 'user/message').map((event) => event.text), ['first'])
+  assert.equal(child.events.some((event) => event.type === 'assistant/message' && event.text === 'answer 2'), false)
+})
+
+test('fork replies in logs missing turn/end stops before the next turn', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const source = await ctx.sessions.create()
+  await ctx.sessions.append(source.id, { type: 'turn/start', turn: 1 })
+  await ctx.sessions.append(source.id, { type: 'user/message', text: 'q1', kind: 'wake' })
+  const reply = await ctx.sessions.append(source.id, { type: 'assistant/message', text: 'a1' })
+  await ctx.sessions.append(source.id, { type: 'turn/start', turn: 2 })
+  await ctx.sessions.append(source.id, { type: 'user/message', text: 'q2', kind: 'wake' })
+  await ctx.sessions.append(source.id, { type: 'assistant/message', text: 'a2' })
+  const child = await ctx.sessions.fork(source.id, undefined, { untilSeq: reply.seq })
+  assert.equal(child.events.at(-1)?.seq, reply.seq)
+  assert.equal(child.events.some((event) => event.type === 'user/message' && event.text === 'q2'), false)
 })

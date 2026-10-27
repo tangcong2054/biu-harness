@@ -1,25 +1,19 @@
 /** @vitest-environment node */
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
-import { forkTurnFromBody } from './index.ts'
+import { forkOptionsFromBody } from './index.ts'
 
-test('fork 请求体解析：没有请求体时回落成整段复制', () => {
-  // 旧前端发的是不带 body 的 POST，json() 会得到 null / undefined；
-  // 这里必须返回 undefined，不能抛错（之前就是读 null.untilTurn 导致 400）。
-  assert.equal(forkTurnFromBody(null), undefined)
-  assert.equal(forkTurnFromBody(undefined), undefined)
-  assert.equal(forkTurnFromBody({}), undefined)
-  assert.equal(forkTurnFromBody(''), undefined)
-  assert.equal(forkTurnFromBody([]), undefined)
-  assert.equal(forkTurnFromBody('null'), undefined)
+test('fork 仅无请求体时沿用全量复制', () => {
+  assert.equal(forkOptionsFromBody(null), undefined)
+  assert.equal(forkOptionsFromBody(undefined), undefined)
+  for (const body of [{}, '', [], 'null', { untilSeq: null }, { untilSeq: -1 }, { untilTurn: 99.5 }]) {
+    assert.throws(() => forkOptionsFromBody(body), /fork/)
+  }
 })
 
-test('fork 请求体解析：只接受正整数的 untilTurn', () => {
-  assert.equal(forkTurnFromBody({ untilTurn: 3 }), 3)
-  assert.equal(forkTurnFromBody({ untilTurn: '2' }), 2)
-  assert.equal(forkTurnFromBody({ untilTurn: 0 }), undefined)
-  assert.equal(forkTurnFromBody({ untilTurn: -1 }), undefined)
-  assert.equal(forkTurnFromBody({ untilTurn: null }), undefined)
-  assert.equal(forkTurnFromBody({ untilTurn: 'abc' }), undefined)
-  assert.equal(forkTurnFromBody({ untilTurn: Number.NaN }), undefined)
+test('fork 按回复事件序号定位（允许首条事件 seq=0），兼容旧回合号', () => {
+  assert.deepEqual(forkOptionsFromBody({ untilSeq: 0 }), { untilSeq: 0 })
+  assert.deepEqual(forkOptionsFromBody({ untilSeq: 10 }), { untilSeq: 10 })
+  assert.deepEqual(forkOptionsFromBody({ untilTurn: 2 }), { untilTurn: 2 })
+  assert.throws(() => forkOptionsFromBody({ untilTurn: 0 }), /invalid fork turn/)
 })
