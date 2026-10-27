@@ -729,6 +729,11 @@ export type CollectionSpec = {
    * update / create / delete 为 true 时必须提供对应实现；不写则不能改、不能新建、不能删。
    */
   records?: CollectionRecordCaps
+  /**
+   * 新建记录的默认归属。只在调用方没显式给 scope 时生效。
+   * 不写则用个人（私人，仅自己可见）。整表数据本来就是空间级共享的表（如 /mcp）写 workspace。
+   */
+  defaultScope?: 'personal' | 'workspace' | 'shared' | 'local'
   /** 可接收查询；不认 ids 时 File System 仍会在内存里收窄。 */
   list: (query?: CollectionListQuery) => DbRecord[] | Promise<DbRecord[]>
   get: (id: string) => DbRecord | null | undefined | Promise<DbRecord | null | undefined>
