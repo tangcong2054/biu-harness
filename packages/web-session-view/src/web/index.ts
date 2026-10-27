@@ -1332,10 +1332,20 @@ export class SessionViewService extends Service {
     this.replace({ project, sessions })
   }
 
-  async forkCurrent() {
+  /**
+   * 分叉当前会话。传 untilTurn 时只复制到该回合结束（含 turn/end），
+   * 后面的回合不带过去；不传则是原来的整段复制。
+   */
+  async forkCurrent(options?: { untilTurn?: number }) {
     const sessionId = this.value.sessionId
     if (!sessionId) throw new Error('no session')
-    const res = await fetch(`/api/sessions/${sessionId}/fork`, { method: 'POST' })
+    const init: RequestInit = { method: 'POST' }
+    const untilTurn = Number.isFinite(options?.untilTurn) ? Number(options?.untilTurn) : undefined
+    if (untilTurn != null && untilTurn > 0) {
+      init.headers = { 'content-type': 'application/json' }
+      init.body = JSON.stringify({ untilTurn })
+    }
+    const res = await fetch(`/api/sessions/${sessionId}/fork`, init)
     const body = (await res.json()) as {
       id?: string
       error?: string

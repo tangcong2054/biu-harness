@@ -360,10 +360,12 @@ export function splitReplyForDisplay(node: Extract<ChatNode, { kind: 'reply' }>)
 
 function ReplyActions({
   text,
+  turn,
   onFork,
 }: {
   text: string
-  onFork: () => void | Promise<void>
+  turn?: number
+  onFork: (turn?: number) => void | Promise<void>
 }) {
   const [copied, setCopied] = useState(false)
   const [forkBusy, setForkBusy] = useState(false)
@@ -383,7 +385,7 @@ function ReplyActions({
     if (forkBusy) return
     setForkBusy(true)
     try {
-      await onFork()
+      await onFork(turn)
     } finally {
       setForkBusy(false)
     }
@@ -632,7 +634,7 @@ function NodeView({
   detailsOpen?: boolean
   onToggleDetails?: (replyId: string) => void
   onInspect: (callId: string) => void
-  onFork: () => void | Promise<void>
+  onFork: (turn?: number) => void | Promise<void>
   sessions?: SessionListItem[]
   dispatchTasks?: import('@biu/web-session-view').DispatchedTaskRow[]
   sessionId?: string
@@ -699,7 +701,7 @@ function NodeView({
         </div>
         {!streaming && node.endReason !== 'cancelled' ? (
           <div className="chat-reply-actions-row">
-            <ReplyActions text={node.copyText} onFork={onFork} />
+            <ReplyActions text={node.copyText} turn={node.turn} onFork={onFork} />
           </div>
         ) : null}
       </div>
@@ -725,7 +727,7 @@ export const ChatNodeList = memo(function ChatNodeList({
 }: {
   nodes: ChatNode[]
   onInspect: (callId: string) => void
-  onFork: () => void | Promise<void>
+  onFork: (turn?: number) => void | Promise<void>
   sessions?: SessionListItem[]
   dispatchedTasksByTurn?: Record<
     string,
@@ -861,8 +863,8 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
     [sessionView],
   )
 
-  const onFork = useCallback(() => {
-    return sessionView.forkCurrent().then((id) => {
+  const onFork = useCallback((untilTurn?: number) => {
+    return sessionView.forkCurrent({ untilTurn }).then((id) => {
       navigate(`/s/${id}`)
     })
   }, [sessionView, navigate])

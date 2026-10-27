@@ -881,3 +881,55 @@ test('a view grant lets the other member see an inherited session', async () => 
   assert.equal(runWithAccount(bob.id, () => ctx.sessions.inWorkspace(sharedId)), true)
 })
 
+
+test('fork untilTurn keeps only up to that turn end', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const parent = await ctx.sessions.create()
+  for (const turn of [1, 2, 3]) {
+    await ctx.sessions.append(parent.id, { type: 'turn/start', turn })
+    await ctx.sessions.append(parent.id, { type: 'user/message', text: `q${turn}`, kind: 'wake' })
+    await ctx.sessions.append(parent.id, { type: 'assistant/message', text: `a${turn}` })
+    await ctx.sessions.append(parent.id, { type: 'turn/end', turn, reason: 'complete' })
+  }
+  const source = await ctx.sessions.require(parent.id)
+  const total = source.events.length
+  assert.equal(total > 12, true)
+
+  // 从倒数第二个回合分叉：第三个回合不能出现
+  const child = await ctx.sessions.fork(parent.id, undefined, { untilTurn: 2 })
+  const texts = child.events
+    .map((event) => (event.type === 'user/message' ? String((event as { text?: string }).text ?? '') : ''))
+    .filter(Boolean)
+  assert.deepEqual(texts, ['q1', 'q2'])
+  assert.equal(child.events.at(-1)?.type, 'turn/end')
+  assert.equal((child.events.at(-1) as { turn?: number }).turn, 2)
+  assert.equal(child.events.some((event) => (event as { text?: string }).text === 'q3'), false)
+
+  // 新会话接着往下写不受影响
+  await ctx.sessions.append(child.id, { type: 'turn/start', turn: 3 })
+  await ctx.sessions.append(child.id, { type: 'assistant/message', text: 'child' })
+  const after = await ctx.sessions.require(child.id)
+  assert.equal(after.events.some((event) => (event as { text?: string }).text === 'child'), true)
+
+  // 不传 untilTurn 仍是整段复制（子任务继承依赖这个行为）
+  const full = await ctx.sessions.fork(parent.id)
+  assert.equal(full.events.length, total)
+
+  // 回合不存在时不截断
+  assert.equal((await ctx.sessions.fork(parent.id, undefined, { untilTurn: 99 })).events.length, total)
+  // 父会话不受影响
+  assert.equal((await ctx.sessions.require(parent.id)).events.length, total)
+})
+
+test('fork does not inherit the parent pinned state or tags', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const parent = await ctx.sessions.create()
+  await ctx.sessions.patchConfig(parent.id, { pinned: true, tags: ['x'] })
+  const child = await ctx.sessions.fork(parent.id)
+  assert.equal(child.config?.pinned, undefined)
+  assert.deepEqual(child.config?.tags, undefined)
+})

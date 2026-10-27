@@ -296,6 +296,19 @@ export function estimateRequestTokens(messages: LlmMessage[], tools: unknown[] =
 type MessageGroup = { messages: LlmMessage[]; tokens: number }
 
 /**
+ * 截断到某个回合结束（含该回合的 turn/end），用于分叉会话。
+ * 必须带上 turn/end，否则新会话落盘后会被 session-heal 当成中断，补一条 host-restart 的原因。
+ * untilTurn 为空或找不到对应回合时原样返回。
+ */
+function truncateEventsAtTurn(events: SessionEvent[], untilTurn?: number): SessionEvent[] {
+  if (!Number.isFinite(untilTurn) || Number(untilTurn) <= 0) return events
+  const want = Number(untilTurn)
+  const end = events.findIndex((event) => event.type === 'turn/end' && (event as { turn?: number }).turn === want)
+  if (end < 0) return events
+  return events.slice(0, end + 1)
+}
+
+/**
  * 每个 user 开启一个对话原子组，后续 assistant/tool 都归入该组直到下一个 user。
  * 这样既不会拆 assistant.tool_calls/tool results，也不会留下失去用户问题的孤立回答。
  */
@@ -690,16 +703,24 @@ export class SessionsService extends Service {
     return statInputComposition(record.events)
   }
 
-  async fork(sourceId: string, childId: string = crypto.randomUUID()) {
+  /**
+   * 分叉会话。
+   * 传 options.untilTurn 时只复制到该回合结束为止（含该回合的 turn/end），后面的回合不带过去；
+   * 不传则是原来的整段复制（子任务继承父会话依赖这个行为）。
+   */
+
+  async fork(sourceId: string, childId: string = crypto.randomUUID(), options?: { untilTurn?: number }) {
     const source = await this.require(sourceId)
     const used = await this.collectUsedMascots()
     const mascot = pickSessionMascot(childId, used)
     const sourceConfig = { ...(source.config ?? {}) }
     delete sourceConfig.inspector
+    delete sourceConfig.pinned
+    delete sourceConfig.tags
     const record: SessionRecord = {
       id: childId,
       version: source.version,
-      events: source.events.map((event) => ({ ...event })),
+      events: truncateEventsAtTurn(source.events, options?.untilTurn).map((event) => ({ ...event })),
       ...(source.project ? { project: { ...source.project } } : {}),
       mascot,
       config: normalizeSessionConfig({

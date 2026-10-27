@@ -1845,7 +1845,11 @@ export function apply(ctx: Context) {
   ctx.http.route('POST', '/api/sessions/:id/fork', async (route) => {
     try {
       if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
-      const child = await ctx.sessions.fork(route.params.id)
+      const body = (await route.json().catch(() => ({}))) as { untilTurn?: unknown }
+      const untilTurn = Number(body.untilTurn)
+      const child = await ctx.sessions.fork(route.params.id, undefined, {
+        ...(Number.isFinite(untilTurn) && untilTurn > 0 ? { untilTurn } : {}),
+      })
       route.send(201, {
         id: child.id,
         version: child.version,
