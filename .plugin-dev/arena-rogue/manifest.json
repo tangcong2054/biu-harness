@@ -16,6 +16,5 @@
     "minWidth": 720,
     "minHeight": 480,
     "resizable": true
-  },
-  "builtin": true
+  }
 }
