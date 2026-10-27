@@ -1185,6 +1185,16 @@ declare module 'cordis' {
   }
 }
 
+/**
+ * 从 fork 请求体里取「截断到哪个回合」。
+ * 没有请求体（旧前端、脚本）、格式不对、或不是正整数时返回 undefined，即保持原来的整段复制。
+ */
+export function forkTurnFromBody(body: unknown): number | undefined {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return undefined
+  const value = Number((body as { untilTurn?: unknown }).untilTurn)
+  return Number.isFinite(value) && value > 0 ? value : undefined
+}
+
 export async function openSessionHttpPayload(ctx: Context, id: string, limitTurns: number) {
   const record = await ctx.sessions.get(id)
   if (!record || !ctx.sessions.inWorkspace(id)) return { status: 404 as const, body: { error: 'unknown session' } }
@@ -1845,11 +1855,10 @@ export function apply(ctx: Context) {
   ctx.http.route('POST', '/api/sessions/:id/fork', async (route) => {
     try {
       if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
-      const body = (await route.json().catch(() => ({}))) as { untilTurn?: unknown }
-      const untilTurn = Number(body.untilTurn)
-      const child = await ctx.sessions.fork(route.params.id, undefined, {
-        ...(Number.isFinite(untilTurn) && untilTurn > 0 ? { untilTurn } : {}),
-      })
+      // 兼容不带请求体的调用（旧前端、脚本）：json() 可能解析成 null。
+      const body = await route.json().catch(() => null)
+      const untilTurn = forkTurnFromBody(body)
+      const child = await ctx.sessions.fork(route.params.id, undefined, untilTurn ? { untilTurn } : undefined)
       route.send(201, {
         id: child.id,
         version: child.version,
