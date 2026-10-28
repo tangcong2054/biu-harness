@@ -26,6 +26,11 @@ export class PickService extends Service {
   marquee: PickHover | null = null
   marqueeHits: PickHover[] = []
   draft: PickDraft | null = null
+  /**
+   * 当前 refs 属于哪个会话。null 表示还没归属（例如冷启动、还没选中会话时在页面里按了 Ctrl/Cmd+L）。
+   * refs 本身是全局一份；输入栏草稿按会话保存，靠这个字段区分「同一会话重挂」和「换了会话」。
+   */
+  sessionOwner: string | null = null
   private seq = 0
   private listeners = new Set<() => void>()
   private readonly source = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
@@ -220,6 +225,23 @@ export class PickService extends Service {
     if (!this.refs.length) return
     this.refs = []
     this.bump()
+  }
+
+  /**
+   * 输入栏绑定到某个会话时调用，返回现有 refs 能否留在这个会话里：
+   * - 同一会话（重挂输入栏、开关悬浮窗）或尚未归属：可以保留，并归到该会话；
+   * - 换了会话：不能保留，调用方应清空后只按新会话自己的草稿恢复；
+   * - 没有会话（如当前会话被删）：清掉上一个会话留下的 refs，之后加入的 refs 等下一个会话认领。
+   */
+  claimSession(sessionId: string | null | undefined): boolean {
+    const next = sessionId || null
+    const prev = this.sessionOwner
+    this.sessionOwner = next
+    if (!next) {
+      if (prev) this.clear()
+      return false
+    }
+    return prev === null || prev === next
   }
 
   setHover(hover: PickHover | null) {
