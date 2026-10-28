@@ -10,6 +10,61 @@ export const name = 'page-terminal'
 
 /** 宿主选区服务（加入对话草稿）。终端选区是 xterm 自绘的，不是浏览器原生选区，宿主读不到，只能由终端自己交过去。 */
 let PICK: { attach?: (refs: unknown[]) => void } | null = null
+
+function isSendHotkey(event: KeyboardEvent) {
+  if (event.isComposing || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return false
+  return event.key === 'l' || event.key === 'L'
+}
+
+/** 把一段终端文字（带终端行号）加入会话草稿。成功返回 true。 */
+function attachTerminalText(opts: { sessionKey: string; text: string; startLine: number; endLine: number; snapshot?: boolean }) {
+  if (typeof PICK?.attach !== 'function') return false
+  const text = opts.text.trim()
+  if (!text) return false
+  const clipped = text.length > PICK_SELECTION_CHARS ? `${text.slice(0, PICK_SELECTION_CHARS)}\n…（终端内容已截断）` : text
+  const { startLine, endLine } = opts
+  let hash = 0
+  const key = `${opts.sessionKey}:${startLine}:${endLine}:${clipped}`
+  for (let i = 0; i < key.length; i += 1) hash = (hash * 33 + key.charCodeAt(i)) >>> 0
+  const where = opts.snapshot ? '终端快照' : '终端'
+  try {
+    PICK.attach([
+      {
+        kind: 'terminal',
+        id: `terminal:${opts.sessionKey}:${hash.toString(16)}`,
+        label: startLine === endLine ? `${where}第 ${startLine} 行` : `${where}第 ${startLine}-${endLine} 行`,
+        title: where,
+        route: location.pathname,
+        plugin: name,
+        // 终端缓冲区 / 快照内的行号（1 起），不是页面 markdown 行号；不带 path，避免被当成页面行。
+        start_line: startLine,
+        end_line: endLine,
+        selection: clipped,
+      },
+    ])
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * ⌘/Ctrl+L 必须挂在 document 捕获阶段：页面编辑器用 onKeyDownCapture 处理同一个快捷键，
+ * React 的捕获监听在根节点上，比终端里的输入框更早拿到事件，并且会 stopPropagation，
+ * 只把「整个块」发出去。document 捕获比 React 根节点更早，才能先把选中文字交过去。
+ * 只在按键时运行，不碰输出路径。
+ */
+function listenSendHotkey(handler: (event: KeyboardEvent) => boolean) {
+  const onKey = (event: KeyboardEvent) => {
+    if (!isSendHotkey(event)) return
+    if (!handler(event)) return
+    event.preventDefault()
+    event.stopPropagation()
+    event.stopImmediatePropagation()
+  }
+  document.addEventListener('keydown', onKey, true)
+  return () => document.removeEventListener('keydown', onKey, true)
+}
 export const inject = ['pageEditor']
 
 const DEFAULTS = { title: '终端', height: 240 }
@@ -551,6 +606,7 @@ function TerminalSurface({
     let fit: FitAddon | null = null
     let socket: WebSocket | undefined
     let detachScroll = () => {}
+    let detachSendKey = () => {}
     let buryObs: MutationObserver | undefined
     let dataSub: { dispose(): void } | undefined
     let resizeSub: { dispose(): void } | undefined
@@ -780,47 +836,19 @@ function TerminalSurface({
         buryObs.observe(element, { childList: true, subtree: true })
         selectionSub = term.onSelectionChange(syncPickSelection)
         scrollSub = term.onScroll(syncPickSelection)
-        // Ctrl/⌘+L：有选区时把「选中文字 + 终端行号」交给会话。
-        // xterm 选区不是浏览器原生选区，冒泡到页面编辑器只会发出整块插件信息；
-        // 没有选区时不拦，照旧发给 shell（清屏）。只在按键时运行，不碰输出路径。
-        term.attachCustomKeyEventHandler((event) => {
-          if (event.type !== 'keydown' || event.isComposing) return true
-          if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return true
-          if (event.key !== 'l' && event.key !== 'L') return true
-          if (!term?.hasSelection() || typeof PICK?.attach !== 'function') return true
-          const raw = term.getSelection()
-          const text = raw.trim()
+        // Ctrl/⌘+L：有选区时把「选中文字 + 终端行号」交给会话；没有选区时不拦，照旧发给 shell（清屏）。
+        detachSendKey = listenSendHotkey((event) => {
+          if (!term?.hasSelection()) return false
+          const target = event.target instanceof Node ? event.target : null
+          const active = document.activeElement
+          if (!(target && paneEl.contains(target)) && !(active && paneEl.contains(active))) return false
           const range = term.getSelectionPosition()
-          if (!text || !range) return true
-          event.preventDefault()
-          event.stopPropagation()
+          if (!range) return false
           const startLine = range.start.y + 1
           const endLine = Math.max(startLine, range.end.y + (range.end.x === 0 ? 0 : 1))
-          const clipped =
-            text.length > PICK_SELECTION_CHARS ? `${text.slice(0, PICK_SELECTION_CHARS)}\n…（终端内容已截断）` : text
-          let hash = 0
-          const key = `${sessionKey}:${startLine}:${endLine}:${clipped}`
-          for (let i = 0; i < key.length; i += 1) hash = (hash * 33 + key.charCodeAt(i)) >>> 0
-          try {
-            PICK.attach([
-              {
-                kind: 'terminal',
-                id: `terminal:${sessionKey}:${hash.toString(16)}`,
-                label: startLine === endLine ? `终端第 ${startLine} 行` : `终端第 ${startLine}-${endLine} 行`,
-                title: '终端',
-                route: location.pathname,
-                plugin: name,
-                // 终端缓冲区行号（含滚动历史，1 起），不是页面 markdown 行号；不带 path，避免被当成页面行。
-                start_line: startLine,
-                end_line: endLine,
-                selection: clipped,
-              },
-            ])
-            term.clearSelection()
-          } catch {
-            // 选区服务不可用时什么都不做。
-          }
-          return false
+          if (!attachTerminalText({ sessionKey, text: term.getSelection(), startLine, endLine })) return false
+          term.clearSelection()
+          return true
         })
         syncPickSelection()
         detachScroll = attachScrollRail(term, paneEl)
@@ -935,6 +963,7 @@ function TerminalSurface({
       resizeObs.disconnect()
       buryObs?.disconnect()
       detachScroll()
+      detachSendKey()
       dataSub?.dispose()
       resizeSub?.dispose()
       selectionSub?.dispose()
@@ -1574,6 +1603,7 @@ function PageTerminal({
           text={snapshot}
           height={height}
           fill={fillMode}
+          sessionKey={sessionKey}
         />
       ) : sessionKey ? (
         <TerminalSurface
@@ -1684,8 +1714,40 @@ function HeightHandle({
   )
 }
 
-function ReadonlySnapshot({ text, height, fill }: { text: string; height: number; fill?: boolean }) {
+function ReadonlySnapshot({
+  text,
+  height,
+  fill,
+  sessionKey,
+}: {
+  text: string
+  height: number
+  fill?: boolean
+  sessionKey: string
+}) {
   const ref = useRef<HTMLDivElement | null>(null)
+  // 只读快照是普通 DOM 文字，但页面编辑器同样会先截走 ⌘L 只发整块；这里同样在 document 捕获阶段抢先处理。
+  useEffect(
+    () =>
+      listenSendHotkey(() => {
+        const root = ref.current
+        const selection = window.getSelection()
+        if (!root || !selection || selection.rangeCount === 0 || selection.isCollapsed) return false
+        if (!root.contains(selection.anchorNode) || !root.contains(selection.focusNode)) return false
+        const range = selection.getRangeAt(0)
+        const picked = selection.toString()
+        // 选区起点之前有几个换行 → 快照内行号。只在按键时算一次。
+        const before = document.createRange()
+        before.setStart(root, 0)
+        before.setEnd(range.startContainer, range.startOffset)
+        const startLine = before.toString().split('\n').length
+        const endLine = startLine + picked.replace(/\n+$/, '').split('\n').length - 1
+        if (!attachTerminalText({ sessionKey, text: picked, startLine, endLine, snapshot: true })) return false
+        selection.removeAllRanges()
+        return true
+      }),
+    [sessionKey],
+  )
   useLayoutEffect(() => {
     // 和终端一样默认停在最底部。
     if (ref.current) ref.current.scrollTop = ref.current.scrollHeight

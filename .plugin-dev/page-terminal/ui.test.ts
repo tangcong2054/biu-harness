@@ -25,14 +25,21 @@ test('no per-scroll selection re-apply on the output path', () => {
   assert.match(source, /scrollSub = term\.onScroll\(syncPickSelection\)/)
 })
 
-test('Ctrl/Cmd+L with a terminal selection sends text plus terminal line range', () => {
-  assert.match(source, /term\.attachCustomKeyEventHandler\(/)
-  assert.match(source, /if \(!term\?\.hasSelection\(\) \|\| typeof PICK\?\.attach !== 'function'\) return true/)
+test('Ctrl/Cmd+L is handled in document capture before the page editor grabs it', () => {
+  // 页面编辑器用 onKeyDownCapture 处理 ⌘L 并 stopPropagation；挂在 xterm 回调里永远轮不到。
+  assert.doesNotMatch(source, /attachCustomKeyEventHandler/)
+  assert.match(source, /document\.addEventListener\('keydown', onKey, true\)/)
+  assert.match(source, /event\.stopImmediatePropagation\(\)/)
   assert.match(source, /kind: 'terminal'/)
   assert.match(source, /start_line: startLine,\s+end_line: endLine,\s+selection: clipped,/)
-  // 拦住冒泡，避免外层页面编辑器再发一次整块。
-  assert.match(source, /event\.stopPropagation\(\)\s+const startLine/)
   assert.match(source, /ctx\.inject\?\.\(\['pick'\]/)
+})
+
+test('live terminal and read-only snapshot both send selected text', () => {
+  assert.match(source, /detachSendKey = listenSendHotkey\(/)
+  assert.match(source, /attachTerminalText\(\{ sessionKey, text: term\.getSelection\(\), startLine, endLine \}\)/)
+  assert.match(source, /attachTerminalText\(\{ sessionKey, text: picked, startLine, endLine, snapshot: true \}\)/)
+  assert.match(source, /detachSendKey\(\)/)
 })
 
 test('height handle previews locally and writes block data once on release', () => {

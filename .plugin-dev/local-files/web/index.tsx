@@ -82,9 +82,17 @@ async function blockDataFor(rootId: string): Promise<Record<string, unknown> | n
   }
 }
 
+/** 当前页面记录的路径：页面编辑器在编辑器根节点上写了 data-live-path。 */
+function currentPageResourcePath(): string {
+  const el = document.querySelector('[data-live-path]')
+  return el?.getAttribute('data-live-path') ?? ''
+}
+
 async function uploadSnapshot(file: File, name: string) {
   const hint = `${Date.now()}-${name.replace(/[^\p{L}\p{N}._-]+/gu, '-') || 'file'}`
-  const res = await fetch(`/api/db/file/hash/${encodeURIComponent(hint)}`, {
+  const path = currentPageResourcePath()
+  if (!path) throw new Error('拿不到当前页面的记录路径（resource path），无法上传快照')
+  const res = await fetch(`/api/db/file/hash/${encodeURIComponent(hint)}?path=${encodeURIComponent(path)}`, {
     method: 'PUT',
     headers: { 'content-type': 'application/octet-stream' },
     body: file,
