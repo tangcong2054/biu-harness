@@ -73,6 +73,8 @@ const DEFAULTS = { title: '终端', height: 240 }
 const HISTORY_MAX = 200      // 最多保留的命令条数
 const HISTORY_OUT_LINES = 10 // 每条命令最多保留的输出行数
 const HISTORY_OUT_CHARS = 600 // 单条输出字符上限，防止撑爆 markdown
+/** 为历史记录攒的原始输出上限（含 ANSI 转义，留足余量给 stripAnsi 后的前 10 行）。 */
+const HISTORY_CAPTURE_CHARS = 16_000
 const OUTPUT_SETTLE_MS = 600 // 输出安静这么久，就认为这条命令跑完了
 const PICK_SELECTION_CHARS = 12_000 // 避免超大终端选区撑爆 agent 上下文
 const SNAPSHOT_LINES = 80 // 画面快照最多保留的行数（会话丢失后只读回显用）
@@ -308,14 +310,25 @@ function attachScrollRail(term: Terminal, pane: HTMLElement) {
   // 还会在布局未落定时读 rail.clientHeight（读到 0，thumb 高度塌成最小值）。
   // scrollToLine / scrollLines 只改 buffer，不一定触发 viewport 原生 scroll 事件，
   // 所以要额外盯 onScroll，那是 buffer 层滚动位置变化时必发的。
+  // 大量输出时 onScroll 每段数据都会触发，而 sync 要读 clientHeight（强制重排）：
+  // 合并成每帧最多一次，事件停了就不再排。
+  let syncFrame = 0
+  const scheduleSync = () => {
+    if (syncFrame) return
+    syncFrame = requestAnimationFrame(() => {
+      syncFrame = 0
+      sync()
+    })
+  }
   const subs = [
-    term.onScroll(() => sync()),
-    term.onRender(() => sync()),
-    term.onResize(() => sync()),
+    term.onScroll(scheduleSync),
+    term.onRender(scheduleSync),
+    term.onResize(scheduleSync),
   ]
   requestAnimationFrame(sync)
 
   return () => {
+    if (syncFrame) cancelAnimationFrame(syncFrame)
     if (fadeTimer) window.clearTimeout(fadeTimer)
     pane.removeEventListener('wheel', onWheel, { capture: true } as EventListenerOptions)
     hotspot.removeEventListener('pointerenter', onHotEnter)
@@ -608,6 +621,8 @@ function TerminalSurface({
     let detachScroll = () => {}
     let detachSendKey = () => {}
     let buryObs: MutationObserver | undefined
+    let pickModeObs: MutationObserver | undefined
+    let cancelPickFrame = () => {}
     let dataSub: { dispose(): void } | undefined
     let resizeSub: { dispose(): void } | undefined
     let selectionSub: { dispose(): void } | undefined
@@ -718,7 +733,9 @@ function TerminalSurface({
 
     const recordOutput = (chunk: string) => {
       if (!capturing) return
-      outBuffer += chunk
+      // 历史只留前 HISTORY_OUT_LINES 行 / HISTORY_OUT_CHARS 字。攒满上限就不再拼接：
+      // 否则 cat 大文件会把几十 MB 拼进内存，结束时还要对整段跑 stripAnsi 正则，卡住主线程。
+      if (outBuffer.length < HISTORY_CAPTURE_CHARS) outBuffer += chunk.slice(0, HISTORY_CAPTURE_CHARS - outBuffer.length)
       if (outTimer) window.clearTimeout(outTimer)
       outTimer = window.setTimeout(flushHistory, OUTPUT_SETTLE_MS)
     }
@@ -806,7 +823,7 @@ function TerminalSurface({
           overflow: 'hidden',
           boxSizing: 'border-box',
         })
-        const syncPickSelection = () => {
+        const writePickSelection = () => {
           if (!term?.element) return
           const selected = term.getSelection()
           const buffer = term.buffer.active
@@ -828,10 +845,42 @@ function TerminalSurface({
           if (content) pickLayerEl.setAttribute('data-biu-selection', content)
           else pickLayerEl.removeAttribute('data-biu-selection')
         }
+        /**
+         * 选取层的属性只有「选取模式」（⌘Q 点选组件）会读。以前每段输出、每次 DOM 变动都同步重算：
+         * 读一屏文字 + 写一个最多 12KB 的属性，大量输出时就是卡顿的主要来源。
+         * 现在只在选取模式下算，且每帧最多一次；进入选取模式时立即补一次。
+         */
+        let pickFrame = 0
+        const pickModeOn = () => document.documentElement.classList.contains('pick-mode')
+        const syncPickSelection = () => {
+          if (pickFrame || !pickModeOn()) return
+          pickFrame = requestAnimationFrame(() => {
+            pickFrame = 0
+            if (!disposed && pickModeOn()) writePickSelection()
+          })
+        }
+        pickModeObs = new MutationObserver(() => {
+          if (pickModeOn()) writePickSelection()
+        })
+        pickModeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
+        cancelPickFrame = () => {
+          if (pickFrame) cancelAnimationFrame(pickFrame)
+          pickFrame = 0
+        }
+        // 先写一次静态身份，选取模式下首帧也能认出是终端。
+        pickLayerEl.setAttribute('data-biu-kind', 'terminal')
+        pickLayerEl.setAttribute('data-biu-id', `terminal:${sessionKey}`)
+        pickLayerEl.setAttribute('data-biu-label', '终端当前画面')
+        pickLayerEl.setAttribute('data-biu-plugin', name)
         buryAuxiliaryNodes(element)
-        buryObs = new MutationObserver(() => {
-          buryAuxiliaryNodes(element)
-          syncPickSelection()
+        buryObs = new MutationObserver((records) => {
+          // DOM 渲染器每帧都在 .xterm-rows / .xterm-selection 里增删节点，那些不是辅助节点，直接跳过；
+          // 只有 xterm 新插入辅助节点（测量元素、无障碍树等）时才需要再压一次。
+          const relevant = records.some((record) => {
+            const target = record.target instanceof Element ? record.target : record.target.parentElement
+            return !target?.closest('.xterm-rows, .xterm-selection, .xterm-decoration-container')
+          })
+          if (relevant) buryAuxiliaryNodes(element)
         })
         buryObs.observe(element, { childList: true, subtree: true })
         selectionSub = term.onSelectionChange(syncPickSelection)
@@ -962,6 +1011,8 @@ function TerminalSurface({
       paneEl.removeEventListener('pointerdown', onPanePointerDown)
       resizeObs.disconnect()
       buryObs?.disconnect()
+      pickModeObs?.disconnect()
+      cancelPickFrame()
       detachScroll()
       detachSendKey()
       dataSub?.dispose()
