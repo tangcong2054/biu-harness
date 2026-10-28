@@ -7,6 +7,9 @@ const React = globalThis.React
 const { useEffect, useLayoutEffect, useRef } = React
 
 export const name = 'page-terminal'
+
+/** 宿主选区服务（加入对话草稿）。终端选区是 xterm 自绘的，不是浏览器原生选区，宿主读不到，只能由终端自己交过去。 */
+let PICK: { attach?: (refs: unknown[]) => void } | null = null
 export const inject = ['pageEditor']
 
 const DEFAULTS = { title: '终端', height: 240 }
@@ -17,9 +20,10 @@ const HISTORY_OUT_LINES = 10 // 每条命令最多保留的输出行数
 const HISTORY_OUT_CHARS = 600 // 单条输出字符上限，防止撑爆 markdown
 const OUTPUT_SETTLE_MS = 600 // 输出安静这么久，就认为这条命令跑完了
 const PICK_SELECTION_CHARS = 12_000 // 避免超大终端选区撑爆 agent 上下文
-const SNAPSHOT_LINES = 200 // 画面快照最多保留的行数（会话丢失后只读回显用）
-const SNAPSHOT_CHARS = 6_000 // 快照字符上限，写在块数据里，不能把 markdown 撑太大
-const SNAPSHOT_SETTLE_MS = 1_500 // 输出安静这么久才存一次快照，避免频繁改块数据
+const SNAPSHOT_LINES = 80 // 画面快照最多保留的行数（会话丢失后只读回显用）
+const SNAPSHOT_CHARS = 2_000 // 快照字符上限，写在块数据里，每次整页保存都要带上，必须小
+/** 持续输出（tail -f、watch）时快照最多这么久写一次；命令结束、切走页面、断开时会立即补写。 */
+const SNAPSHOT_INTERVAL_MS = 30_000
 /** 与 host 的 SESSION_GONE_CODE 一致：attach 时会话已不存在。 */
 const SESSION_GONE_CODE = 4404
 
@@ -334,6 +338,34 @@ const STYLE_CSS = `
   cursor:default;
 }
 .pt-pane .xterm-screen { background: transparent !important; }
+/* xterm 把 .xterm-helpers 作为 .xterm-screen 的第一个子节点插在文字行前面。
+   xterm.css 没注入时它是普通流，会把 .xterm-rows 整体往下推：底部几行被裁掉，
+   而选区层是 absolute top:0 不跟着动 → 选中一处出现两块高亮、且错开。
+   取值与上游 xterm.css 一致。textarea 的 left/top 不能加 !important：
+   输入法组合时 xterm 用行内样式把它挪到光标处，!important 会让候选框跑偏。 */
+.pt-pane .xterm .xterm-helpers { position: absolute; top: 0; z-index: 5; }
+.pt-pane .xterm .xterm-helper-textarea {
+  padding: 0; border: 0; margin: 0; position: absolute; opacity: 0;
+  left: -9999em; top: 0; width: 0; height: 0; z-index: -5;
+  white-space: nowrap; overflow: hidden; resize: none;
+}
+.pt-pane .xterm .composition-view { display: none; position: absolute; white-space: nowrap; z-index: 1; }
+.pt-pane .xterm .composition-view.active { display: block; }
+/* DOM 渲染器把选区画成一层 z-index:1 的不透明色块（颜色是选区色与背景的混合），
+   而文字层 .xterm-rows 是普通流，于是选区直接盖在字上 —— 选中即"遮挡"。
+   把文字层抬到选区上面：选区只当底色，字始终可见。 */
+.pt-pane .xterm-screen .xterm-rows { position: relative; z-index: 2; }
+.pt-pane .xterm-screen .xterm-selection { z-index: 1 !important; }
+.pt-resize{
+  flex:none;height:8px;margin-top:-4px;position:relative;z-index:14;
+  cursor:ns-resize;touch-action:none;user-select:none;
+}
+.pt-resize::after{
+  content:"";position:absolute;left:50%;top:3px;width:36px;height:3px;margin-left:-18px;
+  border-radius:999px;background:rgba(242,241,237,.18);opacity:0;transition:opacity .15s ease-out;
+}
+.pt-card:hover .pt-resize::after,.pt-resize.is-dragging::after{opacity:1}
+.pt-resize.is-dragging::after{background:rgba(242,241,237,.42)}
 .pt-pane canvas { background: transparent !important; }
 .pt-pane .xterm-char-measure-element,
 .pt-pane .xterm-width-cache-measure-container{
@@ -465,15 +497,16 @@ const THEME = {
   brightWhite: '#f0efed',
 }
 
+type TerminalPersistPatch = { history?: HistoryEntry[]; snapshot?: string }
+
 /** 单个终端面：一个块 = 一个 PTY。
    布局按 5456764d 的最终版：外层 contain:strict + 内层 inset:0；
    padding 打在 .xterm 上让 FitAddon 扣掉；未可见不 open。不要对缓冲区做 clear。 */
 function TerminalSurface({
   height,
   history,
-  onHistory,
   snapshot,
-  onSnapshot,
+  onPersist,
   attach,
   onGone,
   sessionKey,
@@ -481,10 +514,10 @@ function TerminalSurface({
 }: {
   height: number
   history: HistoryEntry[]
-  onHistory: (next: HistoryEntry[]) => void
   /** 上次保存的画面纯文本；会话丢失时以只读方式回显。 */
   snapshot: string
-  onSnapshot: (text: string) => void
+  /** 历史与快照合并成一次块数据写入（一次写入 = 一次整页保存）。 */
+  onPersist: (patch: TerminalPersistPatch) => void
   /** 只连已有会话；会话不存在时不起新 shell，转为只读。 */
   attach: boolean
   onGone: () => void
@@ -498,9 +531,10 @@ function TerminalSurface({
   const mount = useRef<HTMLDivElement | null>(null)
   const pickLayer = useRef<HTMLDivElement | null>(null)
   const instance = useRef<Terminal | null>(null)
-  // effect 只跑一次，回调走 ref 拿最新值，避免闭包里是旧的 update。
-  const onSnapshotRef = useRef(onSnapshot)
-  onSnapshotRef.current = onSnapshot
+  // effect 只跑一次，回调必须走 ref 拿最新值：挂载时捕获的 update 会带着旧块数据，
+  // 写回时把之后的修改（快照、高度等）整块覆盖回去。
+  const onPersistRef = useRef(onPersist)
+  onPersistRef.current = onPersist
   const onGoneRef = useRef(onGone)
   onGoneRef.current = onGone
 
@@ -527,6 +561,9 @@ function TerminalSurface({
     let lastSnapshot = snapshot
     /** 收到过 PTY 数据才算真的连上了，才允许用当前画面覆盖快照。 */
     let live = false
+    /** 有新的命令/输出还没写进块数据。 */
+    let historyDirty = false
+    let screenDirty = false
 
     /** 读 xterm 缓冲区（含 scrollback）的纯文本尾部。 */
     const readScreen = () => {
@@ -542,24 +579,43 @@ function TerminalSurface({
       return text.length > SNAPSHOT_CHARS ? text.slice(-SNAPSHOT_CHARS) : text
     }
 
-    const saveSnapshot = () => {
+    const historyRef = [...history]
+
+    /**
+     * 唯一的块数据写入口：历史和快照合并成一次 update。
+     * 每次 update 都会触发整页序列化 + 保存 + 重建块索引，所以要尽量少、尽量合并。
+     */
+    const persist = () => {
       if (snapshotTimer) {
         window.clearTimeout(snapshotTimer)
         snapshotTimer = undefined
       }
-      if (!live || !term) return
-      const text = readScreen()
-      if (!text || text === lastSnapshot) return
-      lastSnapshot = text
-      onSnapshotRef.current(text)
+      const patch: TerminalPersistPatch = {}
+      if (historyDirty) {
+        patch.history = [...historyRef]
+        historyDirty = false
+      }
+      if (screenDirty && live && term) {
+        const text = readScreen()
+        if (text && text !== lastSnapshot) {
+          lastSnapshot = text
+          patch.snapshot = text
+        }
+      }
+      screenDirty = false
+      if (patch.history || patch.snapshot !== undefined) onPersistRef.current(patch)
     }
 
+    /** 会话断开 / 页面切走 / 块卸载时立即补写。 */
+    const saveSnapshot = () => persist()
+
+    /** 输出只标脏；节流到 SNAPSHOT_INTERVAL_MS 一次，不再每段输出安静就整页保存。 */
     const scheduleSnapshot = () => {
-      if (snapshotTimer) window.clearTimeout(snapshotTimer)
-      snapshotTimer = window.setTimeout(saveSnapshot, SNAPSHOT_SETTLE_MS)
+      screenDirty = true
+      if (snapshotTimer) return
+      snapshotTimer = window.setTimeout(persist, SNAPSHOT_INTERVAL_MS)
     }
 
-    const historyRef = [...history]
     let pendingLine = ''
     let capturing = false
     let outBuffer = ''
@@ -581,25 +637,27 @@ function TerminalSurface({
       return false
     }
 
+    /** 命令跑完（输出安静 OUTPUT_SETTLE_MS）：补上输出，历史 + 快照合并写一次。 */
     const flushHistory = () => {
       if (outTimer) {
         window.clearTimeout(outTimer)
         outTimer = undefined
       }
-      if (!capturing) return
-      capturing = false
-      const clean = stripAnsi(outBuffer)
-        .split('\n')
-        .map((line) => line.replace(/\s+$/, ''))
-        .filter((line) => !isPromptLike(line))
-        .filter((line, index, all) => !(index === all.length - 1 && line === ''))
-      outBuffer = ''
-      if (clean.length === 0) return
-      const out = clean.slice(0, HISTORY_OUT_LINES).join('\n').slice(0, HISTORY_OUT_CHARS)
-      const last = historyRef[historyRef.length - 1]
-      if (!last || last.out !== undefined) return
-      last.out = out || undefined
-      onHistory([...historyRef])
+      if (capturing) {
+        capturing = false
+        const clean = stripAnsi(outBuffer)
+          .split('\n')
+          .map((line) => line.replace(/\s+$/, ''))
+          .filter((line) => !isPromptLike(line))
+          .filter((line, index, all) => !(index === all.length - 1 && line === ''))
+        outBuffer = ''
+        const last = historyRef[historyRef.length - 1]
+        if (clean.length && last && last.out === undefined) {
+          last.out = clean.slice(0, HISTORY_OUT_LINES).join('\n').slice(0, HISTORY_OUT_CHARS) || undefined
+          historyDirty = true
+        }
+      }
+      if (historyDirty) persist()
     }
 
     const recordOutput = (chunk: string) => {
@@ -617,9 +675,12 @@ function TerminalSurface({
           if (!cmd) continue
           historyRef.push({ cmd, at: Date.now() })
           if (historyRef.length > HISTORY_MAX) historyRef.splice(0, historyRef.length - HISTORY_MAX)
-          onHistory([...historyRef])
+          // 回车时不单独写：等输出安静后和输出、快照一起写一次。没有输出的命令也会按时落盘。
+          historyDirty = true
           capturing = true
           outBuffer = ''
+          if (outTimer) window.clearTimeout(outTimer)
+          outTimer = window.setTimeout(flushHistory, OUTPUT_SETTLE_MS)
           continue
         }
         if (ch === '\x7f' || ch === '\b') {
@@ -719,6 +780,48 @@ function TerminalSurface({
         buryObs.observe(element, { childList: true, subtree: true })
         selectionSub = term.onSelectionChange(syncPickSelection)
         scrollSub = term.onScroll(syncPickSelection)
+        // Ctrl/⌘+L：有选区时把「选中文字 + 终端行号」交给会话。
+        // xterm 选区不是浏览器原生选区，冒泡到页面编辑器只会发出整块插件信息；
+        // 没有选区时不拦，照旧发给 shell（清屏）。只在按键时运行，不碰输出路径。
+        term.attachCustomKeyEventHandler((event) => {
+          if (event.type !== 'keydown' || event.isComposing) return true
+          if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return true
+          if (event.key !== 'l' && event.key !== 'L') return true
+          if (!term?.hasSelection() || typeof PICK?.attach !== 'function') return true
+          const raw = term.getSelection()
+          const text = raw.trim()
+          const range = term.getSelectionPosition()
+          if (!text || !range) return true
+          event.preventDefault()
+          event.stopPropagation()
+          const startLine = range.start.y + 1
+          const endLine = Math.max(startLine, range.end.y + (range.end.x === 0 ? 0 : 1))
+          const clipped =
+            text.length > PICK_SELECTION_CHARS ? `${text.slice(0, PICK_SELECTION_CHARS)}\n…（终端内容已截断）` : text
+          let hash = 0
+          const key = `${sessionKey}:${startLine}:${endLine}:${clipped}`
+          for (let i = 0; i < key.length; i += 1) hash = (hash * 33 + key.charCodeAt(i)) >>> 0
+          try {
+            PICK.attach([
+              {
+                kind: 'terminal',
+                id: `terminal:${sessionKey}:${hash.toString(16)}`,
+                label: startLine === endLine ? `终端第 ${startLine} 行` : `终端第 ${startLine}-${endLine} 行`,
+                title: '终端',
+                route: location.pathname,
+                plugin: name,
+                // 终端缓冲区行号（含滚动历史，1 起），不是页面 markdown 行号；不带 path，避免被当成页面行。
+                start_line: startLine,
+                end_line: endLine,
+                selection: clipped,
+              },
+            ])
+            term.clearSelection()
+          } catch {
+            // 选区服务不可用时什么都不做。
+          }
+          return false
+        })
         syncPickSelection()
         detachScroll = attachScrollRail(term, paneEl)
         try {
@@ -798,23 +901,35 @@ function TerminalSurface({
     const intersection = typeof IntersectionObserver === 'undefined' ? null : new IntersectionObserver(scheduleFit)
     intersection?.observe(element)
     document.addEventListener('visibilitychange', scheduleFit)
+    // 快照改为节流后，切走标签页 / 关闭页面时要把没写的补上，否则刷新回来看到的是旧画面。
+    const flushPending = () => {
+      if (disposed) return
+      if (outTimer) flushHistory()
+      else if (historyDirty || screenDirty) persist()
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') flushPending()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    window.addEventListener('pagehide', flushPending)
     scheduleFit()
 
     return () => {
+      // 切页 / 块卸载：先补写，再标记 disposed。
+      try {
+        flushPending()
+      } catch {
+        // 编辑器可能已销毁。
+      }
       disposed = true
       if (outTimer) window.clearTimeout(outTimer)
-      // 切页 / 块卸载时把还没落盘的快照补一次；页面整体刷新时这里不保证执行，靠防抖兜底。
-      if (snapshotTimer) {
-        try {
-          saveSnapshot()
-        } catch {
-          // 编辑器可能已销毁。
-        }
-      }
+      if (snapshotTimer) window.clearTimeout(snapshotTimer)
       cancelAnimationFrame(frame)
       cancelAnimationFrame(secondFrame)
       intersection?.disconnect()
       document.removeEventListener('visibilitychange', scheduleFit)
+      document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('pagehide', flushPending)
       window.removeEventListener('focus', onWindowFocus)
       paneEl.removeEventListener('pointerdown', onPanePointerDown)
       resizeObs.disconnect()
@@ -1386,7 +1501,12 @@ function PageTerminal({
     return () => window.removeEventListener('mousedown', onDown)
   }, [settingsOpen])
 
-  const height = typeof data.height === 'number' && data.height > 0 ? Math.min(900, data.height) : DEFAULTS.height
+  const savedHeight =
+    typeof data.height === 'number' && data.height > 0 ? Math.min(MAX_HEIGHT, data.height) : DEFAULTS.height
+  /** 拖动中的预览高度；松手写回 data.height 后清空。 */
+  const [dragHeight, setDragHeight] = React.useState<number | null>(null)
+  const height = dragHeight ?? savedHeight
+  const fillMode = presentation ? presentation.mode === 'sidebar' : legacyZoom.zoomed || popout
 
   // 历史存在块数据里，agent 读页面 markdown 即可看到用户跑过什么。
   const history: HistoryEntry[] = parseHistory(data.history)
@@ -1453,7 +1573,7 @@ function PageTerminal({
         <ReadonlySnapshot
           text={snapshot}
           height={height}
-          fill={presentation ? presentation.mode === 'sidebar' : legacyZoom.zoomed || popout}
+          fill={fillMode}
         />
       ) : sessionKey ? (
         <TerminalSurface
@@ -1461,21 +1581,107 @@ function PageTerminal({
           key={sessionKey}
           height={height}
           history={history}
-          onHistory={(next) => update({ history: next })}
           snapshot={snapshot}
-          onSnapshot={(text) => {
-            if (writable) update({ snapshot: text })
+          onPersist={(patch) => {
+            const next: TerminalPersistPatch = { ...patch }
+            if (!writable) delete next.snapshot
+            if (next.history || next.snapshot !== undefined) update(next)
           }}
           attach={attach}
           onGone={() => setGone(true)}
           sessionKey={sessionKey}
-          fill={presentation ? presentation.mode === 'sidebar' : legacyZoom.zoomed || popout}
+          fill={fillMode}
+        />
+      ) : null}
+      {writable && !fillMode ? (
+        <HeightHandle
+          height={height}
+          onPreview={setDragHeight}
+          onCommit={(next) => update({ height: next })}
         />
       ) : null}
     </section>
   )
 
   return body
+}
+
+const MIN_HEIGHT = 120
+const MAX_HEIGHT = 900
+
+/**
+ * 底部拖拽调高度。拖动过程只改本地预览高度（终端靠 ResizeObserver 自己 fit），
+ * 松手才 update 一次 —— 每次 update 都是一次整页保存，不能每像素写一次。
+ */
+function HeightHandle({
+  height,
+  onPreview,
+  onCommit,
+}: {
+  height: number
+  onPreview: (next: number | null) => void
+  onCommit: (next: number) => void
+}) {
+  const ref = useRef<HTMLDivElement | null>(null)
+  const [dragging, setDragging] = React.useState(false)
+  // 拖动期间块数据可能被别的写入（命令历史）更新；松手时必须用最新的 update，否则会整块回滚。
+  const commitRef = useRef(onCommit)
+  commitRef.current = onCommit
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return
+    // 块外层 mousedown 会设成节点选中、draggable 会变成拖整块，都要拦住。
+    event.preventDefault()
+    event.stopPropagation()
+    const handle = event.currentTarget
+    const startY = event.clientY
+    const startH = height
+    let latest = startH
+    const restored: HTMLElement[] = []
+    for (let el = ref.current?.parentElement; el; el = el.parentElement) {
+      if (el.getAttribute('draggable') === 'true') {
+        el.setAttribute('draggable', 'false')
+        restored.push(el)
+      }
+    }
+    try {
+      handle.setPointerCapture(event.pointerId)
+    } catch {
+      // 不支持指针捕获时退化为 window 监听。
+    }
+    setDragging(true)
+    const move = (e: PointerEvent) => {
+      latest = Math.round(Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, startH + e.clientY - startY)))
+      onPreview(latest)
+    }
+    const end = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', end)
+      window.removeEventListener('pointercancel', end)
+      for (const el of restored) el.setAttribute('draggable', 'true')
+      setDragging(false)
+      if (latest !== startH) commitRef.current(latest)
+      onPreview(null)
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', end)
+    window.addEventListener('pointercancel', end)
+  }
+  return (
+    <div
+      ref={ref}
+      className={'pt-resize' + (dragging ? ' is-dragging' : '')}
+      data-testid="page-terminal-resize"
+      role="separator"
+      aria-orientation="horizontal"
+      aria-label="拖动调整终端高度"
+      onPointerDown={onPointerDown}
+      onMouseDown={(event) => event.stopPropagation()}
+      onDragStart={(event) => {
+        event.preventDefault()
+        event.stopPropagation()
+      }}
+    />
+  )
 }
 
 function ReadonlySnapshot({ text, height, fill }: { text: string; height: number; fill?: boolean }) {
@@ -1543,6 +1749,7 @@ function TerminalMinimized({ data }: { data: Record<string, unknown> }) {
 }
 
 export function apply(ctx: {
+  inject?: (deps: string[], apply: (inner: { pick?: { attach?: (refs: unknown[]) => void }; on?: (event: string, handler: () => void) => void }) => void) => void
   pageEditor: {
     registerBlock: (spec: {
       kind: string
@@ -1566,6 +1773,13 @@ export function apply(ctx: {
     }) => void
   }
 }) {
+  ctx.inject?.(['pick'], (inner) => {
+    const service = inner.pick ?? null
+    PICK = service
+    inner.on?.('dispose', () => {
+      if (PICK === service) PICK = null
+    })
+  })
   ctx.pageEditor.registerBlock({
     kind: 'terminal',
     plugin: name,
