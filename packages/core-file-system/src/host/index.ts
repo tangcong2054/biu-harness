@@ -2834,10 +2834,16 @@ export class DatabaseService extends Service implements Database {
   async listTrash() {
     await this.prepareMetadata()
     const items = []
+    let sessionSummaries: Map<string, DbRecord> | undefined
     for (const row of this.facets.listDeleted()) {
       const spec = this.collection(row.collection)
       if (!spec) continue
-      const record = await spec.get(row.record_id)
+      if (row.collection === '/sessions' && !sessionSummaries) {
+        sessionSummaries = new Map((await spec.list()).map(record => [record.id, record]))
+      }
+      const record = row.collection === '/sessions'
+        ? sessionSummaries?.get(row.record_id)
+        : await spec.get(row.record_id)
       if (!record) continue
       if (this.builtinShared(row.collection, record as { id?: unknown; builtin?: unknown })) continue
       const authorization = this.authorization()

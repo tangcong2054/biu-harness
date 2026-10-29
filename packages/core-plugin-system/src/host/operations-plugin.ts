@@ -1324,7 +1324,7 @@ export async function applyPlatformOperations(ctx: Context) {
     const cloudConfig = cloudStorage?.config
     const store: OperationsRepository =
       cloudStorage?.pool && cloudConfig?.enabled
-        ? new MysqlOperationsStore(cloudStorage.pool, cloudConfig.operationsDatabase)
+        ? new MysqlOperationsStore(cloudStorage.pool, cloudConfig.operationsDatabase, cloudConfig.productDatabase)
         : OperationsStore.open()
     await seedOperationsIdentity(ctx, store)
     registerOperationsIngest(ctx, store)

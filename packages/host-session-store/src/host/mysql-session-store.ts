@@ -197,12 +197,15 @@ export class MysqlSessionStore implements SessionStore {
     const [rows] = await this.pool.query<Array<SessionRow & { last_message_at: number | null; first_event_at: number | null }>>(
       `SELECT s.id, s.version, s.project_json, s.mascot_json, s.config_json,
               s.event_count, s.title, s.updated_at,
-              MAX(CASE WHEN e.type = 'user/message' THEN e.ts END) AS last_message_at,
-              MIN(e.ts) AS first_event_at
+              e.last_message_at, e.first_event_at
        FROM ${this.table('sessions')} s
-       LEFT JOIN ${this.table('events')} e ON e.session_id = s.id
-       GROUP BY s.id, s.version, s.project_json, s.mascot_json, s.config_json,
-                s.event_count, s.title, s.updated_at
+       LEFT JOIN (
+         SELECT session_id,
+                MAX(CASE WHEN type = 'user/message' THEN ts END) AS last_message_at,
+                MIN(ts) AS first_event_at
+         FROM ${this.table('events')}
+         GROUP BY session_id
+       ) e ON e.session_id = s.id
        ORDER BY s.updated_at DESC`,
     )
     return rows.map((row) => {

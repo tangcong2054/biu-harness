@@ -176,6 +176,7 @@ function tableExists(db: import('node:sqlite').DatabaseSync, name: string) {
 }
 
 export async function syncOperationsFromPlatform(store: OperationsRepository, rootDir = process.cwd(), force = false) {
+  if (store.syncFromPlatform) return store.syncFromPlatform(force)
   const now = Date.now()
   if (!force && now - lastPlatformSyncAt < 3000) return false
   const cloudBiu = join(rootDir, '.cloud-data', '.biu', 'biu.sqlite')

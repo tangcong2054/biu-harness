@@ -15,6 +15,7 @@ export type OperationsCounts = {
 }
 
 export interface OperationsRepository {
+  syncFromPlatform?(force?: boolean): Promise<boolean>
   list(kind: OperationsKind, q?: string): MaybePromise<OperationsRow[]>
   audits(q?: string): MaybePromise<OperationsRow[]>
   counts(): MaybePromise<OperationsCounts>

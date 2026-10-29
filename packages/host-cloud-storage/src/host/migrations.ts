@@ -541,6 +541,20 @@ export const PRODUCT_MIGRATIONS: readonly MysqlMigration[] = [
       ) ${MYSQL_TABLE}`,
     ],
   },
+  {
+    version: 13,
+    name: 'session_order_and_workspace_subject_indexes',
+    statements: [
+      `ALTER TABLE sessions
+       ADD INDEX sessions_updated (updated_at DESC), ALGORITHM=INPLACE, LOCK=NONE`,
+      `ALTER TABLE record_grants
+       ADD INDEX record_grants_workspace_subject (workspace_id, subject_type, subject_id),
+       ALGORITHM=INPLACE, LOCK=NONE`,
+      `ALTER TABLE view_grants
+       ADD INDEX view_grants_workspace_subject (workspace_id, subject_type, subject_id),
+       ALGORITHM=INPLACE, LOCK=NONE`,
+    ],
+  },
 ]
 
 export const OPERATIONS_MIGRATIONS: readonly MysqlMigration[] = [
