@@ -77,6 +77,54 @@ describe('splitReplyForDisplay', () => {
     expect(split.detailParts.map((part) => part.id)).toEqual(['think-1', 'a-partial', 't-1'])
     expect(split.finalParts).toHaveLength(0)
   })
+
+  it('keeps the conclusion in final parts when only todo_write follows it', () => {
+    const split = splitReplyForDisplay({
+      id: 'r-todo',
+      kind: 'reply',
+      copyText: '',
+      parts: [
+        { id: 't-read', kind: 'tool', name: 'read_file', callId: 'c1', arguments: '{}' },
+        { id: 'a-conclusion', kind: 'assistant', text: 'full conclusion' },
+        { id: 'think-1', kind: 'think', text: 'update todos' },
+        { id: 't-todo', kind: 'tool', name: 'todo_write', callId: 'c2', arguments: '{"todos":[]}' },
+        { id: 'a-wrap', kind: 'assistant', text: 'done' },
+      ],
+    })
+    expect(split.hasDetails).toBe(true)
+    expect(split.detailParts.map((part) => part.id)).toEqual(['t-read'])
+    expect(split.finalParts.map((part) => part.id)).toEqual(['a-conclusion', 'think-1', 't-todo', 'a-wrap'])
+  })
+
+  it('matches the todo_write tool name, not the displayed Todo label', () => {
+    const split = splitReplyForDisplay({
+      id: 'r-label',
+      kind: 'reply',
+      copyText: '',
+      parts: [
+        { id: 'a-conclusion', kind: 'assistant', text: 'full conclusion' },
+        { id: 't-todo', kind: 'tool', name: 'Todo', callId: 'c1', arguments: '{}' },
+        { id: 'a-wrap', kind: 'assistant', text: 'done' },
+      ],
+    })
+    expect(split.finalParts.map((part) => part.id)).toEqual(['a-wrap'])
+  })
+
+  it('does not pull the conclusion forward across other tools', () => {
+    const split = splitReplyForDisplay({
+      id: 'r-bash',
+      kind: 'reply',
+      copyText: '',
+      parts: [
+        { id: 'a-conclusion', kind: 'assistant', text: 'full conclusion' },
+        { id: 't-todo', kind: 'tool', name: 'todo_write', callId: 'c1', arguments: '{}' },
+        { id: 't-bash', kind: 'tool', name: 'bash', callId: 'c2', arguments: '{}' },
+        { id: 'a-wrap', kind: 'assistant', text: 'done' },
+      ],
+    })
+    expect(split.detailParts.map((part) => part.id)).toEqual(['a-conclusion', 't-todo', 't-bash'])
+    expect(split.finalParts.map((part) => part.id)).toEqual(['a-wrap'])
+  })
 })
 
 describe('Details collapse UI', () => {

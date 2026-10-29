@@ -27,6 +27,7 @@ import {
   type ChatStepStat,
   type TrajectoryUsage,
 } from '@biu/web-session-view'
+import { TODO_TOOL_NAME } from '@biu/type-session'
 import { SidebarMascot } from '@biu/public-mascot'
 import { StaticMascotMark } from '@biu/public-mascot'
 import { resolveSessionMascot } from '@biu/public-mascot'
@@ -347,6 +348,17 @@ export function splitReplyForDisplay(node: Extract<ChatNode, { kind: 'reply' }>)
         break
       }
     }
+  }
+  // 结束前的 todo 追问会让模型在结论后再调一次 todo_write + 短收尾；
+  // 结论与收尾之间只隔着 todo_write（按工具名判断，不看前端展示的 "Todo" 标签）/ think / 空正文时，最终区前移到结论。
+  for (let i = finalIndex - 1; i >= 0; i -= 1) {
+    const part = parts[i]!
+    if (part.kind === 'think') continue
+    if (part.kind === 'tool') {
+      if (part.name === TODO_TOOL_NAME) continue
+      break
+    }
+    if (part.text.trim()) finalIndex = i
   }
   if (finalIndex <= 0) {
     return { detailParts: [], finalParts: parts, hasDetails: false }
