@@ -395,6 +395,6 @@ export interface SessionStore {
   load(id: string): Promise<SessionRecord | undefined>
   save(record: SessionRecord): Promise<void>
   list(): Promise<string[]>
-  listSummaries(): Promise<SessionSummary[]>
+  listSummaries(options?: { sessionIds?: readonly string[] }): Promise<SessionSummary[]>
   delete(id: string): Promise<boolean>
 }

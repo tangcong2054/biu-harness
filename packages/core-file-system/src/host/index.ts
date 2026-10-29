@@ -1060,6 +1060,9 @@ export class DatabaseService extends Service implements Database {
   ) {
     const authorization = this.authorization()
     const actor = authorization?.currentActor()
+    if (collection === '/plugin-catalog' && (action === 'resource:read' || action === 'resource:list')) {
+      return rows
+    }
     const keep = <R extends T>(row: R, sqliteAllows: () => boolean) => {
       // 已按账号·空间安装的插件包跨空间复用：记录归属在别的空间也要可见，不能被 MySQL 归属否决。
       if (collection === '/plugins' && actor?.type === 'account' && 'pluginPath' in row &&
@@ -1155,6 +1158,14 @@ export class DatabaseService extends Service implements Database {
         recordId: target.id,
       }) === scope
     })
+  }
+
+  mayAllowViaView(collection: string) {
+    const authorization = this.authorization()
+    const actor = authorization?.currentActor()
+    if (!authorization || !actor) return false
+    const store = this.collabStore()
+    return Boolean(store?.viewGrantsFor?.(actor.workspaceId, collection).length)
   }
 
   allowsViaView(collection: string, record: { id?: unknown }, action: PermissionAction = 'resource:read') {
@@ -3573,7 +3584,10 @@ export function apply(ctx: Context) {
   }
   db.viewCatalog = savedViews
   ctx.inject(['sessions'], (inner) => {
-    inner.sessions.viewAccess = (id, record) => db.allowsViaView('/sessions', { ...record, id })
+    inner.sessions.viewAccess = Object.assign(
+      (id: string, record?: { id?: unknown }) => db.allowsViaView('/sessions', { ...record, id }),
+      { mayAllow: () => db.mayAllowViaView('/sessions') },
+    )
   })
   account?.authorization?.setMemberViewMatcher((workspaceId, viewId, accountId) => {
     const view = savedViews.viewsFor('/workspace-members').find((item) => item.id === viewId)

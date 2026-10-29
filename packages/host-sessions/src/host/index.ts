@@ -446,7 +446,8 @@ export class SessionsService extends Service {
   private cache = new Map<string, SessionRecord>()
   private defaultSessionPromise: Promise<string> | null = null
   /** 视图授权能不能看见这条会话。由数据库在启动时接上。 */
-  viewAccess: (id: string, record?: { id?: unknown }) => boolean = () => false
+  viewAccess: ((id: string, record?: { id?: unknown }) => boolean) & { mayAllow?: () => boolean } =
+    Object.assign(() => false, { mayAllow: () => false })
 
   constructor(ctx: Context) {
     super(ctx, 'sessions')
@@ -823,12 +824,12 @@ export class SessionsService extends Service {
    * 记录必须在这个工作区有归属（策略或 owner），且对当前账号不是别人的私有记录。
    * 缺账号、缺工作区、不是成员时一律返回空集合（fail-closed）。
    */
-  private async mysqlVisibleSessions(ids: string[]) {
+  private async mysqlVisibleSessions(ids?: string[]) {
     const out = new Set<string>()
     const mysql = this.mysqlAccount()
     const accountId = currentAccountId()
     const workspaceId = currentRequestWorkspaceId()
-    if (!mysql || !accountId || !workspaceId || !ids.length) return out
+    if (!mysql || !accountId || !workspaceId || ids?.length === 0) return out
     if (!(await mysql.membership(accountId, workspaceId))) return out
     const sources = new Map<string, ScopeSource>()
     const load = async (collection: string) => {
@@ -838,7 +839,7 @@ export class SessionsService extends Service {
     }
     await load('/sessions')
     const own = sources.get('/sessions')!
-    for (const id of ids) {
+    for (const id of ids ?? new Set([...own.owners, ...Object.keys(own.policies)])) {
       const policy = own.policies[id]
       if (!policy && !own.owners.has(id)) continue
       // 继承到别的集合时把父集合也读进来，否则会把继承记录当成无策略。
@@ -889,7 +890,15 @@ export class SessionsService extends Service {
   }
 
   async listSummaries() {
-    const all = await this.ctx.sessionStore.listSummaries()
+    const narrowed = process.env.BIU_SESSION_SCOPE_PUSHDOWN === '1'
+      && Boolean(this.mysqlAccount()) && this.viewAccess.mayAllow?.() === false
+    const candidateIds = narrowed ? [...await this.mysqlVisibleSessions()] : undefined
+    let all = await this.ctx.sessionStore.listSummaries(
+      candidateIds === undefined ? undefined : { sessionIds: candidateIds },
+    )
+    if (narrowed && this.viewAccess.mayAllow?.() !== false) {
+      all = await this.ctx.sessionStore.listSummaries()
+    }
     const mysqlVisible = this.mysqlAccount() ? await this.mysqlVisibleSessions(all.map((item) => item.id)) : null
     const items = all.filter((item) =>
       mysqlVisible ? mysqlVisible.has(item.id) || this.viewAccess(item.id, item) : this.inWorkspace(item.id, item),

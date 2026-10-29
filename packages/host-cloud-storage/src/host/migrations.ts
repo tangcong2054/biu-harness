@@ -555,6 +555,29 @@ export const PRODUCT_MIGRATIONS: readonly MysqlMigration[] = [
        ALGORITHM=INPLACE, LOCK=NONE`,
     ],
   },
+  {
+    version: 14,
+    name: 'session_event_time_projection',
+    statements: [
+      `ALTER TABLE sessions
+       ADD COLUMN first_event_at BIGINT NULL,
+       ADD COLUMN last_user_message_at BIGINT NULL,
+       ADD COLUMN event_times_ready TINYINT(1) NOT NULL DEFAULT 0,
+       ALGORITHM=INSTANT`,
+      `CREATE TRIGGER events_summary_insert AFTER INSERT ON events FOR EACH ROW
+       UPDATE sessions SET
+         first_event_at = IF(first_event_at IS NULL, NEW.ts, LEAST(first_event_at, NEW.ts)),
+         last_user_message_at = IF(NEW.type = 'user/message',
+           IF(last_user_message_at IS NULL, NEW.ts, GREATEST(last_user_message_at, NEW.ts)),
+           last_user_message_at)
+       WHERE id = NEW.session_id AND event_times_ready = 1`,
+      `CREATE TRIGGER events_summary_delete AFTER DELETE ON events FOR EACH ROW
+       UPDATE sessions SET event_times_ready = 0 WHERE id = OLD.session_id`,
+      `CREATE TRIGGER events_summary_update AFTER UPDATE ON events FOR EACH ROW
+       UPDATE sessions SET event_times_ready = 0
+       WHERE id IN (OLD.session_id, NEW.session_id)`,
+    ],
+  },
 ]
 
 export const OPERATIONS_MIGRATIONS: readonly MysqlMigration[] = [
