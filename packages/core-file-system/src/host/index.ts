@@ -2691,9 +2691,11 @@ export class DatabaseService extends Service implements Database {
       const parentField = spec.schema.parentField
       const parentRecordId = parentField ? String(record[parentField] ?? '').trim() : ''
       if (spec.path !== '/workspace-members') {
-        const workspaceOwned = options.scope === 'workspace'
-        const shared = options.scope === 'shared' && !parentRecordId
-        const local = options.scope === 'local' && !parentRecordId
+        // 调用方没给 scope 时按表自己的默认归属；整表共享的表（如 /mcp）可声明 workspace。
+        const scope = options.scope ?? spec.defaultScope ?? 'personal'
+        const workspaceOwned = scope === 'workspace'
+        const shared = scope === 'shared' && !parentRecordId
+        const local = scope === 'local' && !parentRecordId
         await this.attachWorkspaceRecord(spec.path, record.id, {
           ownership: parentRecordId || workspaceOwned ? 'workspace' : shared ? 'shared' : 'personal',
           accessMode: parentRecordId ? 'inherit' : workspaceOwned || shared ? 'members' : 'private',
@@ -3409,6 +3411,13 @@ function asCreateRecords(args: Record<string, unknown>) {
   return records
 }
 
+/** 认四种归属；不认的值返回 undefined，让 db.create 落回该表自己的默认归属。 */
+function recordScope(value: unknown): 'personal' | 'workspace' | 'shared' | 'local' | undefined {
+  return value === 'workspace' || value === 'shared' || value === 'local' || value === 'personal'
+    ? value
+    : undefined
+}
+
 function broadcastInspectorReveal(
   ctx: Context,
   path: string,
@@ -3716,17 +3725,14 @@ export function apply(ctx: Context) {
         scope: {
           type: 'string',
           enum: ['personal', 'workspace', 'shared', 'local'],
-          description: '根记录归属：personal 私人（默认，仅自己可见）；workspace 空间（成员可编辑）；shared 公开链接，所有人可查看；local 存在本机，仍属于当前账号和空间。子记录始终继承父记录。',
+          description: '根记录归属：personal 私人（仅自己可见）；workspace 空间（成员可编辑）；shared 公开链接，所有人可查看；local 存在本机，仍属于当前账号和空间。子记录始终继承父记录。不给时按表默认，多数表是 personal，/mcp 这类整表共享的表是 workspace。',
         },
       },
       required: ['path', 'records'],
     },
     execute: (args) =>
       withInspectorReveal(ctx, String(args.path), () =>
-        db.create(String(args.path), asCreateRecords(args), {
-          scope:
-            args.scope === 'workspace' ? 'workspace' : args.scope === 'shared' ? 'shared' : args.scope === 'local' ? 'local' : 'personal',
-        }),
+        db.create(String(args.path), asCreateRecords(args), { scope: recordScope(args.scope) }),
       ).then(
         (body) => agentDbCompact.write(body),
       ),
@@ -4138,8 +4144,8 @@ export function apply(ctx: Context) {
         content?: unknown
         scope?: 'personal' | 'workspace' | 'shared' | 'local'
       }
-      const scope =
-        body?.scope === 'workspace' ? 'workspace' : body?.scope === 'shared' ? 'shared' : body?.scope === 'local' ? 'local' : 'personal'
+      // 不认的值留给 db.create 兜底到该表默认归属（/mcp 等表默认是空间）。
+      const scope = recordScope(body?.scope)
       let activeLocation: 'device' | 'cloud' = isOnlineRuntime() ? 'cloud' : 'device'
       if (!isOnlineRuntime()) {
         try {

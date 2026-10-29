@@ -215,6 +215,12 @@ export function lineSpanLabel(ref: PickRef) {
   return String(ref.start_line)
 }
 
+/** 文本芯片背后的完整原文（长粘贴 / 选区）。不是文本芯片时返回空串。 */
+export function pickFullText(ref: Pick<PickRef, 'kind' | 'selection' | 'text'>) {
+  if (ref.kind !== 'text') return ''
+  return ref.selection || ref.text || ''
+}
+
 /** 有源码行号用行号；纯文本选区/长粘贴用字数。 */
 export function chipSpanLabel(ref: PickRef) {
   const lines = lineSpanLabel(ref)

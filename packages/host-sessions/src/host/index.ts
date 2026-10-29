@@ -296,6 +296,36 @@ export function estimateRequestTokens(messages: LlmMessage[], tools: unknown[] =
 
 type MessageGroup = { messages: LlmMessage[]; tokens: number }
 
+/** 保留回复所在回合的事件；找不到有效边界时拒绝分叉，绝不意外复制完整会话。 */
+function truncateForkEvents(events: SessionEvent[], options?: { untilSeq?: number; untilTurn?: number }): SessionEvent[] {
+  if (!options) return events
+  let end = -1
+  if (options.untilSeq !== undefined) {
+    if (!Number.isSafeInteger(options.untilSeq) || options.untilSeq < 0) throw new Error('invalid fork reply seq')
+    const start = events.findIndex((event) => event.seq === options.untilSeq)
+    if (start < 0 || ['session/open', 'turn/start', 'turn/end', 'user/message'].includes(events[start]!.type)) {
+      throw new Error('fork reply not found')
+    }
+    // 优先用回合结束标记；旧日志没有 turn 标记时，以下一条用户消息为边界。
+    for (let index = start + 1; index < events.length; index++) {
+      if (events[index]!.type === 'turn/end') { end = index; break }
+      if (events[index]!.type === 'turn/start') { end = index - 1; break }
+    }
+    if (end < 0) {
+      const nextUser = events.findIndex((event, index) => index > start && event.type === 'user/message')
+      end = nextUser < 0 ? events.length - 1 : nextUser - 1
+    }
+  } else if (options.untilTurn !== undefined) {
+    if (!Number.isSafeInteger(options.untilTurn) || options.untilTurn <= 0) throw new Error('invalid fork turn')
+    end = events.findIndex((event) => event.type === 'turn/end' && event.turn === options.untilTurn)
+    if (end < 0) throw new Error('fork turn end not found')
+  } else {
+    throw new Error('fork cutoff required')
+  }
+  if (end < 0) throw new Error('fork boundary not found')
+  return events.slice(0, end + 1)
+}
+
 /**
  * 每个 user 开启一个对话原子组，后续 assistant/tool 都归入该组直到下一个 user。
  * 这样既不会拆 assistant.tool_calls/tool results，也不会留下失去用户问题的孤立回答。
@@ -691,16 +721,34 @@ export class SessionsService extends Service {
     return statInputComposition(record.events)
   }
 
-  async fork(sourceId: string, childId: string = crypto.randomUUID()) {
+  /**
+   * 分叉会话。
+   * 传 options.untilTurn 时只复制到该回合结束为止（含该回合的 turn/end），后面的回合不带过去；
+   * 不传则是原来的整段复制（子任务继承父会话依赖这个行为）。
+   */
+
+  /**
+   * 只校验截点能否在源会话里定位，不写入。桌面端 fork 云端会话时先在本机确认，
+   * 避免云端已经建好子会话、本机却截不出来，留下只在云端存在的孤儿会话。
+   */
+  async checkForkCutoff(sourceId: string, options?: { untilSeq?: number; untilTurn?: number }) {
     const source = await this.require(sourceId)
+    truncateForkEvents(source.events, options)
+  }
+
+  async fork(sourceId: string, childId: string = crypto.randomUUID(), options?: { untilSeq?: number; untilTurn?: number }) {
+    const source = await this.require(sourceId)
+    const forkEvents = truncateForkEvents(source.events, options)
     const used = await this.collectUsedMascots()
     const mascot = pickSessionMascot(childId, used)
     const sourceConfig = { ...(source.config ?? {}) }
     delete sourceConfig.inspector
+    delete sourceConfig.pinned
+    delete sourceConfig.tags
     const record: SessionRecord = {
       id: childId,
       version: source.version,
-      events: source.events.map((event) => ({ ...event })),
+      events: forkEvents.map((event) => ({ ...event })),
       ...(source.project ? { project: { ...source.project } } : {}),
       mascot,
       config: normalizeSessionConfig({

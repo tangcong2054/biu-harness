@@ -1308,6 +1308,66 @@ declare module 'cordis' {
   }
 }
 
+/** 旧客户端不带请求体时保持全量复制；显式传了截点但无效时必须报错，不能悄悄全量复制。 */
+export function forkOptionsFromBody(body: unknown): { untilSeq?: number; untilTurn?: number } | undefined {
+  if (body == null) return undefined
+  if (typeof body !== 'object' || Array.isArray(body)) throw new Error('invalid fork cutoff')
+  const { untilSeq, untilTurn } = body as { untilSeq?: unknown; untilTurn?: unknown }
+  if (untilSeq !== undefined) {
+    if (!Number.isSafeInteger(untilSeq) || (untilSeq as number) < 0) throw new Error('invalid fork reply seq')
+    return { untilSeq: untilSeq as number }
+  }
+  if (untilTurn !== undefined) {
+    if (!Number.isSafeInteger(untilTurn) || (untilTurn as number) <= 0) throw new Error('invalid fork turn')
+    return { untilTurn: untilTurn as number }
+  }
+  throw new Error('fork cutoff required')
+}
+
+type ForkCutoff = { untilSeq?: number; untilTurn?: number }
+
+/**
+ * 分叉会话。桌面端打开的是云端会话时 `forward` 会转发到 Online：
+ * 先在线上 fork 拿到子会话 id，本机再用同一 id、同一截点复制。
+ * - 截点必须一起转发，否则云端整段复制、本机按回复截断，两边子会话内容不一致；
+ * - 转发前先在本机校验截点，避免云端已经建好子会话、本机却截不出来留下孤儿。
+ */
+export async function forkSessionWithCloud(
+  deps: {
+    sessions: {
+      checkForkCutoff?(sourceId: string, options?: ForkCutoff): Promise<void>
+      fork(sourceId: string, childId?: string, options?: ForkCutoff): Promise<{ id: string; version: number; mascot?: unknown }>
+    }
+    forward: (path: string, init: { body?: unknown }) => Promise<{ status: number; body: unknown } | null>
+    markRemote?: (childId: string) => void
+  },
+  sourceId: string,
+  body: unknown,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const options = forkOptionsFromBody(body)
+  if (options) await deps.sessions.checkForkCutoff?.(sourceId, options)
+  const forwarded = await deps.forward(`/api/sessions/${sourceId}/fork`, options ? { body: options } : {})
+  let childId: string | undefined
+  if (forwarded) {
+    const remote = forwarded.body as { id?: string; error?: string }
+    if (forwarded.status >= 300 || !remote?.id) {
+      return { status: forwarded.status >= 300 ? forwarded.status : 502, body: { error: remote?.error || '创建云端会话失败' } }
+    }
+    childId = remote.id
+  }
+  const child = await deps.sessions.fork(sourceId, childId, options)
+  if (childId) deps.markRemote?.(child.id)
+  return {
+    status: 201,
+    body: {
+      id: child.id,
+      version: child.version,
+      parentId: sourceId,
+      ...(child.mascot ? { mascot: child.mascot } : {}),
+    },
+  }
+}
+
 export async function openSessionHttpPayload(ctx: Context, id: string, limitTurns: number) {
   const record = await ctx.sessions.get(id)
   if (!record || !(await ctx.sessions.inWorkspaceAsync(id))) return { status: 404 as const, body: { error: 'unknown session' } }
@@ -1968,23 +2028,18 @@ export function apply(ctx: Context) {
   ctx.http.route('POST', '/api/sessions/:id/fork', async (route) => {
     try {
       if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
-      const forwarded = await forwardCloud(ctx, '/sessions', route.params.id, `/api/sessions/${route.params.id}/fork`)
-      let childId: string | undefined
-      if (forwarded) {
-        const remote = forwarded.body as { id?: string; error?: string }
-        if (forwarded.status >= 300 || !remote.id) {
-          return route.send(forwarded.status, { error: remote.error || '创建云端会话失败' })
-        }
-        childId = remote.id
-      }
-      const child = await ctx.sessions.fork(route.params.id, childId)
-      if (childId) accountRuntime(ctx)?.markRemote?.('/sessions', child.id)
-      route.send(201, {
-        id: child.id,
-        version: child.version,
-        parentId: route.params.id,
-        ...(child.mascot ? { mascot: child.mascot } : {}),
-      })
+      // 仅空请求体沿用全量 fork；有 body 却解析失败或截点不合法时不能静默回退。
+      const body = await route.json()
+      const result = await forkSessionWithCloud(
+        {
+          sessions: ctx.sessions,
+          forward: (path, init) => forwardCloud(ctx, '/sessions', route.params.id, path, init),
+          markRemote: (id) => accountRuntime(ctx)?.markRemote?.('/sessions', id),
+        },
+        route.params.id,
+        body,
+      )
+      route.send(result.status, result.body)
     } catch (error) {
       route.send(400, { error: String(error) })
     }

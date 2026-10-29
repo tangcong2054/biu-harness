@@ -1363,10 +1363,19 @@ export class SessionViewService extends Service {
     this.replace({ project, sessions })
   }
 
-  async forkCurrent() {
+  /** 传回复事件序号时只复制到该回复所在回合；不传则保持全量复制。 */
+  async forkCurrent(options?: { untilSeq?: number }) {
     const sessionId = this.value.sessionId
     if (!sessionId) throw new Error('no session')
-    const res = await fetch(`/api/sessions/${sessionId}/fork`, { method: 'POST' })
+    const init: RequestInit = { method: 'POST' }
+    if (options) {
+      if (!Number.isSafeInteger(options.untilSeq) || options.untilSeq! < 0) {
+        throw new Error('无法定位选中的回复，不能分叉会话')
+      }
+      init.headers = { 'content-type': 'application/json' }
+      init.body = JSON.stringify({ untilSeq: options.untilSeq })
+    }
+    const res = await fetch(`/api/sessions/${sessionId}/fork`, init)
     const body = (await res.json()) as {
       id?: string
       error?: string

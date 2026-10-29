@@ -206,3 +206,25 @@ test('popout mirrors pick mode and sends picked refs back to the main window', (
     history.replaceState({}, '', originalUrl)
   }
 })
+
+test('claimSession keeps refs within one session and drops them on switch', () => {
+  const ctx = new Context()
+  const pick = new PickService(ctx)
+  // 还没有会话时加入的引用，第一个会话认领
+  pick.add({ kind: 'page', id: 'p1', label: '页面', route: '/pages' })
+  assert.equal(pick.claimSession('a'), true)
+  assert.equal(pick.sessionOwner, 'a')
+  // 同一会话重挂：保留
+  assert.equal(pick.claimSession('a'), true)
+  // 换了会话：不保留（由调用方清空）
+  assert.equal(pick.claimSession('b'), false)
+  assert.equal(pick.sessionOwner, 'b')
+  // 没有会话：清掉上一个会话留下的引用，归属清空
+  assert.equal(pick.refs.length, 1)
+  assert.equal(pick.claimSession(null), false)
+  assert.equal(pick.refs.length, 0)
+  assert.equal(pick.sessionOwner, null)
+  pick.add({ kind: 'page', id: 'p2', label: '另一页', route: '/pages' })
+  assert.equal(pick.claimSession('c'), true)
+  assert.deepEqual(pick.refs.map((item) => item.id), ['p2'])
+})

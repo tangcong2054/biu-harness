@@ -9,6 +9,7 @@ import { pickKey, textPickFromPlain, usePickState, type PickService } from '@biu
 import { HeadlessDismiss } from '@biu/public-ui'
 import { composerDocExtensions } from './composer-kit.ts'
 import {
+  bindComposerSession,
   collectPickKeys,
   deletePlainRange,
   editorCaretPlain,
@@ -595,19 +596,14 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
   )
 
   useEffect(() => {
-    if (!editor || !sessionId) return
-    const draft = readDraftMap()[sessionId]
-    const keep = pick?.refs.slice() ?? []
-    if (!pick?.picking) pick?.clear()
-    pickKeysRef.current = new Set()
-    if (typeof draft === 'string' && draft) {
-      editor.commands.setContent(jsonFromDraft(draft))
-      const { refs } = serializeComposer(editor)
-      if (refs.length) pick?.addMany(refs)
-    } else {
-      editor.commands.clearContent()
+    if (!editor) return
+    if (!sessionId) {
+      // 没有会话（如当前会话被删）：清掉上一个会话留下的引用，后面加入的等下一个会话认领。
+      pick?.claimSession(null)
+      return
     }
-    if (keep.length && !pick?.picking) pick?.addMany(keep)
+    pickKeysRef.current = new Set()
+    bindComposerSession(editor, pick, sessionId, readDraftMap()[sessionId])
     pickKeysRef.current = collectPickKeys(editor)
     if (isComposerFocusPending()) editor.commands.focus('end')
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -126,6 +126,8 @@ export function mcpCollection(mcp: McpService): CollectionSpec {
       icon: 'link',
     },
     records: { update: true, create: true, delete: true },
+    // 配置文件是整个空间共用的一份，新建时默认归到空间，而不是创建者私有。
+    defaultScope: 'workspace',
     schema: {
       labelField: 'title',
       columns: ['title', 'transport', 'status', 'enabled', 'command', 'args', 'url', 'toolCount', 'totalToolCount', 'allow', 'deny', 'error'],

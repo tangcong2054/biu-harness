@@ -133,15 +133,15 @@ test('系统技能不可修改；sys- 前缀不能被新建或导入占用；动
   const { ctx, database } = await boot({ online: false })
   const spec = database.specs.find((item) => item.path === '/skills')!
   await assert.rejects(async () => spec.update!('sys-docs', { title: '改名' }), /unknown skill/)
-  assert.throws(() => ctx.skills.create({ id: 'sys-docs', name: 'x', description: 'y' }), /sys-/)
-  assert.throws(() => ctx.skills.create({ name: 'sys hack', description: 'y' }), /sys-/)
-  assert.throws(
-    () => ctx.skills.import({ files: [{ path: 'SKILL.md', content: '---\nname: sys-evil\ndescription: x\n---\n正文' }] }),
+  await assert.rejects(ctx.skills.create({ id: 'sys-docs', name: 'x', description: 'y' }), /sys-/)
+  await assert.rejects(ctx.skills.create({ name: 'sys hack', description: 'y' }), /sys-/)
+  await assert.rejects(
+    ctx.skills.import({ files: [{ path: 'SKILL.md', content: '---\nname: sys-evil\ndescription: x\n---\n正文' }] }),
     /sys-/,
   )
   assert.deepEqual(await spec.list(), [])
 
-  const normal = ctx.skills.create({ name: 'normal', description: '普通技能' })
+  const normal = await ctx.skills.create({ name: 'normal', description: '普通技能' })
   const remove = spec.actions!.find((item) => item.id === 'remove-builtin')!
   assert.throws(() => remove.run(normal.id, { id: normal.id }), /unknown builtin skill/)
 })

@@ -27,6 +27,7 @@ import {
   type ChatStepStat,
   type TrajectoryUsage,
 } from '@biu/web-session-view'
+import { TODO_TOOL_NAME } from '@biu/type-session'
 import { SidebarMascot } from '@biu/public-mascot'
 import { StaticMascotMark } from '@biu/public-mascot'
 import { resolveSessionMascot } from '@biu/public-mascot'
@@ -349,6 +350,17 @@ export function splitReplyForDisplay(node: Extract<ChatNode, { kind: 'reply' }>)
       }
     }
   }
+  // 结束前的 todo 追问会让模型在结论后再调一次 todo_write + 短收尾；
+  // 结论与收尾之间只隔着 todo_write（按工具名判断，不看前端展示的 "Todo" 标签）/ think / 空正文时，最终区前移到结论。
+  for (let i = finalIndex - 1; i >= 0; i -= 1) {
+    const part = parts[i]!
+    if (part.kind === 'think') continue
+    if (part.kind === 'tool') {
+      if (part.name === TODO_TOOL_NAME) continue
+      break
+    }
+    if (part.text.trim()) finalIndex = i
+  }
   if (finalIndex <= 0) {
     return { detailParts: [], finalParts: parts, hasDetails: false }
   }
@@ -361,13 +373,16 @@ export function splitReplyForDisplay(node: Extract<ChatNode, { kind: 'reply' }>)
 
 function ReplyActions({
   text,
+  replyId,
   onFork,
 }: {
   text: string
-  onFork: () => void | Promise<void>
+  replyId: string
+  onFork: (replyId: string) => void | Promise<void>
 }) {
   const [copied, setCopied] = useState(false)
   const [forkBusy, setForkBusy] = useState(false)
+  const [forkError, setForkError] = useState('')
 
   async function copy() {
     if (!text.trim()) return
@@ -383,8 +398,11 @@ function ReplyActions({
   async function fork() {
     if (forkBusy) return
     setForkBusy(true)
+    setForkError('')
     try {
-      await onFork()
+      await onFork(replyId)
+    } catch (error) {
+      setForkError(error instanceof Error ? error.message : String(error))
     } finally {
       setForkBusy(false)
     }
@@ -417,6 +435,7 @@ function ReplyActions({
           </>
         ) : null}
       </div>
+      {forkError ? <div role="alert" className="text-xs text-(--dsw-danger)">{forkError}</div> : null}
     </>
   )
 }
@@ -633,7 +652,7 @@ function NodeView({
   detailsOpen?: boolean
   onToggleDetails?: (replyId: string) => void
   onInspect: (callId: string) => void
-  onFork: () => void | Promise<void>
+  onFork: (replyId: string) => void | Promise<void>
   sessions?: SessionListItem[]
   dispatchTasks?: import('@biu/web-session-view').DispatchedTaskRow[]
   sessionId?: string
@@ -700,7 +719,7 @@ function NodeView({
         </div>
         {!streaming && node.endReason !== 'cancelled' ? (
           <div className="chat-reply-actions-row">
-            <ReplyActions text={node.copyText} onFork={onFork} />
+            <ReplyActions text={node.copyText} replyId={node.id} onFork={onFork} />
           </div>
         ) : null}
       </div>
@@ -726,7 +745,7 @@ export const ChatNodeList = memo(function ChatNodeList({
 }: {
   nodes: ChatNode[]
   onInspect: (callId: string) => void
-  onFork: () => void | Promise<void>
+  onFork: (replyId: string) => void | Promise<void>
   sessions?: SessionListItem[]
   dispatchedTasksByTurn?: Record<
     string,
@@ -891,8 +910,10 @@ export const ChatThread = memo(function ChatThread(props: SlotProps) {
     [sessionView],
   )
 
-  const onFork = useCallback(() => {
-    return sessionView.forkCurrent().then((id) => {
+  const onFork = useCallback((replyId: string) => {
+    const match = /^r-(\d+)$/.exec(replyId)
+    if (!match) return Promise.reject(new Error('无法定位选中的回复，不能分叉会话'))
+    return sessionView.forkCurrent({ untilSeq: Number(match[1]) }).then((id) => {
       navigate(`/s/${id}`)
     })
   }, [sessionView, navigate])

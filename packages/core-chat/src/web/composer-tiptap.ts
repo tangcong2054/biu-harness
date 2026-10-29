@@ -1,6 +1,6 @@
 import type { Editor } from '@tiptap/react'
 import { mentionPickFromAttrs } from '@biu/core-editor/mention'
-import { formatPick, pickChipAttrs, pickKey, pickRefFromAttrs, splitPickStream, type PickRef } from '@biu/core-pick/web'
+import { formatPick, pickChipAttrs, pickKey, pickRefFromAttrs, splitPickStream, type PickRef, type PickService } from '@biu/core-pick/web'
 
 function attrsToRef(attrs: Record<string, unknown>): PickRef | null {
   return pickRefFromAttrs(attrs)
@@ -95,6 +95,33 @@ export function insertPickChips(editor: Editor, refs: PickRef[]) {
     .focus()
     .insertContent(refs.map(chipContent))
     .run()
+}
+
+type SessionBoundPick = Pick<PickService, 'refs' | 'picking' | 'clear' | 'addMany' | 'claimSession'>
+
+/**
+ * 输入栏绑定到某个会话：切换会话、重挂输入栏、开关悬浮窗都会走这里。
+ * 选中的引用（refs）全局只有一份，草稿按会话保存；这里只在同一会话（或尚未归属）时保留现有 refs，
+ * 换了会话就清掉，只按新会话自己的草稿恢复，避免选中的内容串到所有会话、并被写进别的会话的草稿。
+ */
+export function bindComposerSession(
+  editor: Editor,
+  pick: SessionBoundPick | undefined,
+  sessionId: string,
+  draft: string | undefined,
+) {
+  const keep = pick?.refs.slice() ?? []
+  const owned = pick?.claimSession(sessionId) ?? false
+  // 选取模式中、同一会话内不清，避免重挂输入栏把正在选的引用清掉。
+  if (!owned || !pick?.picking) pick?.clear()
+  if (typeof draft === 'string' && draft) {
+    editor.commands.setContent(jsonFromDraft(draft))
+    const { refs } = serializeComposer(editor)
+    if (refs.length) pick?.addMany(refs)
+  } else {
+    editor.commands.clearContent()
+  }
+  if (owned && keep.length && !pick?.picking) pick?.addMany(keep)
 }
 
 export function editorCaretPlain(editor: Editor | null): { value: string; cursor: number } {

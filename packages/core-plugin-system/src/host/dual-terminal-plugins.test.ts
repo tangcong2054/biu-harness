@@ -141,7 +141,8 @@ describe('page terminal store plugin', () => {
   it('page terminal persists history into block data and keeps sessions alive', async () => {
     const web = await readFile(pluginFile('page-terminal', 'web/index.tsx'), 'utf8')
     const host = await readFile(pluginFile('page-terminal', 'host/index.ts'), 'utf8')
-    assert.match(web, /update\(\{ history: next \}\)/)
+    // 上游 f16da87e 起历史与画面合并成一次整页保存（节流），不再每段输出各写一次。
+    assert.match(web, /if \(next\.history \|\| next\.snapshot !== undefined\) update\(next\)/)
     assert.match(web, /HISTORY_MAX/)
     assert.match(web, /function parseHistory/)
     assert.match(web, /pt-history-out/)

@@ -33,5 +33,9 @@ export const inject = ['tools']
 
 export function apply(ctx: Context) {
   const prompt = new SystemPromptService(ctx)
-  prompt.register('base', '你是控制台里的助手。优先调用已注册 tools 完成操作。回答简洁。')
+  prompt.register(
+    'base',
+    '你是控制台里的助手。优先调用已注册 tools 完成操作。回答简洁，不要堆废话。' +
+      '判断一件事确实做不到时，直接说做不到并讲清原因，不要含糊其辞、反复硬试，也不要用长篇过程掩盖结论。',
+  )
 }
