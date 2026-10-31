@@ -63,9 +63,19 @@ export function projectTrajectoryRows(events: SessionEvent[]): TrajectoryRow[] {
     } else if (event.type === 'tool/call') {
       callId = event.id
       summary = `${event.name}(${event.arguments.slice(0, 80)})`
+      const prev = rows.findLast((row) => row.type === 'tool/call' && row.callId === event.id)
+      if (prev) {
+        prev.summary = summary
+        prev.seq = event.seq
+        continue
+      }
     } else if (event.type === 'tool/result') {
       callId = event.id
       summary = `${event.name} → ${event.ok ? 'ok' : 'fail'}: ${event.detail.slice(0, 80)}`
+    } else if (event.type === 'content/edits') {
+      const add = event.files.reduce((n, file) => n + file.added, 0)
+      const del = event.files.reduce((n, file) => n + file.removed, 0)
+      summary = `db_content ${event.files.length} · +${add} −${del}`
     } else if (event.type === 'turn/end') {
       summary = `end · ${event.reason}`
     } else if (event.type === 'step/start' || event.type === 'step/end') {

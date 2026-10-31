@@ -192,7 +192,89 @@ test('flush aborts current turn and claims queued wake+inject', async () => {
   assert.ok(users.includes('queued-wake'))
 })
 
-test('cancel aborts the current turn but still claims queued wake', async () => {
+test('cancel unblocks a hung tool and clears busy', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  await ctx.plugin(tools)
+  await ctx.plugin(systemPrompt)
+  await ctx.plugin(llm)
+  await ctx.plugin(agentLoop)
+  await ctx.plugin(agents)
+  ctx.agents.configure({ provider: 'deepseek', apiKey: '', model: 'x' })
+  ctx.tools.register({
+    name: 'hang',
+    description: 'hang',
+    parameters: { type: 'object', properties: {} },
+    execute: () => new Promise(() => undefined),
+  })
+  const originalCreate = ctx.agentLoop.create.bind(ctx.agentLoop)
+  ctx.agentLoop.create = ((config, sessionId, signal) => {
+    const runner = originalCreate(config, sessionId, signal)
+    runner.run = async () => {
+      await ctx.tools.invoke('hang', {}, signal)
+      return { text: 'nope', steps: [] }
+    }
+    return runner
+  }) as typeof ctx.agentLoop.create
+
+  const agent = await ctx.agents.create()
+  void agent.send('go', { wait: false })
+  for (let i = 0; i < 20 && !ctx.agents.isBusy(agent.sessionId); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.equal(ctx.agents.isBusy(agent.sessionId), true)
+  agent.cancel()
+  for (let i = 0; i < 50 && ctx.agents.isBusy(agent.sessionId); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.equal(ctx.agents.isBusy(agent.sessionId), false)
+})
+
+test('cancel does not auto-kick a follow-up wake that was queued while running', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  await ctx.plugin(tools)
+  await ctx.plugin(systemPrompt)
+  await ctx.plugin(llm)
+  await ctx.plugin(agentLoop)
+  await ctx.plugin(agents)
+  ctx.agents.configure({ provider: 'deepseek', apiKey: '', model: 'x' })
+  ctx.tools.register({
+    name: 'hang',
+    description: 'hang',
+    parameters: { type: 'object', properties: {} },
+    execute: () => new Promise(() => undefined),
+  })
+  let runs = 0
+  const originalCreate = ctx.agentLoop.create.bind(ctx.agentLoop)
+  ctx.agentLoop.create = ((config, sessionId, signal) => {
+    const runner = originalCreate(config, sessionId, signal)
+    runner.run = async () => {
+      runs += 1
+      await ctx.tools.invoke('hang', {}, signal)
+      return { text: 'nope', steps: [] }
+    }
+    return runner
+  }) as typeof ctx.agentLoop.create
+  const agent = await ctx.agents.create()
+  void agent.send('go', { wait: false })
+  for (let i = 0; i < 20 && !ctx.agents.isBusy(agent.sessionId); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  await agent.send('follow-up', { wait: false })
+  assert.equal(ctx.agents.listInbox(agent.sessionId).some((item) => item.kind === 'wake'), true)
+  agent.cancel()
+  for (let i = 0; i < 50 && ctx.agents.isBusy(agent.sessionId); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.equal(ctx.agents.isBusy(agent.sessionId), false)
+  assert.equal(runs, 1)
+  assert.equal(ctx.agents.listInbox(agent.sessionId).some((item) => item.text === 'follow-up'), true)
+})
+
+test('/goal wakes continuation until the goal is marked complete', async () => {
   const ctx = new Context()
   await ctx.plugin(sessionStore, { driver: 'memory' })
   await ctx.plugin(sessions)
@@ -203,46 +285,234 @@ test('cancel aborts the current turn but still claims queued wake', async () => 
   await ctx.plugin(agents)
   ctx.agents.configure({ provider: 'deepseek', apiKey: '', model: 'x' })
   const agent = await ctx.agents.create()
-
-  let release!: () => void
-  const gate = new Promise<void>((resolve) => {
-    release = resolve
-  })
   let runs = 0
   const originalCreate = ctx.agentLoop.create.bind(ctx.agentLoop)
   ctx.agentLoop.create = ((config, sessionId, signal) => {
     const runner = originalCreate(config, sessionId, signal)
-    const originalRun = runner.run.bind(runner)
-    runner.run = async (claimed) => {
+    runner.run = async () => {
       runs += 1
-      if (runs === 1) {
-        await gate
-        if (signal.aborted) throw new Error('cancelled')
+      if (runs >= 2) {
+        const current = ctx.sessions.peek(agent.sessionId)?.config?.goal
+        if (current) {
+          await ctx.sessions.patchConfig(agent.sessionId, {
+            goal: { ...current, status: 'achieved', summary: 'verified' },
+          })
+        }
+        return { text: 'done', steps: [] }
       }
-      return originalRun(claimed)
+      return { text: 'working', steps: [] }
     }
     return runner
   }) as typeof ctx.agentLoop.create
 
-  void agent.send('running-now', { wait: false })
+  const turn = await agent.send('/goal 修好测试')
+  assert.equal(turn.text, 'done')
+  assert.equal(runs, 2)
+  assert.equal(ctx.sessions.peek(agent.sessionId)?.config?.goal?.status, 'achieved')
+  assert.equal(ctx.sessions.peek(agent.sessionId)?.config?.goal?.objective, '修好测试')
+})
+
+test('/goal pause does not start an agent turn', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  await ctx.plugin(tools)
+  await ctx.plugin(systemPrompt)
+  await ctx.plugin(llm)
+  await ctx.plugin(agentLoop)
+  await ctx.plugin(agents)
+  ctx.agents.configure({ provider: 'deepseek', apiKey: '', model: 'x' })
+  const agent = await ctx.agents.create()
+  await ctx.sessions.patchConfig(agent.sessionId, {
+    goal: { id: 'goal-x', objective: '修好测试', status: 'pursuing', turns: 0 },
+  })
+  const turn = await agent.send('/goal pause')
+  assert.match(turn.text, /已暂停/)
+  assert.equal(ctx.sessions.peek(agent.sessionId)?.config?.goal?.status, 'paused')
+  assert.equal(
+    (await ctx.sessions.require(agent.sessionId)).events.some((item) => item.type === 'turn/start'),
+    false,
+  )
+})
+
+test('controlGoal pause cancels the live turn so Goal cannot keep going', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  await ctx.plugin(tools)
+  await ctx.plugin(systemPrompt)
+  await ctx.plugin(llm)
+  await ctx.plugin(agentLoop)
+  await ctx.plugin(agents)
+  ctx.agents.configure({ provider: 'deepseek', apiKey: '', model: 'x' })
+  ctx.tools.register({
+    name: 'hang',
+    description: 'hang',
+    parameters: { type: 'object', properties: {} },
+    execute: () => new Promise(() => undefined),
+  })
+  const originalCreate = ctx.agentLoop.create.bind(ctx.agentLoop)
+  ctx.agentLoop.create = ((config, sessionId, signal) => {
+    const runner = originalCreate(config, sessionId, signal)
+    runner.run = async () => {
+      await ctx.tools.invoke('hang', {}, signal)
+      return { text: 'nope', steps: [] }
+    }
+    return runner
+  }) as typeof ctx.agentLoop.create
+  const agent = await ctx.agents.create()
+  await ctx.sessions.patchConfig(agent.sessionId, {
+    goal: { id: 'goal-x', objective: '修好测试', status: 'pursuing', turns: 0 },
+  })
+  void agent.send('go', { wait: false })
   for (let i = 0; i < 20 && !ctx.agents.isBusy(agent.sessionId); i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
-  // 派工进来的 wake（task_deliver / 回传 的 wait:false 路径）：只入队，靠当前 kick 循环下一轮 claim
-  await agent.send('queued-wake', { wait: false })
-  assert.equal(ctx.agents.listInbox(agent.sessionId).length, 1)
-
-  agent.cancel()
-  // 让 abort 生效后再放行第一回合
-  await new Promise((resolve) => setTimeout(resolve, 20))
-  release()
-
-  for (let i = 0; i < 80 && ctx.agents.isBusy(agent.sessionId); i += 1) {
+  assert.equal(ctx.agents.isBusy(agent.sessionId), true)
+  const result = await ctx.agents.controlGoal(agent.sessionId, 'pause')
+  assert.equal(result.goal?.status, 'paused')
+  for (let i = 0; i < 50 && ctx.agents.isBusy(agent.sessionId); i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 20))
   }
+  assert.equal(ctx.agents.isBusy(agent.sessionId), false)
+})
+
+test('controlGoal pause aborts the live turn before patchConfig returns', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  await ctx.plugin(tools)
+  await ctx.plugin(systemPrompt)
+  await ctx.plugin(llm)
+  await ctx.plugin(agentLoop)
+  await ctx.plugin(agents)
+  ctx.agents.configure({ provider: 'deepseek', apiKey: '', model: 'x' })
+  ctx.tools.register({
+    name: 'hang',
+    description: 'hang',
+    parameters: { type: 'object', properties: {} },
+    execute: () => new Promise(() => undefined),
+  })
+  const originalCreate = ctx.agentLoop.create.bind(ctx.agentLoop)
+  ctx.agentLoop.create = ((config, sessionId, signal) => {
+    const runner = originalCreate(config, sessionId, signal)
+    runner.run = async () => {
+      await ctx.tools.invoke('hang', {}, signal)
+      return { text: 'nope', steps: [] }
+    }
+    return runner
+  }) as typeof ctx.agentLoop.create
+  const originalPatch = ctx.sessions.patchConfig.bind(ctx.sessions)
+  let patchDone = false
+  ctx.sessions.patchConfig = (async (id: string, patch: Parameters<typeof originalPatch>[1]) => {
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    patchDone = true
+    return originalPatch(id, patch)
+  }) as typeof ctx.sessions.patchConfig
+  const agent = await ctx.agents.create()
+  await originalPatch(agent.sessionId, {
+    goal: { id: 'goal-x', objective: '修好测试', status: 'pursuing', turns: 0 },
+  })
+  void agent.send('go', { wait: false })
+  for (let i = 0; i < 20 && !ctx.agents.isBusy(agent.sessionId); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.equal(ctx.agents.isBusy(agent.sessionId), true)
+  const paused = ctx.agents.controlGoal(agent.sessionId, 'pause')
+  for (let i = 0; i < 30 && ctx.agents.isBusy(agent.sessionId); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.equal(ctx.agents.isBusy(agent.sessionId), false)
+  assert.equal(patchDone, false)
+  await paused
+  assert.equal(patchDone, true)
+})
+
+test('controlGoal resume kicks again after a cancelled turn finishes draining', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  await ctx.plugin(tools)
+  await ctx.plugin(systemPrompt)
+  await ctx.plugin(llm)
+  await ctx.plugin(agentLoop)
+  await ctx.plugin(agents)
+  ctx.agents.configure({ provider: 'deepseek', apiKey: '', model: 'x' })
+  let runs = 0
+  const originalCreate = ctx.agentLoop.create.bind(ctx.agentLoop)
+  ctx.agentLoop.create = ((config, sessionId, signal) => {
+    const runner = originalCreate(config, sessionId, signal)
+    runner.run = async () => {
+      runs += 1
+      if (runs === 1) {
+        await new Promise<void>((_resolve, reject) => {
+          const fail = () => setTimeout(() => reject(new Error('cancelled')), 60)
+          if (signal.aborted) fail()
+          else signal.addEventListener('abort', fail, { once: true })
+        })
+      }
+      return { text: 'resumed', steps: [] }
+    }
+    return runner
+  }) as typeof ctx.agentLoop.create
+  const agent = await ctx.agents.create()
+  await ctx.sessions.patchConfig(agent.sessionId, {
+    goal: { id: 'goal-x', objective: '修好测试', status: 'paused', turns: 0 },
+  })
+  void agent.send('go', { wait: false })
+  for (let i = 0; i < 20 && !ctx.agents.isBusy(agent.sessionId); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.equal(ctx.agents.isBusy(agent.sessionId), true)
+  agent.cancel()
+  const result = await ctx.agents.controlGoal(agent.sessionId, 'resume')
+  assert.equal(result.goal?.status, 'pursuing')
+  for (let i = 0; i < 40 && runs < 2; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.equal(runs >= 2, true)
+})
+
+test('dropInbox and patchInbox edit queued wakes before they are claimed', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  await ctx.plugin(tools)
+  await ctx.plugin(systemPrompt)
+  await ctx.plugin(llm)
+  await ctx.plugin(agentLoop)
+  await ctx.plugin(agents)
+  ctx.agents.configure({ provider: 'deepseek', apiKey: '', model: 'x' })
+  ctx.tools.register({
+    name: 'hang',
+    description: 'hang',
+    parameters: { type: 'object', properties: {} },
+    execute: () => new Promise(() => undefined),
+  })
+  const originalCreate = ctx.agentLoop.create.bind(ctx.agentLoop)
+  ctx.agentLoop.create = ((config, sessionId, signal) => {
+    const runner = originalCreate(config, sessionId, signal)
+    runner.run = async () => {
+      await ctx.tools.invoke('hang', {}, signal)
+      return { text: 'nope', steps: [] }
+    }
+    return runner
+  }) as typeof ctx.agentLoop.create
+
+  const agent = await ctx.agents.create()
+  void agent.send('go', { wait: false })
+  for (let i = 0; i < 20 && !ctx.agents.isBusy(agent.sessionId); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  await agent.send('挺好的', { wait: false })
+  const queued = ctx.agents.listInbox(agent.sessionId)
+  assert.equal(queued.length, 1)
+  const id = queued[0]!.id
+  assert.equal(ctx.agents.patchInbox(agent.sessionId, id, '改一下'), true)
+  assert.equal(ctx.agents.listInbox(agent.sessionId)[0]?.text, '改一下')
+  assert.equal(ctx.agents.patchInbox(agent.sessionId, id, '   '), false)
+  assert.equal(ctx.agents.dropInbox(agent.sessionId, id), true)
   assert.equal(ctx.agents.listInbox(agent.sessionId).length, 0)
-  const users = (await ctx.sessions.require(agent.sessionId)).events
-    .filter((item) => item.type === 'user/message')
-    .map((item) => ('text' in item ? item.text : ''))
-  assert.ok(users.includes('queued-wake'))
+  assert.equal(ctx.agents.dropInbox(agent.sessionId, id), false)
+  agent.cancel()
 })

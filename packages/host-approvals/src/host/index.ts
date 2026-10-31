@@ -15,8 +15,7 @@ export class ApprovalsService extends Service {
   constructor(ctx: Context) {
     super(ctx, 'approvals')
     ctx.tools.guard(async (req) => {
-      if (this.mode === 'auto') return req
-      if (this.mode === 'hold' && !sensitive(req.name)) return req
+      if (!needsApproval(req.name, this.mode)) return req
       const id = crypto.randomUUID()
       const allow = await new Promise<boolean>((resolve) => {
         const timer = setTimeout(() => {
@@ -45,8 +44,20 @@ export class ApprovalsService extends Service {
     this.pending.delete(id)
     if (item.timer) clearTimeout(item.timer)
     item.resolve(allow)
+    try {
+      const notices = this.ctx.get('notices') as { markSourceRead?: (key: string) => void } | undefined
+      notices?.markSourceRead?.(`approval:${id}`)
+    } catch {
+      /* notices 未登记 */
+    }
     return { ok: true }
   }
+}
+
+function needsApproval(name: string, mode: 'auto' | 'hold') {
+  if (name === 'db_delete') return true
+  if (mode === 'auto') return false
+  return sensitive(name)
 }
 
 function sensitive(name: string) {
@@ -59,7 +70,9 @@ export const inject = ['tools']
 export function apply(ctx: Context) {
   const approvals = new ApprovalsService(ctx)
   ctx.inject(['http'], (inner) => {
-    approvals.setNotify((payload) => inner.http.broadcast('approval', payload))
+    approvals.setNotify((payload) => {
+      inner.http.broadcast('approval', payload)
+    })
     inner.http.route('GET', '/api/approvals', (route) => {
       route.send(200, { mode: approvals.mode, pending: approvals.list() })
     })

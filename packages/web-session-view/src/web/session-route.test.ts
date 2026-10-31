@@ -18,12 +18,13 @@ const plugins: AppModule[] = [
 
 test('parseAppPath covers home, session, and registered plugin modules', () => {
   assert.deepEqual(parseAppPath('/'), { kind: 'home' })
-  assert.deepEqual(parseAppPath('/s/abc'), { kind: 'session', sessionId: 'abc', view: 'chat' })
-  assert.deepEqual(parseAppPath('/s/abc/debug'), {
+  assert.deepEqual(parseAppPath('/agents/abc'), { kind: 'session', sessionId: 'abc', view: 'chat' })
+  assert.deepEqual(parseAppPath('/agents/abc/debug'), {
     kind: 'session',
     sessionId: 'abc',
     view: 'debug',
   })
+  assert.deepEqual(parseAppPath('/s/abc'), { kind: 'home' })
   assert.deepEqual(parseAppPath('/extra', plugins), {
     kind: 'module',
     moduleId: 'extra',
@@ -33,9 +34,15 @@ test('parseAppPath covers home, session, and registered plugin modules', () => {
   assert.deepEqual(parseAppPath('/unknown'), { kind: 'home' })
   assert.deepEqual(parseAppPath('/tasks'), { kind: 'home' })
   assert.deepEqual(parseAppPath('/database', plugins), { kind: 'module', moduleId: 'database', path: '/database' })
+  assert.deepEqual(parseAppPath('/login'), { kind: 'auth', mode: 'login' })
+  assert.deepEqual(parseAppPath('/register'), { kind: 'auth', mode: 'register' })
+  assert.deepEqual(parseAppPath('/signup'), { kind: 'auth', mode: 'register' })
+  assert.deepEqual(parseAppPath('/share/tok'), { kind: 'share', token: 'tok' })
+  assert.deepEqual(parseAppPath('/share/tok/r/p001'), { kind: 'share', token: 'tok', recordId: 'p001' })
+  assert.equal(isKnownAppPath('/share/tok'), true)
 })
 
-test('database nested routes identify view vs record without touching /s/:id', () => {
+test('database nested routes identify view vs record without touching /agents/:id', () => {
   assert.deepEqual(parseAppPath('/database/pages', plugins), {
     kind: 'collection-view',
     moduleId: 'database',
@@ -62,6 +69,7 @@ test('database nested routes identify view vs record without touching /s/:id', (
     moduleId: 'database',
     path: '/database',
     collection: '/pages',
+    viewId: 'board',
     recordId: 'rec-1',
   })
   assert.deepEqual(parseAppPath('/database/c/pages/v/board/r/rec-1', plugins), {
@@ -69,12 +77,24 @@ test('database nested routes identify view vs record without touching /s/:id', (
     moduleId: 'database',
     path: '/database',
     collection: '/pages',
+    viewId: 'board',
     recordId: 'rec-1',
   })
   assert.equal(isLegacyDatabasePath('/database/c/pages/v/x'), true)
-  assert.equal(isLegacyDatabasePath('/database/pages/view/board/record/rec-1'), true)
+  assert.equal(isLegacyDatabasePath('/database/pages/view/board/record/rec-1'), false)
   assert.equal(isLegacyDatabasePath('/database/pages/view/x'), false)
   assert.equal(isLegacyDatabasePath('/database/pages/record/rec-1'), false)
+  assert.equal(
+    buildAppPath({
+      kind: 'record',
+      moduleId: 'database',
+      path: '/database',
+      collection: '/tasks',
+      viewId: 'board',
+      recordId: 'task_mtdbgnqj_5022je',
+    }),
+    '/database/tasks/view/board/record/task_mtdbgnqj_5022je',
+  )
   assert.equal(
     buildAppPath({
       kind: 'record',
@@ -85,7 +105,8 @@ test('database nested routes identify view vs record without touching /s/:id', (
     }),
     '/database/tasks/record/task_mtdbgnqj_5022je',
   )
-  assert.equal(parseAppPath('/s/rec-1', plugins).kind, 'session')
+  assert.equal(parseAppPath('/agents/rec-1', plugins).kind, 'session')
+  assert.equal(parseAppPath('/s/rec-1', plugins).kind, 'home')
 })
 
 test('isKnownAppPath only accepts builtins plus registered plugin paths', () => {
@@ -94,7 +115,10 @@ test('isKnownAppPath only accepts builtins plus registered plugin paths', () => 
   assert.equal(isKnownAppPath('/extra', plugins), true)
   assert.equal(isKnownAppPath('/tasks', plugins), true)
   assert.equal(isKnownAppPath('/workspace'), false)
-  assert.equal(isKnownAppPath('/s/abc'), true)
+  assert.equal(isKnownAppPath('/login'), true)
+  assert.equal(isKnownAppPath('/register'), true)
+  assert.equal(isKnownAppPath('/agents/abc'), true)
+  assert.equal(isKnownAppPath('/s/abc'), false)
   assert.equal(isKnownAppPath('/unknown'), false)
   assert.equal(isKnownAppPath('/database/pages/view/x', plugins), true)
 })
@@ -102,6 +126,8 @@ test('isKnownAppPath only accepts builtins plus registered plugin paths', () => 
 test('buildAppPath round-trips with parseAppPath', () => {
   const routes = [
     { kind: 'home' as const },
+    { kind: 'auth' as const, mode: 'login' as const },
+    { kind: 'auth' as const, mode: 'register' as const },
     { kind: 'session' as const, sessionId: 's1', view: 'chat' as const },
     { kind: 'session' as const, sessionId: 's1', view: 'debug' as const },
     { kind: 'module' as const, moduleId: 'extra' as const, path: '/extra' },
@@ -112,6 +138,14 @@ test('buildAppPath round-trips with parseAppPath', () => {
       path: '/database',
       collection: '/pages',
       viewId: 'v1',
+    },
+    {
+      kind: 'record' as const,
+      moduleId: 'database' as const,
+      path: '/database',
+      collection: '/pages',
+      viewId: 'board',
+      recordId: 'r1',
     },
     {
       kind: 'record' as const,

@@ -1,9 +1,14 @@
-import { memo, useEffect, useRef, type ReactNode } from 'react'
+import { memo, useEffect, useRef, useState, type ReactNode } from 'react'
 import { ChevronDoubleLeftIcon, ChevronDoubleRightIcon } from '@heroicons/react/16/solid'
 import { chromeIcon } from './chrome-icon.ts'
-
-export const SIDEBAR_BRAND_GRADIENT =
-  'linear-gradient(105deg, color-mix(in srgb, #0066B0 42%, var(--dsw-hover)), color-mix(in srgb, #5B3E90 40%, var(--dsw-hover)) 52%, color-mix(in srgb, #E22726 42%, var(--dsw-hover)))'
+import { ShellSidePlaces, ShellWorkspaceSwitcher } from './shell-chrome.tsx'
+import {
+  isSidebarFlyoutKeepTarget,
+  isSidebarFlyoutIgnoreTarget,
+  SIDEBAR_FLYOUT_HIDE_MS,
+  shouldKeepSidebarFlyout,
+} from './sidebar-flyout.ts'
+import { shellColumnStartWidth } from './chat-overlay.ts'
 
 export type ShellSidebarFrameProps = {
   visible: boolean
@@ -12,7 +17,13 @@ export type ShellSidebarFrameProps = {
   onCollapse?: () => void
   onExpand?: () => void
   onWidthChange?: (width: number) => void
+  onWidthLive?: (width: number) => void
   testId?: string
+  activeId?: string
+  agentHref?: string
+  onSettings?: (tab?: string) => void
+  onSearch?: () => void
+  searchOpen?: boolean
   children: ReactNode
 }
 
@@ -24,34 +35,114 @@ export const ShellSidebarFrame = memo(function ShellSidebarFrame({
   onCollapse,
   onExpand,
   onWidthChange,
+  onWidthLive,
   testId = 'shell-sidebar',
+  activeId,
+  agentHref,
+  onSettings,
+  onSearch,
+  searchOpen = false,
   children,
 }: ShellSidebarFrameProps) {
-  const dragRef = useRef<{ startX: number; startWidth: number } | null>(null)
+  const dragRef = useRef<{ startX: number; startWidth: number; last: number } | null>(null)
+  const hostRef = useRef<HTMLDivElement | null>(null)
+  const peekRef = useRef(false)
+  const hideRef = useRef<number | null>(null)
+  const [peek, setPeek] = useState(false)
+
   useEffect(() => {
     const onMove = (event: PointerEvent) => {
       const drag = dragRef.current
       if (!drag) return
-      onWidthChange?.(drag.startWidth + (event.clientX - drag.startX))
+      const next = drag.startWidth + (event.clientX - drag.startX)
+      drag.last = next
+      if (onWidthLive) onWidthLive(next)
+      else onWidthChange?.(next)
     }
     const onUp = () => {
+      const drag = dragRef.current
       dragRef.current = null
       document.body.style.removeProperty('cursor')
       document.body.style.removeProperty('user-select')
+      if (drag && onWidthLive) onWidthChange?.(drag.last)
     }
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
     return () => {
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
     }
-  }, [onWidthChange])
+  }, [onWidthChange, onWidthLive])
+
+  useEffect(() => {
+    if (visible) {
+      peekRef.current = false
+      setPeek(false)
+      if (hideRef.current != null) {
+        clearTimeout(hideRef.current)
+        hideRef.current = null
+      }
+      return
+    }
+
+    const openPeek = () => {
+      if (hideRef.current != null) {
+        clearTimeout(hideRef.current)
+        hideRef.current = null
+      }
+      peekRef.current = true
+      setPeek(true)
+    }
+    const scheduleHide = () => {
+      if (hideRef.current != null) return
+      hideRef.current = window.setTimeout(() => {
+        hideRef.current = null
+        peekRef.current = false
+        setPeek(false)
+      }, SIDEBAR_FLYOUT_HIDE_MS)
+    }
+    const onPointer = (event: PointerEvent) => {
+      const host = hostRef.current
+      const shell = host?.parentElement
+      const raw = shell ? getComputedStyle(shell).getPropertyValue('--sidebar-flyout-width') : ''
+      const width = Number.parseFloat(raw) || 240
+      if (isSidebarFlyoutIgnoreTarget(event.target)) {
+        if (peekRef.current) scheduleHide()
+        return
+      }
+      if (
+        isSidebarFlyoutKeepTarget(event.target, host) ||
+        shouldKeepSidebarFlyout(event.clientX, event.clientY, peekRef.current, width, window.innerWidth, window.innerHeight)
+      ) {
+        openPeek()
+        return
+      }
+      if (peekRef.current) scheduleHide()
+    }
+    window.addEventListener('pointermove', onPointer)
+    window.addEventListener('pointerdown', onPointer)
+    return () => {
+      window.removeEventListener('pointermove', onPointer)
+      window.removeEventListener('pointerdown', onPointer)
+      if (hideRef.current != null) {
+        clearTimeout(hideRef.current)
+        hideRef.current = null
+      }
+    }
+  }, [visible])
 
   return (
+    <div
+      ref={hostRef}
+      className={`sidebar-flyout-host${visible ? '' : ' is-collapsed'}${!visible && peek ? ' is-flyout-open' : ''}`}
+      data-testid="sidebar-flyout-host"
+    >
+      {visible ? null : <div className="sidebar-edge-hot" data-testid="sidebar-edge-hot" aria-hidden />}
     <aside
-      className={`app-side-bar min-h-0 flex-col overflow-hidden border-r border-(--dsw-border) bg-(--dsw-sidebar)${narrow ? ' is-narrow' : ''}${showTags ? ' is-wide' : ''}${visible ? ' flex' : ' is-closed flex'}`}
+      className={`app-side-bar min-h-0 flex-col overflow-hidden border-r border-(--biu-color-border) bg-(--biu-color-bg-subtle)${narrow ? ' is-narrow' : ''}${showTags ? ' is-wide' : ''}${visible ? ' flex' : ' is-closed flex'}`}
       aria-hidden={!visible}
-      inert={!visible || undefined}
       data-testid={testId}
     >
       {onWidthChange ? (
@@ -62,21 +153,18 @@ export const ShellSidebarFrame = memo(function ShellSidebarFrame({
           title="拖动调整宽度"
           onPointerDown={(event) => {
             event.preventDefault()
-            const visual = event.currentTarget.parentElement?.getBoundingClientRect().width ?? 0
-            dragRef.current = { startX: event.clientX, startWidth: visual }
+            const visual = shellColumnStartWidth(event.currentTarget, 'left', 0)
+            dragRef.current = { startX: event.clientX, startWidth: visual, last: visual }
             document.body.style.cursor = 'col-resize'
             document.body.style.userSelect = 'none'
           }}
         />
       ) : null}
-      <div className="app-side-bar-head app-side-bar-head-brand">
-        <span
-          className="inline-flex min-w-0 max-w-full items-center truncate rounded-md px-2 py-0.5 text-[14px] font-semibold tracking-wide text-white"
-          style={{ background: SIDEBAR_BRAND_GRADIENT }}
-        >
-          Biu Agent OS
-        </span>
-        {narrow ? (
+      <div className="app-side-bar-head app-side-bar-head-brand" data-biu-ignore>
+        <div className="shell-workspace-head">
+          <ShellWorkspaceSwitcher onWorkspaceSettings={() => onSettings?.('workspace')} />
+        </div>
+        {!visible || narrow ? (
           <button
             type="button"
             className="chat-view-header-expand"
@@ -100,7 +188,19 @@ export const ShellSidebarFrame = memo(function ShellSidebarFrame({
           </button>
         )}
       </div>
+      {onSettings && agentHref && activeId != null ? (
+        <div className="shrink-0 px-2 pt-1" data-biu-ignore>
+          <ShellSidePlaces
+            activeId={activeId}
+            agentHref={agentHref}
+            onSettings={() => onSettings()}
+            onSearch={onSearch}
+            searchOpen={searchOpen}
+          />
+        </div>
+      ) : null}
       {children}
     </aside>
+    </div>
   )
 })

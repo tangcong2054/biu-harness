@@ -1,7 +1,16 @@
 import { Service, type Context } from 'cordis'
 import type { LlmConfig } from '@biu/host-llm'
 import type { AgentTurn, ClaimedInput } from '@biu/type-agent-loop'
-import type { MessageSender } from '@biu/type-session'
+import type { MessageSender, LiveUiContext, SessionGoal } from '@biu/type-session'
+import { currentSessionId } from '@biu/host-sessions/scope'
+import {
+  continuationPrompt,
+  decideGoalContinuation,
+  goalFromConfig,
+  newGoalId,
+  parseGoalSlash,
+  type GoalSlash,
+} from './goal.ts'
 
 export type { AgentTurn, LlmConfig }
 
@@ -11,7 +20,8 @@ export interface AgentSendOptions {
   wait?: boolean
   /** 消息来源：Live 派工时传入 { type: 'session', sessionId } */
   sender?: MessageSender
-  images?: Array<{ name: string; mime: string; url: string }>
+  images?: Array<{ name: string; mime: string; url: string; path?: string }>
+  liveContext?: LiveUiContext
 }
 
 export interface AgentHandle {
@@ -35,6 +45,8 @@ interface LiveAgent {
   inbox: ClaimedInput[]
   running?: Promise<void>
   abort: AbortController
+  /** 上一回合还在收尾时又 resume / 入队：结束后立刻再 kick，避免 wake 停在 inbox 没人领 */
+  restartWhenIdle?: boolean
 }
 
 let inboxSeq = 0
@@ -73,11 +85,34 @@ export class AgentsService extends Service {
   listInbox(sessionId: string): InboxRow[] {
     const live = this.lives.get(sessionId)
     if (!live) return []
-    return live.inbox.map((item) => ({
-      id: item.id ?? nextInboxId(),
-      kind: item.kind,
-      text: item.text,
-    }))
+    return live.inbox.map((item) => {
+      if (!item.id) item.id = nextInboxId()
+      return { id: item.id, kind: item.kind, text: item.text }
+    })
+  }
+
+  /** 丢掉尚未 claim 的排队项（编辑回输入框 / 删除）。 */
+  dropInbox(sessionId: string, itemId: string) {
+    const live = this.lives.get(sessionId)
+    if (!live || !itemId) return false
+    const index = live.inbox.findIndex((item) => (item.id ?? '') === itemId)
+    if (index < 0) return false
+    live.inbox.splice(index, 1)
+    this.emitInbox(sessionId)
+    return true
+  }
+
+  /** 改尚未 claim 的排队正文。空文本且没有图片时拒绝。 */
+  patchInbox(sessionId: string, itemId: string, text: string) {
+    const live = this.lives.get(sessionId)
+    if (!live || !itemId) return false
+    const item = live.inbox.find((row) => (row.id ?? '') === itemId)
+    if (!item) return false
+    const trimmed = text.trim()
+    if (!trimmed && !item.images?.length) return false
+    item.text = trimmed || item.text
+    this.emitInbox(sessionId)
+    return true
   }
 
   private emitInbox(sessionId: string) {
@@ -101,23 +136,33 @@ export class AgentsService extends Service {
       while (true) {
         const claimed = claim(live.inbox)
         this.emitInbox(id)
-        if (!claimed) break
+        if (!claimed) {
+          if (live.abort.signal.aborted) break
+          const queued = await this.queueGoalContinuation(id, live)
+          if (!queued) break
+          continue
+        }
         try {
           last = await this.ctx.agentLoop.create(this.resolveLlm(id), id, live.abort.signal).run(claimed)
         } catch (error) {
-          // 停止/空回车只终结「当前回合」，不代表放弃整个队列：排队的 wake 多半是别的
-          // session 派工（task_deliver / 进度回传 走 wait:false，入队后不再自行 kick），
-          // 若在这里整体退出循环，它们会永久滞留在 inbox 直到用户下次手动发消息。
-          // 已 abort 的 signal 无法复用，换一个再跑下一轮。
-          if (!isCancelled(error) || !live.inbox.some((item) => item.kind === 'wake')) throw error
-          live.abort = new AbortController()
-          last = { text: '', steps: [] }
+          if (/cancelled|AbortError|aborted/i.test(String(error))) break
+          throw error
         }
+        if (last.halt || live.abort.signal.aborted) break
       }
       return last
     }
 
     const startKick = (wait: boolean): Promise<AgentTurn> => {
+      if (live.running) {
+        if (!wait) return Promise.resolve({ text: '', steps: [] })
+        return live.running.then(() => ({ text: '', steps: [] })).catch((error) => {
+          if (/cancelled|AbortError|aborted/i.test(String(error))) {
+            return { text: '', steps: [] }
+          }
+          throw error
+        })
+      }
       live.abort = new AbortController()
       let result: AgentTurn = { text: '', steps: [] }
       const running = kick()
@@ -125,7 +170,14 @@ export class AgentsService extends Service {
           result = turn
         })
         .finally(() => {
-          if (live.running === running) live.running = undefined
+          if (live.running === running) {
+            live.running = undefined
+            this.ctx.emit('agent/status', { sessionId: id, status: 'idle' })
+            if (live.restartWhenIdle) {
+              live.restartWhenIdle = false
+              if (live.inbox.some((item) => item.kind === 'wake')) startKick(false)
+            }
+          }
         })
       live.running = running
       this.ctx.emit('agent/status', { sessionId: id, status: 'running', step: 0 })
@@ -147,6 +199,15 @@ export class AgentsService extends Service {
         const trimmed = text.trim()
         const images = sanitizeImages(opts?.images)
         if (!trimmed && !images?.length) return { text: '请先输入内容。', steps: [] }
+        const slash = parseGoalSlash(trimmed)
+        if (slash) {
+          const control = await this.applyGoalSlash(id, slash)
+          if (control !== 'run') {
+            await this.ctx.sessions.append(id, { type: 'user/message', text: trimmed, kind: 'wake' })
+            await this.ctx.sessions.append(id, { type: 'assistant/message', text: control })
+            return { text: control, steps: [] }
+          }
+        }
         const extraTools = sanitizeExtraTools(opts?.extraTools)
         const wait = opts?.wait !== false
         const entry = {
@@ -155,6 +216,7 @@ export class AgentsService extends Service {
           ...(extraTools.length ? { extraTools } : {}),
           ...(opts?.sender ? { sender: opts.sender } : {}),
           ...(images ? { images } : {}),
+          ...(opts?.liveContext ? { liveContext: opts.liveContext } : {}),
         }
 
         // Cursor 同款：忙碌且已有 wake 排队时，再发送 → inject（并入该 wake 的下一回合）
@@ -168,7 +230,10 @@ export class AgentsService extends Service {
         this.emitInbox(id)
 
         if (live.running) {
-          if (!wait) return { text: '', steps: [] }
+          if (!wait) {
+            live.restartWhenIdle = true
+            return { text: '', steps: [] }
+          }
           await live.running.catch(() => undefined)
         }
         return startKick(wait)
@@ -185,6 +250,7 @@ export class AgentsService extends Service {
           ...(extraTools.length ? { extraTools } : {}),
           ...(opts?.sender ? { sender: opts.sender } : {}),
           ...(images ? { images } : {}),
+          ...(opts?.liveContext ? { liveContext: opts.liveContext } : {}),
         })
         this.emitInbox(id)
       },
@@ -201,7 +267,10 @@ export class AgentsService extends Service {
         await startKick(wait)
         return { flushed: true }
       },
-      cancel: () => live.abort.abort(),
+      cancel: () => {
+        live.restartWhenIdle = false
+        live.abort.abort()
+      },
       dispose: () => {
         live.abort.abort()
         this.lives.delete(id)
@@ -215,6 +284,90 @@ export class AgentsService extends Service {
 
   get(sessionId: string) {
     return this.lives.get(sessionId)?.handle
+  }
+
+  async controlGoal(sessionId: string, action: 'pause' | 'resume' | 'clear') {
+    if (!(await this.ctx.sessions.get(sessionId))) throw new Error(`unknown session: ${sessionId}`)
+    await this.create(sessionId)
+    if (action === 'pause' || action === 'clear') {
+      const live = this.lives.get(sessionId)
+      if (live) live.restartWhenIdle = false
+      this.get(sessionId)?.cancel()
+    }
+    const text = await this.applyGoalSlash(sessionId, { kind: action })
+    if (text === 'run' && action === 'resume') {
+      const live = this.lives.get(sessionId)
+      if (live?.running) {
+        live.abort.abort()
+        live.restartWhenIdle = true
+      }
+      const goal = this.peekGoal(sessionId)
+      if (goal) void this.get(sessionId)?.send(continuationPrompt(goal), { wait: false })
+    }
+    return {
+      ok: true as const,
+      goal: this.peekGoal(sessionId) ?? null,
+      text: text === 'run' ? '已继续 Goal' : text,
+    }
+  }
+
+  private peekGoal(sessionId: string): SessionGoal | undefined {
+    return goalFromConfig(this.ctx.sessions.peek(sessionId)?.config?.goal)
+  }
+
+  private async applyGoalSlash(sessionId: string, slash: GoalSlash): Promise<'run' | string> {
+    const existing = this.peekGoal(sessionId)
+    if (slash.kind === 'start') {
+      await this.ctx.sessions.patchConfig(sessionId, {
+        goal: { id: newGoalId(), objective: slash.objective, status: 'pursuing', turns: 0 },
+      })
+      return 'run'
+    }
+    if (slash.kind === 'resume') {
+      if (!existing) return '没有可恢复的 Goal。用 /goal <目标> 开始。'
+      if (existing.status === 'achieved') return '当前 Goal 已完成。用 /goal <目标> 开新的。'
+      await this.ctx.sessions.patchConfig(sessionId, { goal: { ...existing, status: 'pursuing' } })
+      return 'run'
+    }
+    if (slash.kind === 'pause') {
+      if (!existing || existing.status !== 'pursuing') return '没有正在推进的 Goal。'
+      await this.ctx.sessions.patchConfig(sessionId, { goal: { ...existing, status: 'paused' } })
+      return `已暂停 Goal：${existing.objective}`
+    }
+    if (slash.kind === 'clear') {
+      await this.ctx.sessions.patchConfig(sessionId, { goal: null })
+      return existing ? `已清除 Goal：${existing.objective}` : '当前没有 Goal。'
+    }
+    if (!existing) return '当前没有 Goal。输入 /goal <目标> 开始，会一直做到完成。'
+    return `Goal ${existing.status} · ${existing.objective}${existing.summary ? ` · ${existing.summary}` : ''} · goal_id=${existing.id}`
+  }
+
+  private async queueGoalContinuation(sessionId: string, live: LiveAgent) {
+    const goal = this.peekGoal(sessionId)
+    const decision = decideGoalContinuation({
+      goal,
+      aborted: live.abort.signal.aborted,
+      inboxLength: live.inbox.length,
+    })
+    if (decision === 'budget' && goal) {
+      await this.ctx.sessions.patchConfig(sessionId, {
+        goal: {
+          ...goal,
+          status: 'blocked',
+          summary: `达到 ${goal.turns} 回合上限，目标未完成`,
+        },
+      })
+      return false
+    }
+    if (decision !== 'continue' || !goal) return false
+    await this.ctx.sessions.patchConfig(sessionId, { goal: { ...goal, turns: goal.turns + 1 } })
+    live.inbox.push({
+      kind: 'wake',
+      text: continuationPrompt(goal),
+      id: nextInboxId(),
+    })
+    this.emitInbox(sessionId)
+    return true
   }
 
   /** 兼容旧入口：把最后一条用户消息送进 session。 */
@@ -239,8 +392,9 @@ function sanitizeImages(raw: AgentSendOptions['images']): ClaimedInput['images']
     const url = String(item.url ?? '')
     const name = String(item.name ?? 'image.png').slice(0, 80)
     if (!/^image\/(png|jpe?g|gif|webp)$/i.test(mime)) continue
-    if (!url.startsWith('data:image/') || url.length > 8 * 1024 * 1024) continue
-    out.push({ name: name || 'image.png', mime, url })
+    if (!/^data:image\/(?:png|jpeg|jpg|gif|webp);base64,/i.test(url) || url.length > 8 * 1024 * 1024) continue
+    const path = typeof (item as { path?: unknown }).path === 'string' ? String((item as { path: string }).path).trim() : ''
+    out.push({ name: name || 'image.png', mime, url, ...(path && !path.includes('..') ? { path } : {}) })
     if (out.length >= 6) break
   }
   return out.length ? out : undefined
@@ -248,7 +402,7 @@ function sanitizeImages(raw: AgentSendOptions['images']): ClaimedInput['images']
 
 function sanitizeExtraTools(names: string[] | undefined): string[] {
   if (!Array.isArray(names) || !names.length) return []
-  return [...new Set(names.map((name) => String(name).trim()).filter(Boolean))]
+  return [...new Set(names.map((name) => String(name).trim()).filter((name) => name && name !== 'goal'))]
 }
 
 function claim(inbox: ClaimedInput[]): ClaimedInput[] | undefined {
@@ -262,11 +416,62 @@ function claim(inbox: ClaimedInput[]): ClaimedInput[] | undefined {
 }
 
 export const name = 'agents'
-export const inject = ['agentLoop', 'sessions']
+export const inject = ['agentLoop', 'sessions', 'tools']
 
 export function apply(ctx: Context) {
   const agents = new AgentsService(ctx)
   // 无循环依赖地把"按 session 取 AgentHandle"的能力装进 SessionsService：
   // agents 依赖 sessions（单向）；反向派工能力通过 sessions.installAgentFactory 回调注入。
   ctx.sessions.installAgentFactory((id) => agents.create(id))
+  registerGoalTools(ctx)
+}
+
+function registerGoalTools(ctx: Context) {
+  ctx.tools.register({
+    name: 'goal_complete',
+    description:
+      'Goal 模式：目标已用具体证据验证完成后调用。必须带当前 goal_id 与 summary。不要只在回复里声称完成。',
+    parameters: {
+      type: 'object',
+      properties: {
+        goal_id: { type: 'string', description: '当前代理正在推进的 goal_id' },
+        summary: { type: 'string', description: '完成证据：跑过的测试、改动的文件、验收结果' },
+      },
+      required: ['goal_id', 'summary'],
+    },
+    execute: async (args) => updateGoal(ctx, 'achieved', args),
+  })
+  ctx.tools.register({
+    name: 'goal_blocked',
+    description:
+      'Goal 模式：只有真正无法继续时才调用（缺密钥、缺权限、外部依赖、同一障碍反复出现）。必须带当前 goal_id。',
+    parameters: {
+      type: 'object',
+      properties: {
+        goal_id: { type: 'string' },
+        reason: { type: 'string' },
+        evidence: { type: 'string' },
+      },
+      required: ['goal_id', 'reason'],
+    },
+    execute: async (args) =>
+      updateGoal(ctx, 'blocked', {
+        goal_id: args.goal_id,
+        summary: [args.reason, args.evidence].filter(Boolean).map(String).join('\n'),
+      }),
+  })
+}
+
+async function updateGoal(ctx: Context, status: 'achieved' | 'blocked', args: Record<string, unknown>) {
+  const sessionId = currentSessionId()
+  if (!sessionId) throw new Error('goal tools need an active session')
+  const goal = goalFromConfig(ctx.sessions.peek(sessionId)?.config?.goal)
+  if (!goal) throw new Error('no active goal')
+  const goalId = String(args.goal_id ?? '').trim()
+  if (goalId !== goal.id) throw new Error('stale goal_id')
+  if (goal.status !== 'pursuing') throw new Error(`goal is ${goal.status}`)
+  const summary = String(args.summary ?? '').trim().slice(0, 4000)
+  if (status === 'achieved' && !summary) throw new Error('goal_complete needs summary evidence')
+  await ctx.sessions.patchConfig(sessionId, { goal: { ...goal, status, ...(summary ? { summary } : {}) } })
+  return { ok: true, status, goal_id: goal.id }
 }

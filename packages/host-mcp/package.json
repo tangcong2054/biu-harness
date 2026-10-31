@@ -1,13 +1,25 @@
 {
   "name": "@biu/host-mcp",
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "MCP 缝",
+  "description": "MCP 缝：挂载外部 server，同时把本机 Biu 暴露成 Streamable HTTP MCP",
   "exports": {
-    ".": "./src/host/index.ts"
+    ".": "./src/host/index.ts",
+    "./config": "./src/host/config.ts",
+    "./web": "./src/web/index.tsx"
   },
   "peerDependencies": {
-    "cordis": "4.0.0-rc.8"
+    "cordis": "4.0.0-rc.8",
+    "react": "^19.1.1"
+  },
+  "dependencies": {
+    "@biu/host-plugin-loader": "0.1.0",
+    "@biu/host-tools": "0.1.0",
+    "@biu/type-file-system": "0.1.0",
+    "@biu/type-http": "0.1.0",
+    "@biu/database-ui": "0.1.0",
+    "@modelcontextprotocol/sdk": "^1.30.0"
   }
 }

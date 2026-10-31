@@ -1,12 +1,16 @@
 /** @vitest-environment node */
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { Context } from 'cordis'
 import { PluginStoreService } from './index.ts'
-import { compileStoreModule, registerPluginCreate } from './plugin-create.ts'
+import { withPluginPackLock } from './plugin-create.ts'
+import { pluginsCollection } from './collection.ts'
+import type { PluginStoreService as Store } from './store.ts'
 
 function stubHub(ctx: Context) {
   ;(ctx as unknown as { hub: unknown }).hub = {
@@ -16,14 +20,61 @@ function stubHub(ctx: Context) {
   }
 }
 
-test('create compiles host source straight into .plugin/<id>/', async () => {
+async function installViaSandbox(store: PluginStoreService, input: Parameters<PluginStoreService['initSandbox']>[0]) {
+  await store.initSandbox(input)
+  return store.pack(input.id)
+}
+
+test('list writes createdAt into old manifests and does not use directory ctime', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-created-at-'))
+  try {
+    const ctx = new Context()
+    stubHub(ctx)
+    const pluginDir = join(dir, '.plugin')
+    const idDir = join(pluginDir, 'store-old')
+    const { mkdir, utimes } = await import('node:fs/promises')
+    await mkdir(idDir, { recursive: true })
+    await writeFile(
+      join(idDir, 'manifest.json'),
+      `${JSON.stringify({ id: 'store-old', name: 'Old', blurb: 'x', tags: [], author: '', authorUrl: '' }, null, 2)}\n`,
+    )
+    const store = new PluginStoreService(ctx, pluginDir, join(dir, 'store.json'), join(dir, '.plugin-dev')).open()
+    const listed = await store.list()
+    const createdAt = listed[0]?.createdAt
+    assert.ok(typeof createdAt === 'number' && createdAt > 0)
+    const onDisk = JSON.parse(await readFile(join(idDir, 'manifest.json'), 'utf8')) as { createdAt: number }
+    assert.equal(onDisk.createdAt, createdAt)
+    await utimes(idDir, 1, 1)
+    await writeFile(join(idDir, 'host.js'), 'export const name = "store-old"\n')
+    const ctx2 = new Context()
+    stubHub(ctx2)
+    const store2 = new PluginStoreService(ctx2, pluginDir, join(dir, 'store.json'), join(dir, '.plugin-dev')).open()
+    const listed2 = await store2.list()
+    assert.equal(listed2[0]?.createdAt, createdAt)
+    await writeFile(
+      join(idDir, 'manifest.json'),
+      `${JSON.stringify({ id: 'store-old', name: 'Old', blurb: 'x', tags: [], author: '', authorUrl: '', createdAt: 0 }, null, 2)}\n`,
+    )
+    const ctx3 = new Context()
+    stubHub(ctx3)
+    const store3 = new PluginStoreService(ctx3, pluginDir, join(dir, 'store.json'), join(dir, '.plugin-dev')).open()
+    const listed3 = await store3.list()
+    assert.ok((listed3[0]?.createdAt ?? 0) > 0)
+    const fixed = JSON.parse(await readFile(join(idDir, 'manifest.json'), 'utf8')) as { createdAt: number }
+    assert.equal(fixed.createdAt, listed3[0]?.createdAt)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('sandbox then pack compiles host source into .plugin/<id>/', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'plugin-create-small-'))
   try {
     const ctx = new Context()
     stubHub(ctx)
     const pluginDir = join(dir, '.plugin')
     const store = new PluginStoreService(ctx, pluginDir, join(dir, 'store.json'), join(dir, '.plugin-dev')).open()
-    await store.create({
+    await installViaSandbox(store, {
       id: 'store-echo',
       name: 'Echo',
       tags: ['tool', 'demo'],
@@ -52,23 +103,27 @@ test('create compiles host source straight into .plugin/<id>/', async () => {
     const hostJs = await readFile(join(pluginDir, 'store-echo', 'host.js'), 'utf8')
     assert.match(hostJs, /\bapply\b/)
     assert.doesNotMatch(hostJs, /ctx: \{/)
-    await assert.rejects(
-      () => store.create({ id: 'store-empty', name: 'Empty' }),
-      /hostJs and\/or webJs/,
-    )
+    const readme = await readFile(join(pluginDir, 'store-echo', 'README.md'), 'utf8')
+    assert.match(readme, /^# Echo\n/)
+    await store.writeReadme('store-echo', '# Echo\n\n自定义介绍\n')
+    assert.equal(await store.readReadme('store-echo'), '# Echo\n\n自定义介绍\n')
+    assert.equal(await readFile(join(pluginDir, 'store-echo', 'README.md'), 'utf8'), '# Echo\n\n自定义介绍\n')
+    assert.equal(await readFile(join(dir, '.plugin-dev', 'store-echo', 'README.md'), 'utf8'), '# Echo\n\n自定义介绍\n')
+    await store.initSandbox({ id: 'store-empty', name: 'Empty' })
+    await assert.rejects(() => store.pack('store-empty'), /host\/index\.ts/)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
 })
 
-test('create writes manifest.shell from input', async () => {
+test('sandbox then pack writes manifest.shell from input', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'plugin-shell-'))
   try {
     const ctx = new Context()
     stubHub(ctx)
     const pluginDir = join(dir, '.plugin')
     const store = new PluginStoreService(ctx, pluginDir, join(dir, 'store.json'), join(dir, '.plugin-dev')).open()
-    await store.create({
+    await installViaSandbox(store, {
       id: 'store-game',
       name: 'Game',
       shell: { width: 640, height: 480, resizable: false },
@@ -88,7 +143,7 @@ test('create writes manifest.shell from input', async () => {
   }
 })
 
-test('create with web rejects missing shell size', async () => {
+test('sandbox with web rejects missing shell size', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'plugin-shell-required-'))
   try {
     const ctx = new Context()
@@ -101,7 +156,7 @@ test('create with web rejects missing shell size', async () => {
     ).open()
     await assert.rejects(
       () =>
-        store.create({
+        store.initSandbox({
           id: 'store-game',
           name: 'Game',
           webJs: `export const name = 'store-game'\nexport function apply() {}`,
@@ -126,11 +181,55 @@ test('pack with web rejects sandbox manifest without shell size', async () => {
     ).open()
     await store.initSandbox({ id: 'store-ui', name: 'UI' })
     const sandbox = join(dir, '.plugin-dev', 'store-ui')
+    await mkdir(join(sandbox, 'web'), { recursive: true })
     await writeFile(
-      join(sandbox, 'web.tsx'),
+      join(sandbox, 'web/index.tsx'),
       `export const name = 'store-ui'\nexport function apply() {}\n`,
     )
     await assert.rejects(() => store.pack('store-ui'), /shell\.width and shell\.height/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('sandbox and pack allow web without shell when headless', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-headless-'))
+  try {
+    const ctx = new Context()
+    stubHub(ctx)
+    const store = new PluginStoreService(
+      ctx,
+      join(dir, '.plugin'),
+      join(dir, 'store.json'),
+      join(dir, '.plugin-dev'),
+    ).open()
+    await installViaSandbox(store, {
+      id: 'store-skin',
+      name: 'Skin',
+      headless: true,
+      webJs: `export const name = 'store-skin'\nexport function apply() {}`,
+    })
+    const created = JSON.parse(await readFile(join(dir, '.plugin', 'store-skin', 'manifest.json'), 'utf8')) as {
+      headless?: boolean
+      shell?: unknown
+    }
+    assert.equal(created.headless, true)
+    assert.equal(created.shell, undefined)
+    const listed = await store.list()
+    assert.equal(listed[0]?.headless, true)
+    assert.equal(listed[0]?.shell, undefined)
+
+    await store.initSandbox({ id: 'store-skin-src', name: 'Skin Src', headless: true })
+    const sandbox = join(dir, '.plugin-dev', 'store-skin-src')
+    await mkdir(join(sandbox, 'web'), { recursive: true })
+    await writeFile(join(sandbox, 'web/index.tsx'), `export const name = 'store-skin-src'\nexport function apply() {}\n`)
+    await store.pack('store-skin-src')
+    const packed = JSON.parse(await readFile(join(dir, '.plugin', 'store-skin-src', 'manifest.json'), 'utf8')) as {
+      headless?: boolean
+      shell?: unknown
+    }
+    assert.equal(packed.headless, true)
+    assert.equal(packed.shell, undefined)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -151,6 +250,16 @@ test('initSandbox writes source; pack bundles into .plugin/<id>/', async () => {
       hostJs: `export const name = 'store-echo'\nexport function apply(ctx: { ok: boolean }) { return ctx.ok }`,
     })
     assert.equal(result.sandboxPath, join(sandboxDir, 'store-echo'))
+    const sandboxPkg = JSON.parse(await readFile(join(sandboxDir, 'store-echo', 'package.json'), 'utf8')) as {
+      name: string
+      private: boolean
+      dependencies: Record<string, string>
+    }
+    assert.equal(sandboxPkg.name, 'store-echo')
+    assert.equal(sandboxPkg.private, true)
+    assert.deepEqual(sandboxPkg.dependencies, {})
+    const sandboxReadme = await readFile(join(sandboxDir, 'store-echo', 'README.md'), 'utf8')
+    assert.match(sandboxReadme, /回声/)
     const packed = await store.pack('store-echo')
     assert.equal(packed.pluginPath, join(pluginDir, 'store-echo'))
     const manifest = JSON.parse(await readFile(join(pluginDir, 'store-echo', 'manifest.json'), 'utf8')) as {
@@ -161,6 +270,17 @@ test('initSandbox writes source; pack bundles into .plugin/<id>/', async () => {
     const hostJs = await readFile(join(pluginDir, 'store-echo', 'host.js'), 'utf8')
     assert.match(hostJs, /\bapply\b/)
     assert.doesNotMatch(hostJs, /ctx: \{/)
+    const packedReadme = await readFile(join(pluginDir, 'store-echo', 'README.md'), 'utf8')
+    assert.equal(packedReadme, sandboxReadme)
+    const mp3 = join(sandboxDir, 'store-echo', 'bgm.MP3')
+    await writeFile(mp3, Buffer.from('ID3', 'ascii'))
+    await mkdir(join(sandboxDir, 'store-echo', 'assets'), { recursive: true })
+    await writeFile(join(sandboxDir, 'store-echo', 'assets', 'loop.wav'), Buffer.from('RIFF'))
+    await store.pack('store-echo')
+    const packedMp3 = await readFile(join(pluginDir, 'store-echo', 'assets', 'bgm.mp3'))
+    const packedWav = await readFile(join(pluginDir, 'store-echo', 'assets', 'loop.wav'))
+    assert.equal(packedMp3.equals(Buffer.from('ID3', 'ascii')), true)
+    assert.equal(packedWav.equals(Buffer.from('RIFF')), true)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -179,9 +299,10 @@ test('pack bundles relative imports from sandbox', async () => {
     ).open()
     await store.initSandbox({ id: 'store-math', name: 'Math' })
     const sandbox = join(dir, '.plugin-dev', 'store-math')
-    await writeFile(join(sandbox, 'util.ts'), `export const ping = 'pong'\n`)
+    await mkdir(join(sandbox, 'host'), { recursive: true })
+    await writeFile(join(sandbox, 'host/util.ts'), `export const ping = 'pong'\n`)
     await writeFile(
-      join(sandbox, 'host.ts'),
+      join(sandbox, 'host/index.ts'),
       `import { ping } from './util.ts'\nexport const name = 'store-math'\nexport function apply() { return ping }\n`,
     )
     await store.pack('store-math')
@@ -193,34 +314,317 @@ test('pack bundles relative imports from sandbox', async () => {
   }
 })
 
-test('registers plugin_create, plugin_sandbox, plugin_pack', () => {
-  const ctx = new Context()
-  const names: string[] = []
-  const descriptions: string[] = []
-  ;(ctx as unknown as { tools: { register: (spec: { name: string; description?: string }) => void } }).tools = {
-    register(spec) {
-      names.push(spec.name)
-      if (spec.description) descriptions.push(spec.description)
-    },
-  }
-  const store = new PluginStoreService(
-    ctx,
-    '/tmp/plugin-store-tools/.plugin',
-    '/tmp/plugin-store-tools/store.json',
-    '/tmp/plugin-store-tools/.plugin-dev',
-  )
-  registerPluginCreate(ctx, store)
-  assert.deepEqual(names, ['plugin_create', 'plugin_sandbox', 'plugin_pack'])
-  assert.match(descriptions.join('\n'), /storeShellFromRecord/)
-  assert.match(descriptions.join('\n'), /listing\.shell/)
-  assert.match(descriptions.join('\n'), /shellWidth/)
+test('sandbox/pack live on the plugins collection, not as tools', () => {
+  const spec = pluginsCollection({
+    list: () => Promise.resolve([]),
+    listSandboxes: () => Promise.resolve([]),
+    readReadme: async () => '',
+    writeReadme: async () => {},
+    openPlugin() {},
+    close() {},
+    pack() {},
+    uninstall() {},
+    initSandbox: async () => ({ id: 'x', sandboxPath: '/tmp/x' }),
+  } as Store)
+  const ids = spec.actions?.map((item) => item.id) ?? []
+  assert.deepEqual(ids, ['sandbox', 'start', 'stop', 'pack', 'uninstall'])
+  const sandbox = spec.actions?.find((item) => item.id === 'sandbox')
+  const pack = spec.actions?.find((item) => item.id === 'pack')
+  assert.equal(spec.actions?.find((item) => item.id === 'create'), undefined)
+  assert.equal(sandbox?.allowMissing, true)
+  assert.match(JSON.stringify(sandbox?.parameters), /listing\.shell/)
+  assert.match(String(pack?.parameters?.description ?? ''), /host\/index\.ts/)
+  assert.match(String(pack?.parameters?.description ?? ''), /每个沙箱都有 package.json/)
 })
 
-test('compileStoreModule strips TypeScript in-process', async () => {
-  const code = await compileStoreModule(
-    `export const name = 'store-echo'\nexport function apply(ctx: { ok: boolean }) { return ctx.ok }`,
-    'host',
+test('pack web jsx uses globalThis.React instead of bundling npm react', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-pack-jsx-'))
+  try {
+    const ctx = new Context()
+    stubHub(ctx)
+    const store = new PluginStoreService(
+      ctx,
+      join(dir, '.plugin'),
+      join(dir, 'store.json'),
+      join(dir, '.plugin-dev'),
+    ).open()
+    await store.initSandbox({
+      id: 'store-jsx',
+      name: 'JSX',
+      shell: { width: 320, height: 200 },
+    })
+    const sandbox = join(dir, '.plugin-dev', 'store-jsx')
+    await mkdir(join(sandbox, 'web'), { recursive: true })
+    await writeFile(
+      join(sandbox, 'web/index.tsx'),
+      `export const name = 'store-jsx'\nexport const inject = ['slots']\nfunction Hi() { return <div data-testid="hi">hi</div> }\nexport function apply(ctx: { slots: { place: (name: string, Comp: unknown, opt: unknown) => void } }) {\n  ctx.slots.place('plugin-store-extras', Hi, { key: 'store-jsx' })\n}\n`,
+    )
+    await store.pack('store-jsx')
+    const webJs = await readFile(join(dir, '.plugin', 'store-jsx', 'web.js'), 'utf8')
+    assert.match(webJs, /globalThis\.React/)
+    assert.match(webJs, /createElement/)
+    assert.doesNotMatch(webJs, /node_modules\/react/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('pack maps react/jsx-runtime to globalThis.ReactJSXRuntime', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-pack-jsx-rt-'))
+  try {
+    const ctx = new Context()
+    stubHub(ctx)
+    const store = new PluginStoreService(
+      ctx,
+      join(dir, '.plugin'),
+      join(dir, 'store.json'),
+      join(dir, '.plugin-dev'),
+    ).open()
+    await store.initSandbox({
+      id: 'store-jsx-rt',
+      name: 'JSXRT',
+      shell: { width: 320, height: 200 },
+    })
+    const sandbox = join(dir, '.plugin-dev', 'store-jsx-rt')
+    await mkdir(join(sandbox, 'web'), { recursive: true })
+    await writeFile(
+      join(sandbox, 'web/index.tsx'),
+      `import { jsx } from 'react/jsx-runtime'\nexport const name = 'store-jsx-rt'\nexport function apply() { return jsx('div', { children: 'hi' }, 'k') }\n`,
+    )
+    await store.pack('store-jsx-rt')
+    const webJs = await readFile(join(dir, '.plugin', 'store-jsx-rt', 'web.js'), 'utf8')
+    assert.match(webJs, /ReactJSXRuntime/)
+    assert.doesNotMatch(webJs, /node_modules\/react/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('pack bundles npm deps but keeps react on globalThis', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-npm-'))
+  try {
+    const ctx = new Context()
+    stubHub(ctx)
+    const store = new PluginStoreService(
+      ctx,
+      join(dir, '.plugin'),
+      join(dir, 'store.json'),
+      join(dir, '.plugin-dev'),
+    ).open()
+    await store.initSandbox({
+      id: 'store-dep',
+      name: 'Dep',
+      headless: true,
+    })
+    const sandbox = join(dir, '.plugin-dev', 'store-dep')
+    const pkg = join(dir, '.plugin-dev', 'store-dep', 'node_modules', 'tiny-ping')
+    await mkdir(join(sandbox, 'web'), { recursive: true })
+    await writeFile(join(sandbox, 'web/index.tsx'), `import { ping } from 'tiny-ping'\nimport { useMemo } from 'react'\nexport const name = 'store-dep'\nexport function apply() { return ping + useMemo(() => 1, []) }\n`)
+    await mkdir(pkg, { recursive: true })
+    await writeFile(join(pkg, 'package.json'), JSON.stringify({ name: 'tiny-ping', type: 'module', main: 'index.js' }))
+    await writeFile(join(pkg, 'index.js'), `export const ping = 'pong'\n`)
+    await store.pack('store-dep')
+    const webJs = await readFile(join(dir, '.plugin', 'store-dep', 'web.js'), 'utf8')
+    assert.match(webJs, /pong/)
+    assert.match(webJs, /globalThis\.React/)
+    assert.doesNotMatch(webJs, /from ['"]react['"]/)
+    assert.doesNotMatch(webJs, /from ['"]tiny-ping['"]/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('pack installs sandbox package.json deps without host node_modules', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-sandbox-npm-'))
+  try {
+    const ctx = new Context()
+    stubHub(ctx)
+    const store = new PluginStoreService(
+      ctx,
+      join(dir, '.plugin'),
+      join(dir, 'store.json'),
+      join(dir, '.plugin-dev'),
+    ).open()
+    await store.initSandbox({
+      id: 'store-file-dep',
+      name: 'File dep',
+      headless: true,
+    })
+    const sandbox = join(dir, '.plugin-dev', 'store-file-dep')
+    const vendor = join(sandbox, 'vendor', 'tiny-ping')
+    const { mkdir } = await import('node:fs/promises')
+    await mkdir(vendor, { recursive: true })
+    await writeFile(join(vendor, 'package.json'), JSON.stringify({ name: 'tiny-ping', type: 'module', main: 'index.js' }))
+    await writeFile(join(vendor, 'index.js'), `export const ping = 'from-sandbox'\n`)
+    await writeFile(
+      join(sandbox, 'package.json'),
+      `${JSON.stringify({ name: 'store-file-dep', private: true, dependencies: { 'tiny-ping': 'file:./vendor/tiny-ping' } }, null, 2)}\n`,
+    )
+    await mkdir(join(sandbox, 'web'), { recursive: true })
+    await writeFile(
+      join(sandbox, 'web/index.tsx'),
+      `import { ping } from 'tiny-ping'\nexport const name = 'store-file-dep'\nexport function apply() { return ping }\n`,
+    )
+    await store.pack('store-file-dep')
+    const webJs = await readFile(join(dir, '.plugin', 'store-file-dep', 'web.js'), 'utf8')
+    assert.match(webJs, /from-sandbox/)
+    assert.doesNotMatch(webJs, /from ['"]tiny-ping['"]/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('pack maps @biu/reui to globalThis.ReUI', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-reui-'))
+  try {
+    const ctx = new Context()
+    stubHub(ctx)
+    const store = new PluginStoreService(
+      ctx,
+      join(dir, '.plugin'),
+      join(dir, 'store.json'),
+      join(dir, '.plugin-dev'),
+    ).open()
+    await store.initSandbox({ id: 'store-reui', name: 'Reui', headless: true })
+    const sandbox = join(dir, '.plugin-dev', 'store-reui')
+    await mkdir(join(sandbox, 'web'), { recursive: true })
+    await writeFile(
+      join(sandbox, 'web/index.tsx'),
+      `import { Button, ReUI } from '@biu/reui'\nexport const name = 'store-reui'\nexport function apply() { return { Button, ReUI } }\n`,
+    )
+    await store.pack('store-reui')
+    const webJs = await readFile(join(dir, '.plugin', 'store-reui', 'web.js'), 'utf8')
+    assert.match(webJs, /globalThis\.ReUI/)
+    assert.doesNotMatch(webJs, /from"@biu\/reui"/)
+    assert.doesNotMatch(webJs, /\.rui-root\{/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('pack maps @biu/biu-ui to globalThis.BiuUi', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-biu-ui-'))
+  try {
+    const ctx = new Context()
+    stubHub(ctx)
+    const store = new PluginStoreService(
+      ctx,
+      join(dir, '.plugin'),
+      join(dir, 'store.json'),
+      join(dir, '.plugin-dev'),
+    ).open()
+    await store.initSandbox({ id: 'store-ui', name: 'Ui', headless: true })
+    const sandbox = join(dir, '.plugin-dev', 'store-ui')
+    await mkdir(join(sandbox, 'web'), { recursive: true })
+    await writeFile(
+      join(sandbox, 'web/index.tsx'),
+      `import { Calendar, ConfirmDialog, Image, TagChip } from '@biu/biu-ui'\nexport const name = 'store-ui'\nexport function apply() { return { Calendar, ConfirmDialog, Image, TagChip } }\n`,
+    )
+    await store.pack('store-ui')
+    const webJs = await readFile(join(dir, '.plugin', 'store-ui', 'web.js'), 'utf8')
+    assert.match(webJs, /globalThis\.BiuUi/)
+    assert.doesNotMatch(webJs, /from"@biu\/biu-ui"/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('pack rejects @biu imports', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-biu-'))
+  try {
+    const ctx = new Context()
+    stubHub(ctx)
+    const store = new PluginStoreService(
+      ctx,
+      join(dir, '.plugin'),
+      join(dir, 'store.json'),
+      join(dir, '.plugin-dev'),
+    ).open()
+    await store.initSandbox({ id: 'store-biu', name: 'Biu', headless: true })
+    const sandbox = join(dir, '.plugin-dev', 'store-biu')
+    await mkdir(join(sandbox, 'web'), { recursive: true })
+    await writeFile(
+      join(sandbox, 'web/index.tsx'),
+      `import { foo } from '@biu/web-slots'\nexport const name = 'store-biu'\nexport function apply() { return foo }\n`,
+    )
+    await assert.rejects(() => store.pack('store-biu'), /@biu\/web-slots/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('concurrent pack of every sandbox plugin finishes', async () => {
+  const root = resolve(import.meta.dirname, '../../../..')
+  const sandboxDir = join(root, '.plugin-dev')
+  const ids = (await readdir(sandboxDir)).filter((name) => existsSync(join(sandboxDir, name, 'manifest.json'))).sort()
+  assert.ok(ids.length >= 8)
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-pack-all-'))
+  const ctx = new Context()
+  stubHub(ctx)
+  const store = new PluginStoreService(ctx, join(dir, '.plugin'), join(dir, 'store.json'), sandboxDir).open()
+  try {
+    const results = await Promise.all(
+      ids.map(async (id) => {
+        try {
+          await store.pack(id)
+          return { id, ok: true as const }
+        } catch (error) {
+          return { id, ok: false as const, error: error instanceof Error ? error.message : String(error) }
+        }
+      }),
+    )
+    const failed = results.filter((item) => !item.ok)
+    assert.deepEqual(failed, [], failed.map((item) => `${item.id}: ${item.error}`).join('\n'))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+}, 300_000)
+
+test('plugin pack lock runs one bundle at a time', async () => {
+  let current = 0
+  let max = 0
+  await Promise.all(
+    [0, 1, 2, 3].map(() =>
+      withPluginPackLock(async () => {
+        current += 1
+        max = Math.max(max, current)
+        await new Promise((resolve) => setTimeout(resolve, 30))
+        current -= 1
+      }),
+    ),
   )
-  assert.match(code, /\bapply\b/)
-  assert.doesNotMatch(code, /ctx: \{/)
+  assert.equal(max, 1)
+  assert.equal(current, 0)
+})
+
+test('native esbuild starts its platform binary without a PATH node executable', () => {
+  execFileSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '--eval',
+      `import('esbuild').then(({ transform }) => transform('const n: number = 1', { loader: 'ts' }))`,
+    ],
+    {
+      cwd: resolve(import.meta.dirname, '../../../..'),
+      env: { ...process.env, PATH: '/path-without-node' },
+      stdio: 'pipe',
+    },
+  )
+})
+
+test('excalidraw board onChange does not setState', async () => {
+  const src = await readFile(resolve(import.meta.dirname, '../../../../.plugin-dev/page-excalidraw/web/index.tsx'), 'utf8')
+  const onChange = src.match(/const onChange = useCallback\([\s\S]*?\}, \[file\]\)/)?.[0]
+  assert.ok(onChange)
+  assert.doesNotMatch(onChange, /setScene/)
+  assert.match(onChange, /saveScene/)
+  assert.match(src, /function reloadHost/)
+  assert.match(src, /appliedEtag/)
+  assert.match(src, /function parkHost/)
+  assert.match(src, /parkHost\(host\)/)
+  assert.match(src, /data-page-block-expand/)
+  assert.match(src, /host\.expanded = false/)
+  assert.match(src, /export const inject/)
+  assert.match(src, /View: Board/)
 })

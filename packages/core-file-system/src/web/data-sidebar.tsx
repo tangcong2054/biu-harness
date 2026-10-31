@@ -1,19 +1,24 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import { lazy, memo, Suspense, useEffect, useLayoutEffect, useMemo, useState, useSyncExternalStore, type MouseEvent } from 'react'
 import { createPortal } from 'react-dom'
-import { ChatCount, RecordEmojiBoard, SidebarFold } from '@biu/public-ui'
+import { ChatCount } from '@biu/biu-ui/chat-count'
+import { SidebarFold } from '@biu/biu-ui/sidebar-fold'
 import {
   ChevronDoubleLeftIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   PencilSquareIcon,
   PlusIcon,
-  Square2StackIcon,
+  RectangleStackIcon,
   StarIcon,
 } from '@heroicons/react/16/solid'
 import { TrashGlyph } from '@biu/web-session-view/trash-glyph'
-import type { CollectionInfo, DbRecord } from '@biu/type-file-system'
-import { builtinAllViewId, mergeCatalogViews, mergeTableViews } from '../catalog-views.ts'
-import { VIEWS_COLLECTION_PATH, isSystemCollection, sortDataCollections } from './database-path.ts'
+import type { CollectionInfo, CollectionSchema, DbRecord } from '@biu/type-file-system'
+import { groupField, groupRecords, parentFieldKey, treeChildren } from './fields.ts'
+import { builtinAllViewId, type DataScope } from '../catalog-views.ts'
+import { isIndexCollection, isRecordTreeCollection, isSystemCollection, sortDataCollections } from './database-path.ts'
+import { rememberInspectorWorkingView } from './inspector-db-route.ts'
+import { readJson } from './db-client.ts'
+import { paintCollectionViews } from './collection-nav.ts'
 import type { SavedView } from './saved-view.ts'
 import {
   fetchViewPreview,
@@ -21,36 +26,80 @@ import {
   getPreviewTotal,
   getPreviewTotalsVersion,
   nextPreviewLimit,
+  orderViewTotalJobs,
   previewCacheKey,
+  shouldFetchViewPreview,
+  shouldFetchViewTotal,
+  whenListIdle,
   recordPreviewEmoji,
   recordPreviewLabel,
   rememberPreviewTotal,
   SIDEBAR_PREVIEW_MAX,
   subscribePreviewTotals,
+  VIEW_TOTAL_IDLE_MS,
   viewTotalKey,
   writeRecordEmoji,
 } from './sidebar-preview.ts'
 import {
   activeViewStorageKey,
+  getStarredRecords,
+  getStarredRecordsVersion,
   getStarredViews,
   getStarredViewsVersion,
+  isRecordStarred,
   isViewStarred,
-  loadViews,
+  getCrumbsVersion,
+  loadRecords,
+  peekRecord,
+  subscribeCrumbs,
+  persistStarredRecords,
   persistStarredViews,
+  rememberRecords,
+  starredRecordEmoji,
+  starredRecordLabel,
+  subscribeStarredRecords,
   subscribeStarredViews,
+  toggleStarredRecord,
   toggleStarredView,
-  withViewDisplay,
 } from './view-storage.ts'
 import { pickDomAttrs, recordPickKind, viewPickId } from './pick-dom.ts'
 import { toggleExpandedViewKey } from './sidebar-nav.ts'
 import { TableGlyph, ViewModeGlyph } from './nav-glyphs.tsx'
+import { getDatabaseUi } from './database-ui.ts'
+import { RecordMark, recordMarkStub } from './record-mark.tsx'
+import { SidebarBrandLockup } from '@biu/public-mascot'
 
-const SIDEBAR_BRAND_GRADIENT =
-  'linear-gradient(105deg, color-mix(in srgb, #0066B0 42%, var(--dsw-hover)), color-mix(in srgb, #5B3E90 40%, var(--dsw-hover)) 52%, color-mix(in srgb, #E22726 42%, var(--dsw-hover)))'
+const RecordEmojiBoard = lazy(() => import('@biu/biu-ui/emoji-board').then((m) => ({ default: m.RecordEmojiBoard })))
 
-type PreviewState = { items: DbRecord[]; total: number; loading: boolean; error: string }
+type PreviewState = {
+  items: DbRecord[]
+  total: number
+  schema?: CollectionSchema
+  loading: boolean
+  error: string
+}
 
-const previewCache = new Map<string, { items: DbRecord[]; total: number }>()
+type PreviewCache = { items: DbRecord[]; total: number; schema?: CollectionSchema }
+
+const previewCache = new Map<string, PreviewCache>()
+
+function crumbsToPreviewItems(path: string, viewId: string): DbRecord[] {
+  return loadRecords(path, viewId).map((row) => ({
+    id: row.id,
+    title: row.label,
+    emoji: row.emoji ?? '',
+    ...(row.mascot != null ? { mascot: row.mascot } : {}),
+  }))
+}
+
+function cachedDirectKidCount(path: string, recordId: string) {
+  for (const [key, cache] of previewCache) {
+    if (!key.startsWith(`${path}\0`)) continue
+    const parentKey = parentFieldKey(cache.schema, cache.items) ?? 'parentId'
+    return treeChildren(cache.items, parentKey, recordId).length
+  }
+  return 0
+}
 
 function ViewRecordPreview({
   path,
@@ -58,6 +107,8 @@ function ViewRecordPreview({
   open,
   recordKind,
   tableIcon,
+  rootId,
+  skipFetch,
   onOpenRecord,
 }: {
   path: string
@@ -65,45 +116,80 @@ function ViewRecordPreview({
   open: boolean
   recordKind: string
   tableIcon?: string
+  rootId?: string
+  skipFetch?: boolean
   onOpenRecord?: (recordId: string, row?: DbRecord) => void
 }) {
   const key = previewCacheKey(path, view)
   const cached = previewCache.get(key)
-  const [state, setState] = useState<PreviewState>(() => ({
-    items: cached?.items ?? [],
-    total: cached?.total ?? 0,
-    loading: !cached,
-    error: '',
-  }))
+  const seedKey = skipFetch ? loadRecords(path, view.id).map((row) => row.id).join('\n') : ''
+  const [state, setState] = useState<PreviewState>(() => {
+    if (cached) {
+      return { items: cached.items, total: cached.total, schema: cached.schema, loading: false, error: '' }
+    }
+    if (skipFetch) {
+      const items = crumbsToPreviewItems(path, view.id)
+      return {
+        items,
+        total: getPreviewTotal(key) ?? items.length,
+        loading: false,
+        error: '',
+      }
+    }
+    return { items: [], total: 0, loading: true, error: '' }
+  })
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({})
+  const [openKids, setOpenKids] = useState<Record<string, boolean>>({})
   const [pickerId, setPickerId] = useState<string | null>(null)
   const [pickerAnchor, setPickerAnchor] = useState<HTMLElement | null>(null)
-  const [emojiDraft, setEmojiDraft] = useState('')
+  const chromeIcon = getDatabaseUi()?.chrome(path).Icon
+  const nested = isRecordTreeCollection(path)
+  const totalsVersion = useSyncExternalStore(subscribePreviewTotals, getPreviewTotalsVersion, () => 0)
+  const crumbsVersion = useSyncExternalStore(subscribeCrumbs, getCrumbsVersion, () => 0)
+  const crumbTick = skipFetch ? crumbsVersion : 0
+  useSyncExternalStore(subscribeStarredRecords, getStarredRecordsVersion, () => 0)
+  const starredRecords = getStarredRecords()
 
   useEffect(() => {
     if (!open) return
+    if (skipFetch) {
+      const items = crumbsToPreviewItems(path, view.id)
+      setState({
+        items,
+        total: getPreviewTotal(key) ?? items.length,
+        schema: previewCache.get(key)?.schema,
+        loading: false,
+        error: '',
+      })
+      return
+    }
     const hit = previewCache.get(key)
     if (hit) {
-      setState({ items: hit.items, total: hit.total, loading: false, error: '' })
+      setState({ items: hit.items, total: hit.total, schema: hit.schema, loading: false, error: '' })
       return
     }
     let cancelled = false
     setState((prev) => ({ ...prev, loading: true, error: '' }))
-    void fetchViewPreview(path, view, 0).then(
-      (page) => {
-        if (cancelled) return
-        previewCache.set(key, { items: page.items, total: page.total })
-        rememberPreviewTotal(key, page.total)
-        setState({ items: page.items, total: page.total, loading: false, error: '' })
-      },
-      (err: unknown) => {
-        if (cancelled) return
-        setState((prev) => ({ ...prev, loading: false, error: String(err) }))
-      },
-    )
+    const stop = whenListIdle(() => {
+      if (cancelled) return
+      void fetchViewPreview(path, view, 0).then(
+        (page) => {
+          if (cancelled) return
+          previewCache.set(key, { items: page.items, total: page.total, schema: page.schema })
+          rememberPreviewTotal(key, page.total)
+          setState({ items: page.items, total: page.total, schema: page.schema, loading: false, error: '' })
+        },
+        (err: unknown) => {
+          if (cancelled) return
+          setState((prev) => ({ ...prev, loading: false, error: String(err) }))
+        },
+      )
+    })
     return () => {
       cancelled = true
+      stop()
     }
-  }, [key, open, path, view.query, view.sortField, view.sortDir, view.filters])
+  }, [crumbTick, key, open, path, seedKey, skipFetch, totalsVersion, view.id, view.query, view.sortField, view.sortDir, view.filters, view.groupBy])
 
   async function loadMore() {
     const more = nextPreviewLimit(state.items.length, state.total)
@@ -113,9 +199,10 @@ function ViewRecordPreview({
       const page = await fetchViewPreview(path, view, state.items.length, more)
       const items = [...state.items, ...page.items]
       const total = page.total
-      previewCache.set(key, { items, total })
+      const schema = page.schema ?? state.schema
+      previewCache.set(key, { items, total, schema })
       rememberPreviewTotal(key, total)
-      setState({ items, total, loading: false, error: '' })
+      setState({ items, total, schema, loading: false, error: '' })
     } catch (err) {
       setState((prev) => ({ ...prev, loading: false, error: String(err) }))
     }
@@ -125,7 +212,7 @@ function ViewRecordPreview({
     try {
       const emoji = await writeRecordEmoji(path, row.id, next)
       const items = state.items.map((item) => (item.id === row.id ? { ...item, emoji } : item))
-      previewCache.set(key, { items, total: state.total })
+      previewCache.set(key, { items, total: state.total, schema: state.schema })
       setState((prev) => ({ ...prev, items }))
       setPickerId(null)
       setPickerAnchor(null)
@@ -137,82 +224,272 @@ function ViewRecordPreview({
 
   const remaining = Math.max(0, state.total - state.items.length)
   const capped = state.items.length >= SIDEBAR_PREVIEW_MAX && remaining > 0
-  return (
-    <div className="fsdb-view-preview" role="list">
-      {state.items.map((row) => {
-        const emoji = recordPreviewEmoji(row)
+  const grouping = Boolean(groupField(state.schema, view.groupBy))
+  const buckets = useMemo(() => {
+    if (!grouping) return null
+    return groupRecords(state.items, state.schema, view.groupBy).filter((bucket) => bucket.rows.length)
+  }, [grouping, state.items, state.schema, view.groupBy])
+  const parentKey = nested ? parentFieldKey(state.schema, state.items) ?? 'parentId' : null
+
+  function toggleKid(id: string) {
+    setOpenKids((prev) => ({ ...prev, [id]: !prev[id] }))
+  }
+
+  function toggleRecordStar(row: DbRecord) {
+    const label = recordPreviewLabel(row)
+    const emoji = recordPreviewEmoji(row)
+    rememberRecords(path, [{ id: row.id, label, emoji }])
+    persistStarredRecords(toggleStarredRecord(getStarredRecords(), path, row.id, { label, emoji }))
+  }
+
+  async function createChild(row: DbRecord) {
+    if (!parentKey) return
+    try {
+      const data = await readJson<{ items?: Array<{ value?: DbRecord }> }>('/api/db/create', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path, records: [{ [parentKey]: row.id }] }),
+      })
+      const created = data.items?.[0]?.value
+      const items = created ? [...state.items, created] : state.items
+      const total = state.total + (created ? 1 : 0)
+      previewCache.set(key, { items, total, schema: state.schema })
+      rememberPreviewTotal(key, total)
+      setState((prev) => ({ ...prev, items, total }))
+      setOpenKids((prev) => ({ ...prev, [row.id]: true }))
+      window.dispatchEvent(new Event('fsdb:change'))
+      if (created?.id) onOpenRecord?.(created.id, created)
+    } catch (err) {
+      setState((prev) => ({ ...prev, error: String(err) }))
+    }
+  }
+
+  function recordFace(row: DbRecord) {
+    const emoji = recordPreviewEmoji(row)
+    return emoji ? <span className="fsdb-record-emoji">{emoji}</span> : <RecordMark record={row} tableIcon={tableIcon} Icon={chromeIcon} />
+  }
+
+  function emojiBoard(row: DbRecord) {
+    if (pickerId !== row.id || !pickerAnchor) return null
+    return (
+      <Suspense fallback={null}>
+        <RecordEmojiBoard
+          anchor={pickerAnchor}
+          onPick={(next) => void saveEmoji(row, next)}
+          onClear={() => void saveEmoji(row, '')}
+          onClose={() => {
+            setPickerId(null)
+            setPickerAnchor(null)
+          }}
+        />
+      </Suspense>
+    )
+  }
+
+  function openEmojiPicker(event: MouseEvent<HTMLElement>, row: DbRecord) {
+    event.preventDefault()
+    event.stopPropagation()
+    const btn = event.currentTarget
+    setPickerId((prev) => {
+      if (prev === row.id) {
+        setPickerAnchor(null)
+        return null
+      }
+      setPickerAnchor(btn)
+      return row.id
+    })
+  }
+
+  function renderRecords(scope: DbRecord[], parentId = '', trail: ReadonlySet<string> = new Set()) {
+    const rows = parentKey ? treeChildren(scope, parentKey, parentId) : parentId ? [] : scope
+    return rows.map((row) => {
+      if (trail.has(row.id)) return null
+      const nextTrail = new Set(trail)
+      nextTrail.add(row.id)
+      const label = recordPreviewLabel(row)
+      const kids = parentKey ? treeChildren(scope, parentKey, row.id) : []
+      const kidCount = kids.length
+      const expanded = Boolean(openKids[row.id])
+      const starred = isRecordStarred(starredRecords, path, row.id)
+      if (!nested) {
         return (
           <div
             key={row.id}
             className="chat-session-row"
             role="listitem"
-            {...pickDomAttrs(recordKind, row.id, recordPreviewLabel(row))}
+            {...pickDomAttrs(recordKind, row.id, label)}
           >
             <div className="chat-session-row-main flex min-w-0 flex-1 items-center gap-1.5 py-1 text-left text-[14px] leading-5">
               <span className="fsdb-record-icon relative grid size-6 shrink-0 place-items-center">
                 <button
                   type="button"
                   className="grid size-6 place-items-center border-0 bg-transparent p-0 text-[16px] leading-none text-inherit"
-                  title={emoji ? '更换图标' : '设置图标'}
-                  aria-label={emoji ? `更换 ${recordPreviewLabel(row)} 的图标` : `设置 ${recordPreviewLabel(row)} 的图标`}
-                  onClick={(event) => {
-                    event.stopPropagation()
-                    const btn = event.currentTarget
-                    setPickerId((prev) => {
-                      if (prev === row.id) {
-                        setPickerAnchor(null)
-                        return null
-                      }
-                      setPickerAnchor(btn)
-                      return row.id
-                    })
-                    setEmojiDraft(emoji)
-                  }}
+                  title={recordPreviewEmoji(row) ? '更换图标' : '设置图标'}
+                  aria-label={recordPreviewEmoji(row) ? `更换 ${label} 的图标` : `设置 ${label} 的图标`}
+                  onClick={(event) => openEmojiPicker(event, row)}
                 >
-                  {emoji ? <span className="fsdb-record-emoji">{emoji}</span> : <TableGlyph icon={tableIcon} />}
+                  {recordFace(row)}
                 </button>
-                {pickerId === row.id && pickerAnchor ? (
-                  <RecordEmojiBoard
-                    anchor={pickerAnchor}
-                    draft={emojiDraft}
-                    onDraft={setEmojiDraft}
-                    onPick={(next) => void saveEmoji(row, next)}
-                    onClear={() => void saveEmoji(row, '')}
-                    onClose={() => {
-                      setPickerId(null)
-                      setPickerAnchor(null)
-                    }}
-                  />
-                ) : null}
+                {emojiBoard(row)}
               </span>
               <button
                 type="button"
                 className="min-w-0 flex-1 truncate border-0 bg-transparent p-0 text-left font-medium text-inherit"
-                title={recordPreviewLabel(row)}
+                title={label}
                 onClick={(event) => {
                   event.stopPropagation()
                   onOpenRecord?.(row.id, row)
                 }}
               >
-                {recordPreviewLabel(row)}
+                {label}
               </button>
             </div>
           </div>
         )
-      })}
+      }
+      return (
+        <div key={row.id} className="min-w-0" role="listitem">
+          <div
+            className={`chat-session-row group${starred ? ' is-pinned' : ''}`}
+            {...pickDomAttrs(recordKind, row.id, label)}
+          >
+            <div className="chat-session-row-main flex min-w-0 flex-1 items-center gap-1.5 py-1 text-left text-[14px] leading-5">
+              <button
+                type="button"
+                className="relative grid size-6 shrink-0 place-items-center border-0 bg-transparent p-0 text-inherit"
+                title={expanded ? '收起子记录' : '展开子记录'}
+                aria-expanded={expanded}
+                onClick={() => toggleKid(row.id)}
+                onContextMenu={(event) => openEmojiPicker(event, row)}
+              >
+                <span className="sidebar-rail-icon sidebar-group-fold">
+                  <span className="sidebar-group-fold-face">{recordFace(row)}</span>
+                  <span className="sidebar-group-fold-chevron">
+                    {expanded ? (
+                      <ChevronDownIcon className="size-4 shrink-0 opacity-80" />
+                    ) : (
+                      <ChevronRightIcon className="size-4 shrink-0 opacity-80" />
+                    )}
+                  </span>
+                </span>
+                {emojiBoard(row)}
+              </button>
+              <button
+                type="button"
+                className="min-w-0 flex-1 truncate border-0 bg-transparent p-0 text-left font-medium text-inherit"
+                title={label}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onOpenRecord?.(row.id, row)
+                }}
+              >
+                {label}
+              </button>
+            </div>
+            <ChatCount count={kidCount} title={`${kidCount} 个子记录`} />
+            <button
+              type="button"
+              className="sidebar-add"
+              title={`在 ${label} 下添加子记录`}
+              aria-label={`在 ${label} 下添加子记录`}
+              onClick={(event) => {
+                event.stopPropagation()
+                void createChild(row)
+              }}
+            >
+              <PlusIcon className="size-4 shrink-0" />
+            </button>
+            <button
+              type="button"
+              className={`chat-session-row-star${starred ? ' is-on' : ''}`}
+              aria-pressed={starred}
+              aria-label={starred ? `取消收藏 ${label}` : `收藏 ${label}`}
+              title={starred ? '取消收藏' : '收藏'}
+              onClick={(event) => {
+                event.stopPropagation()
+                toggleRecordStar(row)
+              }}
+            >
+              <StarIcon className="size-4 shrink-0" />
+            </button>
+          </div>
+          <SidebarFold open={expanded}>
+            <div className="fsdb-record-kids">{renderRecords(scope, row.id, nextTrail)}</div>
+          </SidebarFold>
+        </div>
+      )
+    })
+  }
+
+  const treeRoot = rootId || ''
+  const listed = treeRoot
+    ? renderRecords(state.items, treeRoot)
+    : buckets?.length
+      ? null
+      : renderRecords(state.items)
+
+  return (
+    <div className="fsdb-view-preview" role="list">
+      {listed}
+      {!treeRoot && buckets?.length ? (
+        buckets.map((bucket, index) => {
+          const groupKey = bucket.key || 'unset'
+          const expanded = openGroups[groupKey] ?? index === 0
+          return (
+            <div key={groupKey} className="min-w-0" data-testid="sidebar-view-group">
+              <div className="chat-session-row fsdb-view-preview-group">
+                <div className="chat-session-row-main flex min-w-0 flex-1 items-center gap-1.5 py-1 text-left text-[14px] leading-5">
+                  <button
+                    type="button"
+                    className="grid size-6 shrink-0 place-items-center border-0 bg-transparent p-0 text-inherit"
+                    title={expanded ? '收起分组' : '展开分组'}
+                    aria-expanded={expanded}
+                    onClick={() => setOpenGroups((prev) => ({ ...prev, [groupKey]: !expanded }))}
+                  >
+                    <span className="sidebar-rail-icon sidebar-group-fold">
+                      <span className="sidebar-group-fold-face">
+                        <RectangleStackIcon aria-hidden className="size-[14px] shrink-0" />
+                      </span>
+                      <span className="sidebar-group-fold-chevron">
+                        {expanded ? (
+                          <ChevronDownIcon className="size-4 shrink-0 opacity-80" />
+                        ) : (
+                          <ChevronRightIcon className="size-4 shrink-0 opacity-80" />
+                        )}
+                      </span>
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 truncate border-0 bg-transparent p-0 text-left font-medium text-inherit"
+                    title={bucket.label}
+                    onClick={() => setOpenGroups((prev) => ({ ...prev, [groupKey]: !expanded }))}
+                  >
+                    {bucket.label}
+                  </button>
+                </div>
+                <ChatCount count={bucket.rows.length} />
+              </div>
+              <SidebarFold open={expanded}>
+                <div className="fsdb-view-preview-records">{renderRecords(bucket.rows)}</div>
+              </SidebarFold>
+            </div>
+          )
+        })
+      ) : null}
       {state.loading && !state.items.length ? (
         <div className="fsdb-view-preview-hint">加载中…</div>
       ) : null}
       {state.error ? <div className="fsdb-view-preview-hint">{state.error}</div> : null}
-      {!state.loading && !state.error && !state.items.length ? (
+      {!treeRoot && !state.loading && !state.error && !state.items.length ? (
         <div className="fsdb-view-preview-hint">没有数据</div>
       ) : null}
-      {remaining > 0 && !capped ? (
+      {!treeRoot && remaining > 0 && !capped ? (
         <button type="button" className="fsdb-view-preview-more" disabled={state.loading} onClick={() => void loadMore()}>
           {state.loading ? '加载中…' : `还有 ${remaining} 条 · 加载更多`}
         </button>
       ) : null}
-      {capped ? <div className="fsdb-view-preview-hint">侧栏最多预览 {SIDEBAR_PREVIEW_MAX} 条，完整数据在主区</div> : null}
+      {!treeRoot && capped ? <div className="fsdb-view-preview-hint">侧栏最多预览 {SIDEBAR_PREVIEW_MAX} 条，完整数据在主区</div> : null}
     </div>
   )
 }
@@ -232,7 +509,6 @@ export const DataSidebar = memo(function DataSidebar({
   onRenameView,
   onDeleteView,
   onAddView,
-  onCopyView,
   onOpenRecord,
   expandedViewKey: expandedViewKeyProp,
   onExpandedViewKeyChange,
@@ -247,8 +523,7 @@ export const DataSidebar = memo(function DataSidebar({
   onApplyView: (view: SavedView) => void
   onRenameView: (view: SavedView) => void
   onDeleteView: (view: SavedView) => void
-  onAddView: (path?: string) => void
-  onCopyView: () => void
+  onAddView: (path?: string, scope?: DataScope) => void
   onOpenRecord?: (path: string, view: SavedView, recordId: string, row?: DbRecord) => void
   expandedViewKey?: string | null
   onExpandedViewKeyChange?: (key: string | null) => void
@@ -256,13 +531,20 @@ export const DataSidebar = memo(function DataSidebar({
 }) {
   const listedTables = useMemo(() => {
     const raw = tables.length ? tables : ([{ path: collectionPath, label: title, view: { title } }] as CollectionInfo[])
-    const { user, system } = sortDataCollections(raw)
-    return [...user, ...system]
+    const { user, index, system } = sortDataCollections(raw)
+    return [...user, ...index, ...system]
   }, [collectionPath, tables, title])
-  const { user: userTables, system: systemTables } = useMemo(() => sortDataCollections(listedTables), [listedTables])
-  const [openTables, setOpenTables] = useState<Record<string, boolean>>(() => ({ [collectionPath]: true }))
+  const { user: userTables, index: indexTables, system: systemTables } = useMemo(() => sortDataCollections(listedTables), [listedTables])
+  const [openTables, setOpenTables] = useState<Record<string, boolean>>(() => {
+    const group = isIndexCollection(collectionPath) ? 'index' : isSystemCollection(collectionPath) ? 'system' : 'user'
+    return {
+      [`${group}:${collectionPath}`]: true,
+    }
+  })
   useSyncExternalStore(subscribeStarredViews, getStarredViewsVersion, () => 0)
+  useSyncExternalStore(subscribeStarredRecords, getStarredRecordsVersion, () => 0)
   const starredViews = getStarredViews()
+  const starredRecords = getStarredRecords()
   const [favOpen, setFavOpen] = useState(() => {
     try {
       return localStorage.getItem('fsdb.favOpen') !== '0'
@@ -271,17 +553,23 @@ export const DataSidebar = memo(function DataSidebar({
     }
   })
   const [userOpen, setUserOpen] = useState(true)
-  const [systemOpen, setSystemOpen] = useState(true)
+  const [indexOpen, setIndexOpen] = useState(true)
+  const [systemOpen, setSystemOpen] = useState(false)
   const [expandedViewKeyLocal, setExpandedViewKeyLocal] = useState<string | null>(null)
   const expandedViewKey = expandedViewKeyProp !== undefined ? expandedViewKeyProp : expandedViewKeyLocal
   const setExpandedViewKey = onExpandedViewKeyChange ?? setExpandedViewKeyLocal
-  usePreviewTotalsVersion()
+  const totalsVersion = usePreviewTotalsVersion()
+  useEffect(() => {
+    const onChange = (event: Event) => {
+      if ((event as CustomEvent<{ views?: boolean }>).detail?.views) return
+      previewCache.clear()
+    }
+    window.addEventListener('fsdb:change', onChange)
+    return () => window.removeEventListener('fsdb:change', onChange)
+  }, [])
 
   function viewsFor(path: string) {
-    const listed = path === collectionPath ? views : loadViews(path)
-    if (path === VIEWS_COLLECTION_PATH) return mergeCatalogViews(tables, listed).map((view) => withViewDisplay(path, view))
-    const table = listedTables.find((row) => row.path === path) ?? { path, label: path.replace(/^\//, '') }
-    return mergeTableViews(table, listed).map((view) => withViewDisplay(path, view))
+    return paintCollectionViews(path, tables)
   }
 
   const starredRows = starredViews.flatMap((item) => {
@@ -290,43 +578,161 @@ export const DataSidebar = memo(function DataSidebar({
     if (!table || !view) return []
     return [{ table, view }]
   })
+  const starredRecordRows = starredRecords.flatMap((item) => {
+    const table = listedTables.find((row) => row.path === item.path)
+    if (!table) return []
+    return [{ table, item }]
+  })
+  const favCount = starredRows.length + starredRecordRows.length
 
   const countJobs = useMemo(() => {
     const jobs: Array<{ path: string; view: SavedView }> = []
+    const take = (path: string, view: SavedView) => {
+      if (
+        shouldFetchViewTotal({
+          path,
+          view,
+          collectionPath,
+          activeViewId,
+        })
+      ) {
+        jobs.push({ path, view })
+      }
+    }
     if (favOpen) {
-      for (const { table, view } of starredRows) jobs.push({ path: table.path, view })
+      for (const { table, view } of starredRows) take(table.path, view)
     }
     if (userOpen) {
       for (const table of userTables) {
-        if (openTables[table.path]) {
-          for (const view of viewsFor(table.path)) jobs.push({ path: table.path, view })
+        if (openTables[`user:${table.path}`]) {
+          for (const view of viewsFor(table.path)) take(table.path, view)
+        }
+      }
+    }
+    if (indexOpen) {
+      for (const table of indexTables) {
+        if (openTables[`index:${table.path}`]) {
+          for (const view of viewsFor(table.path)) take(table.path, view)
         }
       }
     }
     if (systemOpen) {
       for (const table of systemTables) {
-        if (openTables[table.path]) {
-          for (const view of viewsFor(table.path)) jobs.push({ path: table.path, view })
+        if (openTables[`system:${table.path}`]) {
+          for (const view of viewsFor(table.path)) take(table.path, view)
         }
       }
     }
     return jobs
-  }, [userOpen, systemOpen, favOpen, userTables, systemTables, listedTables, openTables, starredRows, tables, views, collectionPath])
+  }, [userOpen, indexOpen, systemOpen, favOpen, userTables, indexTables, systemTables, listedTables, openTables, starredRows, tables, views, collectionPath, activeViewId])
 
   const countJobKey = countJobs.map((job) => viewTotalKey(job.path, job.view)).join('|')
   useEffect(() => {
     let cancelled = false
-    void Promise.all(
-      countJobs.map((job) =>
-        fetchViewTotal(job.path, job.view).catch(() => {
+    const missing = countJobs.some((job) => getPreviewTotal(viewTotalKey(job.path, job.view)) == null)
+    const stop = whenListIdle(() => {
+      if (cancelled) return
+      const jobs = orderViewTotalJobs(countJobs, collectionPath)
+      const urgent = jobs.filter((job) => job.path === collectionPath)
+      const rest = jobs.filter((job) => job.path !== collectionPath)
+      void (async () => {
+        await Promise.all(
+          urgent.map((job) => {
+            if (getPreviewTotal(viewTotalKey(job.path, job.view)) != null) return Promise.resolve()
+            return fetchViewTotal(job.path, job.view).catch(() => {
+              if (cancelled) return
+            })
+          }),
+        )
+        for (const job of rest) {
           if (cancelled) return
-        }),
-      ),
-    )
+          if (getPreviewTotal(viewTotalKey(job.path, job.view)) != null) continue
+          await new Promise<void>((resolve) => {
+            const ric = window.requestIdleCallback
+            if (typeof ric === 'function') ric(() => resolve(), { timeout: 200 })
+            else window.setTimeout(() => resolve(), 0)
+          })
+          if (cancelled) return
+          await fetchViewTotal(job.path, job.view).catch(() => {
+            if (cancelled) return
+          })
+        }
+      })()
+    }, missing ? 0 : VIEW_TOTAL_IDLE_MS)
     return () => {
       cancelled = true
+      stop()
     }
-  }, [countJobKey, countJobs])
+  }, [collectionPath, countJobKey, countJobs, totalsVersion])
+
+  useEffect(() => {
+    let cancelled = false
+    const stop = whenListIdle(() => {
+      if (cancelled) return
+      void Promise.all(
+        starredRecords.map(async (item) => {
+          if (item.label || peekRecord(item.path, item.recordId)?.label) {
+            if (item.label) rememberRecords(item.path, [{ id: item.recordId, label: item.label, emoji: item.emoji }])
+            return
+          }
+          try {
+            const data = await readJson<{ value?: DbRecord }>(`/api/db/read?path=${encodeURIComponent(`${item.path}/${item.recordId}`)}`)
+            const row = data.value
+            if (cancelled || !row?.id) return
+            const label = recordPreviewLabel(row)
+            const emoji = recordPreviewEmoji(row)
+            rememberRecords(item.path, [{ id: row.id, label, emoji, mascot: row.mascot }])
+            persistStarredRecords(
+              getStarredRecords().map((entry) =>
+                entry.path === item.path && entry.recordId === item.recordId ? { ...entry, label, emoji } : entry,
+              ),
+            )
+          } catch {
+            /* ignore */
+          }
+        }),
+      )
+    })
+    return () => {
+      cancelled = true
+      stop()
+    }
+  }, [starredRecords])
+
+  const starredTreePreviewKey = starredRecordRows
+    .filter(({ table }) => isRecordTreeCollection(table.path))
+    .map(({ table }) => table.path)
+    .sort()
+    .join('|')
+
+  useEffect(() => {
+    if (!favOpen || !starredTreePreviewKey) return
+    let cancelled = false
+    const paths = starredTreePreviewKey.split('|')
+    const stop = whenListIdle(() => {
+      if (cancelled) return
+      void Promise.all(
+        paths.map((path) => {
+          const view = viewsFor(path).find((row) => row.id === builtinAllViewId(path)) ?? viewsFor(path)[0]
+          if (!view) return Promise.resolve()
+          const key = previewCacheKey(path, view)
+          if (previewCache.get(key)?.items.length) return Promise.resolve()
+          return fetchViewPreview(path, view, 0).then(
+            (page) => {
+              if (cancelled) return
+              previewCache.set(key, { items: page.items, total: page.total, schema: page.schema })
+              rememberPreviewTotal(key, page.total)
+            },
+            () => undefined,
+          )
+        }),
+      )
+    })
+    return () => {
+      cancelled = true
+      stop()
+    }
+  }, [favOpen, starredTreePreviewKey, tables, views, collectionPath])
 
   function toggleStar(path: string, viewId: string) {
     persistStarredViews(toggleStarredView(getStarredViews(), path, viewId))
@@ -338,6 +744,7 @@ export const DataSidebar = memo(function DataSidebar({
     } catch {
       /* ignore */
     }
+    rememberInspectorWorkingView(path, viewId)
     onOpenTable?.(path, viewId)
   }
 
@@ -351,27 +758,28 @@ export const DataSidebar = memo(function DataSidebar({
     onOpenRecord?.(path, view, recordId, row)
   }
 
-  function renderTableRows(rows: CollectionInfo[]) {
+  function renderTableRows(rows: CollectionInfo[], group: 'user' | 'index' | 'system' = 'system') {
     return rows.map((table) => {
       const name = table.view?.title ?? table.label
-      const open = openTables[table.path] ?? false
+      const tableStateKey = `${group}:${table.path}`
+      const open = openTables[tableStateKey] ?? false
       const listed = viewsFor(table.path)
       const system = isSystemCollection(table.path)
       return (
-        <div key={table.path} className="min-w-0" data-collection-kind={system ? 'system' : 'user'}>
-          <div className="sidebar-group-head mb-0.5">
+        <div key={`${group}:${table.path}`} className="flex min-w-0 flex-col gap-px" data-collection-kind={group}>
+          <div className="sidebar-group-head">
             <div
               className="flex min-h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md text-left text-[14px] font-medium tracking-normal text-inherit"
               title={name}
               aria-expanded={open}
-              {...pickDomAttrs('collection', table.path, name)}
+              {...pickDomAttrs('collection', table.path, name, { path: table.path })}
             >
               <button
                 type="button"
                 className="grid size-6 shrink-0 place-items-center border-0 bg-transparent p-0 text-inherit"
                 title={open ? '收起视图' : '展开视图'}
                 aria-label={open ? '收起视图' : '展开视图'}
-                onClick={() => setOpenTables((prev) => ({ ...prev, [table.path]: !open }))}
+                onClick={() => setOpenTables((prev) => ({ ...prev, [tableStateKey]: !open }))}
               >
                 <span className="sidebar-rail-icon sidebar-group-fold" aria-hidden>
                   <span className="sidebar-group-fold-face">
@@ -388,11 +796,16 @@ export const DataSidebar = memo(function DataSidebar({
               </button>
               <button
                 type="button"
-                className="min-w-0 flex-1 truncate border-0 bg-transparent p-0 text-left font-medium text-inherit outline-none hover:text-(--dsw-sidebar-fg-active) focus-visible:ring-1 focus-visible:ring-(--dsw-border)"
-                onClick={() => onOpenTable?.(table.path, builtinAllViewId(table.path))}
+                className="min-w-0 flex-1 truncate border-0 bg-transparent p-0 text-left font-medium text-inherit outline-none hover:text-(--biu-color-text) focus-visible:ring-1 focus-visible:ring-(--biu-color-border)"
+                onClick={() => onOpenTable?.(
+                  table.path,
+                  builtinAllViewId(table.path),
+                )}
               >
                 {name}
               </button>
+            </div>
+              <ChatCount count={listed.length} />
               <button
                 type="button"
                 className="sidebar-add"
@@ -401,26 +814,24 @@ export const DataSidebar = memo(function DataSidebar({
                 data-testid={`sidebar-add-view-${table.path}`}
                 onClick={(event) => {
                   event.stopPropagation()
-                  setOpenTables((prev) => ({ ...prev, [table.path]: true }))
+                  setOpenTables((prev) => ({ ...prev, [tableStateKey]: true }))
                   onAddView(table.path)
                 }}
               >
                 <PlusIcon className="size-4 shrink-0" />
               </button>
-            </div>
-            <ChatCount count={listed.length} />
           </div>
           <SidebarFold open={open} className="sidebar-session-list min-w-0">
             {listed.map((view) => {
               const starred = isViewStarred(starredViews, table.path, view.id)
               const active = table.path === collectionPath && view.id === activeViewId
-              const previewKey = `${table.path}:${view.id}`
+              const previewKey = `${group}:${table.path}:${view.id}`
               const expanded = expandedViewKey === previewKey
               return (
                 <div key={view.id} className="min-w-0">
                   <div
                     className={`chat-session-row group${active ? ' is-active' : ''}${starred ? ' is-pinned' : ''}`}
-                    {...pickDomAttrs('view', viewPickId(table.path, view.id), view.name)}
+                    {...pickDomAttrs('view', viewPickId(table.path, view.id), view.name, { path: table.path })}
                   >
                     <div className="chat-session-row-main flex min-w-0 flex-1 items-center gap-1.5 py-1 text-left text-[14px] leading-5">
                       <button
@@ -482,7 +893,7 @@ export const DataSidebar = memo(function DataSidebar({
                       title={starred ? '取消收藏' : '收藏'}
                       onClick={() => toggleStar(table.path, view.id)}
                     >
-                      <StarIcon className={`size-4 shrink-0${starred ? ' text-[#f5b700]' : ''}`} />
+                      <StarIcon className="size-4 shrink-0" />
                     </button>
                   </div>
                   <SidebarFold open={expanded}>
@@ -490,7 +901,8 @@ export const DataSidebar = memo(function DataSidebar({
                     path={table.path}
                     view={view}
                     open={expanded}
-                    recordKind={recordPickKind(table.view?.moduleId)}
+                    skipFetch={!shouldFetchViewPreview({ path: table.path, view, collectionPath, activeViewId })}
+                    recordKind={recordPickKind(table.view?.moduleId || table.id)}
                     tableIcon={table.view?.icon}
                     onOpenRecord={(id, row) => openRecord(table.path, view, id, row)}
                   />
@@ -513,23 +925,8 @@ export const DataSidebar = memo(function DataSidebar({
 
   const body = (
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pb-3">
-        <div className="app-side-actions" role="navigation" aria-label="视图操作" data-biu-ignore>
-          <button type="button" className="app-side-actions-item" title="添加视图" onClick={onAddView}>
-            <span className="app-side-actions-icon" aria-hidden>
-              <PlusIcon className="size-4 shrink-0" />
-            </span>
-            <span className="app-side-actions-label">添加视图</span>
-          </button>
-          <button type="button" className="app-side-actions-item" title="拷贝视图" onClick={onCopyView}>
-            <span className="app-side-actions-icon" aria-hidden>
-              <Square2StackIcon className="size-4 shrink-0" />
-            </span>
-            <span className="app-side-actions-label">拷贝视图</span>
-          </button>
-        </div>
-
         <div className="mt-2 space-y-1.5">
-          {starredRows.length ? (
+          {favCount ? (
             <section className="min-w-0">
               <div className="sidebar-section-head min-w-0">
                 <div className="flex min-h-8 min-w-0 flex-1 items-center">
@@ -550,10 +947,136 @@ export const DataSidebar = memo(function DataSidebar({
                     <span className="min-w-0 flex-1 truncate tracking-normal">收藏</span>
                   </button>
                 </div>
-                <ChatCount count={starredRows.length} />
+                <ChatCount count={favCount} />
               </div>
               <SidebarFold open={favOpen}>
                 <div className="min-w-0 pt-0.5">
+                  {starredRecordRows.map(({ table, item }) => {
+                    const tableName = table.view?.title ?? table.label
+                    const label = starredRecordLabel(item)
+                    const emoji = starredRecordEmoji(item)
+                    const chromeIcon = getDatabaseUi()?.chrome(table.path).Icon
+                    const view = viewsFor(table.path).find((row) => row.id === builtinAllViewId(table.path)) ?? viewsFor(table.path)[0]
+                    const nested = isRecordTreeCollection(table.path)
+                    const previewKey = `star-record:${table.path}:${item.recordId}`
+                    const expanded = expandedViewKey === previewKey
+                    const kidCount = nested ? cachedDirectKidCount(table.path, item.recordId) : 0
+                    const face = (
+                      <RecordMark
+                        record={recordMarkStub({ id: item.recordId, emoji, mascot: peekRecord(table.path, item.recordId)?.mascot })}
+                        tableIcon={table.view?.icon}
+                        Icon={chromeIcon}
+                      />
+                    )
+                    return (
+                      <div key={previewKey} className="min-w-0">
+                        <div
+                          className="chat-session-row group is-pinned"
+                          {...pickDomAttrs(recordPickKind(table.view?.moduleId || table.id), item.recordId, label)}
+                        >
+                          <div className="chat-session-row-main flex min-w-0 flex-1 items-center gap-1.5 py-1 text-left text-[14px] leading-5">
+                            {nested ? (
+                              <button
+                                type="button"
+                                className="relative grid size-6 shrink-0 place-items-center border-0 bg-transparent p-0 text-inherit"
+                                title={expanded ? '收起子记录' : '展开子记录'}
+                                aria-expanded={expanded}
+                                onClick={() => toggleViewPreview(previewKey)}
+                              >
+                                <span className="sidebar-rail-icon sidebar-group-fold">
+                                  <span className="sidebar-group-fold-face">{face}</span>
+                                  <span className="sidebar-group-fold-chevron">
+                                    {expanded ? (
+                                      <ChevronDownIcon className="size-4 shrink-0 opacity-80" />
+                                    ) : (
+                                      <ChevronRightIcon className="size-4 shrink-0 opacity-80" />
+                                    )}
+                                  </span>
+                                </span>
+                              </button>
+                            ) : (
+                              <span className="grid size-6 shrink-0 place-items-center" aria-hidden>
+                                {face}
+                              </span>
+                            )}
+                            <button
+                              type="button"
+                              className="min-w-0 flex-1 truncate border-0 bg-transparent p-0 text-left font-medium text-inherit"
+                              title={label}
+                              onClick={() => {
+                                if (!view) return
+                                openRecord(table.path, view, item.recordId, {
+                                  id: item.recordId,
+                                  title: label,
+                                  emoji,
+                                })
+                              }}
+                            >
+                              {label}
+                            </button>
+                          </div>
+                          {nested ? <ChatCount count={kidCount} title={`${kidCount} 个子记录`} /> : null}
+                          <span className="sidebar-trail-icon" title={tableName} aria-label={tableName}>
+                            <TableGlyph icon={table.view?.icon} />
+                          </span>
+                          {nested ? (
+                            <button
+                              type="button"
+                              className="sidebar-add"
+                              title={`在 ${label} 下添加子记录`}
+                              aria-label={`在 ${label} 下添加子记录`}
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                void (async () => {
+                                  try {
+                                    const data = await readJson<{ items?: Array<{ value?: DbRecord }> }>('/api/db/create', {
+                                      method: 'POST',
+                                      headers: { 'content-type': 'application/json' },
+                                      body: JSON.stringify({ path: table.path, records: [{ parentId: item.recordId }] }),
+                                    })
+                                    for (const key of [...previewCache.keys()]) {
+                                      if (key.startsWith(`${table.path}\0`)) previewCache.delete(key)
+                                    }
+                                    window.dispatchEvent(new Event('fsdb:change'))
+                                    if (expandedViewKey !== previewKey) toggleViewPreview(previewKey)
+                                    const created = data.items?.[0]?.value
+                                    if (created?.id && view) openRecord(table.path, view, created.id, created)
+                                  } catch {
+                                    /* ignore */
+                                  }
+                                })()
+                              }}
+                            >
+                              <PlusIcon className="size-4 shrink-0" />
+                            </button>
+                          ) : null}
+                          <button
+                            type="button"
+                            className="chat-session-row-star is-on"
+                            aria-pressed
+                            aria-label={`取消收藏 ${label}`}
+                            title="取消收藏"
+                            onClick={() => persistStarredRecords(toggleStarredRecord(getStarredRecords(), table.path, item.recordId))}
+                          >
+                            <StarIcon className="size-4 shrink-0" />
+                          </button>
+                        </div>
+                        {nested && view ? (
+                          <SidebarFold open={expanded}>
+                            <ViewRecordPreview
+                              path={table.path}
+                              view={view}
+                              open={expanded}
+                              rootId={item.recordId}
+                              recordKind={recordPickKind(table.view?.moduleId || table.id)}
+                              tableIcon={table.view?.icon}
+                              onOpenRecord={(id, row) => openRecord(table.path, view, id, row)}
+                            />
+                          </SidebarFold>
+                        ) : null}
+                      </div>
+                    )
+                  })}
                   {starredRows.map(({ table, view }) => {
                     const tableName = table.view?.title ?? table.label
                     const active = table.path === collectionPath && view.id === activeViewId
@@ -563,7 +1086,7 @@ export const DataSidebar = memo(function DataSidebar({
                       <div key={previewKey} className="min-w-0">
                         <div
                           className={`chat-session-row group${active ? ' is-active' : ''} is-pinned`}
-                          {...pickDomAttrs('view', viewPickId(table.path, view.id), view.name)}
+                          {...pickDomAttrs('view', viewPickId(table.path, view.id), view.name, { path: table.path })}
                         >
                           <div className="chat-session-row-main flex min-w-0 flex-1 items-center gap-1.5 py-1 text-left text-[14px] leading-5">
                             <button
@@ -595,7 +1118,7 @@ export const DataSidebar = memo(function DataSidebar({
                             </button>
                           </div>
                           <ChatCount count={getPreviewTotal(viewTotalKey(table.path, view))} />
-                          <span className="grid size-6 shrink-0 place-items-center" title={tableName} aria-label={tableName}>
+                          <span className="sidebar-trail-icon" title={tableName} aria-label={tableName}>
                             <TableGlyph icon={table.view?.icon} />
                           </span>
                           <button
@@ -606,7 +1129,7 @@ export const DataSidebar = memo(function DataSidebar({
                             title="取消收藏"
                             onClick={() => toggleStar(table.path, view.id)}
                           >
-                            <StarIcon className="size-4 shrink-0 text-[#f5b700]" />
+                            <StarIcon className="size-4 shrink-0" />
                           </button>
                         </div>
                         <SidebarFold open={expanded}>
@@ -614,7 +1137,8 @@ export const DataSidebar = memo(function DataSidebar({
                           path={table.path}
                           view={view}
                           open={expanded}
-                          recordKind={recordPickKind(table.view?.moduleId)}
+                          skipFetch={!shouldFetchViewPreview({ path: table.path, view, collectionPath, activeViewId })}
+                          recordKind={recordPickKind(table.view?.moduleId || table.id)}
                           tableIcon={table.view?.icon}
                           onOpenRecord={(id, row) => openRecord(table.path, view, id, row)}
                         />
@@ -634,6 +1158,8 @@ export const DataSidebar = memo(function DataSidebar({
                   type="button"
                   className="flex h-full min-w-0 flex-1 items-center gap-2 text-left text-[12px] font-bold tracking-wider"
                   aria-expanded={userOpen}
+                  title="展开或收起用户数据"
+                  data-testid="sidebar-user-home"
                   onClick={() => setUserOpen((prev) => !prev)}
                 >
                   <span className="min-w-0 flex-1 truncate tracking-normal">用户数据</span>
@@ -642,37 +1168,60 @@ export const DataSidebar = memo(function DataSidebar({
               <ChatCount count={userTables.length} />
             </div>
             <SidebarFold open={userOpen}>
-              <div className="min-w-0 space-y-1.5 pt-0.5" data-testid="sidebar-user-collections">
-                {userTables.length ? renderTableRows(userTables) : (
-                  <div className="px-1 py-1 text-[12px] text-(--dsw-label-3)">还没有可改的表</div>
+              <div className="flex min-w-0 flex-col gap-px" data-testid="sidebar-user-collections">
+                {userTables.length ? renderTableRows(userTables, 'user') : (
+                  <div className="px-1 py-1 text-[12px] text-(--biu-color-text-subtle)">还没有用户数据表</div>
                 )}
               </div>
             </SidebarFold>
           </section>
 
-          {systemTables.length ? (
-            <section className="min-w-0">
-              <div className="sidebar-section-head min-w-0">
-                <div className="flex min-h-8 min-w-0 flex-1 items-center">
-                  <button
-                    type="button"
-                    className="flex h-full min-w-0 flex-1 items-center gap-2 text-left text-[12px] font-bold tracking-wider"
-                    aria-expanded={systemOpen}
-                    title="系统运行时记下的数据"
-                    onClick={() => setSystemOpen((prev) => !prev)}
-                  >
-                    <span className="min-w-0 flex-1 truncate tracking-normal">系统数据</span>
-                  </button>
-                </div>
-                <ChatCount count={systemTables.length} />
+          <section className="min-w-0">
+            <div className="sidebar-section-head min-w-0">
+              <div className="flex min-h-8 min-w-0 flex-1 items-center">
+                <button
+                  type="button"
+                  className="flex h-full min-w-0 flex-1 items-center gap-2 text-left text-[12px] font-bold tracking-wider"
+                  aria-expanded={indexOpen}
+                  title="从你能看到的用户数据反查出来"
+                  data-testid="sidebar-index-home"
+                  onClick={() => setIndexOpen((prev) => !prev)}
+                >
+                  <span className="min-w-0 flex-1 truncate tracking-normal">索引数据</span>
+                </button>
               </div>
+              <ChatCount count={indexTables.length} />
+            </div>
+            <SidebarFold open={indexOpen}>
+              <div className="flex min-w-0 flex-col gap-px" data-testid="sidebar-index-collections">
+                {indexTables.length ? renderTableRows(indexTables, 'index') : (
+                  <div className="px-1 py-1 text-[12px] text-(--biu-color-text-subtle)">还没有索引数据</div>
+                )}
+              </div>
+            </SidebarFold>
+          </section>
+
+          <section className="min-w-0">
+            <div className="sidebar-section-head min-w-0">
+              <div className="flex min-h-8 min-w-0 flex-1 items-center">
+                <button
+                  type="button"
+                  className="flex h-full min-w-0 flex-1 items-center gap-2 text-left text-[12px] font-bold tracking-wider"
+                  aria-expanded={systemOpen}
+                  title="系统运行时记下的数据"
+                  onClick={() => setSystemOpen((prev) => !prev)}
+                >
+                  <span className="min-w-0 flex-1 truncate tracking-normal">系统数据</span>
+                </button>
+              </div>
+              <ChatCount count={systemTables.length} />
+            </div>
               <SidebarFold open={systemOpen}>
-                <div className="min-w-0 space-y-1.5 pt-0.5" data-testid="sidebar-system-collections">
+                <div className="flex min-w-0 flex-col gap-px" data-testid="sidebar-system-collections">
                   {renderTableRows(systemTables)}
                 </div>
               </SidebarFold>
             </section>
-          ) : null}
         </div>
       </div>
   )
@@ -688,16 +1237,11 @@ export const DataSidebar = memo(function DataSidebar({
 
   return (
     <aside
-      className="app-side-bar fsdb-views flex min-h-0 flex-col overflow-hidden border-r border-(--dsw-border) bg-(--dsw-sidebar)"
+      className="app-side-bar fsdb-views flex min-h-0 flex-col overflow-hidden border-r border-(--biu-color-border) bg-(--biu-color-bg-subtle)"
       aria-label="数据"
     >
-      <div className="app-side-bar-head app-side-bar-head-brand">
-        <span
-          className="inline-flex min-w-0 max-w-full items-center truncate rounded-md px-2 py-0.5 text-[14px] font-semibold tracking-wide text-white"
-          style={{ background: SIDEBAR_BRAND_GRADIENT }}
-        >
-          Biu Agent OS
-        </span>
+      <div className="app-side-bar-head app-side-bar-head-brand" data-biu-ignore>
+        <SidebarBrandLockup />
         <button
           type="button"
           className="chat-view-header-expand"

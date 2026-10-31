@@ -3,15 +3,17 @@ import { createPortal } from 'react-dom'
 import {
   CheckCircleIcon,
   ListBulletIcon,
+  EllipsisHorizontalIcon,
   PlusIcon,
   Squares2X2Icon,
   XMarkIcon,
   TableCellsIcon,
   ViewColumnsIcon,
-  ClipboardDocumentListIcon,
-  ChatBubbleLeftRightIcon,
+  CursorArrowRaysIcon,
   DocumentIcon,
   PuzzlePieceIcon,
+  RectangleGroupIcon,
+  TagIcon,
   BoltIcon,
   EyeIcon,
 } from '@heroicons/react/16/solid'
@@ -22,16 +24,34 @@ import {
 } from '@biu/web-session-view'
 import { useSlotEntries } from '@biu/web-slots'
 import type { SlotsService } from '@biu/web-slots'
-import { inspectorTabFromEvent, requestInspectorAction } from './chat-overlay.ts'
+import { inspectorTabFromEvent, requestInspectorAction, shellColumnStartWidth } from './chat-overlay.ts'
 import { getInspectorCaption, getInspectorCaptionVersion, subscribeInspectorCaptions } from './inspector-captions.ts'
-import { inspectorPanelMatches, inspectorViewProps, nextRepeatableTabId, resolveInspectorTab, slotTabId } from './inspector-panels.ts'
+import { inspectorPanelMatches, inspectorViewProps, nextRepeatableTabId, pruneOpenedForCollections, resolveInspectorTab, slotTabId } from './inspector-panels.ts'
+import { HeadlessDismiss } from '@biu/biu-ui/headless-dismiss'
 import { SidebarMascot, resolveSessionMascot } from '@biu/public-mascot'
+import {
+  getInspectorDbPath,
+  isInspectorPaneAbandoned,
+  restoreInspectorDbPaths,
+  reuseInspectorOfferPane,
+  snapshotInspectorDbPaths,
+  subscribeInspectorDbPath,
+} from '@biu/core-file-system/inspector-db-route'
+import {
+  bindInspectorPaneMenuDismiss,
+  getInspectorPaneMenu,
+  getInspectorPaneMenuVersion,
+  subscribeInspectorPaneMenu,
+} from '@biu/core-file-system/inspector-pane-menu'
+import { mergeInspectorBind, type SessionInspectorBind } from '@biu/type-session'
 
 function captionTableIcon(icon?: string) {
   const name = (icon ?? '').trim().toLowerCase()
   if (name === 'puzzle-piece' || name === 'puzzle') return PuzzlePieceIcon
-  if (name === 'clipboard-document-list' || name === 'clipboard') return ClipboardDocumentListIcon
-  if (name === 'chat-bubble' || name === 'chat-bubble-left-right') return ChatBubbleLeftRightIcon
+  if (name === 'tag' || name === 'rectangle-stack' || name === 'collection') return TagIcon
+  if (name === 'rectangle-group' || name === 'squares-2x2' || name === 'widgets') return RectangleGroupIcon
+  if (name === 'check-circle' || name === 'check' || name === 'clipboard-document-list' || name === 'clipboard') return CheckCircleIcon
+  if (name === 'cursor' || name === 'cursor-arrow-rays' || name === 'chat-bubble' || name === 'chat-bubble-left-right') return CursorArrowRaysIcon
   if (name === 'document' || name === 'document-text' || name === 'page') return DocumentIcon
   if (name === 'bolt') return BoltIcon
   if (name === 'eye') return EyeIcon
@@ -42,6 +62,7 @@ function PaneLeafIcon({
   kind,
   mode,
   icon,
+  emoji,
   Fallback,
 }: {
   kind?: string
@@ -50,6 +71,9 @@ function PaneLeafIcon({
   emoji?: string
   Fallback?: ComponentType<{ className?: string }>
 }) {
+  if (kind === 'record' && emoji) {
+    return <span className="fsdb-record-emoji">{emoji}</span>
+  }
   if (kind === 'record' || kind === 'collection') {
     const Glyph = captionTableIcon(icon)
     return <Glyph {...chromeIcon} />
@@ -64,52 +88,48 @@ function PaneLeafIcon({
   return <Squares2X2Icon {...chromeIcon} />
 }
 
+function closePaneLabel(paneId: string, kind?: string) {
+  const path = getInspectorDbPath(paneId).split('?')[0]
+  if (kind === 'record' && /\/pages(?:\/|$)/.test(path)) return '关闭页面'
+  if (kind === 'record') return '关闭记录'
+  if (kind === 'view') return '关闭视图'
+  if (kind === 'collection' || path.startsWith('/database/')) return '关闭表格'
+  return '关闭此栏'
+}
+
 export type SessionInspectorProps = {
   open: boolean
   width: number
   onWidthChange: (width: number) => void
+  onWidthLive?: (width: number) => void
   useSessionView: ReturnType<typeof bindSessionView>
   sessionView: SessionViewService
   slots: SlotsService
   renderSlot: (name: string) => ReactNode
-}
-
-function inspectorTabStorageKey(sid: string | null | undefined) {
-  return sid ? `inspector.tab:${sid}` : 'inspector.tab:home'
-}
-
-function inspectorOpenedKey(sid: string | null | undefined) {
-  return sid ? `inspector.opened:${sid}` : 'inspector.opened:home'
-}
-
-function readOpened(sid: string | null | undefined): string[] {
-  try {
-    const raw = localStorage.getItem(inspectorOpenedKey(sid))
-    if (!raw) return []
-    const parsed = JSON.parse(raw) as unknown
-    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : []
-  } catch {
-    return []
-  }
+  collections?: Array<{ path: string }>
 }
 
 export const SessionInspector = memo(function SessionInspector({
   open,
   width,
   onWidthChange,
+  onWidthLive,
   useSessionView,
   sessionView,
   slots,
   renderSlot,
+  collections,
 }: SessionInspectorProps) {
   const sessionId = useSessionView((state) => state.sessionId)
   const sessions = useSessionView((state) => state.sessions)
+  const sessionBusy = useSessionView((state) => Boolean(state.sessionId && state.busySessions[state.sessionId]))
   const currentSession = sessions.find((item) => item.id === sessionId)
   const sessionIdentity = sessionId ? resolveSessionMascot(sessionId, currentSession?.mascot) : null
   const sessionLabel = (currentSession?.title || '').trim() || (sessionIdentity ? `${sessionIdentity.shape}` : '')
   const focusCallId = useSessionView((state) => state.focusCallId)
   const extras = useSlotEntries(slots, 'inspector-panels')
   const captionRev = useSyncExternalStore(subscribeInspectorCaptions, getInspectorCaptionVersion, () => 0)
+  const paneMenuRev = useSyncExternalStore(subscribeInspectorPaneMenu, getInspectorPaneMenuVersion, () => 0)
   const extraTabs = useMemo(() => {
     return [...extras]
       .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id))
@@ -135,64 +155,128 @@ export const SessionInspector = memo(function SessionInspector({
   const toolTabs = extraTabs.filter((item) => item.action)
 
   const [tab, setTabState] = useState('')
-  const [opened, setOpened] = useState(() => readOpened(sessionId))
+  const [opened, setOpened] = useState<string[]>([])
+  const inspectorReady = useSessionView((state) => state.inspectorReady)
+  const sessionInspector = useSessionView((state) => state.sessionInspector)
   const [plusOpen, setPlusOpen] = useState(false)
+  const [moreOpen, setMoreOpen] = useState(false)
   const plusRef = useRef<HTMLDivElement>(null)
+  const moreRef = useRef<HTMLDivElement>(null)
+  const moreMenuRef = useRef<HTMLDivElement>(null)
+  const [morePos, setMorePos] = useState<{ right: number; top: number } | null>(null)
   const plusMenuRef = useRef<HTMLDivElement>(null)
   const [plusPos, setPlusPos] = useState<{ right: number; top: number } | null>(null)
   const tabsRef = useRef<HTMLDivElement>(null)
+  const hydratingRef = useRef(false)
+  const persistForRef = useRef<string | null>(sessionId)
+  const tabRef = useRef(tab)
+  const openedRef = useRef(opened)
+  tabRef.current = tab
+  openedRef.current = opened
+  const captureBind = useCallback((): SessionInspectorBind => {
+    return {
+      tab: tabRef.current,
+      opened: openedRef.current,
+      dbPaths: snapshotInspectorDbPaths(),
+    }
+  }, [])
+  const pushInspector = useCallback(
+    (partial?: SessionInspectorBind) => {
+      if (!sessionId || hydratingRef.current) return
+      const next = mergeInspectorBind(captureBind(), partial ?? {}) ?? captureBind()
+      void sessionView.patchInspector(sessionId, next)
+    },
+    [captureBind, sessionId, sessionView],
+  )
   const setTab = useCallback(
     (next: string) => {
+      tabRef.current = next
       setTabState(next)
-      try {
-        localStorage.setItem(inspectorTabStorageKey(sessionId), next)
-      } catch {
-        /* ignore */
-      }
+      pushInspector({ tab: next })
     },
-    [sessionId],
+    [pushInspector],
   )
   const persistOpened = useCallback(
     (next: string[]) => {
+      openedRef.current = next
       setOpened(next)
-      try {
-        localStorage.setItem(inspectorOpenedKey(sessionId), JSON.stringify(next))
-      } catch {
-        /* ignore */
-      }
+      window.dispatchEvent(new CustomEvent('biu:inspector-opened', { detail: { sessionId, opened: next } }))
+      pushInspector({ opened: next })
     },
-    [sessionId],
+    [pushInspector, sessionId],
   )
-  const dragRef = useRef<{ startX: number; startWidth: number } | null>(null)
 
   useEffect(() => {
-    setOpened(readOpened(sessionId))
-    try {
-      setTabState(localStorage.getItem(inspectorTabStorageKey(sessionId)) ?? '')
-    } catch {
-      setTabState('')
+    const next = pruneOpenedForCollections(opened, collections)
+    if (next.length === opened.length) return
+    persistOpened(next)
+  }, [collections, opened, persistOpened])
+  const dragRef = useRef<{ startX: number; startWidth: number; last: number } | null>(null)
+
+  useLayoutEffect(() => {
+    const prev = persistForRef.current
+    if (prev && prev !== sessionId) {
+      hydratingRef.current = false
+      void sessionView.patchInspector(prev, captureBind())
     }
-  }, [sessionId])
+    persistForRef.current = sessionId
+    hydratingRef.current = true
+    if (!sessionId) {
+      setOpened([])
+      setTabState('')
+      restoreInspectorDbPaths({})
+      hydratingRef.current = false
+      return
+    }
+    if (!inspectorReady) {
+      setOpened([])
+      setTabState('')
+      restoreInspectorDbPaths({})
+      return
+    }
+    const bind = sessionInspector
+    const openedNext = bind?.opened ?? []
+    const tabNext = bind?.tab && openedNext.includes(bind.tab) ? bind.tab : bind?.tab || openedNext[0] || ''
+    openedRef.current = openedNext
+    tabRef.current = tabNext
+    setOpened(openedNext)
+    setTabState(tabNext)
+    restoreInspectorDbPaths(bind?.dbPaths ?? {})
+    if (tabNext) {
+      queueMicrotask(() => {
+        window.dispatchEvent(new CustomEvent('biu:inspector-tab', { detail: tabNext }))
+        hydratingRef.current = false
+      })
+    } else {
+      hydratingRef.current = false
+    }
+  }, [captureBind, inspectorReady, sessionId, sessionView])
+
+  useEffect(() => {
+    return subscribeInspectorDbPath(() => pushInspector({ dbPaths: snapshotInspectorDbPaths() }))
+  }, [pushInspector])
 
   const focusTabId = extraTabs.find((item) => item.focusOnCall)?.id
   useEffect(() => {
-    if (focusCallId && focusTabId) {
-      persistOpened(opened.includes(focusTabId) ? opened : [...opened, focusTabId])
-      setTab(focusTabId)
-      return
-    }
-    setTabState((current) => {
-      const next = resolveInspectorTab(current, allowedTabs, opened)
-      if (next !== current) {
-        try {
-          localStorage.setItem(inspectorTabStorageKey(sessionId), next)
-        } catch {
-          /* ignore */
-        }
-      }
+    if (!focusCallId || !focusTabId) return
+    setOpened((prev) => {
+      if (prev.includes(focusTabId)) return prev
+      const next = [...prev, focusTabId]
+      window.dispatchEvent(new CustomEvent('biu:inspector-opened', { detail: { sessionId, opened: next } }))
+      pushInspector({ opened: next })
       return next
     })
-  }, [sessionId, focusCallId, focusTabId, allowedTabs.join('|'), opened, setTab])
+    setTab(focusTabId)
+  }, [focusCallId, focusTabId, pushInspector, sessionId, setTab])
+
+  useEffect(() => {
+    if (focusCallId && focusTabId) return
+    setTabState((current) => {
+      const next = resolveInspectorTab(current, allowedTabs, opened)
+      if (next !== current) tabRef.current = next
+      return next
+    })
+  }, [sessionId, focusCallId, focusTabId, allowedTabs.join('|'), opened])
 
   useEffect(() => {
     const onTab = (event: Event) => {
@@ -200,14 +284,25 @@ export const SessionInspector = memo(function SessionInspector({
       if (!next) return
       const allowed = allowedTabs.includes(next) || allowedTabs.includes(slotTabId(next))
       if (!allowed) return
-      const existing = opened.find((id) => id === next || slotTabId(id) === next)
-      const id = existing ?? next
-      persistOpened(opened.includes(id) ? opened : [...opened, id])
-      setTab(id)
+      if (isInspectorPaneAbandoned(next)) return
+      persistOpened(opened.includes(next) ? opened : [...opened, next])
+      setTab(next)
     }
     window.addEventListener('biu:inspector-tab', onTab)
     return () => window.removeEventListener('biu:inspector-tab', onTab)
   }, [allowedTabs.join('|'), opened, persistOpened, setTab])
+
+  useEffect(() => {
+    const onClosed = (event: Event) => {
+      const id = (event as CustomEvent).detail
+      if (typeof id !== 'string' || !openedRef.current.includes(id)) return
+      const next = openedRef.current.filter((item) => item !== id)
+      persistOpened(next)
+      if (tabRef.current === id) setTab(next.at(-1) ?? '')
+    }
+    window.addEventListener('biu:inspector-pane-closed', onClosed)
+    return () => window.removeEventListener('biu:inspector-pane-closed', onClosed)
+  }, [persistOpened, setTab])
 
   useEffect(() => {
     if (!open) return
@@ -228,35 +323,49 @@ export const SessionInspector = memo(function SessionInspector({
     })
   }, [plusOpen])
 
-  useEffect(() => {
-    function onPointer(event: MouseEvent) {
-      const target = event.target as Node
-      if (plusRef.current?.contains(target) || plusMenuRef.current?.contains(target)) return
-      setPlusOpen(false)
+  useLayoutEffect(() => {
+    if (!moreOpen) {
+      setMorePos(null)
+      return
     }
-    window.addEventListener('mousedown', onPointer)
-    return () => window.removeEventListener('mousedown', onPointer)
-  }, [])
+    const box = moreRef.current?.getBoundingClientRect()
+    if (!box) return
+    setMorePos({
+      right: Math.max(8, window.innerWidth - box.right),
+      top: box.bottom + 4,
+    })
+  }, [moreOpen])
+
+  useEffect(() => {
+    if (!moreOpen) return
+    return bindInspectorPaneMenuDismiss(() => setMoreOpen(false))
+  }, [moreOpen])
 
   useEffect(() => {
     const onMove = (event: PointerEvent) => {
       const drag = dragRef.current
       if (!drag) return
       const next = drag.startWidth + (drag.startX - event.clientX)
-      onWidthChange(next)
+      drag.last = next
+      if (onWidthLive) onWidthLive(next)
+      else onWidthChange(next)
     }
     const onUp = () => {
+      const drag = dragRef.current
       dragRef.current = null
       document.body.style.removeProperty('cursor')
       document.body.style.removeProperty('user-select')
+      if (drag && onWidthLive) onWidthChange(drag.last)
     }
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
     return () => {
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
     }
-  }, [onWidthChange])
+  }, [onWidthChange, onWidthLive])
 
   useEffect(() => {
     const activeTab = tabsRef.current?.querySelector<HTMLElement>('.inspector-tab.is-active, .inspector-crumb-tab.is-active')
@@ -269,7 +378,6 @@ export const SessionInspector = memo(function SessionInspector({
     return [{ ...item, id: openedId }]
   })
   const extraActive = headerTabs.find((item) => item.id === tab)
-  const ExtraComponent = extraActive?.entry.Component
 
   function pickOffer(item: (typeof extraTabs)[number]) {
     if (item.action) {
@@ -277,6 +385,12 @@ export const SessionInspector = memo(function SessionInspector({
       return
     }
     if (item.repeatable) {
+      const existing = reuseInspectorOfferPane(item.id, opened)
+      if (existing) {
+        persistOpened(opened.includes(existing) ? opened : [...opened, existing])
+        setTab(existing)
+        return
+      }
       const instanceId = nextRepeatableTabId(item.id)
       persistOpened([...opened, instanceId])
       setTab(instanceId)
@@ -287,16 +401,20 @@ export const SessionInspector = memo(function SessionInspector({
   }
 
   function closeOpenedTab(id: string) {
+    if (slotTabId(id) === focusTabId) sessionView.clearInspectCall()
     const next = opened.filter((item) => item !== id)
     persistOpened(next)
     if (tab === id) setTab(next.at(-1) ?? '')
+    queueMicrotask(() => {
+      window.dispatchEvent(new CustomEvent('biu:inspector-pane-closed', { detail: id }))
+    })
   }
 
   return (
     <aside
-      className={`session-inspector relative flex min-h-0 min-w-0 flex-col bg-(--dsw-bg) text-(--dsw-label)${open ? '' : ' is-closed'}`}
+      className={`session-inspector relative flex min-h-0 min-w-0 flex-col bg-(--biu-color-bg) text-(--biu-color-text)${open ? '' : ' is-closed'}`}
       data-testid="session-inspector"
-      aria-label="会话检查器"
+      aria-label="代理检查器"
       aria-hidden={!open}
       inert={!open || undefined}
     >
@@ -307,8 +425,8 @@ export const SessionInspector = memo(function SessionInspector({
         title="拖动调整宽度"
         onPointerDown={(event) => {
           event.preventDefault()
-          const visual = event.currentTarget.parentElement?.getBoundingClientRect().width ?? width
-          dragRef.current = { startX: event.clientX, startWidth: visual }
+          const visual = shellColumnStartWidth(event.currentTarget, 'inspector', width)
+          dragRef.current = { startX: event.clientX, startWidth: visual, last: visual }
           document.body.style.cursor = 'col-resize'
           document.body.style.userSelect = 'none'
         }}
@@ -369,6 +487,67 @@ export const SessionInspector = memo(function SessionInspector({
             )
           })}
         </div>
+        <div className="inspector-head-tools">
+        <div className="inspector-more" ref={moreRef}>
+          <button
+            type="button"
+            className={`chat-view-header-expand${moreOpen ? ' is-active' : ''}`}
+            title="更多"
+            aria-label="更多"
+            aria-expanded={moreOpen}
+            aria-haspopup="menu"
+            data-testid="inspector-more"
+            onClick={() => {
+              setPlusOpen(false)
+              setMoreOpen((prev) => !prev)
+            }}
+          >
+            <EllipsisHorizontalIcon {...chromeIcon} />
+          </button>
+          {moreOpen && morePos
+            ? createPortal(
+              <HeadlessDismiss
+                onDismiss={() => setMoreOpen(false)}
+                insideRef={moreRef}
+                inside={(node) => node instanceof Element && Boolean(node.closest('.fsdb-detail-more-menu, .inspector-more-menu'))}
+              >
+                <div
+                  ref={moreMenuRef}
+                  className="inspector-more-menu is-fixed"
+                  role="menu"
+                  data-biu-ignore
+                  data-testid="inspector-more-menu"
+                  data-caption-rev={captionRev}
+                  data-pane-menu-rev={paneMenuRev}
+                  style={{ right: morePos.right, top: morePos.top }}
+                >
+                  {tab ? getInspectorPaneMenu(tab) : null}
+                  {(() => {
+                    if (!tab) return null
+                    const kind = getInspectorCaption(tab)?.kind
+                    const label = closePaneLabel(tab, kind)
+                    return (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="fsdb-detail-more-item"
+                        data-testid="inspector-more-close"
+                        onClick={() => {
+                          setMoreOpen(false)
+                          closeOpenedTab(tab)
+                        }}
+                      >
+                        <XMarkIcon {...chromeIcon} />
+                        {label}
+                      </button>
+                    )
+                  })()}
+                </div>
+              </HeadlessDismiss>,
+              document.body,
+            )
+            : null}
+        </div>
         <div className="inspector-add" ref={plusRef}>
           <button
             type="button"
@@ -377,12 +556,16 @@ export const SessionInspector = memo(function SessionInspector({
             aria-label="添加可展示的内容"
             aria-expanded={plusOpen}
             data-testid="inspector-add"
-            onClick={() => setPlusOpen((prev) => !prev)}
+            onClick={() => {
+              setMoreOpen(false)
+              setPlusOpen((prev) => !prev)
+            }}
           >
             <PlusIcon {...chromeIcon} />
           </button>
           {plusOpen && plusPos
             ? createPortal(
+            <HeadlessDismiss onDismiss={() => setPlusOpen(false)} insideRef={plusRef}>
             <div
               ref={plusMenuRef}
               className="inspector-add-menu is-fixed"
@@ -398,7 +581,7 @@ export const SessionInspector = memo(function SessionInspector({
                     size={22}
                     sessionId={sessionId}
                     identity={sessionIdentity}
-                    busy={Boolean(currentSession?.busy)}
+                    busy={sessionBusy}
                     animate={false}
                     title={sessionLabel}
                   />
@@ -416,9 +599,8 @@ export const SessionInspector = memo(function SessionInspector({
                       onClick={() => setTab(item.id)}
                       data-testid={`inspector-offer-${item.id}`}
                     >
-                      <PaneLeafIcon kind={caption?.kind} mode={caption?.mode} icon={caption?.icon} Fallback={item.Icon} />
+                      <PaneLeafIcon kind={caption?.kind} mode={caption?.mode} icon={caption?.icon} emoji={caption?.emoji} Fallback={item.Icon} />
                       <span className="min-w-0 flex-1 truncate">{caption?.label || item.label}</span>
-                      <CheckCircleIcon aria-hidden className="size-4 shrink-0 inspector-add-check" />
                     </button>
                     <button
                       type="button"
@@ -467,37 +649,43 @@ export const SessionInspector = memo(function SessionInspector({
                   </button>
                 ))}
               </div>
-            </div>,
+            </div>
+            </HeadlessDismiss>,
             document.body,
           )
           : null}
         </div>
+        </div>
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        {extraActive && ExtraComponent ? (
-          <div className="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid={`inspector-${extraActive.id}`}>
-            <ExtraComponent {...inspectorViewProps((extraActive.entry.props?.() ?? {}) as Record<string, unknown>)} paneId={extraActive.id} renderSlot={renderSlot} />
-          </div>
-        ) : (
-          <div className="inspector-empty" data-testid="inspector-catalog">
-            {displayTabs.length || toolTabs.length ? (
-              <div className="inspector-empty-list">
-                {displayTabs
-                  .filter((item) => item.repeatable || !opened.some((id) => slotTabId(id) === item.id))
-                  .map((item) => (
-                    <button
-                      key={item.id}
-                      type="button"
-                      className="inspector-empty-item"
-                      onClick={() => pickOffer(item)}
-                      data-testid={`inspector-empty-${item.id}`}
-                    >
-                      {item.Icon ? <item.Icon {...chromeIcon} /> : <Squares2X2Icon {...chromeIcon} />}
-                      <span className="min-w-0 flex-1 truncate">{item.label}</span>
-                    </button>
-                  ))}
-                {toolTabs.map((item) => (
+      <div className="inspector-stage">
+        {headerTabs.map((item) => {
+          const Pane = item.entry.Component
+          if (!Pane) return null
+          const active = item.id === tab
+          return (
+            <div
+              key={item.id}
+              className={`inspector-stage-pane${active ? ' is-active' : ''}`}
+              data-testid={`inspector-${item.id}`}
+              aria-hidden={!active}
+              inert={!active || undefined}
+            >
+              <Pane {...inspectorViewProps((item.entry.props?.() ?? {}) as Record<string, unknown>)} paneId={item.id} renderSlot={renderSlot} />
+            </div>
+          )
+        })}
+        <div
+          className={`inspector-stage-pane inspector-empty${extraActive ? '' : ' is-active'}`}
+          data-testid="inspector-catalog"
+          aria-hidden={Boolean(extraActive)}
+          inert={extraActive ? true : undefined}
+        >
+          {displayTabs.length || toolTabs.length ? (
+            <div className="inspector-empty-list">
+              {displayTabs
+                .filter((item) => item.repeatable || !opened.some((id) => slotTabId(id) === item.id))
+                .map((item) => (
                   <button
                     key={item.id}
                     type="button"
@@ -509,10 +697,21 @@ export const SessionInspector = memo(function SessionInspector({
                     <span className="min-w-0 flex-1 truncate">{item.label}</span>
                   </button>
                 ))}
-              </div>
-            ) : null}
-          </div>
-        )}
+              {toolTabs.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className="inspector-empty-item"
+                  onClick={() => pickOffer(item)}
+                  data-testid={`inspector-empty-${item.id}`}
+                >
+                  {item.Icon ? <item.Icon {...chromeIcon} /> : <Squares2X2Icon {...chromeIcon} />}
+                  <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </div>
       </div>
     </aside>
   )

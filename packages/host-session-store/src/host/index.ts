@@ -1,24 +1,30 @@
-import { join } from 'node:path'
+import { biuSqlitePath, eventsSqlitePath } from '@biu/host-plugin-loader/data-dir'
 import { Service, type Context } from 'cordis'
 import {
   type SessionRecord,
   type SessionStore,
   type SessionSummary,
-  normalizeSessionType,
+  lastSpokenAt,
   sessionDisplayTitle,
 } from '@biu/type-session'
 
 function toSummary(record: SessionRecord, updatedAt?: number): SessionSummary {
+  const touched = updatedAt ?? record.events.at(-1)?.ts ?? 0
+  const spoken = lastSpokenAt(record.events)
+  const createdAt = Number(record.config?.createdAt)
+  const stamp = Number.isFinite(createdAt) && createdAt > 0 ? createdAt : (record.events[0]?.ts ?? touched)
   return {
     id: record.id,
     version: record.version,
     eventCount: record.events.length,
     title: sessionDisplayTitle(record),
-    updatedAt: updatedAt ?? record.events.at(-1)?.ts ?? 0,
-    type: normalizeSessionType(record.type),
+    updatedAt: touched,
+    ...(spoken > 0 ? { lastMessageAt: spoken } : {}),
     ...(record.project ? { project: record.project } : {}),
     ...(record.mascot ? { mascot: record.mascot } : {}),
-    ...(record.config ? { config: record.config } : {}),
+    ...(record.config || stamp
+      ? { config: { ...(record.config ?? {}), ...(stamp ? { createdAt: stamp } : {}) } }
+      : {}),
   }
 }
 
@@ -43,6 +49,11 @@ export class MemorySessionStore implements SessionStore {
     return [...this.records.values()]
       .map((record) => toSummary(record, this.touched.get(record.id)))
       .sort((a, b) => b.updatedAt - a.updatedAt)
+  }
+
+  peekSummary(id: string) {
+    const record = this.records.get(id)
+    return record ? toSummary(record, this.touched.get(id)) : undefined
   }
 
   async delete(id: string) {
@@ -75,6 +86,10 @@ export class SessionStoreService extends Service implements SessionStore {
     return this.inner.listSummaries()
   }
 
+  peekSummary(id: string) {
+    return this.inner.peekSummary?.(id)
+  }
+
   delete(id: string) {
     return this.inner.delete(id)
   }
@@ -87,18 +102,19 @@ export type SessionStoreDriver = 'memory' | 'sqlite'
 
 export async function apply(
   ctx: Context,
-  config: { driver?: SessionStoreDriver; path?: string } = {},
+  config: { driver?: SessionStoreDriver; path?: string; eventsPath?: string } = {},
 ) {
   const envDriver = process.env.CORDIS_SESSION_STORE as SessionStoreDriver | undefined
   const driver = config.driver ?? (envDriver === 'memory' || envDriver === 'sqlite' ? envDriver : 'sqlite')
-  const sqlitePath = config.path ?? join(process.cwd(), '.cordis', 'sessions.sqlite')
+  const sqlitePath = config.path ?? biuSqlitePath()
+  const eventsPath = config.eventsPath ?? (config.path ? undefined : eventsSqlitePath())
 
   let inner: SessionStore
   if (driver === 'memory') {
     inner = new MemorySessionStore()
   } else {
     const { ensureSqliteSessionStore } = await import('./sqlite-session-store.ts')
-    inner = await ensureSqliteSessionStore(sqlitePath)
+    inner = await ensureSqliteSessionStore(sqlitePath, eventsPath)
   }
   new SessionStoreService(ctx, inner)
 }

@@ -56,6 +56,81 @@ test('loop appends multiple assistant/chunk deltas from onDelta', async () => {
   assert.equal(message?.type === 'assistant/message' && message.usage?.inputTokens, 1)
 })
 
+test('streamed tool deltas stay behind the assistant message', async () => {
+  const { ctx, sessionId } = await spine()
+  ctx.tools.register({
+    name: 'echo',
+    description: 'echo',
+    parameters: { type: 'object', properties: { text: { type: 'string' } } },
+    execute: (args) => String(args.text ?? ''),
+  })
+  let chats = 0
+  const llm: LlmClient = {
+    async chat(_messages, _tools, _signal, options) {
+      chats += 1
+      if (chats > 1) return { content: 'done', toolCalls: [] }
+      options?.onToolDelta?.({ id: '1', name: 'echo', arguments: '{"text":' })
+      options?.onToolDelta?.({ id: '1', name: 'echo', arguments: '{"text":"pong"}' })
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      return {
+        content: 'calling',
+        toolCalls: [{ id: '1', name: 'echo', arguments: '{"text":"pong"}' }],
+      }
+    },
+  }
+  const loop = new AgentLoop(ctx, llm, sessionId, new AbortController().signal)
+  await loop.run([{ kind: 'wake', text: 'echo' }])
+  const types = (await ctx.sessions.require(sessionId)).events.map((event) => event.type)
+  const message = types.indexOf('assistant/message')
+  const call = types.indexOf('tool/call')
+  const result = types.indexOf('tool/result')
+  assert.ok(message >= 0 && call > message && result > call)
+})
+
+test('loop invokes multiple tools concurrently', async () => {
+  const { ctx, sessionId } = await spine()
+  let inflight = 0
+  let peak = 0
+  ctx.tools.register({
+    name: 'hold',
+    description: 'hold',
+    parameters: { type: 'object', properties: { id: { type: 'string' } } },
+    execution: 'parallel',
+    execute: async (args) => {
+      inflight += 1
+      peak = Math.max(peak, inflight)
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      inflight -= 1
+      return String(args.id ?? '')
+    },
+  })
+  const loop = new AgentLoop(
+    ctx,
+    new ScriptedLlm([
+      {
+        content: null,
+        toolCalls: [
+          { id: '1', name: 'hold', arguments: '{"id":"a"}' },
+          { id: '2', name: 'hold', arguments: '{"id":"b"}' },
+        ],
+      },
+      { content: 'both done', toolCalls: [] },
+    ]),
+    sessionId,
+    new AbortController().signal,
+  )
+  const turn = await loop.run([{ kind: 'wake', text: 'go' }])
+  assert.equal(peak, 2)
+  assert.deepEqual(
+    turn.steps.map((item) => item.detail),
+    ['a', 'b'],
+  )
+  const types = (await ctx.sessions.require(sessionId)).events.map((event) => event.type)
+  const firstResult = types.indexOf('tool/result')
+  const secondCall = types.lastIndexOf('tool/call')
+  assert.ok(secondCall >= 0 && firstResult >= 0 && secondCall < firstResult)
+})
+
 test('loop invokes tools then asks the model again', async () => {
   const { ctx, sessionId } = await spine()
   ctx.tools.register({
@@ -63,6 +138,10 @@ test('loop invokes tools then asks the model again', async () => {
     description: 'echo',
     parameters: { type: 'object', properties: { text: { type: 'string' } } },
     execute: (args) => String(args.text ?? ''),
+  })
+  const finished: Array<{ sessionId?: string; text?: string }> = []
+  ctx.on('session/finished', (event) => {
+    finished.push(event as { sessionId?: string; text?: string })
   })
   const loop = new AgentLoop(
     ctx,
@@ -75,9 +154,120 @@ test('loop invokes tools then asks the model again', async () => {
   )
   const turn = await loop.run([{ kind: 'wake', text: 'echo' }])
   assert.equal(turn.text, '收到 pong')
+  assert.deepEqual(finished, [{ sessionId, text: '收到 pong' }])
   assert.deepEqual(turn.steps, [{ name: 'echo', ok: true, detail: 'pong' }])
   const messages = ctx.sessions.deriveMessages(sessionId)
   assert.equal(messages.some((item) => item.role === 'tool' && item.content === 'pong'), true)
+})
+
+test('parallel tools overlap while exclusive tools form barriers', async () => {
+  const { ctx, sessionId } = await spine()
+  const timeline: string[] = []
+  let active = 0
+  let maxActive = 0
+  const registerParallel = (name: string) =>
+    ctx.tools.register({
+      name,
+      description: name,
+      parameters: { type: 'object', properties: {} },
+      execution: 'parallel',
+      execute: async () => {
+        timeline.push(`${name}:start`)
+        active += 1
+        maxActive = Math.max(maxActive, active)
+        await new Promise((resolve) => setTimeout(resolve, 30))
+        active -= 1
+        timeline.push(`${name}:end`)
+        return name
+      },
+    })
+  registerParallel('p1')
+  registerParallel('p2')
+  registerParallel('p3')
+  ctx.tools.register({
+    name: 'exclusive',
+    description: 'exclusive',
+    parameters: { type: 'object', properties: {} },
+    execute: () => {
+      timeline.push('exclusive:start')
+      timeline.push('exclusive:end')
+      return 'exclusive'
+    },
+  })
+  const loop = new AgentLoop(
+    ctx,
+    new ScriptedLlm([
+      {
+        content: null,
+        toolCalls: [
+          { id: '1', name: 'p1', arguments: '{}' },
+          { id: '2', name: 'p2', arguments: '{}' },
+          { id: '3', name: 'exclusive', arguments: '{}' },
+          { id: '4', name: 'p3', arguments: '{}' },
+        ],
+      },
+      { content: 'done', toolCalls: [] },
+    ]),
+    sessionId,
+    new AbortController().signal,
+  )
+
+  const turn = await loop.run([{ kind: 'wake', text: 'run' }])
+  assert.equal(maxActive, 2)
+  assert.ok(timeline.indexOf('exclusive:start') > timeline.indexOf('p1:end'))
+  assert.ok(timeline.indexOf('exclusive:start') > timeline.indexOf('p2:end'))
+  assert.ok(timeline.indexOf('p3:start') > timeline.indexOf('exclusive:end'))
+  assert.deepEqual(turn.steps.map((item) => item.name), ['p1', 'p2', 'exclusive', 'p3'])
+
+  const events = (await ctx.sessions.require(sessionId)).events
+  const calls = events.filter((event) => event.type === 'tool/call' && ['1', '2', '3', '4'].includes(event.id))
+  const results = events.filter((event) => event.type === 'tool/result' && ['1', '2', '3', '4'].includes(event.id))
+  assert.equal(calls.length, 4)
+  assert.equal(results.length, 4)
+  assert.ok(Math.max(...calls.map((event) => event.seq)) < Math.min(...results.map((event) => event.seq)))
+})
+
+test('one parallel tool failure does not discard sibling results', async () => {
+  const { ctx, sessionId } = await spine()
+  ctx.tools.register({
+    name: 'bad',
+    description: 'bad',
+    parameters: { type: 'object', properties: {} },
+    execution: 'parallel',
+    execute: () => {
+      throw new Error('broken')
+    },
+  })
+  ctx.tools.register({
+    name: 'good',
+    description: 'good',
+    parameters: { type: 'object', properties: {} },
+    execution: 'parallel',
+    execute: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      return 'kept'
+    },
+  })
+  const loop = new AgentLoop(
+    ctx,
+    new ScriptedLlm([
+      {
+        content: null,
+        toolCalls: [
+          { id: '1', name: 'bad', arguments: '{}' },
+          { id: '2', name: 'good', arguments: '{}' },
+        ],
+      },
+      { content: 'done', toolCalls: [] },
+    ]),
+    sessionId,
+    new AbortController().signal,
+  )
+
+  const turn = await loop.run([{ kind: 'wake', text: 'run' }])
+  assert.equal(turn.steps[0]?.ok, false)
+  assert.match(turn.steps[0]?.detail ?? '', /broken/)
+  assert.deepEqual(turn.steps[1], { name: 'good', ok: true, detail: 'kept' })
 })
 
 test('missing tool is a step failure, not a crash', async () => {
@@ -97,6 +287,22 @@ test('missing tool is a step failure, not a crash', async () => {
   assert.equal(turn.text, '没有这个工具')
 })
 
+test('pre-aborted signal never calls the model', async () => {
+  const { ctx, sessionId } = await spine()
+  const abort = new AbortController()
+  abort.abort()
+  let called = 0
+  const llm: LlmClient = {
+    chat: async () => {
+      called += 1
+      return { content: 'nope', toolCalls: [] }
+    },
+  }
+  const loop = new AgentLoop(ctx, llm, sessionId, abort.signal)
+  await assert.rejects(() => loop.run([{ kind: 'wake', text: 'x' }]), /cancelled/)
+  assert.equal(called, 0)
+})
+
 test('cancelled signal stops the turn', async () => {
   const { ctx, sessionId } = await spine()
   const abort = new AbortController()
@@ -108,6 +314,128 @@ test('cancelled signal stops the turn', async () => {
   }
   const loop = new AgentLoop(ctx, llm, sessionId, abort.signal)
   await assert.rejects(() => loop.run([{ kind: 'wake', text: 'x' }]), /cancelled|AbortError|aborted/i)
+})
+
+test('unsupported image is retried without pictures and the turn completes', async () => {
+  const { ctx, sessionId } = await spine()
+  const seen: Array<boolean> = []
+  const llm: LlmClient = {
+    async chat(messages) {
+      const hasImage = messages.some(
+        (item) => Array.isArray(item.content) && item.content.some((part) => part.type === 'image_url'),
+      )
+      seen.push(hasImage)
+      if (hasImage) throw new Error('.messages[1].image[0]: You have uploaded an unsupported image')
+      return { content: '没图也能说', toolCalls: [] }
+    },
+  }
+  const loop = new AgentLoop(ctx, llm, sessionId, new AbortController().signal)
+  const turn = await loop.run([
+    {
+      kind: 'wake',
+      text: '看看',
+      images: [{ name: 'shot.png', mime: 'image/png', url: 'data:image/png;base64,abc' }],
+    },
+  ])
+  assert.equal(turn.text, '没图也能说')
+  assert.equal(turn.halt, undefined)
+  assert.deepEqual(seen, [true, false])
+  const user = (await ctx.sessions.require(sessionId)).events.find((event) => event.type === 'user/message')
+  assert.equal(user?.type === 'user/message' && user.images?.length, 1)
+  assert.equal(ctx.sessions.llmImagesBlocked(sessionId), true)
+  const end = (await ctx.sessions.require(sessionId)).events.find((event) => event.type === 'turn/end')
+  assert.equal(end?.type === 'turn/end' && end.reason, 'complete')
+})
+
+test('after image reject later text turns stay text-only even if history still has pictures', async () => {
+  const { ctx, sessionId } = await spine()
+  const seen: Array<boolean> = []
+  const llm: LlmClient = {
+    async chat(messages) {
+      const hasImage = messages.some(
+        (item) => Array.isArray(item.content) && item.content.some((part) => part.type === 'image_url'),
+      )
+      seen.push(hasImage)
+      if (hasImage) throw new Error('.messages[1].image[0]: You have uploaded an unsupported image')
+      return { content: hasImage ? '图' : '纯文本', toolCalls: [] }
+    },
+  }
+  const first = new AgentLoop(ctx, llm, sessionId, new AbortController().signal)
+  await first.run([
+    {
+      kind: 'wake',
+      text: '看看',
+      images: [{ name: 'shot.png', mime: 'image/png', url: 'data:image/png;base64,abc' }],
+    },
+  ])
+  assert.equal(ctx.sessions.llmImagesBlocked(sessionId), true)
+  const second = new AgentLoop(ctx, llm, sessionId, new AbortController().signal)
+  const turn = await second.run([{ kind: 'wake', text: '再问一句' }])
+  assert.equal(turn.text, '纯文本')
+  assert.equal(turn.halt, undefined)
+  assert.equal(seen.at(-1), false)
+})
+
+test('image reject after a successful turn only omits pictures added after that reply', async () => {
+  const { ctx, sessionId } = await spine()
+  const seen: Array<string[]> = []
+  const llm: LlmClient = {
+    async chat(messages) {
+      const urls = messages.flatMap((item) =>
+        Array.isArray(item.content)
+          ? item.content.filter((part) => part.type === 'image_url').map((part) => part.image_url.url)
+          : [],
+      )
+      seen.push(urls)
+      if (urls.includes('data:image/png;base64,bad')) {
+        throw new Error('.messages[3].image[0]: You have uploaded an unsupported image')
+      }
+      return { content: urls.length ? '图还在' : '纯文本', toolCalls: [] }
+    },
+  }
+  const first = new AgentLoop(ctx, llm, sessionId, new AbortController().signal)
+  await first.run([
+    {
+      kind: 'wake',
+      text: '好图',
+      images: [{ name: 'ok.png', mime: 'image/png', url: 'data:image/png;base64,ok' }],
+    },
+  ])
+  const second = new AgentLoop(ctx, llm, sessionId, new AbortController().signal)
+  const turn = await second.run([
+    {
+      kind: 'wake',
+      text: '坏图',
+      images: [{ name: 'bad.png', mime: 'image/png', url: 'data:image/png;base64,bad' }],
+    },
+  ])
+  assert.equal(turn.text, '图还在')
+  assert.equal(turn.halt, undefined)
+  assert.equal(seen.at(-1)?.includes('data:image/png;base64,ok'), true)
+  assert.equal(seen.at(-1)?.includes('data:image/png;base64,bad'), false)
+})
+
+test('fatal llm error ends the turn idle with halt so the session can take a new message', async () => {
+  const { ctx, sessionId } = await spine()
+  const llm: LlmClient = {
+    async chat() {
+      throw new Error('llm http 401')
+    },
+  }
+  const loop = new AgentLoop(ctx, llm, sessionId, new AbortController().signal)
+  const turn = await loop.run([{ kind: 'wake', text: 'hi' }])
+  assert.equal(turn.halt, true)
+  assert.match(turn.text, /401/)
+  const events = (await ctx.sessions.require(sessionId)).events
+  assert.equal(events.find((event) => event.type === 'turn/end')?.type === 'turn/end' && events.find((event) => event.type === 'turn/end')?.reason, 'llm-error')
+  const again = new AgentLoop(
+    ctx,
+    new ScriptedLlm([{ content: '还能聊', toolCalls: [] }]),
+    sessionId,
+    new AbortController().signal,
+  )
+  const next = await again.run([{ kind: 'wake', text: '再问' }])
+  assert.equal(next.text, '还能聊')
 })
 
 test('pre-step reject writes a turn with no step', async () => {
@@ -145,6 +473,30 @@ test('abort closes the turn as cancelled', async () => {
   await assert.rejects(() => loop.run([{ kind: 'wake', text: 'x' }]), /cancelled/)
   const types = (await ctx.sessions.require(sessionId)).events.map((item) => item.type)
   assert.equal(types.includes('turn/end'), true)
+})
+
+test('cancel during hung tool ends the turn instead of swallowing cancelled', async () => {
+  const { ctx, sessionId } = await spine()
+  const ac = new AbortController()
+  ctx.tools.register({
+    name: 'hang',
+    description: 'hang',
+    parameters: { type: 'object', properties: {} },
+    execute: () => new Promise(() => undefined),
+  })
+  const loop = new AgentLoop(
+    ctx,
+    new ScriptedLlm([{ content: null, toolCalls: [{ id: '1', name: 'hang', arguments: '{}' }] }]),
+    sessionId,
+    ac.signal,
+  )
+  const pending = loop.run([{ kind: 'wake', text: 'x' }])
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  ac.abort()
+  await assert.rejects(() => pending, /cancelled/)
+  const events = (await ctx.sessions.require(sessionId)).events
+  const end = events.find((event) => event.type === 'turn/end')
+  assert.equal(end?.type === 'turn/end' && end.reason, 'cancelled')
 })
 
 test('truncateToolResult keeps head+tail and clips middle when over limit', () => {

@@ -1,0 +1,99 @@
+export type HeadingOutlineItem = {
+  id: string
+  text: string
+  level: 1 | 2 | 3
+}
+
+const SKIP = ['.fsdb-detail-title', '.fsdb-detail-extra-title']
+
+function asLevel(n: number): 1 | 2 | 3 {
+  if (n === 1) return 1
+  if (n === 2) return 2
+  return 3
+}
+
+function preview(text: string, max = 48) {
+  const one = text.replace(/\s+/g, ' ').trim()
+  if (!one) return ''
+  return one.length > max ? `${one.slice(0, max)}…` : one
+}
+
+function headingElements(root: ParentNode): HTMLElement[] {
+  return [...root.querySelectorAll('h1, h2, h3')].filter(
+    (el) => el instanceof HTMLElement && !SKIP.some((sel) => el.closest(sel)),
+  ) as HTMLElement[]
+}
+
+function chatUserBubbles(root: ParentNode): HTMLElement[] {
+  return [...root.querySelectorAll('[data-testid="user-bubble"]')].filter(
+    (el): el is HTMLElement => el instanceof HTMLElement,
+  )
+}
+
+function itemFromEl(el: HTMLElement, index: number): HeadingOutlineItem | null {
+  const text = (el.textContent ?? '').replace(/\s+/g, ' ').trim()
+  if (!text) return null
+  return { id: `heading-${index}`, text, level: asLevel(Number(el.tagName.slice(1))) }
+}
+
+export function blockElBySnippet(root: ParentNode, snippet: string): HTMLElement | null {
+  const needle = snippet.replace(/\s+/g, ' ').trim().slice(0, 48)
+  if (!needle) return null
+  for (const el of headingElements(root)) {
+    if ((el.textContent ?? '').replace(/\s+/g, ' ').includes(needle)) return el
+  }
+  const scope = root.querySelector('.tiptap, .page-editor') ?? root
+  for (const el of scope.querySelectorAll('h1, h2, h3, p, li, blockquote, pre, th, td, .page-block')) {
+    if (!(el instanceof HTMLElement)) continue
+    if ((el.textContent ?? '').replace(/\s+/g, ' ').includes(needle)) return el
+  }
+  return null
+}
+
+function escapeId(id: string) {
+  return typeof CSS !== 'undefined' && typeof CSS.escape === 'function' ? CSS.escape(id) : id
+}
+
+/** 只读扫描。会话详情只收用户气泡，刻度用二级标题长度；页面/任务只收 h1–h3。禁止给标题写 data-*。 */
+export function headingsFromRoot(root: ParentNode): HeadingOutlineItem[] {
+  if (root.querySelector('[data-testid="session-record-chat"]')) {
+    const items: HeadingOutlineItem[] = []
+    for (const el of chatUserBubbles(root)) {
+      const wrap = el.closest('[data-chat-kind="user"][data-node-id]')
+      const id = wrap instanceof HTMLElement ? wrap.getAttribute('data-node-id')?.trim() : ''
+      const text = preview(el.textContent ?? '')
+      if (!id || !text) continue
+      items.push({ id, text, level: 2 })
+    }
+    return items
+  }
+  const items: HeadingOutlineItem[] = []
+  for (const el of headingElements(root)) {
+    const item = itemFromEl(el, items.length)
+    if (item) items.push(item)
+  }
+  return items
+}
+
+export function headingElById(root: ParentNode, id: string): HTMLElement | null {
+  const user = root.querySelector(`[data-chat-kind="user"][data-node-id="${escapeId(id)}"]`)
+  if (user instanceof HTMLElement) return user
+  const items: HeadingOutlineItem[] = []
+  for (const el of headingElements(root)) {
+    const item = itemFromEl(el, items.length)
+    if (!item) continue
+    if (item.id === id) return el
+    items.push(item)
+  }
+  return null
+}
+
+export function sameOutlineItems(a: HeadingOutlineItem[], b: HeadingOutlineItem[]) {
+  return (
+    a.length === b.length &&
+    a.every((item, index) => {
+      const other = b[index]
+      return other && item.id === other.id && item.text === other.text && item.level === other.level
+    })
+  )
+}

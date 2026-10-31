@@ -7,8 +7,11 @@ import {
   extractImagePathCandidates,
   findRecentImageFiles,
   ingestSessionImages,
+  persistPastedImages,
+  pastedImagePickText,
   readArtifactFile,
   resolveArtifactFile,
+  withPastedImagePicks,
 } from './artifacts.ts'
 
 const TINY_PNG = Buffer.from(
@@ -17,12 +20,12 @@ const TINY_PNG = Buffer.from(
 )
 
 test('extractImagePathCandidates finds relative and absolute image paths', () => {
-  const text = 'saved shot.png\nalso ./shots/a.jpg and /tmp/out.webp done'
+  const text = 'saved shot.png\nalso ./shots/a.jpg and /tmp/out.webp done public/favicon.svg'
   assert.deepEqual(extractImagePathCandidates(text), ['shot.png', './shots/a.jpg', '/tmp/out.webp'])
 })
 
-test('ingestSessionImages copies workspace images into .cordis/artifacts', async () => {
-  const baseDir = await mkdtemp(join(tmpdir(), 'cordis-art-'))
+test('ingestSessionImages copies workspace images into .biu/artifacts', async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), 'biu-art-'))
   const workspace = join(baseDir, 'ws')
   await mkdir(join(workspace, 'shots'), { recursive: true })
   await writeFile(join(workspace, 'shots', 'demo.png'), TINY_PNG)
@@ -36,12 +39,27 @@ test('ingestSessionImages copies workspace images into .cordis/artifacts', async
   assert.equal(artifacts.length, 1)
   assert.equal(artifacts[0]?.name, 'demo.png')
   assert.equal(artifacts[0]?.mime, 'image/png')
-  assert.equal(artifacts[0]?.url, '/api/sessions/sess-1/artifacts/demo.png')
+  assert.equal(artifacts[0]?.url, '/api/agents/sess-1/artifacts/demo.png')
 
   const file = await readArtifactFile('sess-1', 'demo.png', baseDir)
   assert.ok(file)
   assert.equal(file.mime, 'image/png')
   assert.deepEqual(file.data, TINY_PNG)
+})
+
+test('ingestSessionImages skips svg bytes even when the file is named png', async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), 'biu-art-svg-'))
+  const workspace = join(baseDir, 'ws')
+  await mkdir(workspace, { recursive: true })
+  await writeFile(join(workspace, 'logo.png'), Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"></svg>'))
+
+  const artifacts = await ingestSessionImages({
+    sessionId: 'sess-svg',
+    candidates: ['logo.png'],
+    workspaceRoot: workspace,
+    baseDir,
+  })
+  assert.equal(artifacts.length, 0)
 })
 
 test('ingestSessionImages accepts absolute paths outside workspace', async () => {
@@ -69,6 +87,37 @@ test('findRecentImageFiles picks up newly written workspace images', async () =>
   await writeFile(join(workspace, 'fresh.png'), TINY_PNG)
   const found = await findRecentImageFiles(workspace, since)
   assert.ok(found.some((path) => path.endsWith('fresh.png')))
+})
+
+test('persistPastedImages writes data URLs into session artifacts and names picks', async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), 'biu-paste-'))
+  const png = TINY_PNG.toString('base64')
+  const saved = await persistPastedImages(
+    'sess-paste',
+    [
+      { name: 'shot.png', mime: 'image/png', url: `data:image/png;base64,${png}` },
+      { name: 'shot.png', mime: 'image/png', url: `data:image/png;base64,${png}` },
+    ],
+    baseDir,
+  )
+  assert.equal(saved.length, 2)
+  assert.equal(saved[0]?.name, 'shot.png')
+  assert.equal(saved[1]?.name, 'shot-1.png')
+  assert.ok(saved[0]?.path?.includes(`${join('artifacts', 'sess-paste')}`))
+  const file = await readArtifactFile('sess-paste', 'shot.png', baseDir)
+  assert.deepEqual(file?.data, TINY_PNG)
+  const picks = pastedImagePickText(saved)
+  assert.match(picks, /"kind":"file"/)
+  assert.match(picks, /shot\.png/)
+  assert.equal(withPastedImagePicks('看看', saved).startsWith('看看\n<pick>'), true)
+})
+
+test('persistPastedImages rejects non data URLs', async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), 'biu-paste-bad-'))
+  await assert.rejects(
+    () => persistPastedImages('sess-bad', [{ name: 'a.png', mime: 'image/png', url: '/tmp/a.png' }], baseDir),
+    /data URL/,
+  )
 })
 
 test('resolveArtifactFile rejects path traversal', () => {

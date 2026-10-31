@@ -1,0 +1,45 @@
+import {
+  AcademicCapIcon,
+  CheckCircleIcon,
+  CursorArrowRaysIcon,
+  BellIcon,
+  BoltIcon,
+  DocumentIcon,
+  EyeIcon,
+  LinkIcon,
+  TagIcon,
+  PuzzlePieceIcon,
+  RectangleGroupIcon,
+  TableCellsIcon,
+  TrashIcon,
+} from '@heroicons/react/16/solid'
+
+export function idleTableIconKind(icon?: string) {
+  const name = (icon ?? '').trim().toLowerCase()
+  if (name === 'check-circle' || name === 'check' || name === 'clipboard-document-list' || name === 'clipboard') return 'check'
+  if (name === 'cursor' || name === 'cursor-arrow-rays' || name === 'chat-bubble' || name === 'chat-bubble-left-right') return 'cursor'
+  if (name === 'academic-cap' || name === 'skill' || name === 'skills') return 'skill'
+  if (name === 'document' || name === 'document-text' || name === 'page') return 'page'
+  return 'table'
+}
+
+export function TableGlyph({ icon, className = 'size-4' }: { icon?: string; className?: string }) {
+  const name = (icon ?? '').trim().toLowerCase()
+  if (name === 'puzzle-piece' || name === 'puzzle') return <PuzzlePieceIcon aria-hidden className={className} />
+  if (name === 'check-circle' || name === 'check' || name === 'clipboard-document-list' || name === 'clipboard') {
+    return <CheckCircleIcon aria-hidden className={className} />
+  }
+  if (name === 'cursor' || name === 'cursor-arrow-rays' || name === 'chat-bubble' || name === 'chat-bubble-left-right') {
+    return <CursorArrowRaysIcon aria-hidden className={className} />
+  }
+  if (name === 'academic-cap' || name === 'skill' || name === 'skills') return <AcademicCapIcon aria-hidden className={className} />
+  if (name === 'document' || name === 'document-text' || name === 'page') return <DocumentIcon aria-hidden className={className} />
+  if (name === 'bolt') return <BoltIcon aria-hidden className={className} />
+  if (name === 'trash' || name === 'recycle') return <TrashIcon aria-hidden className={className} />
+  if (name === 'link' || name === 'mcp') return <LinkIcon aria-hidden className={className} />
+  if (name === 'bell') return <BellIcon aria-hidden className={className} />
+  if (name === 'eye') return <EyeIcon aria-hidden className={className} />
+  if (name === 'tag' || name === 'rectangle-stack' || name === 'collection') return <TagIcon aria-hidden className={className} />
+  if (name === 'rectangle-group' || name === 'squares-2x2' || name === 'widgets') return <RectangleGroupIcon aria-hidden className={className} />
+  return <TableCellsIcon aria-hidden className={className} />
+}

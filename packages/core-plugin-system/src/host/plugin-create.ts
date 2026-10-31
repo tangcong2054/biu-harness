@@ -1,8 +1,9 @@
-import { existsSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { readFile, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
-import type { Context } from 'cordis'
-import type { PluginStoreService } from './store.ts'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { dirname, extname, join, resolve } from 'node:path'
+import type { Plugin as EsbuildPlugin } from 'esbuild'
 import { declaredStoreShell, parseStoreShell, requireDeclaredShell, type StoreShell } from '../shell.ts'
 
 export type PluginCreateInput = {
@@ -12,6 +13,8 @@ export type PluginCreateInput = {
   tags?: string[]
   author?: string
   authorUrl?: string
+  builtin?: boolean
+  headless?: boolean
   shell?: StoreShell | Record<string, unknown>
   hostJs?: string
   webJs?: string
@@ -24,8 +27,15 @@ export type StoreManifestFields = {
   tags: string[]
   author: string
   authorUrl: string
+  builtin?: boolean
   createdAt: number
+  headless?: boolean
   shell?: StoreShell
+}
+
+export function listingCreatedAt(createdAt: unknown) {
+  const n = Number(createdAt)
+  return Number.isFinite(n) && n > 0 ? n : 0
 }
 
 export function parseTags(value: unknown): string[] {
@@ -38,11 +48,12 @@ export function parseTags(value: unknown): string[] {
 }
 
 export function buildStoreManifest(
-  input: Pick<PluginCreateInput, 'id' | 'name' | 'blurb' | 'tags' | 'author' | 'authorUrl' | 'shell'>,
+  input: Pick<PluginCreateInput, 'id' | 'name' | 'blurb' | 'tags' | 'author' | 'authorUrl' | 'shell' | 'headless' | 'builtin'>,
   existing?: Partial<StoreManifestFields>,
   now = Date.now(),
 ): StoreManifestFields {
   const createdAt = Number(existing?.createdAt)
+  const headless = Boolean(input.headless ?? existing?.headless)
   return {
     id: String(input.id).trim(),
     name: String(input.name).trim(),
@@ -51,7 +62,9 @@ export function buildStoreManifest(
     author: String(input.author ?? existing?.author ?? '').trim(),
     authorUrl: String(input.authorUrl ?? existing?.authorUrl ?? '').trim(),
     createdAt: Number.isFinite(createdAt) && createdAt > 0 ? createdAt : now,
-    ...(declaredStoreShell(input.shell ?? existing?.shell)
+    ...(input.builtin === true || existing?.builtin === true ? { builtin: true as const } : {}),
+    ...(headless ? { headless: true } : {}),
+    ...(!headless && declaredStoreShell(input.shell ?? existing?.shell)
       ? { shell: parseStoreShell(input.shell ?? existing?.shell) }
       : {}),
   }
@@ -71,52 +84,527 @@ export function parseStoreManifest(raw: unknown): StoreManifestFields {
       tags: parseTags(data.tags),
       author: data.author != null ? String(data.author) : undefined,
       authorUrl: data.authorUrl != null ? String(data.authorUrl) : data.author_url != null ? String(data.author_url) : undefined,
+      builtin: data.builtin === true,
+      headless: data.headless === true,
       shell: data.shell,
     },
     { createdAt },
-    Number.isFinite(createdAt) && createdAt > 0 ? createdAt : 0,
+    listingCreatedAt(createdAt) || Date.now(),
   )
 }
 
-const HOST_ENTRIES = ['host.ts', 'host.tsx', 'host.js']
-const WEB_ENTRIES = ['web.tsx', 'web.ts', 'web.js']
+/** 缺 createdAt（含 0）时写入 manifest，之后不再用目录 ctime。 */
+export async function persistStoreManifestCreatedAt(dir: string, now = Date.now()): Promise<StoreManifestFields> {
+  const path = join(dir, 'manifest.json')
+  const raw = JSON.parse(await readFile(path, 'utf8')) as unknown
+  const data = raw && typeof raw === 'object' ? { ...(raw as Record<string, unknown>) } : {}
+  const stamped = listingCreatedAt(data.createdAt)
+  const manifest = parseStoreManifest({ ...data, createdAt: stamped || now })
+  if (!stamped) {
+    data.createdAt = manifest.createdAt
+    await writeFile(path, `${JSON.stringify(data, null, 2)}\n`)
+  }
+  return manifest
+}
+
+const HOST_ENTRIES = ['host/index.ts', 'host/index.tsx', 'host/index.js']
+const WEB_ENTRIES = ['web/index.tsx', 'web/index.ts', 'web/index.js']
+const NATIVE_PLUGIN_DEPENDENCIES = new Set(['node-pty'])
 
 export function findEntry(dir: string, names: string[]) {
   return names.map((name) => join(dir, name)).find((path) => existsSync(path)) ?? null
 }
 
-/** 单文件 TS/TSX → ESM（无 bundle）。 */
-export async function compileStoreModule(source: string, kind: 'host' | 'web') {
-  const trimmed = source.trim()
-  if (!trimmed) throw new Error(`${kind} source is empty`)
-  const { transform } = await import('esbuild')
-  const result = await transform(trimmed, {
-    loader: kind === 'web' ? 'tsx' : 'ts',
-    format: 'esm',
-    target: 'es2022',
-    jsx: 'transform',
-    jsxFactory: 'React.createElement',
-    jsxFragment: 'React.Fragment',
-    sourcemap: false,
-  })
-  return finishBundle(result.code, kind)
+/** 入口可以在 host/ 或 web/ 里，包根目录仍是带 manifest.json 的那一层。 */
+export function pluginRoot(dir: string) {
+  let current = dir
+  while (current && current !== dirname(current)) {
+    if (existsSync(join(current, 'manifest.json'))) return current
+    current = dirname(current)
+  }
+  return dir
 }
 
-/** 沙箱入口打包：可相对 import 同目录其它文件。 */
+function mimeForAsset(file: string) {
+  const ext = extname(file).toLowerCase()
+  if (ext === '.woff2') return 'font/woff2'
+  if (ext === '.woff') return 'font/woff'
+  if (ext === '.ttf') return 'font/ttf'
+  if (ext === '.otf') return 'font/otf'
+  if (ext === '.png') return 'image/png'
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg'
+  if (ext === '.svg') return 'image/svg+xml'
+  if (ext === '.css') return 'text/css'
+  return 'application/octet-stream'
+}
+
+function inlineCssUrls(css: string, cssFile: string) {
+  return css.replace(/url\((['"]?)(\.[^'")]+)\1\)/g, (_all, _q: string, rel: string) => {
+    const file = resolve(dirname(cssFile), rel)
+    const buf = readFileSync(file)
+    return `url(data:${mimeForAsset(file)};base64,${buf.toString('base64')})`
+  })
+}
+
+function namedFrom(globalExpr: string, names: string[]) {
+  return `const G = ${globalExpr}
+export default G
+${names.map((name) => `export const ${name} = G.${name}`).join('\n')}
+`
+}
+
+function reactShim(spec: string) {
+  if (spec === 'react/jsx-runtime' || spec === 'react/jsx-dev-runtime') {
+    return `const R = globalThis.React
+const J = globalThis.ReactJSXRuntime
+export const Fragment = (J && J.Fragment) || R.Fragment
+export const jsx = J && J.jsx ? J.jsx : (type, props, key) => R.createElement(type, key == null ? props : { ...props, key })
+export const jsxs = J && J.jsxs ? J.jsxs : jsx
+export const jsxDEV = J && (J.jsxDEV || J.jsx) ? (J.jsxDEV || J.jsx) : jsx
+`
+  }
+  if (spec === 'react-dom' || spec.startsWith('react-dom/')) {
+    return namedFrom('globalThis.ReactDOM', [
+      'createPortal',
+      'createRoot',
+      'findDOMNode',
+      'flushSync',
+      'hydrate',
+      'hydrateRoot',
+      'render',
+      'unmountComponentAtNode',
+      'unstable_batchedUpdates',
+      'unstable_renderSubtreeIntoContainer',
+      'version',
+    ])
+  }
+  return namedFrom('globalThis.React', [
+    'Children',
+    'Component',
+    'Fragment',
+    'Profiler',
+    'PureComponent',
+    'StrictMode',
+    'Suspense',
+    'cloneElement',
+    'createContext',
+    'createElement',
+    'createFactory',
+    'createRef',
+    'forwardRef',
+    'isValidElement',
+    'lazy',
+    'memo',
+    'startTransition',
+    'unstable_act',
+    'use',
+    'useActionState',
+    'useCallback',
+    'useContext',
+    'useDebugValue',
+    'useDeferredValue',
+    'useEffect',
+    'useEffectEvent',
+    'useId',
+    'useImperativeHandle',
+    'useInsertionEffect',
+    'useLayoutEffect',
+    'useMemo',
+    'useOptimistic',
+    'useReducer',
+    'useRef',
+    'useState',
+    'useSyncExternalStore',
+    'useTransition',
+    'version',
+  ])
+}
+
+const BIU_UI_SPEC = /^@biu\/biu-ui(\/.*)?$/
+const REUI_SPEC = /^@biu\/reui(\/.*)?$/
+const REUI_EXPORTS = [
+  'ActivityRings',
+  'Badge',
+  'Button',
+  'Card',
+  'CardActions',
+  'CardContent',
+  'CardDescription',
+  'CardHeader',
+  'CardTitle',
+  'Cell',
+  'Checkbox',
+  'Chrome',
+  'ConfirmDialog',
+  'Group',
+  'Input',
+  'Label',
+  'Progress',
+  'ReUI',
+  'Select',
+  'Separator',
+  'Table',
+  'TableBody',
+  'TableCell',
+  'TableHead',
+  'TableHeader',
+  'TableRow',
+  'Tabs',
+  'TabsTrigger',
+  'TagChip',
+  'Textarea',
+  'Traffic',
+  'Tree',
+  'TreeItem',
+  'TreeItemLabel',
+  'installReUIStyles',
+]
+const BIU_UI_EXPORTS = [
+  'AnchorMenu',
+  'AttachmentList',
+  'AttachmentMark',
+  'Badge',
+  'BoolBox',
+  'Button',
+  'Calendar',
+  'calendarDayVariants',
+  'Card',
+  'CardContent',
+  'CardHeader',
+  'CardTitle',
+  'Checkbox',
+  'CHAT_DOCK_STACK',
+  'CHAT_STAGE_CENTER',
+  'CHAT_STAGE_PANE',
+  'ChatCount',
+  'ChatDockStack',
+  'ChatPane',
+  'ChatStage',
+  'ConfirmDialog',
+  'badgeVariants',
+  'buttonVariants',
+  'cn',
+  'DownloadMark',
+  'HEADLESS_DISMISS_IGNORE',
+  'HeadlessDismiss',
+  'HeadlessPopover',
+  'Image',
+  'ImagePreviewGroup',
+  'Input',
+  'Label',
+  'OutlineNav',
+  'PaperClipMark',
+  'Progress',
+  'RecordEmojiBoard',
+  'RenderBoundary',
+  'SHARE_OVERLAY_Z',
+  'Select',
+  'Separator',
+  'SidebarFold',
+  'TAG_INK_BASE',
+  'TAG_TONES',
+  'TAG_TONE_BLUE',
+  'TAG_TONE_GREEN',
+  'TAG_TONE_ORANGE',
+  'TAG_TONE_RED',
+  'TAG_TONE_ROSE',
+  'Table',
+  'TableBody',
+  'TableCell',
+  'TableHead',
+  'TableHeader',
+  'TableRow',
+  'Tabs',
+  'TabsTrigger',
+  'TagChip',
+  'TagChipCloseMark',
+  'TagChips',
+  'Textarea',
+  'ensureAttachmentListStyle',
+  'ensureButtonStyle',
+  'ensureInputStyle',
+  'ensureTagChipStyle',
+  'hydrateWorkspaceProfile',
+  'listenOutsideDismiss',
+  'overlayPortalRoot',
+  'overlayZ',
+  'persistWorkspaceProfile',
+  'profileDisplayName',
+  'readWorkspaceProfile',
+  'scrollOutlineTarget',
+  'subscribeWorkspaceProfile',
+  'tagTextColor',
+  'tagTone',
+  'tagWashColor',
+  'useWorkspaceProfile',
+  'writeWorkspaceProfile',
+]
+
+function buildUiShim() {
+  return namedFrom('globalThis.BiuUi', BIU_UI_EXPORTS)
+}
+
+function buildReuiShim() {
+  return namedFrom('globalThis.ReUI', REUI_EXPORTS)
+}
+
+function storeBundlePlugins(kind: 'host' | 'web'): EsbuildPlugin[] {
+  const plugins: EsbuildPlugin[] = [
+    {
+      name: 'store-no-biu',
+      setup(build) {
+        build.onResolve({ filter: /^@biu\// }, (args) => {
+          if (kind === 'web' && BIU_UI_SPEC.test(args.path)) {
+            return { path: args.path, namespace: 'host-biu-ui' }
+          }
+          if (kind === 'web' && REUI_SPEC.test(args.path)) {
+            return { path: args.path, namespace: 'host-reui' }
+          }
+          return {
+            errors: [{ text: `store plugins cannot import ${args.path}; inject the host service instead` }],
+            path: args.path,
+          }
+        })
+        if (kind === 'web') {
+          build.onLoad({ filter: /.*/, namespace: 'host-biu-ui' }, () => ({
+            contents: buildUiShim(),
+            loader: 'js',
+          }))
+          build.onLoad({ filter: /.*/, namespace: 'host-reui' }, () => ({
+            contents: buildReuiShim(),
+            loader: 'js',
+          }))
+        }
+      },
+    },
+  ]
+  if (kind !== 'web') return plugins
+  plugins.push({
+    name: 'store-host-react',
+    setup(build) {
+      build.onResolve({ filter: /^(react|react-dom)(\/.*)?$/ }, (args) => ({
+        path: args.path,
+        namespace: 'host-react',
+      }))
+      build.onLoad({ filter: /.*/, namespace: 'host-react' }, (args) => ({
+        contents: reactShim(args.path),
+        loader: 'js',
+      }))
+    },
+  })
+  plugins.push({
+    name: 'store-css',
+    setup(build) {
+      build.onLoad({ filter: /\.css$/ }, (args) => {
+        const css = inlineCssUrls(readFileSync(args.path, 'utf8'), args.path)
+        const id = `store-css-${Buffer.from(args.path).toString('base64url').slice(0, 24)}`
+        return {
+          contents: `if (typeof document !== "undefined" && !document.getElementById(${JSON.stringify(id)})) {
+  const el = document.createElement("style")
+  el.id = ${JSON.stringify(id)}
+  el.textContent = ${JSON.stringify(css)}
+  document.head.appendChild(el)
+}
+`,
+          loader: 'js',
+        }
+      })
+    },
+  })
+  return plugins
+}
+
+export function sandboxPackageJson(id: string) {
+  return `${JSON.stringify({ name: id, private: true, dependencies: {} }, null, 2)}\n`
+}
+
+/** 每个沙箱都有 package.json，即便暂时没有 npm 依赖。已有文件不覆盖。 */
+export async function ensureSandboxPackageJson(dest: string, id: string) {
+  const pkgFile = join(dest, 'package.json')
+  if (existsSync(pkgFile)) return
+  await writeFile(pkgFile, sandboxPackageJson(id))
+}
+
+const execFileAsync = promisify(execFile)
+
+/**
+ * 插件 pack 共用一个 esbuild 服务，IPC 必须靠事件循环收。
+ * 多个 pack 同时跑时，同步 npm 会堵住循环，esbuild 管道写满后两边互相等。
+ * 整段 bundle（含 npm install）排成一条队列。
+ */
+let packTail: Promise<void> = Promise.resolve()
+
+export function withPluginPackLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = packTail.then(fn, fn)
+  packTail = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  return run
+}
+
+/** 沙箱自己的 npm 依赖：pack 时装进 .plugin-dev/<id>/node_modules，再打进 bundle。不走宿主 package.json。 */
+export async function ensureSandboxNpm(sandbox: string) {
+  const pkgFile = join(sandbox, 'package.json')
+  if (!existsSync(pkgFile)) return
+  let pkg: { dependencies?: Record<string, string> }
+  try {
+    pkg = JSON.parse(readFileSync(pkgFile, 'utf8')) as { dependencies?: Record<string, string> }
+  } catch {
+    throw new Error(`invalid package.json: ${pkgFile}`)
+  }
+  const deps = pkg.dependencies ?? {}
+  const names = Object.keys(deps)
+  if (!names.length) return
+  const dependencyReady = (name: string) =>
+    existsSync(join(sandbox, 'node_modules', name, 'package.json')) &&
+    (!NATIVE_PLUGIN_DEPENDENCIES.has(name) || nativeModuleReady(sandbox, name))
+  if (names.every(dependencyReady)) return
+  const options = {
+    cwd: sandbox,
+    encoding: 'utf8' as const,
+    stdio: ['ignore', 'pipe', 'pipe'] as const,
+    env: { ...process.env, npm_config_update_notifier: 'false' },
+    shell: process.platform === 'win32',
+  }
+  const runNpm = (args: string[], timeout: number) =>
+    execFileAsync('npm', args, { ...options, timeout })
+  try {
+    await runNpm(
+      ['install', '--omit=dev', '--no-audit', '--no-fund', '--ignore-scripts', '--no-package-lock'],
+      120_000,
+    )
+    for (const name of pluginExternalDependencies(sandbox)) {
+      if (!nativeModuleReady(sandbox, name)) {
+        await runNpm(['rebuild', name, '--no-audit', '--no-fund'], 180_000)
+      }
+      if (!nativeModuleReady(sandbox, name)) {
+        throw new Error(`native plugin dependency is not runnable: ${name}`)
+      }
+    }
+  } catch (error) {
+    const detail = error instanceof Error && 'stderr' in error ? String((error as { stderr?: string }).stderr || error.message) : String(error)
+    throw new Error(`plugin npm install failed in ${sandbox}: ${detail.trim()}`)
+  }
+}
+
+function nativeModuleReady(sandbox: string, name: string) {
+  if (name !== 'node-pty') return true
+  const dir = join(sandbox, 'node_modules', name)
+  return (
+    existsSync(join(dir, 'prebuilds', `${process.platform}-${process.arch}`, 'pty.node')) ||
+    existsSync(join(dir, 'build', 'Release', 'pty.node'))
+  )
+}
+
+function sandboxDependencies(sandbox: string): Record<string, string> {
+  const pkgFile = join(sandbox, 'package.json')
+  if (!existsSync(pkgFile)) return {}
+  const pkg = JSON.parse(readFileSync(pkgFile, 'utf8')) as { dependencies?: Record<string, string> }
+  return pkg.dependencies ?? {}
+}
+
+function pluginExternalDependencies(sandbox: string) {
+  return Object.keys(sandboxDependencies(sandbox)).filter((name) => NATIVE_PLUGIN_DEPENDENCIES.has(name))
+}
+
+function copyDependencyClosure(name: string, sourceModules: string, destModules: string, copied: Set<string>) {
+  if (copied.has(name)) return
+  const source = join(sourceModules, ...name.split('/'))
+  if (!existsSync(join(source, 'package.json'))) throw new Error(`plugin runtime dependency missing: ${name}`)
+  copied.add(name)
+  const dest = join(destModules, ...name.split('/'))
+  mkdirSync(dirname(dest), { recursive: true })
+  cpSync(source, dest, { recursive: true })
+  const pkg = JSON.parse(readFileSync(join(source, 'package.json'), 'utf8')) as {
+    dependencies?: Record<string, string>
+    optionalDependencies?: Record<string, string>
+  }
+  for (const child of Object.keys({ ...(pkg.dependencies ?? {}), ...(pkg.optionalDependencies ?? {}) })) {
+    const nested = join(source, 'node_modules')
+    copyDependencyClosure(child, existsSync(join(nested, ...child.split('/'))) ? nested : sourceModules, destModules, copied)
+  }
+}
+
+function prunePluginRuntime(dir: string) {
+  if (!existsSync(dir)) return
+  for (const name of readdirSync(dir)) {
+    const path = join(dir, name)
+    const stat = statSync(path)
+    if (stat.isDirectory()) {
+      if (['test', 'tests', '__tests__'].includes(name)) {
+        rmSync(path, { recursive: true, force: true })
+      } else {
+        prunePluginRuntime(path)
+      }
+    } else if (/\.(?:d\.ts|map|md|pdb)$/i.test(name)) {
+      rmSync(path, { force: true })
+    }
+  }
+}
+
+/** 原生 external 由插件自己携带；不再要求桌面宿主提供。 */
+export function copyPluginRuntimeDependencies(sandbox: string, dest: string) {
+  const external = pluginExternalDependencies(sandbox)
+  const destModules = join(dest, 'node_modules')
+  rmSync(destModules, { recursive: true, force: true })
+  if (!external.length) return []
+  const sourceModules = join(sandbox, 'node_modules')
+  for (const name of external) copyDependencyClosure(name, sourceModules, destModules, new Set())
+  prunePluginRuntime(destModules)
+
+  const pty = join(destModules, 'node-pty')
+  for (const name of ['binding.gyp', 'deps', 'scripts', 'src', 'third_party', 'typings']) {
+    rmSync(join(pty, name), { recursive: true, force: true })
+  }
+  const prebuilds = join(pty, 'prebuilds')
+  if (existsSync(prebuilds)) {
+    const keep = `${process.platform}-${process.arch}`
+    for (const name of readdirSync(prebuilds)) {
+      if (name !== keep) rmSync(join(prebuilds, name), { recursive: true, force: true })
+    }
+    const helper = join(prebuilds, keep, 'spawn-helper')
+    if (process.platform !== 'win32' && existsSync(helper)) chmodSync(helper, 0o755)
+    if (!readdirSync(prebuilds).length) rmSync(prebuilds, { recursive: true, force: true })
+  }
+  rmSync(join(pty, 'build', 'Debug'), { recursive: true, force: true })
+  const builtHelper = join(pty, 'build', 'Release', 'spawn-helper')
+  if (process.platform !== 'win32' && existsSync(builtHelper)) chmodSync(builtHelper, 0o755)
+  return external
+}
+
+/** 沙箱入口打包：相对 import + 沙箱 npm（react / @biu/* 除外；web 的 @biu/biu-ui 与 @biu/reui 映射到宿主）。 */
 export async function bundleStoreEntry(entryFile: string, kind: 'host' | 'web') {
+  return withPluginPackLock(() => bundleStoreEntryUnlocked(entryFile, kind))
+}
+
+async function bundleStoreEntryUnlocked(entryFile: string, kind: 'host' | 'web') {
+  const sandbox = pluginRoot(dirname(entryFile))
+  await ensureSandboxNpm(sandbox)
   const { build } = await import('esbuild')
   const result = await build({
-    absWorkingDir: dirname(entryFile),
+    absWorkingDir: sandbox,
     entryPoints: [entryFile],
     bundle: true,
+    minify: true,
+    legalComments: 'none',
     write: false,
     format: 'esm',
-    platform: 'neutral',
+    platform: kind === 'host' ? 'node' : 'browser',
     target: 'es2022',
     jsx: 'transform',
     jsxFactory: 'React.createElement',
     jsxFragment: 'React.Fragment',
+    tsconfigRaw: '{"compilerOptions":{"jsx":"react"}}',
     logLevel: 'silent',
+    define: {
+      'process.env.NODE_ENV': JSON.stringify('production'),
+      'process.env.IS_PREACT': 'false',
+    },
+    conditions: ['production', 'import', 'module', 'browser', 'default'],
+    plugins: storeBundlePlugins(kind),
+    // 原生模块不能打进 host.js，由插件 pack 到自己的 node_modules。
+    external: kind === 'host' ? pluginExternalDependencies(sandbox) : [],
   })
   const text = result.outputFiles?.[0]?.text
   if (!text?.trim()) throw new Error(`${kind} bundle is empty`)
@@ -131,37 +619,29 @@ function finishBundle(code: string, kind: 'host' | 'web') {
   return out.endsWith('\n') ? out : `${out}\n`
 }
 
-export async function readSandboxManifest(dir: string) {
-  const raw = JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8')) as unknown
-  return parseStoreManifest(raw)
-}
-
 const CONTRACT = [
-  '契约：id 与 export const name 相同。禁止 import npm / react / @biu/*。不要改 packages/ 或 cordis.plugins.json。',
-  'Web：ctx.slots.place("plugin-store-extras", Comp, { key, props: () => ({ Icon }) })。Icon 可选，不传则 Dock 用默认拼图图标。运行窗口会给 extras 套 macOS 窗口框（关/缩/全屏），key 尽量用插件 id。',
-  '有 web 时必须在 manifest / 本工具 shell 参数里写 width 与 height（内容区像素）。可选 minWidth / minHeight / resizable。禁止省略让窗口猜尺寸。插件根节点铺满窗口，不要用 100vw。',
-  '/plugins 列表没有 listing.shell 对象，只有扁平字段 shellWidth、shellHeight、shellMinWidth、shellMinHeight、shellResizable。运行窗口必须用 storeShellFromRecord 读这些字段，禁止再读 listing.shell（undefined 会落到默认 480×360，操作栏会离开卡片）。',
+  '契约：id 与 export const name 相同。每个沙箱都有自己的 package.json（没有第三方依赖也写一份，dependencies 可以为空）。可以 import npm；依赖写在这份 package.json，pack 会在沙箱 npm install 再打进 host.js/web.js，不要写进宿主 package.json。不要 import react / react-dom：Web 用宿主 globalThis.React、ReactDOM 与 ReactJSXRuntime。不要 import @biu/*（@biu/biu-ui 与 @biu/reui 除外）。页面块 UI 用 import { ReUI, Button } from \'@biu/reui\'，打包映射到 globalThis.ReUI，不要拷 web/reui.tsx。宿主服务用 inject。安装路径只有 sandbox + pack：db_action /plugins/<id> action=sandbox 建 .plugin-dev/<id>/，写完再用 action=pack。不要直写 .plugin。不要改 packages/ 或 cordis.plugins.json。',
+  '有窗口的 Web：ctx.slots.place("plugin-store-extras", Comp, { key, props: () => ({ Icon }) })。Icon 可选。运行窗口会给 extras 套操纵栏（关/缩；resizable 才有全屏），key 尽量用插件 id。',
+  '无头插件：manifest 写 headless: true。有 web 也不要 shell，不要 place plugin-store-extras，不要操纵栏。只在 apply 里登记服务（如 pageEditor、databaseUi）。pageEditor.registerBlock 必须带 plugin（与本插件 id / export const name 相同），并用 blockType 声明块类型：basic 进斜杠「基础模块」，其它值（如 excalidraw、algorithm）各自成组，不要混进基础。写入文档后编辑器按这个 id 引导启用，不要让编辑器猜插件。页面块插件的 README（介绍）必须含「示例写法」和完整 :::pageBlock 围栏（含 kind、plugin、体），让 agent 读 /plugins/<id> 介绍就知道语法。集合自定义整页模式用 databaseUi.registerView(path, { id, label, plugin, View })。只换每一行的样子用 databaseUi.registerRowView(path 或 "*", { id, label, plugin, Row })，plugin 填本插件 id，宿主会打 data-biu-plugin，选取内部元素也能改这个插件。外壳和可见列由 File System 绑；Row 收到 record、fields、onOpen。',
+  '有窗口的 web 必须在 manifest / 本动作 shell 参数里写 width 与 height。无头插件不要写 shell。',
+  '/plugins 列表没有 listing.shell 对象，只有扁平字段 shellWidth、shellHeight、shellMinWidth、shellMinHeight、shellResizable、headless。有窗口时用 storeShellFromRecord 读尺寸。',
 ].join(' ')
 
-const PLUGIN_CREATE_DESCRIPTION = [
-  '直写已安装插件：单文件小插件。把 host/web 源码放进本工具参数，立刻编译进 .plugin/<id>/，插件列表就能看到。',
-  '适合一两百行、无相对 import、无多文件。更大或要拆文件请改用 plugin_sandbox + plugin_pack。',
-  CONTRACT,
-].join(' ')
-
-const PLUGIN_SANDBOX_DESCRIPTION = [
-  '开沙箱：多文件/大插件。只建/更新 .plugin-dev/<id>/（manifest.json，可选起点 host.ts / web.tsx），不进已安装目录。',
-  '然后用 bash / 文件工具在沙箱里写代码、相对 import。调完必须 plugin_pack 才会打进 .plugin/<id>/。',
+export const PLUGIN_SANDBOX_DESCRIPTION = [
+  '这是安装插件的第一步，不是新建代理。用户说「再开一个 agent」请 db_create /agents。',
+  '开沙箱：只建/更新 .plugin-dev/<id>/（manifest.json、package.json，可选起点 host/index.ts / web/index.tsx），不进已安装目录。',
+  '然后用 bash / 文件工具在沙箱里写代码、相对 import。调完必须 db_action action=pack 才会打进 .plugin/<id>/。',
   '卸载删 .plugin/<id>/，沙箱还在。',
   CONTRACT,
 ].join(' ')
 
-const PLUGIN_PACK_DESCRIPTION = [
+export const PLUGIN_PACK_DESCRIPTION = [
   '把 .plugin-dev/<id>/ 沙箱打包进 .plugin/<id>/（manifest.json + bundle 后的 host.js / web.js）。',
-  '入口：host.ts|tsx|js 与 web.tsx|ts|js，至少要有一个。有 web 时 manifest.shell 必须已写 width/height，否则拒绝打包。已打开的插件会重新挂上。',
+  '入口：host/index.ts|tsx|js 与 web/index.tsx|ts|js，至少要有一个。宿主只在 Node 跑，页面只在浏览器跑，两边分开放。有窗口的 web 必须已写 shell.width/height；无头插件写 headless: true 即可。已打开的插件会重新挂上。',
+  '每个沙箱都有 package.json。npm 依赖写在里面，pack 会在该目录 install，打进 bundle；没有第三方包时 dependencies 为空对象。不要把插件依赖加到宿主 package.json。',
 ].join(' ')
 
-function createArgs(args: Record<string, unknown>): PluginCreateInput {
+export function createArgs(args: Record<string, unknown>): PluginCreateInput {
   return {
     id: String(args.id ?? ''),
     name: String(args.name ?? ''),
@@ -169,6 +649,7 @@ function createArgs(args: Record<string, unknown>): PluginCreateInput {
     tags: parseTags(args.tags),
     author: args.author != null ? String(args.author) : undefined,
     authorUrl: args.authorUrl != null ? String(args.authorUrl) : undefined,
+    headless: args.headless === true,
     shell: args.shell && typeof args.shell === 'object' ? (args.shell as Record<string, unknown>) : undefined,
     hostJs: args.hostJs != null ? String(args.hostJs) : undefined,
     webJs: args.webJs != null ? String(args.webJs) : undefined,
@@ -181,7 +662,11 @@ const ID_NAME_BLURB = {
     description: '插件 id：小写字母开头，仅 [a-z0-9-]，最长 41。',
   },
   name: { type: 'string', description: '商店卡片标题' },
-  blurb: { type: 'string', description: '一行简介' },
+  blurb: {
+    type: 'string',
+    description:
+      '给后续 Agent 和用户看的说明书：插件做什么、怎么打开或调用（窗口 / 无头 / HTTP）、关键文件或 API、不要踩的坑。写两三句，不要只写四个字。',
+  },
   tags: {
     type: 'array',
     items: { type: 'string' },
@@ -189,9 +674,13 @@ const ID_NAME_BLURB = {
   },
   author: { type: 'string', description: '作者名' },
   authorUrl: { type: 'string', description: '作者主页 / 仓库链接' },
+  headless: {
+    type: 'boolean',
+    description: '无头插件：有 web 也不弹窗口、不要操纵栏。true 时不要写 shell。',
+  },
   shell: {
     type: 'object',
-      description: '有 web 时必填。运行窗口内容区像素，对应 manifest.shell。必须给 width 和 height。/plugins 表里会拆成 shellWidth/shellHeight，窗口用 storeShellFromRecord 读取，不要读 listing.shell。',
+      description: '有窗口的 web 必填。无头插件不要传。运行窗口内容区像素，对应 manifest.shell。必须给 width 和 height。',
     properties: {
       width: { type: 'number', description: '内容区宽，必填' },
       height: { type: 'number', description: '内容区高，必填' },
@@ -203,59 +692,16 @@ const ID_NAME_BLURB = {
   },
 }
 
-export function registerPluginCreate(ctx: Context, store: PluginStoreService) {
-  ctx.tools.register({
-    name: 'plugin_create',
-    description: PLUGIN_CREATE_DESCRIPTION,
-    parameters: {
-      type: 'object',
-      properties: {
-        ...ID_NAME_BLURB,
-        hostJs: {
-          type: 'string',
-          description: 'host.ts 源码，编译成 .plugin/<id>/host.js。可与 webJs 二选一或都给。',
-        },
-        webJs: {
-          type: 'string',
-          description: 'web.tsx 源码，编译成 .plugin/<id>/web.js。可与 hostJs 二选一或都给。',
-        },
-      },
-      required: ['id', 'name'],
-    },
-    execute: async (args) => JSON.stringify(await store.create(createArgs(args))),
-  })
-  ctx.tools.register({
-    name: 'plugin_sandbox',
-    description: PLUGIN_SANDBOX_DESCRIPTION,
-    parameters: {
-      type: 'object',
-      properties: {
-        ...ID_NAME_BLURB,
-        hostJs: {
-          type: 'string',
-          description: '可选。写入沙箱 host.ts 的起点，大逻辑请在沙箱目录里改。',
-        },
-        webJs: {
-          type: 'string',
-          description: '可选。写入沙箱 web.tsx 的起点。',
-        },
-      },
-      required: ['id', 'name'],
-    },
-    execute: async (args) => JSON.stringify(await store.initSandbox(createArgs(args))),
-  })
-  ctx.tools.register({
-    name: 'plugin_pack',
-    description: PLUGIN_PACK_DESCRIPTION,
-    parameters: {
-      type: 'object',
-      properties: {
-        id: { type: 'string', description: '要打包的插件 id，对应 .plugin-dev/<id>/' },
-      },
-      required: ['id'],
-    },
-    execute: async (args) => JSON.stringify(await store.pack(String(args.id ?? ''))),
-  })
+export const PLUGIN_SANDBOX_PROPERTIES = {
+  ...ID_NAME_BLURB,
+  hostJs: {
+    type: 'string',
+    description: '可选。写入沙箱 host/index.ts 的起点，大逻辑请在 host 目录里改。',
+  },
+  webJs: {
+    type: 'string',
+    description: '可选。写入沙箱 web/index.tsx 的起点。',
+  },
 }
 
 export { HOST_ENTRIES, WEB_ENTRIES, requireDeclaredShell, declaredStoreShell }

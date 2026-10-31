@@ -34,7 +34,6 @@ const INSPECTOR_VIEW_OMIT = new Set([
   'databaseUi',
   'useSnapshot',
   'slots',
-  'sessionView',
   'repeatable',
 ])
 
@@ -51,15 +50,47 @@ export function slotTabId(openedId: string) {
   return split === -1 ? openedId : openedId.slice(0, split)
 }
 
+export function inspectorTabCollectionPath(tabId: string) {
+  const slot = slotTabId(tabId)
+  return slot.startsWith('database:') ? slot.slice('database:'.length) : null
+}
+
+export function pruneOpenedForCollections(opened: string[], collections: Array<{ path: string }> | undefined) {
+  if (!collections) return opened
+  const live = new Set(collections.map((item) => item.path))
+  return opened.filter((id) => {
+    const path = inspectorTabCollectionPath(id)
+    return !path || live.has(path)
+  })
+}
+
+export function inspectorTabIsOpen(tabId: string, opened: string[]) {
+  return opened.some((id) => slotTabId(id) === tabId)
+}
+
 export function nextRepeatableTabId(tabId: string) {
   return `${tabId}::${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
 }
 
 export function resolveInspectorTab(current: string, allowed: string[], opened: string[] = []) {
-  const hanging = opened.filter((id) => allowed.includes(id) || allowed.includes(slotTabId(id)))
-  if (current && hanging.includes(current)) return current
+  if (current && opened.includes(current)) return current
   const currentSlot = current ? slotTabId(current) : ''
-  const bySlot = currentSlot ? hanging.find((id) => slotTabId(id) === currentSlot) : undefined
+  const bySlot = currentSlot ? opened.find((id) => slotTabId(id) === currentSlot) : undefined
   if (bySlot) return bySlot
+  const hanging = allowed.length
+    ? opened.filter((id) => allowed.includes(id) || allowed.includes(slotTabId(id)))
+    : [...opened]
   return hanging[0] ?? ''
+}
+
+/** 切回 session：本机刚点过的栏优先，再才用后端记下的 tab。 */
+export function rememberedInspectorTab(opened: string[], cached?: string, stored?: string) {
+  if (cached && opened.includes(cached)) return cached
+  if (stored && opened.includes(stored)) return stored
+  const hint = cached || stored || ''
+  if (hint) {
+    const bySlot = opened.find((id) => slotTabId(id) === slotTabId(hint))
+    if (bySlot) return bySlot
+  }
+  return hint
 }

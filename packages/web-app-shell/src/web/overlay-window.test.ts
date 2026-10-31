@@ -5,7 +5,7 @@ import { createElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { act } from 'react'
 import { OverlayChatWindow } from './overlay-window.tsx'
-import { closeChatOverlay, getChatOverlay, setChatOverlay } from './chat-overlay.ts'
+import { closeChatOverlay, getChatOverlay, getOverlayThread, revealOverlayThread, setChatOverlay, setOverlayThread } from './chat-overlay.ts'
 
 let root: Root | null = null
 let host: HTMLDivElement | null = null
@@ -18,6 +18,8 @@ afterEach(() => {
   root = null
   host = null
   setChatOverlay(false)
+  setOverlayThread(false)
+  window.dispatchEvent(new CustomEvent('biu:pick-mode', { detail: { picking: false } }))
   try {
     localStorage.removeItem('cordis.overlay.geom')
   } catch {
@@ -30,6 +32,7 @@ test('clicking the overlay close button actually closes the overlay', () => {
   document.body.append(host)
   root = createRoot(host)
   setChatOverlay(true)
+  setOverlayThread(true)
   const header = createElement(
     'button',
     { type: 'button', 'data-testid': 'chat-overlay-close' },
@@ -54,7 +57,7 @@ test('clicking the overlay close button actually closes the overlay', () => {
   closeChatOverlay()
 })
 
-test('layout button docks the overlay to the right, vertically centered', () => {
+test('overlay opens docked to the right and anchored to the bottom', () => {
   host = document.createElement('div')
   document.body.append(host)
   root = createRoot(host)
@@ -69,48 +72,37 @@ test('layout button docks the overlay to the right, vertically centered', () => 
       }),
     )
   })
-  const toggle = document.querySelector('[data-testid="chat-overlay-layout-toggle"]')
-  assert.ok(toggle)
-  act(() => {
-    toggle!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-  })
-  const menu = document.querySelector('[data-testid="chat-overlay-layout-menu"]')
-  assert.ok(menu)
-  assert.ok(document.querySelector('[data-testid="chat-overlay-layout-bottom"]'))
-  assert.ok(document.querySelector('[data-testid="chat-overlay-layout-free"]'))
-  const right = document.querySelector('[data-testid="chat-overlay-layout-right"]')
-  assert.ok(right)
-  act(() => {
-    right!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-  })
   const panel = document.querySelector('[data-testid="chat-overlay-panel"]') as HTMLElement
+  assert.ok(panel)
+  assert.equal(panel.classList.contains('is-compose-only'), true)
   assert.equal(panel.getAttribute('data-overlay-layout'), 'right')
+  assert.equal(document.querySelector('[data-testid="chat-overlay-drag"]'), null)
   assert.ok(Number.parseFloat(panel.style.left) > 700)
-  const top = Number.parseFloat(panel.style.top)
-  const height = Number.parseFloat(panel.style.height)
-  assert.ok(top > 40)
-  assert.ok(top + height < 800)
+  assert.equal(panel.style.bottom, '12px')
+  assert.equal(panel.style.height, '')
+  assert.equal(document.querySelector('[data-testid="chat-overlay-layout-toggle"]'), null)
+  assert.equal(document.querySelector('[data-testid="chat-overlay-layout"]'), null)
 })
 
-test('layout button sits in the header next to close', () => {
+test('overlay header close button has no layout control beside it', () => {
   host = document.createElement('div')
   document.body.append(host)
   root = createRoot(host)
+  setChatOverlay(true)
+  setOverlayThread(true)
   act(() => {
     root!.render(
       createElement(OverlayChatWindow, {
-        header: (layoutTools: unknown) =>
+        header: createElement(
+          'header',
+          { className: 'chat-view-header' },
+          createElement('div', { className: 'chat-view-header-left' }, 'project'),
           createElement(
-            'header',
-            { className: 'chat-view-header' },
-            createElement('div', { className: 'chat-view-header-left' }, 'project'),
-            createElement(
-              'div',
-              { className: 'chat-view-header-right' },
-              layoutTools as never,
-              createElement('button', { type: 'button', 'data-testid': 'chat-overlay-close' }, 'x'),
-            ),
+            'div',
+            { className: 'chat-view-header-right' },
+            createElement('button', { type: 'button', 'data-testid': 'chat-overlay-close' }, 'x'),
           ),
+        ),
         thread: createElement('div'),
         dock: createElement('div'),
       }),
@@ -118,9 +110,113 @@ test('layout button sits in the header next to close', () => {
   })
   const right = document.querySelector('.chat-view-header-right')
   assert.ok(right)
-  const layout = right.querySelector('[data-testid="chat-overlay-layout-toggle"]')
-  const close = right.querySelector('[data-testid="chat-overlay-close"]')
-  assert.ok(layout)
-  assert.ok(close)
-  assert.equal(layout!.parentElement?.parentElement, close!.parentElement)
+  assert.equal(right.querySelector('[data-testid="chat-overlay-layout-toggle"]'), null)
+  assert.ok(right.querySelector('[data-testid="chat-overlay-close"]'))
+})
+
+test('compose-only overlay shows the thread after send', () => {
+  host = document.createElement('div')
+  document.body.append(host)
+  root = createRoot(host)
+  setChatOverlay(true)
+  act(() => {
+    root!.render(
+      createElement(OverlayChatWindow, {
+        header: createElement('div'),
+        thread: createElement('div', { 'data-testid': 'overlay-thread-stub' }),
+        dock: createElement('div'),
+      }),
+    )
+  })
+  const panel = document.querySelector('[data-testid="chat-overlay-panel"]') as HTMLElement
+  assert.ok(panel)
+  assert.equal(panel.classList.contains('is-compose-only'), true)
+  assert.equal(document.querySelector('[data-testid="chat-overlay-head"]'), null)
+  assert.equal(document.querySelector('[data-testid="chat-overlay-peek"]'), null)
+  act(() => {
+    revealOverlayThread()
+  })
+  assert.equal(getOverlayThread(), true)
+  assert.equal(panel.classList.contains('is-compose-only'), false)
+  assert.ok(document.querySelector('[data-testid="chat-overlay-head"]'))
+  assert.equal(panel.style.bottom, '12px')
+  const pane = document.querySelector('[data-testid="chat-pane"]') as HTMLElement
+  assert.ok(pane)
+  assert.equal(pane.style.height, '')
+  assert.ok(Number.parseFloat(panel.style.height) >= 280)
+  assert.equal(panel.style.maxHeight, 'calc(100dvh - 24px)')
+  assert.equal(panel.contains(pane), true)
+  const dock = panel.querySelector('.chat-composer-dock')
+  assert.ok(dock)
+  assert.equal(pane.contains(dock), false)
+  assert.ok(pane.querySelector('.chat-overlay-thread'))
+  assert.ok(document.querySelector('[data-testid="chat-overlay-resize-n"]'))
+  assert.ok(document.querySelector('[data-testid="chat-overlay-resize-w"]'))
+  assert.ok(document.querySelector('[data-testid="chat-overlay-resize-nw"]'))
+  assert.equal(document.querySelector('[data-testid="chat-overlay-resize-s"]'), null)
+  assert.equal(document.querySelector('[data-testid="chat-overlay-resize-e"]'), null)
+  assert.equal(document.querySelector('[data-testid="chat-overlay-resize-se"]'), null)
+  assert.equal(document.querySelector('[data-testid="chat-overlay-resize-sw"]'), null)
+  assert.equal(document.querySelector('[data-testid="chat-overlay-resize-ne"]'), null)
+  const north = document.querySelector('[data-testid="chat-overlay-resize-n"]') as HTMLElement
+  assert.match(north.className, /\bz-40\b/)
+})
+
+test('compose-only overlay closes when clicking outside; expanded does not', () => {
+  host = document.createElement('div')
+  document.body.append(host)
+  root = createRoot(host)
+  setChatOverlay(true)
+  setOverlayThread(false)
+  act(() => {
+    root!.render(
+      createElement(OverlayChatWindow, {
+        header: createElement('div'),
+        thread: createElement('div'),
+        dock: createElement('div'),
+      }),
+    )
+  })
+  act(() => {
+    document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
+  })
+  assert.equal(getChatOverlay(), false)
+
+  setChatOverlay(true)
+  setOverlayThread(true)
+  act(() => {
+    root!.render(
+      createElement(OverlayChatWindow, {
+        header: createElement('div'),
+        thread: createElement('div'),
+        dock: createElement('div'),
+      }),
+    )
+  })
+  act(() => {
+    document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
+  })
+  assert.equal(getChatOverlay(), true)
+})
+
+test('compose-only overlay stays while pick mode is on', () => {
+  host = document.createElement('div')
+  document.body.append(host)
+  root = createRoot(host)
+  window.dispatchEvent(new CustomEvent('biu:pick-mode', { detail: { picking: true } }))
+  setChatOverlay(true)
+  setOverlayThread(false)
+  act(() => {
+    root!.render(
+      createElement(OverlayChatWindow, {
+        header: createElement('div'),
+        thread: createElement('div'),
+        dock: createElement('div'),
+      }),
+    )
+  })
+  act(() => {
+    document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
+  })
+  assert.equal(getChatOverlay(), true)
 })

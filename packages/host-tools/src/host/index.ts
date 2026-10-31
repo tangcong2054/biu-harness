@@ -1,12 +1,23 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { Service, type Context } from 'cordis'
+import { toolNameForApi, stripToolApiName } from './tool-name.ts'
+import { currentAccountId, currentPluginId, currentRequestWorkspaceId } from '@biu/host-plugin-loader/data-dir'
+
+export { toolNameForApi, stripToolApiName, TOOL_API_NAME } from './tool-name.ts'
 
 export interface ToolSpec {
   name: string
   description: string
   parameters: Record<string, unknown>
+  /**
+   * parallel：允许与同一批次里的其它并行工具重叠执行。
+   * exclusive / 缺省：作为屏障独占执行，保持既有工具的串行语义。
+   */
+  execution?: ToolExecutionMode | ((args: Record<string, unknown>) => ToolExecutionMode)
   execute: (args: Record<string, unknown>, signal: AbortSignal) => unknown | Promise<unknown>
 }
+
+export type ToolExecutionMode = 'parallel' | 'exclusive'
 
 export type ToolOrigin = 'core' | 'store'
 
@@ -24,18 +35,45 @@ export interface ToolRequest {
 
 export type ToolGuard = (req: ToolRequest) => ToolRequest | Promise<ToolRequest>
 
-/** 极简=底座；标准=内置工具；创造=内置 + 商店插件。 */
-export const AGENT_TOOL_MODES = ['minimal', 'standard', 'create'] as const
+/** 极简=底座两工具；文件=文件系统 db_*；标准=全部。旧创造配置并入标准。 */
+export const AGENT_TOOL_MODES = ['minimal', 'file', 'standard'] as const
 export type AgentToolMode = (typeof AGENT_TOOL_MODES)[number]
 
 export function isAgentToolMode(value: unknown): value is AgentToolMode {
-  return value === 'minimal' || value === 'standard' || value === 'create'
+  return value === 'minimal' || value === 'file' || value === 'standard'
+}
+
+export function normalizeAgentMode(value: unknown, fallback: AgentToolMode = 'standard'): AgentToolMode {
+  if (value === 'minimal' || value === 'file') return value
+  if (value === 'standard' || value === 'create') return 'standard'
+  return fallback
 }
 
 export const MINIMAL_TOOL_NAMES = ['bash', 'str_replace_editor'] as const
 
+/** Biu 文件系统 DB 工具；文件模式下只开放这些。 */
+export const FILE_TOOL_NAMES = [
+  'db_list',
+  'db_read',
+  'db_update',
+  'db_create',
+  'db_delete',
+  'db_restore',
+  'db_stat',
+  'db_action',
+  'db_content',
+  'db_asset',
+] as const
+
 /** 本回合 slash 选中的额外工具（极简模式下临时放开）。 */
 const extraToolsStorage = new AsyncLocalStorage<ReadonlySet<string>>()
+
+/** 当前 invoke 的增量汇报（agent-loop 写成 partial tool/result）。 */
+const toolProgressStorage = new AsyncLocalStorage<(detail: string) => void>()
+
+export function runWithToolProgress<T>(onProgress: (detail: string) => void, fn: () => T): T {
+  return toolProgressStorage.run(onProgress, fn)
+}
 
 /** 回合级工具策略（会话 config 覆盖全局 mode/extras）。 */
 const toolPolicyStorage = new AsyncLocalStorage<{
@@ -45,7 +83,7 @@ const toolPolicyStorage = new AsyncLocalStorage<{
 
 const toolOriginStorage = new AsyncLocalStorage<ToolOrigin>()
 
-/** 商店插件 apply 期间注册的工具标成 store，仅创造模式可见。 */
+/** 商店插件 apply 期间注册的工具标成 store，标准模式可见。 */
 export function runWithToolOrigin<T>(origin: ToolOrigin, fn: () => T): T {
   return toolOriginStorage.run(origin, fn)
 }
@@ -68,6 +106,9 @@ export function runWithToolPolicy<T>(
 export class ToolsService extends Service {
   private tools = new Map<string, ToolSpec>()
   private origins = new Map<string, ToolOrigin>()
+  private pluginIds = new Map<string, string>()
+  private aliases = new Map<string, string>()
+  private notes = new Map<string, string[]>()
   private guards: ToolGuard[] = []
   private mode: AgentToolMode = 'standard'
   /** 极简模式下常驻额外工具（配置面板勾选，跨回合生效）。 */
@@ -82,7 +123,7 @@ export class ToolsService extends Service {
   }
 
   originOf(name: string): ToolOrigin {
-    return this.origins.get(name) ?? 'core'
+    return this.origins.get(this.resolveName(name)) ?? 'core'
   }
 
   setMode(mode: AgentToolMode) {
@@ -97,22 +138,13 @@ export class ToolsService extends Service {
   }
 
   setPinnedExtras(names: readonly string[]) {
-    const liveSet = new Set<string>([
-      'session_list',
-      'session_inspect',
-      'session_progress',
-      'session_create',
-      'session_rename',
-      'session_configure',
-      'session_delete',
-    ])
     const cleaned = [
       ...new Set(
         names
           .map((name) => name.trim())
           .filter(Boolean)
           .filter((name) => !(MINIMAL_TOOL_NAMES as readonly string[]).includes(name))
-          .filter((name) => !liveSet.has(name)),
+          .filter((name) => !(FILE_TOOL_NAMES as readonly string[]).includes(name)),
       ),
     ]
     const same =
@@ -123,29 +155,86 @@ export class ToolsService extends Service {
   }
 
   private visible(name: string) {
+    const pluginId = this.pluginIds.get(this.resolveName(name))
+    if (pluginId && currentAccountId()) {
+      const store = (
+        this.ctx.get('account') as {
+          store?: { canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): boolean }
+        } | undefined
+      )?.store
+      if (!store?.canAccessPlugin?.(currentAccountId(), currentRequestWorkspaceId(), pluginId)) return false
+    }
     const policy = toolPolicyStorage.getStore()
     const mode = policy?.mode ?? this.mode
-    if (mode === 'create') return true
-    if (this.originOf(name) === 'store') return false
     if (mode === 'standard') return true
+    if (this.originOf(name) === 'store') return false
+    if (mode === 'file') return (FILE_TOOL_NAMES as readonly string[]).includes(name)
     if ((MINIMAL_TOOL_NAMES as readonly string[]).includes(name)) return true
     if ((policy?.extras ?? new Set()).has(name)) return true
+    if ([...(policy?.extras ?? [])].some((item) => this.resolveName(item) === name)) return true
     if (!policy && this.pinnedExtras.includes(name)) return true
-    return extraToolsStorage.getStore()?.has(name) ?? false
+    if (!policy && this.pinnedExtras.some((item) => this.resolveName(item) === name)) return true
+    if (extraToolsStorage.getStore()?.has(name)) return true
+    return [...(extraToolsStorage.getStore() ?? [])].some((item) => this.resolveName(item) === name)
+  }
+
+  private resolveName(name: string) {
+    const raw = String(name ?? '').trim()
+    const aliased = this.aliases.get(raw)
+    if (aliased) return aliased
+    if (this.tools.has(raw)) return raw
+    const stripped = stripToolApiName(raw)
+    if (stripped && this.tools.has(stripped)) return stripped
+    return raw
+  }
+
+  /** 插件给已有工具追加说明（卸载时摘掉）。工具尚未注册也可以先挂。 */
+  annotate(name: string, text: string) {
+    const key = String(name ?? '').trim()
+    const note = String(text ?? '').trim()
+    if (!key || !note) throw new Error('tools.annotate needs name and text')
+    return this.ctx.effect(() => {
+      const list = this.notes.get(key) ?? []
+      list.push(note)
+      this.notes.set(key, list)
+      this.ctx.emit('hub/change')
+      return () => {
+        const next = (this.notes.get(key) ?? []).filter((item) => item !== note)
+        if (next.length) this.notes.set(key, next)
+        else this.notes.delete(key)
+        this.ctx.emit('hub/change')
+      }
+    }, `tools.annotate ${key}`)
+  }
+
+  private describe(tool: ToolSpec) {
+    const extra = this.notes.get(tool.name) ?? []
+    if (!extra.length) return tool.description
+    return [tool.description, ...extra].join(' ')
   }
 
   register(spec: ToolSpec) {
+    const original = String(spec.name ?? '').trim()
+    const name = toolNameForApi(original, new Set(this.tools.keys()))
+    const pluginId = currentPluginId()
+    const next = { ...spec, name }
     return this.ctx.effect(() => {
-      if (this.tools.has(spec.name)) throw new Error(`tool already registered: ${spec.name}`)
-      this.tools.set(spec.name, spec)
-      this.origins.set(spec.name, toolOriginStorage.getStore() ?? 'core')
+      if (this.tools.has(name)) throw new Error(`tool already registered: ${name}`)
+      this.tools.set(name, next)
+      this.origins.set(name, toolOriginStorage.getStore() ?? 'core')
+      if (pluginId) this.pluginIds.set(name, pluginId)
+      this.aliases.set(name, name)
+      if (original && original !== name) this.aliases.set(original, name)
       this.ctx.emit('hub/change')
       return () => {
-        this.tools.delete(spec.name)
-        this.origins.delete(spec.name)
+        this.tools.delete(name)
+        this.origins.delete(name)
+        this.pluginIds.delete(name)
+        this.aliases.delete(name)
+        if (original && original !== name) this.aliases.delete(original)
         this.ctx.emit('hub/change')
       }
-    }, `tools.register ${spec.name}`)
+    }, `tools.register ${name}`)
   }
 
   guard(fn: ToolGuard) {
@@ -162,7 +251,7 @@ export class ToolsService extends Service {
     return [...this.tools.values()]
       .map((tool) => ({
         name: tool.name,
-        description: tool.description,
+        description: this.describe(tool),
         origin: this.originOf(tool.name),
       }))
       .sort((a, b) => a.name.localeCompare(b.name))
@@ -175,7 +264,7 @@ export class ToolsService extends Service {
         type: 'function' as const,
         function: {
           name: tool.name,
-          description: tool.description,
+          description: this.describe(tool),
           parameters: tool.parameters,
         },
       }))
@@ -185,29 +274,56 @@ export class ToolsService extends Service {
     return [...this.tools.keys()].filter((name) => this.visible(name))
   }
 
-  async invoke(name: string, args: Record<string, unknown> = {}, signal: AbortSignal = new AbortController().signal) {
-    if (!this.visible(name)) {
-      const mode = toolPolicyStorage.getStore()?.mode ?? this.mode
-      throw new Error(`tool not available in ${mode} mode: ${name}`)
+  executionMode(name: string, args: Record<string, unknown> = {}): ToolExecutionMode {
+    const execution = this.tools.get(name)?.execution
+    if (typeof execution !== 'function') return execution ?? 'exclusive'
+    try {
+      return execution(args)
+    } catch {
+      // 调度提示不能改变工具原本的报错路径；判断失败时保守串行。
+      return 'exclusive'
     }
-    let req: ToolRequest = { name, args }
-    for (const guard of this.guards) req = await guard(req)
+  }
+
+  /** 工具执行中把当前结果推到 UI；无 listener 时为空操作。 */
+  report(detail: unknown) {
+    toolProgressStorage.getStore()?.(stringify(detail))
+  }
+
+  async invoke(name: string, args: Record<string, unknown> = {}, signal: AbortSignal = new AbortController().signal) {
+    const resolved = this.resolveName(name)
+    if (signal.aborted) throw new Error('cancelled')
+    if (!this.visible(resolved)) {
+      const mode = toolPolicyStorage.getStore()?.mode ?? this.mode
+      throw new Error(`tool not available in ${mode} mode: ${resolved}`)
+    }
+    let req: ToolRequest = { name: resolved, args }
+    for (const guard of this.guards) req = await raceAbort(signal, Promise.resolve(guard(req)))
     req = this.ctx.waterfall('tools/pre-execute', req, () => req)
     if (req.deny) {
-      this.ctx.emit('tools/post-execute', { name, ok: false, detail: req.deny })
+      this.ctx.emit('tools/post-execute', { name: resolved, ok: false, detail: req.deny })
       throw new Error(req.deny)
     }
-    const tool = this.tools.get(name)
-    if (!tool) throw new Error(`unknown tool: ${name}`)
+    const tool = this.tools.get(resolved)
+    if (!tool) throw new Error(`unknown tool: ${resolved}`)
     try {
-      const result = await tool.execute(req.args, signal)
-      this.ctx.emit('tools/post-execute', { name, ok: true, detail: stringify(result) })
+      const result = await raceAbort(signal, Promise.resolve(tool.execute(req.args, signal)))
+      this.ctx.emit('tools/post-execute', { name: resolved, ok: true, detail: stringify(result) })
       return result
     } catch (error) {
-      this.ctx.emit('tools/post-execute', { name, ok: false, detail: String(error) })
+      this.ctx.emit('tools/post-execute', { name: resolved, ok: false, detail: String(error) })
       throw error
     }
   }
+}
+
+function raceAbort<T>(signal: AbortSignal, work: Promise<T>): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error('cancelled'))
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new Error('cancelled'))
+    signal.addEventListener('abort', onAbort, { once: true })
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+  })
 }
 
 function stringify(value: unknown) {

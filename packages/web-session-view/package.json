@@ -1,5 +1,6 @@
 {
   "name": "@biu/web-session-view",
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -13,5 +14,10 @@
   "peerDependencies": {
     "cordis": "4.0.0-rc.8",
     "react": "^19.1.1"
+  },
+  "dependencies": {
+    "@biu/database-ui": "0.1.0",
+    "@biu/type-file-system": "0.1.0",
+    "@biu/type-session": "0.1.0"
   }
 }

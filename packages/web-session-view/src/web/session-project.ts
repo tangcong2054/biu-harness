@@ -1,3 +1,5 @@
+import { mergeContentEditFiles } from '@biu/type-session'
+
 /** 与 host SessionEvent 对齐的瘦客户端类型（只投影 UI 需要的字段）。 */
 export type SessionEvent = {
   seq: number
@@ -29,9 +31,22 @@ export type SessionEvent = {
         histPct?: number
       }
     }
-  | { type: 'assistant/chunk'; text: string }
+  | { type: 'assistant/chunk'; text: string; channel?: 'reasoning' }
   | { type: 'tool/call'; id: string; name: string; arguments: string }
-  | { type: 'tool/result'; id: string; name: string; ok: boolean; detail: string }
+  | { type: 'tool/result'; id: string; name: string; ok: boolean; detail: string; partial?: boolean }
+  | {
+      type: 'content/edits'
+      turn: number
+      files: Array<{
+        path: string
+        title: string
+        added: number
+        removed: number
+        jump_line: number
+        reverted?: boolean
+        kind?: 'content' | 'create' | 'update' | 'delete'
+      }>
+    }
 )
 
 export interface TrajectoryUsage {
@@ -41,6 +56,8 @@ export interface TrajectoryUsage {
   cacheReadTokens?: number
   /** 该次 LLM 输入中「历史 turn」占比（0~1）；后端 agent-loop 在 derive 时挂载。curPct=1-histPct。 */
   histPct?: number
+  /** 回合汇总时：最后一个有输入的 step 的 input，用来判断上下文是否溢出。 */
+  contextInputTokens?: number
 }
 
 /** 精简 ConversationNode：事件 → 可渲染行。 */
@@ -50,7 +67,7 @@ export type ChatToolPart = {
   callId: string
   name: string
   arguments: string
-  result?: { ok: boolean; detail: string }
+  result?: { ok: boolean; detail: string; streaming?: boolean }
   step?: number
 }
 
@@ -62,7 +79,15 @@ export type ChatAssistantPart = {
   step?: number
 }
 
-export type ChatReplyPart = ChatAssistantPart | ChatToolPart
+export type ChatThinkPart = {
+  id: string
+  kind: 'think'
+  text: string
+  streaming?: boolean
+  step?: number
+}
+
+export type ChatReplyPart = ChatAssistantPart | ChatToolPart | ChatThinkPart
 
 /** 单步摘要：横条展示用。 */
 export type ChatStepStat = {
@@ -100,10 +125,21 @@ export type ChatNode =
       steps?: ChatStepStat[]
       usage?: TrajectoryUsage
       durationMs?: number
+      /** turn/start 的事件时间，直播耗时用 now - startTs。 */
+      startTs?: number
       streaming?: boolean
       finished?: boolean
       /** turn/end reason，如 complete / cancelled */
       endReason?: string
+      contentEdits?: Array<{
+        path: string
+        title: string
+        added: number
+        removed: number
+        jump_line: number
+        reverted?: boolean
+        kind?: 'content' | 'create' | 'update' | 'delete'
+      }>
     }
   | { id: string; kind: 'turn'; text: string }
 
@@ -144,6 +180,7 @@ export function deriveMessages(events: SessionEvent[]): DerivedMessage[] {
           : {}),
       })
     } else if (event.type === 'tool/result') {
+      if (event.partial) continue
       messages.push({ role: 'tool', tool_call_id: event.id, content: event.detail })
     }
   }
@@ -165,6 +202,7 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
     id: string
     parts: ChatReplyPart[]
     streamingId: string | null
+    streamingThinkId: string | null
     tools: Map<string, ChatToolPart>
     usage: { input: number; output: number; total: number; cache: number; hit: boolean }
     /** 历史占比加权累加器：Σ(histPct × inputTokens) / Σ(inputTokens)。 */
@@ -175,6 +213,7 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
     steps: Map<number, ChatStepStat>
     /** step → 该 step 历史占比累加器 {sum, weight}。 */
     stepHist: Map<number, { sum: number; weight: number }>
+    contentEdits?: Extract<ChatNode, { kind: 'reply' }>['contentEdits']
   } | null = null
 
   function ensureReply(seq: number) {
@@ -183,6 +222,7 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
         id: `r-${seq}`,
         parts: [],
         streamingId: null,
+        streamingThinkId: null,
         tools: new Map(),
         usage: { input: 0, output: 0, total: 0, cache: 0, hit: false },
         histSum: 0,
@@ -255,7 +295,7 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
   }
 
   function flushReply(endTs?: number, finished = false, reason?: string) {
-    if (!reply || reply.parts.length === 0) {
+    if (!reply || (reply.parts.length === 0 && !reply.contentEdits?.length)) {
       reply = null
       currentStep = undefined
       stepStartTs = undefined
@@ -269,6 +309,14 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
       .filter(Boolean)
       .join('\n\n')
     const histPct = reply.histWeight > 0 ? reply.histSum / reply.histWeight : undefined
+    const steps = [...reply.steps.values()].sort((a, b) => a.step - b.step)
+    let contextInputTokens: number | undefined
+    for (let i = steps.length - 1; i >= 0; i -= 1) {
+      if (steps[i]!.inputTokens > 0) {
+        contextInputTokens = steps[i]!.inputTokens
+        break
+      }
+    }
     const usage: TrajectoryUsage | undefined = reply.usage.hit
       ? {
           inputTokens: reply.usage.input,
@@ -276,11 +324,11 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
           totalTokens: reply.usage.total,
           ...(reply.usage.cache ? { cacheReadTokens: reply.usage.cache } : {}),
           ...(histPct !== undefined ? { histPct } : {}),
+          ...(contextInputTokens != null ? { contextInputTokens } : {}),
         }
       : undefined
     const durationMs =
       finished && turnStartTs != null && endTs != null ? Math.max(0, endTs - turnStartTs) : undefined
-    const steps = [...reply.steps.values()].sort((a, b) => a.step - b.step)
     // 每个 step 单独写回其按 token 加权的历史占比，供 step 横条的 histPct 胶囊展示
     for (const stat of steps) {
       const acc = reply.stepHist.get(stat.step)
@@ -295,9 +343,11 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
       ...(steps.length ? { stepCount: steps.length, steps } : {}),
       ...(usage ? { usage } : {}),
       ...(durationMs != null ? { durationMs } : {}),
+      ...(turnStartTs != null ? { startTs: turnStartTs } : {}),
       streaming: reply.streaming && !finished,
       finished,
       ...(reason ? { endReason: reason } : {}),
+      ...(reply.contentEdits?.length ? { contentEdits: reply.contentEdits } : {}),
     })
     reply = null
     currentStep = undefined
@@ -335,26 +385,56 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
       })
     } else if (event.type === 'assistant/chunk') {
       const r = ensureReply(event.seq)
-      if (r.streamingId) {
-        const idx = r.parts.findIndex((part) => part.id === r.streamingId)
-        const current = idx >= 0 ? r.parts[idx] : undefined
-        if (current?.kind === 'assistant') {
-          r.parts[idx] = {
-            ...current,
-            text: current.text + event.text,
+      if (event.channel === 'reasoning') {
+        if (r.streamingThinkId) {
+          const idx = r.parts.findIndex((part) => part.id === r.streamingThinkId)
+          const current = idx >= 0 ? r.parts[idx] : undefined
+          if (current?.kind === 'think') {
+            r.parts[idx] = {
+              ...current,
+              text: current.text + event.text,
+              streaming: true,
+              ...(currentStep != null ? { step: currentStep } : {}),
+            }
+          }
+        } else {
+          r.streamingThinkId = `think-${event.seq}`
+          r.parts.push({
+            id: r.streamingThinkId,
+            kind: 'think',
+            text: event.text,
             streaming: true,
             ...(currentStep != null ? { step: currentStep } : {}),
-          }
+          })
         }
       } else {
-        r.streamingId = `a-${event.seq}`
-        r.parts.push({
-          id: r.streamingId,
-          kind: 'assistant',
-          text: event.text,
-          streaming: true,
-          ...(currentStep != null ? { step: currentStep } : {}),
-        })
+        if (r.streamingThinkId) {
+          const idx = r.parts.findIndex((part) => part.id === r.streamingThinkId)
+          const current = idx >= 0 ? r.parts[idx] : undefined
+          if (current?.kind === 'think') r.parts[idx] = { ...current, streaming: false }
+          r.streamingThinkId = null
+        }
+        if (r.streamingId) {
+          const idx = r.parts.findIndex((part) => part.id === r.streamingId)
+          const current = idx >= 0 ? r.parts[idx] : undefined
+          if (current?.kind === 'assistant') {
+            r.parts[idx] = {
+              ...current,
+              text: current.text + event.text,
+              streaming: true,
+              ...(currentStep != null ? { step: currentStep } : {}),
+            }
+          }
+        } else {
+          r.streamingId = `a-${event.seq}`
+          r.parts.push({
+            id: r.streamingId,
+            kind: 'assistant',
+            text: event.text,
+            streaming: true,
+            ...(currentStep != null ? { step: currentStep } : {}),
+          })
+        }
       }
       r.streaming = true
     } else if (event.type === 'assistant/message') {
@@ -384,10 +464,22 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
           ...(currentStep != null ? { step: currentStep } : {}),
         })
       }
+      if (r.streamingThinkId) {
+        const idx = r.parts.findIndex((part) => part.id === r.streamingThinkId)
+        const current = idx >= 0 ? r.parts[idx] : undefined
+        if (current?.kind === 'think') r.parts[idx] = { ...current, streaming: false }
+        r.streamingThinkId = null
+      }
       if (currentTurn != null) r.streaming = true
     } else if (event.type === 'tool/call') {
       const r = ensureReply(event.seq)
       r.streamingId = null
+      if (r.streamingThinkId) {
+        const idx = r.parts.findIndex((part) => part.id === r.streamingThinkId)
+        const current = idx >= 0 ? r.parts[idx] : undefined
+        if (current?.kind === 'think') r.parts[idx] = { ...current, streaming: false }
+        r.streamingThinkId = null
+      }
       if (currentTurn != null) r.streaming = true
       const existing = r.tools.get(event.id)
       if (existing) {
@@ -421,7 +513,10 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
         r.tools.get(event.id) ??
         r.parts.find((part): part is ChatToolPart => part.kind === 'tool' && part.callId === event.id)
       if (existing) {
-        const next = { ...existing, result: { ok: event.ok, detail: event.detail } }
+        const next = {
+          ...existing,
+          result: { ok: event.ok, detail: event.detail, ...(event.partial ? { streaming: true } : {}) },
+        }
         r.tools.set(event.id, next)
         const idx = r.parts.findIndex((part) => part.kind === 'tool' && part.callId === event.id)
         if (idx >= 0) r.parts[idx] = next
@@ -434,12 +529,15 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
           callId: event.id,
           name: event.name,
           arguments: '',
-          result: { ok: event.ok, detail: event.detail },
+          result: { ok: event.ok, detail: event.detail, ...(event.partial ? { streaming: true } : {}) },
           ...(currentStep != null ? { step: currentStep } : {}),
         }
         r.tools.set(event.id, part)
         r.parts.push(part)
       }
+    } else if (event.type === 'content/edits') {
+      const r = ensureReply(event.seq)
+      r.contentEdits = mergeContentEditFiles(r.contentEdits ?? [], event.files)
     } else if (event.type === 'turn/end') {
       flushReply(event.ts, true, event.reason)
       turnStartTs = undefined
@@ -614,7 +712,7 @@ export function compactSessionEvents(events: SessionEvent[]): SessionEvent[] {
   for (const event of events) {
     if (event.type === 'assistant/chunk') {
       const prev = coalesced.at(-1)
-      if (prev?.type === 'assistant/chunk') {
+      if (prev?.type === 'assistant/chunk' && (prev.channel === 'reasoning') === (event.channel === 'reasoning')) {
         coalesced[coalesced.length - 1] = {
           ...prev,
           text: prev.text + event.text,
@@ -629,7 +727,7 @@ export function compactSessionEvents(events: SessionEvent[]): SessionEvent[] {
   for (let i = 0; i < coalesced.length; i++) {
     const event = coalesced[i]!
     const next = coalesced[i + 1]
-    if (event.type === 'assistant/chunk' && next?.type === 'assistant/message') continue
+    if (event.type === 'assistant/chunk' && event.channel !== 'reasoning' && next?.type === 'assistant/message') continue
     out.push(event)
   }
   return out
@@ -667,6 +765,10 @@ export function projectTrajectory(events: SessionEvent[]): TrajectoryRow[] {
     } else if (event.type === 'tool/result') {
       callId = event.id
       summary = `${event.name} → ${event.ok ? 'ok' : 'fail'}: ${event.detail.slice(0, 80)}`
+    } else if (event.type === 'content/edits') {
+      const add = event.files.reduce((n, file) => n + file.added, 0)
+      const del = event.files.reduce((n, file) => n + file.removed, 0)
+      summary = `db_content ${event.files.length} · +${add} −${del}`
     } else if (event.type === 'turn/end') {
       summary = `end · ${event.reason}`
     } else if (event.type === 'step/start' || event.type === 'step/end') {

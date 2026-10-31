@@ -9,6 +9,7 @@ import {
   projectRequestMessages,
   projectTrajectory,
   sumTrajectoryUsage,
+  deriveMessages,
   type SessionEvent,
 } from './session-project.ts'
 
@@ -41,6 +42,71 @@ test('projects user, streaming assistant, tool call/result from session events',
   const user = nodes[0]
   assert.equal(user?.kind, 'user')
   if (user?.kind === 'user') assert.equal(user.ts, 2)
+})
+
+test('projectNodes attaches content/edits onto the turn reply', () => {
+  const files = [
+    { path: '/pages/home', title: '首页', added: 3, removed: 1, jump_line: 4 },
+  ]
+  const nodes = projectNodes([
+    { type: 'turn/start', turn: 2, seq: 1, ts: 1 },
+    { type: 'user/message', text: '改文档', kind: 'wake', seq: 2, ts: 2 },
+    { type: 'content/edits', turn: 2, files, seq: 3, ts: 3 },
+    { type: 'assistant/message', text: '已改', seq: 4, ts: 4 },
+    { type: 'turn/end', turn: 2, reason: 'complete', seq: 5, ts: 5 },
+  ])
+  const reply = nodes.find((node) => node.kind === 'reply')
+  assert.equal(reply?.kind, 'reply')
+  if (reply?.kind !== 'reply') return
+  assert.deepEqual(reply.contentEdits, files)
+  assert.equal(reply.copyText, '已改')
+})
+
+test('projectNodes keeps all five 你好 content edits on the reply', () => {
+  const files = [1, 2, 3, 4, 5].map((n) => ({
+    path: `/pages/p${n}`,
+    title: '你好',
+    added: 1,
+    removed: 0,
+    jump_line: 1,
+  }))
+  const nodes = projectNodes([
+    { type: 'turn/start', turn: 3, seq: 1, ts: 1 },
+    { type: 'user/message', text: '五页你好', kind: 'wake', seq: 2, ts: 2 },
+    { type: 'content/edits', turn: 3, files: files.slice(0, 1), seq: 3, ts: 3 },
+    { type: 'content/edits', turn: 3, files, seq: 4, ts: 4 },
+    { type: 'assistant/message', text: '好了', seq: 5, ts: 5 },
+    { type: 'turn/end', turn: 3, reason: 'complete', seq: 6, ts: 6 },
+  ])
+  const reply = nodes.find((node) => node.kind === 'reply')
+  assert.equal(reply?.kind, 'reply')
+  if (reply?.kind !== 'reply') return
+  assert.equal(reply.contentEdits?.length, 5)
+  assert.deepEqual(
+    reply.contentEdits?.map((file) => file.path),
+    ['/pages/p1', '/pages/p2', '/pages/p3', '/pages/p4', '/pages/p5'],
+  )
+})
+
+test('projectNodes keeps streamed DeepSeek reasoning as a think part', () => {
+  const nodes = projectNodes([
+    { type: 'turn/start', turn: 1, seq: 1, ts: 1 },
+    { type: 'step/start', turn: 1, step: 0, seq: 2, ts: 2 },
+    { type: 'assistant/chunk', text: '先想', channel: 'reasoning', seq: 3, ts: 3 },
+    { type: 'assistant/chunk', text: '清楚', channel: 'reasoning', seq: 4, ts: 4 },
+    { type: 'assistant/chunk', text: '短答', seq: 5, ts: 5 },
+    { type: 'assistant/message', text: '短答', seq: 6, ts: 6 },
+  ])
+  const reply = nodes.find((node) => node.kind === 'reply')
+  assert.equal(reply?.kind, 'reply')
+  if (reply?.kind !== 'reply') return
+  assert.deepEqual(
+    reply.parts.map((part) => part.kind),
+    ['think', 'assistant'],
+  )
+  assert.equal(reply.parts[0]?.kind === 'think' && reply.parts[0].text, '先想清楚')
+  assert.equal(reply.parts[1]?.kind === 'assistant' && reply.parts[1].text, '短答')
+  assert.equal(reply.copyText, '短答')
 })
 
 test('projects live sender onto user nodes', () => {
@@ -94,6 +160,61 @@ test('keeps reply streaming across tools until turn/end (Details stay open)', ()
     assert.equal(doneReply.finished, true)
     assert.equal(doneReply.copyText.includes('final answer'), true)
   }
+})
+
+test('accumulates usage and stepCount while the turn is still streaming', () => {
+  const nodes = projectNodes([
+    { type: 'turn/start', turn: 1, seq: 0, ts: 1 },
+    { type: 'user/message', text: 'hi', kind: 'wake', seq: 1, ts: 2 },
+    { type: 'step/start', turn: 1, step: 0, seq: 2, ts: 3 },
+    {
+      type: 'assistant/message',
+      text: 'thinking',
+      tool_calls: [{ id: 'c1', name: 'bash', arguments: '{}' }],
+      usage: { inputTokens: 12, outputTokens: 4 },
+      seq: 3,
+      ts: 4,
+    },
+    { type: 'tool/call', id: 'c1', name: 'bash', arguments: '{}', seq: 4, ts: 5 },
+    { type: 'tool/result', id: 'c1', name: 'bash', ok: true, detail: 'ok', seq: 5, ts: 6 },
+    { type: 'step/end', turn: 1, step: 0, seq: 6, ts: 7 },
+    { type: 'step/start', turn: 1, step: 1, seq: 7, ts: 8 },
+    { type: 'assistant/message', text: 'more', usage: { inputTokens: 8, outputTokens: 3 }, seq: 8, ts: 9 },
+  ])
+  const reply = nodes.find((node) => node.kind === 'reply')
+  assert.equal(reply?.kind, 'reply')
+  if (reply?.kind !== 'reply') return
+  assert.equal(reply.streaming, true)
+  assert.equal(reply.finished, false)
+  assert.equal(reply.durationMs, undefined)
+  assert.equal(reply.startTs, 1)
+  assert.equal(reply.stepCount, 2)
+  assert.deepEqual(reply.usage, {
+    inputTokens: 20,
+    outputTokens: 7,
+    totalTokens: 27,
+  })
+})
+
+test('partial tool/result marks the tool part as streaming', () => {
+  const nodes = projectNodes([
+    { type: 'turn/start', turn: 1, seq: 0, ts: 1 },
+    { type: 'tool/call', id: 'c1', name: 'web_search', arguments: '{"query":"jay"}', seq: 1, ts: 2 },
+    { type: 'tool/result', id: 'c1', name: 'web_search', ok: true, detail: '{"sources":[]}', partial: true, seq: 2, ts: 3 },
+  ])
+  const reply = nodes.find((node) => node.kind === 'reply')
+  assert.equal(reply?.kind, 'reply')
+  if (reply?.kind !== 'reply') return
+  const tool = reply.parts.find((part) => part.kind === 'tool')
+  assert.equal(tool?.kind === 'tool' && tool.result?.streaming, true)
+  const events: SessionEvent[] = [
+    { type: 'assistant/message', text: '', tool_calls: [{ id: 'c1', name: 'web_search', arguments: '{}' }], seq: 0, ts: 1 },
+    { type: 'tool/result', id: 'c1', name: 'web_search', ok: true, detail: '{}', partial: true, seq: 1, ts: 2 },
+  ]
+  assert.equal(
+    deriveMessages(events).some((item) => item.role === 'tool'),
+    false,
+  )
 })
 
 test('tool/call after tool/result keeps a single completed tool part', () => {
@@ -242,6 +363,21 @@ test('compactSessionEvents coalesces chunks and drops ones superseded by message
     ['user/message', 'assistant/message', 'assistant/chunk'],
   )
   assert.equal(compacted[2]?.type === 'assistant/chunk' && compacted[2].text, 'partial')
+})
+
+test('compactSessionEvents keeps reasoning chunks when the answer message arrives', () => {
+  const compacted = compactSessionEvents([
+    { type: 'assistant/chunk', text: '想', channel: 'reasoning', seq: 1, ts: 1 },
+    { type: 'assistant/chunk', text: '一下', channel: 'reasoning', seq: 2, ts: 2 },
+    { type: 'assistant/chunk', text: '答', seq: 3, ts: 3 },
+    { type: 'assistant/message', text: '答', seq: 4, ts: 4 },
+  ])
+  assert.deepEqual(
+    compacted.map((event) => event.type),
+    ['assistant/chunk', 'assistant/message'],
+  )
+  assert.equal(compacted[0]?.type === 'assistant/chunk' && compacted[0].channel, 'reasoning')
+  assert.equal(compacted[0]?.type === 'assistant/chunk' && compacted[0].text, '想一下')
 })
 
 test('projectTrajectory keeps seq ledger and tool callIds for inspect', () => {

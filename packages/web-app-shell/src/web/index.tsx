@@ -1,13 +1,19 @@
-import { memo, useCallback, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react'
+import { lazy, memo, Suspense, useCallback, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import {
   getChatOverlay,
   subscribeChatOverlay,
-  setChatOverlay,
   closeChatOverlay,
+  setOverlayThread,
+  requestOverlayFocus,
   requestInspectorClose,
   allocateShellColumns,
+  applyShellColumnCssVars,
+  commitShellLayoutSnap,
+  publishShellLayout,
   clampSidebarWidth,
+  isChatPagePath,
+  openOverlayComposer,
   SIDEBAR_DEFAULT,
   SIDEBAR_LABEL_AT,
   SIDEBAR_TAG_AT,
@@ -20,7 +26,7 @@ import type { SlotProps } from '@biu/web-slots'
 import { bindSnapshot, type SnapshotService } from '@biu/web-snapshot'
 import { bindSessionView, type SessionViewService } from '@biu/web-session-view'
 import { bindProjectView, type ProjectViewService } from '@biu/web-project-view'
-import { parseAppPath } from '@biu/web-session-view'
+import { parseAppPath, sessionAppPath } from '@biu/web-session-view'
 import {
   isMascotDancing,
   mascotDanceShape,
@@ -32,94 +38,98 @@ import {
   moduleIdFromPath,
   type AppModulesService,
 } from '@biu/web-app-modules'
-import { ChatSidebar } from './chat-sidebar.tsx'
+const ChatSidebar = lazy(() => import('./chat-sidebar.tsx').then((m) => ({ default: m.ChatSidebar })))
 import { ShellSidebarFrame } from './shell-sidebar-frame.tsx'
 import { ChatSessionTitle } from './chat-session-title.tsx'
 import { BrandCornerMascot, DanceStage } from '@biu/public-mascot'
-import type { DockService } from '@biu/core-dock'
 import { SessionInspector } from './session-inspector.tsx'
 import { SessionConfigDialog } from '@biu/web-session-view/dialog'
 import { FolderGlyph } from '@biu/web-session-view/folder-glyph'
-import { OverlayChatWindow } from './overlay-window.tsx'
-import { ShellDockNav } from './shell-dock-nav.tsx'
+import { AuthGate, ShellSettingsAccount, ShellSettingsAppearance, ShellSettingsMembers, ShellSettingsMcp, ShellSettingsShortcuts, ShellSettingsWorkspace } from './shell-chrome.tsx'
+import { hydrateWorkspaceProfile } from '@biu/biu-ui/workspace-profile'
+import { hydrateTheme } from './theme.ts'
+import { hydratePagePrefs } from '@biu/core-file-system/page-width'
+import { isGlobalSearchHotkey } from './search-hotkey.ts'
 import { useSlotEntries } from '@biu/web-slots'
 import type { SlotsService } from '@biu/web-slots'
 import { chromeIcon } from './chrome-icon.ts'
+import { ChatDockStack, ChatStage } from '@biu/biu-ui/chat-pane'
+
+const OverlayChatWindow = lazy(() => import('./overlay-window.tsx').then((m) => ({ default: m.OverlayChatWindow })))
+const ShellSearchPanel = lazy(() => import('./shell-search.tsx').then((m) => ({ default: m.ShellSearchPanel })))
 import {
   ChevronDoubleLeftIcon,
   ChevronDoubleRightIcon,
+  ArrowsPointingOutIcon,
+  MinusIcon,
   AdjustmentsHorizontalIcon,
+  CommandLineIcon,
+  CircleStackIcon,
+  LinkIcon,
+  SwatchIcon,
+  UserCircleIcon,
+  UserGroupIcon,
   XMarkIcon,
 } from '@heroicons/react/16/solid'
 
 export const name = 'shell'
-export const inject = ['slots', 'dock', 'snapshot', 'sessionView', 'projectView', 'appModules']
+export const inject = ['slots', 'snapshot', 'sessionView', 'projectView', 'appModules']
 
 function DockSessionMascot({
   useSessionView,
-  sessionView,
 }: {
   useSessionView: ReturnType<typeof bindSessionView>
-  sessionView: SessionViewService
 }) {
+  const location = useLocation()
   const agents = useSessionView((state) => state.sessions)
   const activeId = useSessionView((state) => state.sessionId)
+  const overlayOpen = useSyncExternalStore(subscribeChatOverlay, getChatOverlay, () => false)
+  const onChatPage = isChatPagePath(location.pathname)
+  const busy = useSessionView((state) => {
+    const id = state.sessionId
+    if (!id) return false
+    return Boolean(state.busySessions[id])
+  })
   return (
     <BrandCornerMascot
       agents={agents}
       activeId={activeId}
-      menu={(close) => (
-        <ChatSidebar
-          variant="popover"
-          visible
-          routeSessionId={activeId}
-          useSessionView={useSessionView}
-          sessionView={sessionView}
-          onActivate={close}
-        />
-      )}
+      busy={busy}
+      open={onChatPage ? false : overlayOpen}
+      tapToDance={onChatPage}
+      onToggle={() => {
+        if (getChatOverlay()) {
+          closeChatOverlay()
+          return
+        }
+        if (isChatPagePath(location.pathname)) return
+        openOverlayComposer()
+        requestOverlayFocus()
+      }}
     />
   )
 }
 
 function ShellDockPins({
-  dock,
   useSessionView,
-  sessionView,
 }: {
-  dock: DockService
   useSessionView: ReturnType<typeof bindSessionView>
-  sessionView: SessionViewService
 }) {
-  useEffect(() => {
-    const Tile = () => (
-      <DockSessionMascot useSessionView={useSessionView} sessionView={sessionView} />
-    )
-    return dock.register({
-      id: 'session',
-      title: 'Session',
-      kind: 'session',
-      group: 'places',
-      order: 10,
-      Tile,
-    })
-  }, [dock, useSessionView, sessionView])
-  return null
+  const overlayOpen = useSyncExternalStore(subscribeChatOverlay, getChatOverlay, () => false)
+  if (overlayOpen) return null
+  return <DockSessionMascot useSessionView={useSessionView} />
 }
 
 /** 主区固定聊天；轨迹改在右侧检查器。悬浮形态可挂到任意页面最顶层。 */
 const AgentMainPanels = memo(function AgentMainPanels({
   renderSlot,
   header,
-  floating,
   showCenter,
 }: {
   renderSlot: SlotProps['renderSlot']
-  header: ReactNode | ((layoutTools: ReactNode) => ReactNode)
-  floating: boolean
+  header: ReactNode
   showCenter: boolean
 }) {
-  const overlay = floating
   const overlayOpen = useSyncExternalStore(subscribeChatOverlay, getChatOverlay, () => false)
   const [overlayMounted, setOverlayMounted] = useState(false)
   const [heldCenter, setHeldCenter] = useState(showCenter)
@@ -129,56 +139,53 @@ const AgentMainPanels = memo(function AgentMainPanels({
   }, [])
   const stageRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
-    if (!overlay) return
+    if (!overlayOpen) return
     const el = stageRef.current
     if (el) el.scrollTop = el.scrollHeight
-  }, [overlay])
+  }, [overlayOpen])
 
   const centerStage = (
-    <div className="chat-stage flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain px-6 py-3 pb-44 md:px-8 lg:px-10">
-      {renderSlot('stage')}
-    </div>
+    <ChatStage variant="center">{renderSlot('stage')}</ChatStage>
   )
   const overlayStage = (
-    <div
-      ref={stageRef}
-      className="chat-stage flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain px-1 py-1"
-    >
+    <ChatStage variant="pane" stageRef={stageRef}>
       {renderSlot('stage')}
-    </div>
+    </ChatStage>
   )
   const centerDock = (
-    <div className="pointer-events-auto w-full space-y-2 bg-transparent">
+    <ChatDockStack>
       {renderSlot('dock')}
       {renderSlot('composer')}
-    </div>
+    </ChatDockStack>
   )
   const overlayDock = (
-    <div className="pointer-events-auto w-full space-y-2 bg-transparent">
+    <ChatDockStack>
       {renderSlot('dock')}
       {renderSlot('composer')}
-    </div>
+    </ChatDockStack>
   )
 
   const overlayNode =
-    overlay && overlayMounted && overlayOpen
+    overlayMounted && overlayOpen && !showCenter
       ? createPortal(
-        <OverlayChatWindow
-          header={header}
-          thread={overlayStage}
-          dock={overlayDock}
-        />,
+        <Suspense fallback={null}>
+          <OverlayChatWindow
+            header={header}
+            thread={overlayStage}
+            dock={overlayDock}
+          />
+        </Suspense>,
         document.body,
       )
       : null
 
-  const mountCenter = showCenter || (heldCenter && !overlayOpen)
+  const mountCenter = (showCenter || heldCenter) && !overlayOpen
   if (!mountCenter) return overlayNode
 
   return (
     <>
       <div
-        className={`relative min-h-0 w-full flex-1 flex-col overflow-hidden ${showCenter ? 'flex' : 'hidden'}`}
+        className="relative flex min-h-0 w-full flex-1 flex-col overflow-hidden"
         aria-hidden={!showCenter}
         inert={showCenter ? undefined : true}
         data-testid="agent-center"
@@ -186,7 +193,7 @@ const AgentMainPanels = memo(function AgentMainPanels({
         <div className="absolute inset-0 z-1 flex min-h-0 overflow-hidden">
           <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             {centerStage}
-            <div className="chat-composer-dock pointer-events-none absolute inset-x-0 bottom-0 bg-transparent px-6 pb-4 md:px-8 lg:px-10">
+            <div className="chat-composer-dock pointer-events-none absolute inset-x-0 bottom-0 bg-transparent px-[var(--biu-pad-page)] pb-[calc(1rem+5px)]">
               {centerDock}
             </div>
             {renderSlot('stage-aside')}
@@ -198,7 +205,7 @@ const AgentMainPanels = memo(function AgentMainPanels({
   )
 })
 
-function PluginModuleStage({
+const PluginModuleStage = memo(function PluginModuleStage({
   slots,
   activeId,
   renderSlot,
@@ -207,6 +214,8 @@ function PluginModuleStage({
   activeId: string
   renderSlot: SlotProps['renderSlot']
 }) {
+  const visited = useRef(new Set<string>())
+  if (activeId) visited.current.add(activeId)
   const entries = useSlotEntries(slots, 'app-modules')
   const sorted = [...entries].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id))
   return (
@@ -214,13 +223,16 @@ function PluginModuleStage({
       {sorted.map((entry) => {
         const extra = entry.props?.() ?? {}
         const moduleId = String(extra.moduleId ?? extra.id ?? entry.id)
-        if (moduleId !== activeId) return null
+        const active = moduleId === activeId
+        if (!active && !visited.current.has(moduleId)) return null
         const Component = entry.Component
         return (
           <div
             key={entry.id}
-            className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+            className={`app-stage-pane${active ? ' is-active' : ''}`}
             data-testid={`${moduleId}-module`}
+            aria-hidden={!active}
+            inert={!active || undefined}
           >
             <Component {...extra} renderSlot={renderSlot} />
           </div>
@@ -228,7 +240,7 @@ function PluginModuleStage({
       })}
     </>
   )
-}
+})
 
 function Shell(props: SlotProps) {
   const useSnapshot = props.useSnapshot as ReturnType<typeof bindSnapshot>
@@ -239,14 +251,14 @@ function Shell(props: SlotProps) {
   const sessionView = props.sessionView as SessionViewService
   const projectView = props.projectView as ProjectViewService
   const slots = props.slots as SlotsService
-  const dock = props.dock as DockService
   const navigate = useNavigate()
   const location = useLocation()
   const modules = useAppModules()
   const navReady = useAppModulesNavReady ? useAppModulesNavReady() : true
   const pluginModules = modules.filter((item) => item.id !== 'agent')
-  const railModules = navReady ? modules : modules.filter((item) => item.id === 'agent')
   const sessionId = useSessionView((state) => state.sessionId)
+  const overlayOpen = useSyncExternalStore(subscribeChatOverlay, getChatOverlay, () => false)
+  const collections = useSnapshot((state) => state.collections)
   const danceSessions = useSessionView((state) => state.sessions)
   const dancing = useSyncExternalStore(
     subscribeMascotDance,
@@ -267,8 +279,28 @@ function Shell(props: SlotProps) {
   const focusCallId = useSessionView((state) => state.focusCallId)
   const routeView = useSessionView((state) => state.view)
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [settingsTab, setSettingsTab] = useState<string>('plugins')
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [settingsTab, setSettingsTab] = useState<string>('account')
+  const [workspaceLocation, setWorkspaceLocation] = useState<'device' | 'cloud'>('device')
   const [configOpen, setConfigOpen] = useState(false)
+  useEffect(() => {
+    if (!settingsOpen) return
+    let live = true
+    void fetch('/api/profile')
+      .then((response) => (response.ok ? response.json() : null))
+      .then((profile: { dataLocation?: 'device' | 'cloud' } | null) => {
+        if (!live) return
+        const next = profile?.dataLocation === 'cloud' ? 'cloud' : 'device'
+        setWorkspaceLocation(next)
+        if (next === 'device') setSettingsTab((current) => (current === 'members' ? 'workspace' : current))
+      })
+      .catch(() => {
+        if (live) setWorkspaceLocation('device')
+      })
+    return () => {
+      live = false
+    }
+  }, [settingsOpen])
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
       return localStorage.getItem('cordis.sidebar.collapsed') === '1'
@@ -286,8 +318,13 @@ function Shell(props: SlotProps) {
     return SIDEBAR_DEFAULT
   })
   const lastWideSidebar = useRef(sidebarWidth >= SIDEBAR_LABEL_AT ? sidebarWidth : SIDEBAR_MAX)
+  const sidebarCollapsedRef = useRef(sidebarCollapsed)
+  const sidebarWidthRef = useRef(sidebarWidth)
+  sidebarCollapsedRef.current = sidebarCollapsed
+  sidebarWidthRef.current = sidebarWidth
   const persistSidebar = useCallback((width: number, collapsed: boolean) => {
     if (collapsed) {
+      paintLiveLayoutRef.current({ sidebarCollapsed: true })
       setSidebarCollapsed(true)
       try {
         localStorage.setItem('cordis.sidebar.collapsed', '1')
@@ -298,6 +335,7 @@ function Shell(props: SlotProps) {
     }
     const next = clampSidebarWidth(width)
     if (next === 0) {
+      paintLiveLayoutRef.current({ sidebarCollapsed: true })
       setSidebarCollapsed(true)
       try {
         localStorage.setItem('cordis.sidebar.collapsed', '1')
@@ -308,6 +346,7 @@ function Shell(props: SlotProps) {
     }
     setSidebarWidth(next)
     setSidebarCollapsed(false)
+    paintLiveLayoutRef.current({ sidebarCollapsed: false, sidebarWidth: next })
     if (next >= SIDEBAR_LABEL_AT) lastWideSidebar.current = next
     try {
       localStorage.setItem('cordis.sidebar.width', String(next))
@@ -317,6 +356,7 @@ function Shell(props: SlotProps) {
     }
   }, [])
   const collapseSidebar = useCallback(() => {
+    paintLiveLayoutRef.current({ sidebarCollapsed: true })
     setSidebarCollapsed(true)
     try {
       localStorage.setItem('cordis.sidebar.collapsed', '1')
@@ -325,17 +365,56 @@ function Shell(props: SlotProps) {
     }
   }, [])
   const expandSidebar = useCallback(
-    () => persistSidebar(Math.max(SIDEBAR_LABEL_AT, lastWideSidebar.current, sidebarWidth), false),
-    [persistSidebar, sidebarWidth],
+    () => persistSidebar(Math.max(SIDEBAR_LABEL_AT, lastWideSidebar.current, sidebarWidthRef.current), false),
+    [persistSidebar],
   )
   const onSidebarWidthChange = useCallback(
     (width: number) => {
-      const next = clampSidebarWidth(width)
-      persistSidebar(next === 0 ? sidebarWidth : next, next === 0)
+      endColumnResizeRef.current({ sidebar: width })
     },
-    [persistSidebar, sidebarWidth],
+    [],
   )
-  const openSettings = useCallback(() => setSettingsOpen(true), [])
+  const openSettings = useCallback((tab?: string) => {
+    if (tab) setSettingsTab(tab)
+    setSettingsOpen(true)
+  }, [])
+  useEffect(() => {
+    void hydrateWorkspaceProfile()
+    const onLibrary = () => {
+      void hydrateWorkspaceProfile()
+    }
+    window.addEventListener('fsdb:change', onLibrary)
+    void hydrateTheme()
+    void hydratePagePrefs()
+    return () => window.removeEventListener('fsdb:change', onLibrary)
+  }, [])
+  useEffect(() => {
+    if (!settingsOpen) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      setSettingsOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [settingsOpen])
+  const [searchFocusSeq, setSearchFocusSeq] = useState(0)
+  const openSearch = useCallback(() => {
+    setSearchOpen(true)
+    setSearchFocusSeq((seq) => seq + 1)
+  }, [])
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target
+      const inPageEditor = target instanceof Element && Boolean(target.closest('.page-editor'))
+      if (!isGlobalSearchHotkey(event, { inPageEditor })) return
+      event.preventDefault()
+      event.stopPropagation()
+      openSearch()
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [openSearch])
   const [inspectorOpen, setInspectorOpen] = useState(() => {
     try {
       return localStorage.getItem('cordis.inspector.open') === '1'
@@ -352,38 +431,39 @@ function Shell(props: SlotProps) {
     }
     return 320
   })
+  const layoutSnap = useRef({
+    leftPane: true,
+    inspectorVisible: inspectorOpen,
+    inspectorWidth,
+    sidebarWidth,
+    sidebarCollapsed,
+  })
   const [columnResizing, setColumnResizing] = useState(false)
-  useEffect(() => {
-    const onDown = (event: PointerEvent) => {
-      const target = event.target
-      if (!(target instanceof Element)) return
-      if (!target.closest('.sidebar-resize, .inspector-resize')) return
-      setColumnResizing(true)
-    }
-    const onUp = () => setColumnResizing(false)
-    window.addEventListener('pointerdown', onDown)
-    window.addEventListener('pointerup', onUp)
-    window.addEventListener('pointercancel', onUp)
-    return () => {
-      window.removeEventListener('pointerdown', onDown)
-      window.removeEventListener('pointerup', onUp)
-      window.removeEventListener('pointercancel', onUp)
+  const [windowResizing, setWindowResizing] = useState(false)
+  const shellRef = useRef<HTMLDivElement>(null)
+  const columnResizingRef = useRef(false)
+  const columnDragAxisRef = useRef<'sidebar' | 'inspector' | null>(null)
+  const endColumnResizeRef = useRef<(patch?: { sidebar?: number; inspector?: number }) => void>(() => {})
+  const inspectorOpenRef = useRef(inspectorOpen)
+  inspectorOpenRef.current = inspectorOpen
+  const applyInspector = useCallback((next: boolean) => {
+    inspectorOpenRef.current = next
+    paintLiveLayoutRef.current({ inspectorOpen: next })
+    setInspectorOpen(next)
+    try {
+      localStorage.setItem('cordis.inspector.open', next ? '1' : '0')
+    } catch {
+      /* ignore */
     }
   }, [])
   const toggleInspector = useCallback(() => {
-    setInspectorOpen((prev) => {
-      const next = !prev
-      try {
-        localStorage.setItem('cordis.inspector.open', next ? '1' : '0')
-      } catch {
-        /* ignore */
-      }
-      if (!next) requestInspectorClose()
-      return next
-    })
-  }, [])
-  const onInspectorWidthChange = useCallback((width: number) => {
+    const next = !inspectorOpenRef.current
+    applyInspector(next)
+    if (!next) requestInspectorClose()
+  }, [applyInspector])
+  const persistInspectorWidth = useCallback((width: number) => {
     const next = Math.min(1000, Math.max(240, Math.round(width)))
+    layoutSnap.current = commitShellLayoutSnap(layoutSnap.current, { inspectorWidth: next })
     setInspectorWidth(next)
     try {
       localStorage.setItem('cordis.inspector.width', String(next))
@@ -391,37 +471,26 @@ function Shell(props: SlotProps) {
       /* ignore */
     }
   }, [])
+  const onInspectorWidthChange = useCallback((width: number) => {
+    endColumnResizeRef.current({ inspector: width })
+  }, [])
   const activeModule = moduleIdFromPath(location.pathname, pluginModules)
   useEffect(() => {
     const onWidth = (event: Event) => {
       const n = (event as CustomEvent<number>).detail
-      if (typeof n === 'number' && Number.isFinite(n)) onInspectorWidthChange(n)
+      if (typeof n === 'number' && Number.isFinite(n)) persistInspectorWidth(n)
     }
     window.addEventListener('biu:inspector-width', onWidth)
     return () => window.removeEventListener('biu:inspector-width', onWidth)
-  }, [onInspectorWidthChange])
+  }, [persistInspectorWidth])
   useEffect(() => {
-    const persist = (next: boolean) => {
-      setInspectorOpen(next)
-      try {
-        localStorage.setItem('cordis.inspector.open', next ? '1' : '0')
-      } catch {
-        /* ignore */
-      }
-    }
+    const persist = (next: boolean) => applyInspector(next)
     const onOpen = () => persist(true)
     const onClose = () => persist(false)
     const onToggle = () => {
-      setInspectorOpen((prev) => {
-        const next = !prev
-        try {
-          localStorage.setItem('cordis.inspector.open', next ? '1' : '0')
-        } catch {
-          /* ignore */
-        }
-        if (!next) queueMicrotask(() => requestInspectorClose())
-        return next
-      })
+      const next = !inspectorOpenRef.current
+      persist(next)
+      if (!next) queueMicrotask(() => requestInspectorClose())
     }
     window.addEventListener('biu:inspector-open', onOpen)
     window.addEventListener('biu:inspector-close', onClose)
@@ -431,24 +500,46 @@ function Shell(props: SlotProps) {
       window.removeEventListener('biu:inspector-close', onClose)
       window.removeEventListener('biu:inspector-toggle', onToggle)
     }
-  }, [])
+  }, [applyInspector])
   const appRoute = parseAppPath(location.pathname, pluginModules)
   const inspectorVisible = inspectorOpen
   // 侧栏高亮跟 URL，不跟 store：点一下立刻亮，不等 load 完成
   const routeSessionId = appRoute.kind === 'session' ? appRoute.sessionId : null
-  const agentHref = sessionId ? `/s/${sessionId}` : '/'
+  const agentHref = sessionId ? sessionAppPath(sessionId) : '/'
   const showChatSidebar = activeModule === 'agent'
+  const visitedChatSidebar = useRef(false)
+  if (showChatSidebar) visitedChatSidebar.current = true
   const sidebarCol = sidebarCollapsed ? 0 : sidebarWidth
-  const sidebarNarrow = sidebarCol < SIDEBAR_LABEL_AT
-  const sidebarShowTags = sidebarCol >= SIDEBAR_TAG_AT
+  const sidebarNarrow = sidebarWidth < SIDEBAR_LABEL_AT
+  const sidebarShowTags = sidebarWidth >= SIDEBAR_TAG_AT
   const [viewportWidth, setViewportWidth] = useState(() =>
     typeof window === 'undefined' ? 1440 : window.innerWidth,
   )
   useEffect(() => {
-    const sync = () => setViewportWidth(window.innerWidth)
+    let timer = 0
+    let raf = 0
+    const applyWidth = () => {
+      raf = 0
+      const next = window.innerWidth
+      setViewportWidth((prev) => (prev === next ? prev : next))
+    }
+    const sync = () => {
+      shellRef.current?.classList.add('is-window-resizing')
+      setWindowResizing((prev) => prev || true)
+      if (!raf) raf = window.requestAnimationFrame(applyWidth)
+      window.clearTimeout(timer)
+      timer = window.setTimeout(() => {
+        shellRef.current?.classList.remove('is-window-resizing')
+        setWindowResizing(false)
+      }, 160)
+    }
     sync()
     window.addEventListener('resize', sync)
-    return () => window.removeEventListener('resize', sync)
+    return () => {
+      window.clearTimeout(timer)
+      if (raf) window.cancelAnimationFrame(raf)
+      window.removeEventListener('resize', sync)
+    }
   }, [])
   const leftPane =
     showChatSidebar ||
@@ -462,13 +553,113 @@ function Shell(props: SlotProps) {
     inspectorOpen: inspectorVisible,
     inspectorWidth,
   })
+  layoutSnap.current.leftPane = leftPane
+  const paintedCols = useRef({ left: shellColumns.left, inspector: shellColumns.inspector })
+  if (!columnResizing) paintedCols.current = { left: shellColumns.left, inspector: shellColumns.inspector }
+  const dragPaintRaf = useRef(0)
+  const dragPaintPending = useRef<{ sidebar?: number; inspector?: number }>({})
+  const applyPendingColumnDrag = useCallback((patch?: { sidebar?: number; inspector?: number }) => {
+    if (patch) Object.assign(dragPaintPending.current, patch)
+    const pending = dragPaintPending.current
+    const hasPending = pending.sidebar != null || pending.inspector != null
+    dragPaintPending.current = {}
+    if (!hasPending) return paintedCols.current
+    const snap = layoutSnap.current
+    const cols = allocateShellColumns({
+      viewportWidth: window.innerWidth,
+      leftPane: snap.leftPane,
+      leftWidth: snap.leftPane ? (pending.sidebar ?? (snap.sidebarCollapsed ? 0 : snap.sidebarWidth)) : undefined,
+      inspectorOpen: snap.inspectorVisible,
+      inspectorWidth: pending.inspector ?? snap.inspectorWidth,
+    })
+    paintedCols.current = { left: cols.left, inspector: cols.inspector }
+    applyShellColumnCssVars(shellRef.current, cols)
+    return paintedCols.current
+  }, [])
+  const flushColumnDrag = useCallback((patch?: { sidebar?: number; inspector?: number }) => {
+    if (dragPaintRaf.current) {
+      window.cancelAnimationFrame(dragPaintRaf.current)
+      dragPaintRaf.current = 0
+    }
+    return applyPendingColumnDrag(patch)
+  }, [applyPendingColumnDrag])
+  const endColumnResize = useCallback((patch?: { sidebar?: number; inspector?: number }) => {
+    const axis = columnDragAxisRef.current
+    const cols = flushColumnDrag(patch)
+    if (patch?.sidebar != null || axis === 'sidebar') {
+      persistSidebar(cols.left === 0 ? sidebarWidthRef.current : cols.left, cols.left === 0)
+    }
+    if (patch?.inspector != null || axis === 'inspector') {
+      persistInspectorWidth(cols.inspector)
+    }
+    columnDragAxisRef.current = null
+    columnResizingRef.current = false
+    setColumnResizing(false)
+  }, [flushColumnDrag, persistInspectorWidth, persistSidebar])
+  endColumnResizeRef.current = endColumnResize
+  const paintLiveLayout = useCallback((patch: { inspectorOpen?: boolean; sidebarCollapsed?: boolean; sidebarWidth?: number }) => {
+    const snap = commitShellLayoutSnap(layoutSnap.current, patch)
+    layoutSnap.current = snap
+    const cols = allocateShellColumns({
+      viewportWidth: window.innerWidth,
+      leftPane: snap.leftPane,
+      leftWidth: snap.leftPane ? (snap.sidebarCollapsed ? 0 : snap.sidebarWidth) : undefined,
+      inspectorOpen: snap.inspectorVisible,
+      inspectorWidth: snap.inspectorWidth,
+    })
+    paintedCols.current = { left: cols.left, inspector: cols.inspector }
+    applyShellColumnCssVars(shellRef.current, cols)
+    publishShellLayout(cols)
+  }, [])
+  const paintLiveLayoutRef = useRef(paintLiveLayout)
+  paintLiveLayoutRef.current = paintLiveLayout
+  const paintColumnDrag = useCallback((patch: { sidebar?: number; inspector?: number }) => {
+    Object.assign(dragPaintPending.current, patch)
+    if (dragPaintRaf.current) return
+    dragPaintRaf.current = window.requestAnimationFrame(() => {
+      dragPaintRaf.current = 0
+      applyPendingColumnDrag()
+    })
+  }, [applyPendingColumnDrag])
+  useEffect(() => {
+    const onDown = (event: PointerEvent) => {
+      const target = event.target
+      if (!(target instanceof Element)) return
+      if (target.closest('.sidebar-resize')) {
+        columnDragAxisRef.current = 'sidebar'
+        columnResizingRef.current = true
+        setColumnResizing(true)
+        return
+      }
+      if (target.closest('.inspector-resize')) {
+        columnDragAxisRef.current = 'inspector'
+        columnResizingRef.current = true
+        setColumnResizing(true)
+      }
+    }
+    const onUp = () => {
+      if (!columnResizingRef.current && !columnDragAxisRef.current) return
+      endColumnResizeRef.current()
+    }
+    window.addEventListener('pointerdown', onDown)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
+    return () => {
+      window.removeEventListener('pointerdown', onDown)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
+    }
+  }, [])
+  const onSidebarWidthLive = useCallback((width: number) => paintColumnDrag({ sidebar: width }), [paintColumnDrag])
+  const onInspectorWidthLive = useCallback((width: number) => paintColumnDrag({ inspector: width }), [paintColumnDrag])
   const leftHidden = shellColumns.left <= 0
   useEffect(() => {
     window.dispatchEvent(new CustomEvent('biu:shell-sidebar-width', { detail: sidebarCol }))
-  }, [sidebarCol])
+    publishShellLayout({ left: paintedCols.current.left, inspector: paintedCols.current.inspector })
+  }, [sidebarCol, inspectorVisible])
   useEffect(() => {
     const toggle = () => {
-      if (sidebarCollapsed || sidebarWidth < SIDEBAR_LABEL_AT) expandSidebar()
+      if (sidebarCollapsedRef.current || sidebarWidthRef.current < SIDEBAR_LABEL_AT) expandSidebar()
       else collapseSidebar()
     }
     const onCollapse = () => collapseSidebar()
@@ -481,38 +672,56 @@ function Shell(props: SlotProps) {
       window.removeEventListener('biu:collapse-shell-sidebar', onCollapse)
       window.removeEventListener('biu:expand-shell-sidebar', onExpand)
     }
-  }, [collapseSidebar, expandSidebar, sidebarCollapsed, sidebarWidth])
+  }, [collapseSidebar, expandSidebar])
 
   // 工具检查 /debuginspect：打开右侧轨迹 Tab（主区不再切 Debug 页）
   useEffect(() => {
     if (!focusCallId && routeView !== 'debug') return
-    setInspectorOpen(true)
-    try {
-      localStorage.setItem('cordis.inspector.open', '1')
-    } catch {
-      /* ignore */
-    }
-  }, [focusCallId, routeView])
+    applyInspector(true)
+  }, [applyInspector, focusCallId, routeView])
 
   // 单向：URL → sessionView。插件还没挂上时不要把 /database 当成首页。
   useEffect(() => {
     const waitingOnNav =
-      !navReady && location.pathname !== '/' && !location.pathname.startsWith('/s/')
+      !navReady && location.pathname !== '/' && !location.pathname.startsWith('/agents/')
     if (waitingOnNav) return
     const route = parseAppPath(location.pathname, pluginModules)
+    if (route.kind === 'auth') return
     void sessionView.applyRoute(route).catch(() => undefined)
   }, [location.pathname, navReady, sessionView, appModules.version()])
 
-  // /debug 兼容：主区仍聊天，轨迹在右侧；URL 收成 /s/:id
   useEffect(() => {
-    const route = parseAppPath(location.pathname)
-    if (route.kind !== 'session' || route.view !== 'debug') return
-    navigate(`/s/${encodeURIComponent(route.sessionId)}`, { replace: true })
+    if (!overlayOpen) return
+    void sessionView.ensureSessionThread()
+  }, [overlayOpen, sessionView])
+
+  useEffect(() => {
+    if (activeModule !== 'agent') return
+    void sessionView.ensureSessionThread()
+  }, [activeModule, sessionView])
+
+  useEffect(() => {
+    const onMissing = (event: Event) => {
+      const id = String((event as CustomEvent<{ sessionId?: string }>).detail?.sessionId ?? '')
+      if (!id) return
+      const prefix = sessionAppPath(id)
+      const path = location.pathname
+      if (path === prefix || path.startsWith(`${prefix}/`)) navigate('/', { replace: true })
+    }
+    window.addEventListener('biu:session-missing', onMissing)
+    return () => window.removeEventListener('biu:session-missing', onMissing)
   }, [location.pathname, navigate])
 
   useEffect(() => {
-    void sessionView.refreshSessions()
-  }, [sessionView])
+    if (activeModule === 'agent' && getChatOverlay()) closeChatOverlay()
+  }, [activeModule])
+
+  // /debug 兼容：主区仍聊天，轨迹在右侧；URL 收成 /agents/:id
+  useEffect(() => {
+    const route = parseAppPath(location.pathname)
+    if (route.kind !== 'session' || route.view !== 'debug') return
+    navigate(sessionAppPath(route.sessionId), { replace: true })
+  }, [location.pathname, navigate])
 
   useEffect(() => {
     void projectView.attachSession(sessionId, project)
@@ -534,7 +743,7 @@ function Shell(props: SlotProps) {
   const chatHeader = (
     <header className="chat-view-header" data-biu-ignore>
       <div className="chat-view-header-left">
-        {sidebarNarrow ? (
+        {leftHidden || sidebarNarrow ? (
           <button
             type="button"
             className="chat-view-header-expand"
@@ -584,7 +793,7 @@ function Shell(props: SlotProps) {
     </header>
   )
 
-  const overlayHeader = (layoutTools: ReactNode) => (
+  const overlayHeader = (
     <header className="chat-view-header" data-biu-ignore>
       <div className="chat-view-header-left">
         {project ? (
@@ -596,7 +805,35 @@ function Shell(props: SlotProps) {
       </div>
       <ChatSessionTitle useSessionView={useSessionView} sessionView={sessionView} />
       <div className="chat-view-header-right">
-        {layoutTools}
+        <button
+          type="button"
+          className="chat-view-header-expand"
+          title="收起对话"
+          aria-label="收起对话"
+          data-testid="chat-overlay-shrink"
+          onPointerDown={(event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            setOverlayThread(false)
+          }}
+        >
+          <MinusIcon {...chromeIcon} />
+        </button>
+        <button
+          type="button"
+          className="chat-view-header-expand"
+          title="在主栏打开"
+          aria-label="在主栏打开"
+          data-testid="chat-overlay-expand"
+          onPointerDown={(event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            closeChatOverlay()
+            navigate(agentHref)
+          }}
+        >
+          <ArrowsPointingOutIcon {...chromeIcon} />
+        </button>
         <button
           type="button"
           className="chat-view-header-expand"
@@ -617,32 +854,22 @@ function Shell(props: SlotProps) {
 
   return (
     <div
+      ref={shellRef}
       className={`app-shell${leftPane
           ? ` app-shell-agent${leftHidden ? ' is-sidebar-collapsed' : ''}${sidebarNarrow && !leftHidden ? ' is-sidebar-narrow' : ''}${inspectorVisible ? ' is-inspector-open' : ''
-          }${columnResizing ? ' is-resizing' : ''}`
-          : ` app-shell-module${inspectorVisible ? ' is-inspector-open' : ''}${columnResizing ? ' is-resizing' : ''}`
+          }${columnResizing ? ' is-resizing' : ''}${windowResizing ? ' is-window-resizing' : ''}`
+          : ` app-shell-module${inspectorVisible ? ' is-inspector-open' : ''}${columnResizing ? ' is-resizing' : ''}${windowResizing ? ' is-window-resizing' : ''}`
         }${leftHidden ? ' is-left-hidden' : ''}`}
       data-testid="app-shell"
       style={
         {
-          ['--sidebar-col' as string]: `${shellColumns.left}px`,
-          ['--inspector-width' as string]: `${shellColumns.inspector}px`,
+          ['--sidebar-col' as string]: `${paintedCols.current.left}px`,
+          ['--sidebar-flyout-width' as string]: `${Math.max(SIDEBAR_MIN, sidebarWidth)}px`,
+          ['--inspector-width' as string]: `${paintedCols.current.inspector}px`,
         } as CSSProperties
       }
     >
-      {showChatSidebar ? (
-        <ChatSidebar
-          visible={!leftHidden}
-          narrow={sidebarNarrow}
-          showTags={sidebarShowTags}
-          routeSessionId={routeSessionId}
-          useSessionView={useSessionView}
-          sessionView={sessionView}
-          onCollapse={collapseSidebar}
-          onExpand={expandSidebar}
-          onWidthChange={onSidebarWidthChange}
-        />
-      ) : leftPane ? (
+      {leftPane ? (
         <ShellSidebarFrame
           visible={!leftHidden}
           narrow={sidebarNarrow}
@@ -650,34 +877,59 @@ function Shell(props: SlotProps) {
           onCollapse={collapseSidebar}
           onExpand={expandSidebar}
           onWidthChange={onSidebarWidthChange}
-          testId="module-sidebar"
+          onWidthLive={onSidebarWidthLive}
+          testId={showChatSidebar ? 'chat-sidebar' : 'module-sidebar'}
+          activeId={activeModule}
+          agentHref={agentHref}
+          onSettings={openSettings}
+          onSearch={openSearch}
+          searchOpen={searchOpen}
         >
-          <div
-            id="shell-module-sidebar"
-            className="app-side-bar-module-slot min-h-0 flex min-w-0 flex-1 flex-col overflow-hidden"
-          />
+          <div className="app-stage">
+            <div
+              className={`app-stage-pane${showChatSidebar ? ' is-active' : ''}`}
+              aria-hidden={!showChatSidebar}
+              inert={!showChatSidebar || undefined}
+            >
+              {showChatSidebar || visitedChatSidebar.current ? (
+                <Suspense fallback={null}>
+                  <ChatSidebar
+                    embedded
+                    visible
+                    narrow={sidebarNarrow}
+                    showTags={sidebarShowTags}
+                    routeSessionId={routeSessionId}
+                    useSessionView={useSessionView}
+                    sessionView={sessionView}
+                  />
+                </Suspense>
+              ) : null}
+            </div>
+            <div
+              id="shell-module-sidebar"
+              className={`app-stage-pane app-side-bar-module-slot min-h-0 flex min-w-0 flex-1 flex-col overflow-hidden${showChatSidebar ? '' : ' is-active'}`}
+              data-testid="module-sidebar"
+              aria-hidden={showChatSidebar}
+              inert={showChatSidebar || undefined}
+            />
+          </div>
         </ShellSidebarFrame>
       ) : null}
 
       <DanceStage sessions={danceSessions} on={dancing} shape={danceShape} />
-      <ShellDockPins dock={dock} useSessionView={useSessionView} sessionView={sessionView} />
-      <ShellDockNav
-        dock={dock}
-        modules={railModules}
-        activeId={activeModule}
-        agentHref={agentHref}
-        onSettings={openSettings}
-      />
+      <ShellDockPins useSessionView={useSessionView} />
 
-      <main className="flex min-h-0 min-w-0 flex-col overflow-hidden">
+      <main className="app-stage">
         <div
-          className={`min-h-0 min-w-0 flex-col overflow-hidden ${activeModule === 'agent' ? 'flex flex-1' : 'contents'}`}
+          className={`app-stage-pane${activeModule === 'agent' ? ' is-active' : ''}`}
+          data-stage="agent"
+          aria-hidden={activeModule !== 'agent'}
+          inert={activeModule !== 'agent' || undefined}
         >
-          {activeModule === 'agent' ? chatHeader : null}
+          {chatHeader}
           <AgentMainPanels
             renderSlot={props.renderSlot}
             header={overlayHeader}
-            floating={activeModule !== 'agent'}
             showCenter={activeModule === 'agent'}
           />
         </div>
@@ -692,10 +944,12 @@ function Shell(props: SlotProps) {
         open={inspectorVisible}
         width={inspectorWidth}
         onWidthChange={onInspectorWidthChange}
+        onWidthLive={onInspectorWidthLive}
         useSessionView={useSessionView}
         sessionView={sessionView}
         slots={slots}
         renderSlot={props.renderSlot}
+        collections={collections}
       />
 
       <SessionConfigDialog
@@ -705,66 +959,85 @@ function Shell(props: SlotProps) {
         sessionView={sessionView}
       />
 
-      <div
-        className={`fixed inset-0 z-20 flex items-center justify-center bg-(--dsw-overlay) ${settingsOpen ? '' : 'hidden'}`}
-        onClick={() => setSettingsOpen(false)}
-      >
-        <div
-          className="flex h-[min(800px,calc(100vh-48px))] w-[min(800px,calc(100vw-48px))] overflow-hidden rounded-3xl bg-(--dsw-surface) shadow-2xl"
-          role="dialog"
-          aria-modal="true"
-          onClick={(event) => event.stopPropagation()}
-        >
-          <nav className="w-48 shrink-0 border-r border-(--dsw-border) bg-(--dsw-sidebar) p-4">
-            <div className="mb-4 flex items-center gap-2 text-(--dsw-label)">
-              <span className="text-sm font-semibold">Settings</span>
+      {settingsOpen
+        ? createPortal(
+          <div
+            className="biu-float-overlay"
+            data-testid="settings-dialog"
+            onClick={() => setSettingsOpen(false)}
+          >
+            <div
+              className="biu-float settings-float"
+              role="dialog"
+              aria-modal="true"
+              aria-label="设置"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <nav className="settings-rail" aria-label="设置分类">
+                <ul className="settings-rail-list">
+                  {[
+                    { key: 'account', label: '账户', Icon: UserCircleIcon },
+                    { key: 'workspace', label: '空间', Icon: CircleStackIcon },
+                    { key: 'members', label: '成员', Icon: UserGroupIcon },
+                    { key: 'appearance', label: '外观', Icon: SwatchIcon },
+                    { key: 'mcp', label: 'MCP', Icon: LinkIcon },
+                    { key: 'shortcuts', label: '快捷键', Icon: CommandLineIcon },
+                  ].filter((item) => item.key !== 'members' || workspaceLocation === 'cloud').map((item) => (
+                    <li key={item.key}>
+                      <button
+                        type="button"
+                        className={`settings-nav-btn${settingsTab === item.key ? ' is-on' : ''}`}
+                        onClick={() => setSettingsTab(item.key)}
+                      >
+                        <item.Icon {...chromeIcon} />
+                        {item.label}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </nav>
+              <div className="settings-body">
+                <button
+                  type="button"
+                  className="biu-float-close settings-body-close"
+                  title="关闭"
+                  aria-label="关闭"
+                  onClick={() => setSettingsOpen(false)}
+                >
+                  <XMarkIcon {...chromeIcon} />
+                </button>
+                <div className="settings-pane">
+                  {settingsTab === 'account' ? <ShellSettingsAccount /> : null}
+                  {settingsTab === 'workspace' ? <ShellSettingsWorkspace /> : null}
+                  {settingsTab === 'members' && workspaceLocation === 'cloud' ? <ShellSettingsMembers /> : null}
+                  {settingsTab === 'appearance' ? <ShellSettingsAppearance /> : null}
+                  {settingsTab === 'mcp' ? <ShellSettingsMcp onLeave={() => setSettingsOpen(false)} /> : null}
+                  {settingsTab === 'shortcuts' ? <ShellSettingsShortcuts /> : null}
+                </div>
+              </div>
             </div>
-            <ul className="space-y-1 text-sm text-(--dsw-label-2)">
-              {[
-                { key: 'plugins', label: 'Plugins' },
-                { key: 'routes', label: 'Routes' },
-                { key: 'events', label: 'Events' },
-              ].map((item) => (
-                <li key={item.key}>
-                  <button
-                    type="button"
-                    className={`w-full rounded-lg px-3 py-2 text-left transition-colors ${settingsTab === item.key
-                        ? 'bg-(--dsw-business-soft) text-(--dsw-business)'
-                        : 'hover:bg-(--dsw-hover)'
-                      }`}
-                    onClick={() => setSettingsTab(item.key)}
-                  >
-                    {item.label}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </nav>
-          <div className="flex min-w-0 flex-1 flex-col">
-            <div className="flex items-center justify-between border-b border-(--dsw-border) px-5 py-3">
-              <h2 className="text-sm font-medium">{settingsTab}</h2>
-              <button
-                type="button"
-                className="rounded-full px-2 py-1 text-sm text-(--dsw-label-3) hover:bg-(--dsw-hover)"
-                onClick={() => setSettingsOpen(false)}
-              >
-                Close
-              </button>
-            </div>
-            <div className="flex-1 space-y-6 overflow-y-auto px-5 py-4">
-              {settingsTab === 'plugins' ? (
-                <section>{props.renderSlot('sidebar')}</section>
-              ) : null}
-              {settingsTab === 'routes' ? (
-                <section>{props.renderSlot('routes')}</section>
-              ) : null}
-              {settingsTab === 'events' ? (
-                <section>{props.renderSlot('log')}</section>
-              ) : null}
-            </div>
-          </div>
-        </div>
-      </div>
+          </div>,
+          document.body,
+        )
+        : null}
+      {searchOpen
+        ? createPortal(
+          <Suspense fallback={null}>
+            <ShellSearchPanel
+              sessions={danceSessions.map((item) => ({
+                id: item.id,
+                title: item.title,
+                tags: item.facet?.tags,
+                updatedAt: item.updatedAt,
+                mascot: item.mascot,
+              }))}
+              onClose={() => setSearchOpen(false)}
+              focusSeq={searchFocusSeq}
+            />
+          </Suspense>,
+          document.body,
+        )
+        : null}
       {props.renderSlot('root-overlays')}
     </div>
   )
@@ -780,10 +1053,15 @@ export function apply(ctx: Context) {
     projectView: ctx.projectView as ProjectViewService,
     useProjectView: bindProjectView(ctx.projectView as ProjectViewService),
     slots: ctx.slots as SlotsService,
-    dock: ctx.dock as DockService,
     appModules: ctx.appModules as AppModulesService,
   }
-  ctx.slots.fill('root', Shell, {
+  ctx.slots.fill('root', function ShellEntry(props: SlotProps) {
+    return (
+      <AuthGate>
+        <Shell {...props} />
+      </AuthGate>
+    )
+  }, {
     children: {
       sidebar: { kind: 'single' },
       demos: { kind: 'list' },

@@ -1,0 +1,79 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { test } from 'vitest'
+import assert from 'node:assert/strict'
+
+test('tool panels match the step bar: sidebar fill, no border', () => {
+  const source = readFileSync(resolve(import.meta.dirname, './tool-card.tsx'), 'utf8')
+  const css = readFileSync(resolve(import.meta.dirname, '../../../../web/style.css'), 'utf8')
+  assert.doesNotMatch(source, /#1e1f24|#e8eaed|#8ab4f8/)
+  assert.match(source, /parsed\.kind === 'bash'[\s\S]*bg-\(--biu-color-bg-subtle\)[\s\S]*text-\(--biu-color-text-muted\)/)
+  assert.match(source, /detail\.kind === 'bash'[\s\S]*bg-\(--biu-color-bg-subtle\)/)
+  assert.match(source, /prettyJsonString\(rawArguments\)[\s\S]*bg-\(--biu-color-bg-subtle\)|bg-\(--biu-color-bg-subtle\)[\s\S]*prettyJsonString/)
+  assert.equal((source.match(/border border-\(--biu-color-border\)/g) || []).length, 0)
+  assert.match(css, /\.chat-step-bar\s*\{[^}]*background:\s*var\(--biu-color-bg-subtle\)/s)
+  assert.match(
+    css,
+    /\.tool-call-head:hover::before,\s*\.tool-call-head\.is-open::before\s*\{[^}]*background:\s*var\(--biu-color-bg-subtle\)/s,
+  )
+  assert.doesNotMatch(source, /CheckCircleIcon|XCircleIcon|tool-call-status/)
+  assert.match(source, /tool-call-chevron \$\{status\.className\}/)
+  assert.match(source, /tool-call-head\$\{open \? ' is-open' : ''\} \$\{status\.className\}/)
+  assert.doesNotMatch(css, /\.tool-call-head\.is-open\.is-ok::before/)
+  assert.doesNotMatch(css, /\.tool-call-head\.is-open\.is-fail::before/)
+  assert.match(css, /\.tool-call-chevron\.is-ok\s*\{[^}]*color:\s*var\(--biu-color-ink-green\)/s)
+  assert.match(css, /\.tool-call-chevron\.is-fail\s*\{[^}]*color:\s*var\(--biu-color-ink-red\)/s)
+  assert.match(css, /\.tool-call-title\s*\{[^}]*color:\s*var\(--biu-color-text-muted\)/s)
+  assert.match(css, /html:not\(\.dark\) \.tool-call-title[\s\S]*color:\s*var\(--biu-color-text-muted\)/)
+  assert.match(css, /\.tool-call-chevron\s*\{[^}]*color:\s*var\(--biu-color-icon\)/s)
+  assert.match(css, /\.tool-call-inspect\s*\{[^}]*color:\s*var\(--biu-color-icon-muted\)/s)
+  assert.match(css, /\.tool-call-copy,\s*\.tool-call-copy:hover,\s*\.tool-call-copy\.is-done,\s*\.tool-call-copy svg\s*\{[^}]*color:\s*var\(--biu-color-icon-muted\)/s)
+  assert.match(css, /\.tool-call-head:hover \.tool-call-chars[\s\S]*display:\s*none/)
+  assert.match(css, /:root \{[^}]*--biu-color-icon: #91918e/)
+  assert.match(css, /html:not\(\.dark\) \[data-testid="content-edits-table"\] \.content-edits-ink[\s\S]*color:\s*var\(--biu-color-text-muted\)/)
+  assert.match(css, /html:not\(\.dark\) \[data-testid="content-edits-table"\] \.content-edits-icon[\s\S]*color:\s*var\(--biu-color-icon\)/)
+  assert.match(css, /\.tool-call-tools\s*\{[^}]*width:\s*0/s)
+  assert.match(css, /\.tool-call-head:hover \.tool-call-tools[\s\S]*width:\s*auto/)
+  assert.match(css, /\.tool-call-head\.is-running::after/)
+  assert.match(css, /@keyframes tool-call-text-pulse/)
+  assert.match(source, /className: 'is-running'/)
+  assert.match(source, /className="tool-call-tools"/)
+  assert.match(source, /CopyIconButton/)
+  assert.match(source, /className="tool-call-copy"/)
+  assert.match(css, /\.tool-call-copy,\s*\.chat-code-copy\s*\{[^}]*width:\s*24px[^}]*height:\s*24px/s)
+  assert.match(css, /\.chat-code-copy\s*\{[^}]*right:\s*8px[^}]*bottom:\s*8px/s)
+  assert.match(css, /\.chat-reply-block:hover \.chat-code-copy/)
+  assert.doesNotMatch(css, /\.tool-call-head\.is-running \.tool-call-title[\s\S]{0,400}color:\s*transparent/)
+  assert.match(source, /toolOutputChars/)
+  assert.match(source, /parsed\.kind === 'insert'/)
+  assert.match(source, /parsed\.kind === 'str_replace'/)
+  assert.match(source, /detail\.kind === 'chart'/)
+  assert.match(source, /className="tool-chart"/)
+  assert.doesNotMatch(source, /from 'antd'/)
+  assert.doesNotMatch(source, /Image\.PreviewGroup/)
+  assert.match(source, /tool-artifact-open/)
+})
+
+test('any tool result can be zoomed: shared float chrome, no height caps inside', () => {
+  const source = readFileSync(resolve(import.meta.dirname, './tool-card.tsx'), 'utf8')
+  const css = readFileSync(resolve(import.meta.dirname, '../../../../web/style.css'), 'utf8')
+  // 放大按钮挂在每张卡的头上，不限工具类型
+  assert.match(source, /data-testid="tool-call-zoom"/)
+  assert.match(source, /ArrowsPointingOutIcon/)
+  // 浮层沿用 .biu-float，且挂到 body 以躲开卡片 overflow 和检查器 z-index
+  assert.match(source, /className="biu-float-overlay[^"]*" data-testid="tool-zoom"/)
+  assert.match(source, /createPortal\([\s\S]*document\.body/)
+  assert.match(source, /event\.key === 'Escape'/)
+  // 全屏里复用同一个 ToolBody，只是换成高画布
+  assert.match(source, /<ToolBody parsed=\{parsed\} rawArguments=\{rawArguments\} detail=\{detail\} tall \/>/)
+  assert.match(source, /const height = tall \? 460 : 200/)
+  // 卡片里的 max-h-* 必须在放大层内失效，否则放大了还是只能看一小截
+  assert.match(css, /\.tool-zoom-body pre,[\s\S]*?max-height:\s*none/)
+  // 放大就是全屏：撑满 overlay，并让开 .biu-float-overlay 的居中内边距
+  assert.match(css, /\.tool-zoom\s*\{[^}]*width:\s*100%[^}]*height:\s*100%/s)
+  assert.match(css, /\.tool-zoom-overlay\s*\{[^}]*padding:\s*0/s)
+  // 全屏下关闭按钮不能被内容挤走
+  assert.match(css, /\.tool-zoom > \.biu-float-head\s*\{[^}]*flex:\s*none/s)
+  assert.match(source, /biu-float-overlay tool-zoom-overlay/)
+  assert.match(css, /\.tool-call-chars\s*\{[^}]*tabular-nums/s)
+})

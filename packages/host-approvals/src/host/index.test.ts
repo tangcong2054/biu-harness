@@ -59,3 +59,46 @@ test('non-sensitive tools skip hold', async () => {
   assert.equal(await ctx.tools.invoke('echo'), 'ok')
   assert.equal(ctx.approvals.list().length, 0)
 })
+
+test('db_delete waits for approval even in auto mode', async () => {
+  const ctx = await setup()
+  ctx.tools.register({
+    name: 'db_delete',
+    description: 'delete',
+    parameters: { type: 'object', properties: {} },
+    execute: () => 'deleted',
+  })
+  ctx.approvals.mode = 'auto'
+  const invoke = ctx.tools.invoke('db_delete', { path: '/tasks', ids: ['t1'] })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const pending = ctx.approvals.list()
+  assert.equal(pending.length, 1)
+  assert.equal(pending[0]?.name, 'db_delete')
+  ctx.approvals.decide(pending[0]!.id, true)
+  assert.equal(await invoke, 'deleted')
+})
+
+test('db_delete deny in auto mode blocks the tool', async () => {
+  const ctx = await setup()
+  ctx.tools.register({
+    name: 'db_delete',
+    description: 'delete',
+    parameters: { type: 'object', properties: {} },
+    execute: () => 'deleted',
+  })
+  ctx.approvals.mode = 'auto'
+  const invoke = ctx.tools.invoke('db_delete', { path: '/tasks', ids: ['t1'] })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const [item] = ctx.approvals.list()
+  assert.ok(item)
+  ctx.approvals.decide(item.id, false)
+  await assert.rejects(() => invoke, /denied: db_delete/)
+})
+
+test('approvals do not push inbox notices', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { resolve } = await import('node:path')
+  const src = readFileSync(resolve(import.meta.dirname, './index.ts'), 'utf8')
+  assert.doesNotMatch(src, /需要审批/)
+  assert.doesNotMatch(src, /notices\?\.push/)
+})

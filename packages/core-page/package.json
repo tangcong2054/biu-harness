@@ -1,0 +1,22 @@
+{
+  "name": "@biu/core-page",
+  "license": "Apache-2.0",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Core-Page：正文在 .biu/biu.sqlite 的 pages.notes",
+  "exports": {
+    "./host": "./src/host/index.ts",
+    "./web": "./src/web/index.ts"
+  },
+  "peerDependencies": {
+    "cordis": "4.0.0-rc.8",
+    "react": "^19.1.1"
+  },
+  "dependencies": {
+    "@biu/core-editor": "0.1.0",
+    "@biu/host-plugin-loader": "0.1.0",
+    "@biu/type-file-system": "0.1.0",
+    "yaml": "^2.9.0"
+  }
+}

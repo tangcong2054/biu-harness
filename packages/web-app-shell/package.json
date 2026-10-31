@@ -1,12 +1,22 @@
 {
   "name": "@biu/web-app-shell",
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "应用壳",
   "exports": {
     ".": "./src/web/index.tsx",
-    "./chat-overlay": "./src/web/chat-overlay.ts"
+    "./theme": "./src/web/theme.ts",
+    "./chat-overlay": "./src/web/chat-overlay.ts",
+    "./chat-sidebar": "./src/web/chat-sidebar.tsx"
+  },
+  "dependencies": {
+    "@biu/biu-ui": "0.1.0",
+    "@biu/public-mascot": "0.1.0",
+    "@biu/type-file-system": "0.1.0",
+    "@biu/core-file-system": "0.1.0",
+    "@biu/type-session": "0.1.0"
   },
   "peerDependencies": {
     "cordis": "4.0.0-rc.8",

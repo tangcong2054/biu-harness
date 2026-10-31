@@ -18,11 +18,17 @@ class FakeDatabaseUi extends Service implements DatabaseUi {
     this.registered.push({ path, view })
     return { dispose() {} }
   }
+  registerRowView() {
+    return { dispose() {} }
+  }
   chrome() {
     return this.last?.chrome ?? {}
   }
   views(path: string) {
     return this.registered.filter((item) => item.path === path).map((item) => item.view)
+  }
+  rowViews() {
+    return []
   }
   subscribe() {
     return () => undefined
@@ -35,14 +41,42 @@ test('task-system web paints /tasks chrome without importing file-system', async
   await ctx.plugin(taskSystemUi)
   assert.equal(ui.last?.path, '/tasks')
   assert.equal(typeof ui.last?.chrome.Title, 'function')
-  assert.equal(typeof ui.last?.chrome.cells?.status, 'function')
-  assert.equal(typeof ui.last?.chrome.cells?.priority, 'function')
-  assert.equal(typeof ui.last?.chrome.cells?.difficulty, 'function')
+  assert.equal(ui.last?.chrome.cells?.status, undefined)
+  assert.equal(ui.last?.chrome.cells?.priority, undefined)
+  assert.equal(ui.last?.chrome.cells?.difficulty, undefined)
   assert.equal(typeof ui.last?.chrome.cells?.usage, 'function')
-  assert.equal(typeof ui.last?.chrome.cells?.creator, 'function')
-  assert.equal(typeof ui.last?.chrome.cells?.assignee, 'function')
+  assert.equal(Object.keys(ui.last?.chrome.cells ?? {}).join(','), 'usage')
+  const { readFileSync } = await import('node:fs')
+  const { resolve } = await import('node:path')
+  const chrome = readFileSync(resolve(import.meta.dirname, './chrome.tsx'), 'utf8')
+  assert.doesNotMatch(chrome, /\/api\/tasks/)
+  assert.doesNotMatch(chrome, /function StatusCell/)
+  assert.doesNotMatch(chrome, /function PriorityCell/)
+  assert.doesNotMatch(chrome, /function DifficultyCell/)
+  assert.doesNotMatch(chrome, /function ChipSelect/)
+  assert.doesNotMatch(chrome, /function TagsCell/)
+  assert.doesNotMatch(chrome, /function ProjectCell/)
+  assert.doesNotMatch(chrome, /function DueCell/)
+  assert.doesNotMatch(chrome, /function PersonPicker/)
+  assert.doesNotMatch(chrome, /选择承担者/)
   assert.equal(ui.last?.chrome.panes?.map((pane) => pane.id).join(','), 'script,reports')
   assert.equal(ui.registered[0]?.path, '/tasks')
   assert.equal(ui.registered[0]?.view.id, 'graph')
   assert.equal(ui.registered[0]?.view.label, '依赖图')
+})
+
+test('task list cells besides usage stay native', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { resolve } = await import('node:path')
+  const chrome = readFileSync(resolve(import.meta.dirname, './chrome.tsx'), 'utf8')
+  const css = readFileSync(resolve(import.meta.dirname, './index.tsx'), 'utf8')
+  assert.doesNotMatch(chrome, /<CellMulti/)
+  assert.doesNotMatch(chrome, /<CellDateTime/)
+  assert.doesNotMatch(chrome, /datetime-local/)
+  assert.doesNotMatch(chrome, /tasks-tag-input/)
+  assert.doesNotMatch(chrome, /className="tasks-tag"/)
+  assert.doesNotMatch(css, /\.tasks-tag\{/)
+  assert.doesNotMatch(css, /\.tasks-tag-input\{/)
+  assert.doesNotMatch(css, /\.tasks-assignee-picker\{/)
+  assert.doesNotMatch(css, /\.tasks-cell-input\{/)
 })

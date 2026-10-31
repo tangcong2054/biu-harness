@@ -1,5 +1,6 @@
 {
   "name": "@biu/host-sessions",
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -16,6 +17,8 @@
     "cordis": "4.0.0-rc.8"
   },
   "dependencies": {
-    "@biu/type-file-system": "0.1.0"
+    "@biu/host-account": "0.1.0",
+    "@biu/type-file-system": "0.1.0",
+    "@biu/host-plugin-loader": "0.1.0"
   }
 }

@@ -8,6 +8,7 @@ export const inject = ['slots', 'snapshot']
 const SECTIONS = [
   { layer: 'host', title: '内核 · Host' },
   { layer: 'web', title: '内核 · Web' },
+  { layer: 'core', title: '内核 · Core' },
   { layer: 'capability', title: '能力插件' },
 ] as const
 
@@ -16,36 +17,39 @@ function PluginTree(props: SlotProps) {
   const setEnabled = props.setEnabled as (id: string, enabled: boolean) => Promise<void>
   const snap = useSnapshot((state: Snapshot) => state.plugins)
   return (
-    <div className="space-y-5">
+    <div className="flex flex-col gap-4">
       {SECTIONS.map((section) => {
         const rows = snap.filter((plugin) => plugin.layer === section.layer)
         if (!rows.length) return null
         return (
           <section key={section.layer}>
-            <h2 className="m-0 mb-2 text-xs font-medium tracking-wide text-(--dsw-label-3)">{section.title}</h2>
-            <ul className="m-0 list-none space-y-2 p-0">
+            <h2 className="settings-muted m-0 mb-1 px-2">{section.title}</h2>
+            <ul className="m-0 list-none p-0">
               {rows.map((plugin) => (
                 <li
-                  className="rounded-xl border border-(--dsw-border) bg-(--dsw-surface) px-3 py-3"
+                  className="flex items-center justify-between gap-3 rounded-md px-2 py-1.5"
                   key={`${plugin.layer}:${plugin.id}`}
                 >
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <h3 className="m-0 text-sm font-medium">{plugin.name}</h3>
-                      <div className="mt-0.5 text-xs text-(--dsw-label-3)">
-                        {plugin.id} · {plugin.state}
-                        {!plugin.togglable ? ' · 不可卸载' : ''}
-                      </div>
-                    </div>
-                    <button
-                      className="toggle"
-                      type="button"
-                      aria-checked={plugin.enabled}
-                      disabled={!plugin.togglable}
-                      onClick={() => void setEnabled(plugin.id, !plugin.enabled)}
-                    />
-                  </div>
-                  <p className="mt-2 mb-0 text-sm leading-5 text-(--dsw-label-3)">{plugin.blurb}</p>
+                  <h3 className="settings-name m-0 min-w-0 truncate">{plugin.name}</h3>
+                  <span className="flex shrink-0 items-center gap-2">
+                    {plugin.state === 'active' ? (
+                      <span
+                        className="size-1.5 shrink-0 rounded-full bg-(--biu-color-ok,var(--biu-color-ok))"
+                        data-testid="plugin-enabled-dot"
+                        title="Active"
+                        aria-label="已启用"
+                      />
+                    ) : null}
+                    {plugin.togglable ? (
+                      <button
+                        className="toggle"
+                        type="button"
+                        aria-label={plugin.enabled ? `关闭 ${plugin.name}` : `打开 ${plugin.name}`}
+                        aria-checked={plugin.enabled}
+                        onClick={() => void setEnabled(plugin.id, !plugin.enabled)}
+                      />
+                    ) : null}
+                  </span>
                 </li>
               ))}
             </ul>

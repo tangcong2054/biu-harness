@@ -1,10 +1,11 @@
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { Context } from 'cordis'
-import { buildDeliverText, coerceAssigneeArg, computeBlocked, computeBlockedBy, computeNextTriggerAt, computeTurnUsage, defaultTrigger, depsSatisfied, deriveExecution, deriveExecutionFromReports, normalizeTrigger, normalizeViewConfig, parseCron, reportBackToCreator, shouldPromptProgress, sumReportUsage, TasksService } from './index.ts'
+import { buildDeliverText, coerceAssigneeArg, computeBlocked, computeBlockedBy, computeNextTriggerAt, computeTurnUsage, defaultTrigger, depsSatisfied, deriveExecution, deriveExecutionFromReports, MAX_REPORT_PROMPTS, normalizeTrigger, parseCron, reportBackToCreator, shouldPromptProgress, sumReportUsage, TasksService } from './index.ts'
 
 test('tasks sqlite crud and status move', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'tasks-'))
@@ -42,6 +43,24 @@ test('tasks sqlite crud and status move', async () => {
     assert.equal(listed[0]?.creator.name, '用户')
     assert.equal(tasks.delete(a.id), true)
     assert.equal(tasks.list().length, 0)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('task search hits editor_content body', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tasks-search-'))
+  const path = join(dir, 'tasks.sqlite')
+  try {
+    const tasks = new TasksService(new Context(), path).open()
+    tasks.create({
+      title: '标题不含关键字',
+      creator: { kind: 'user', name: '用户' },
+      description: '把需求写清楚 unique-body-token',
+    })
+    const hit = tasks.list({ q: 'unique-body-token' })
+    assert.equal(hit.length, 1)
+    assert.match(hit[0]?.description ?? '', /unique-body-token/)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -317,9 +336,9 @@ test('buildDeliverText renders a派工 message with task key fields', () => {
   assert.match(text, /明天跟进/)
   assert.match(text, /task_x/)
   assert.match(text, /协作规范/)
-  assert.match(text, /tasks_create/)
-  assert.match(text, /task_deliver/)
-  assert.match(text, /task_report/)
+  assert.match(text, /db_create/)
+  assert.match(text, /action=deliver/)
+  assert.match(text, /action=report/)
 })
 
 test('reportBackToCreator sends a progress message to the assigner session via sendMessage (wake-first)', async () => {
@@ -459,6 +478,7 @@ test('reportIntervalSec persists with default 60 and is updatable to 5', async (
     // 默认 60
     assert.equal(a.reportIntervalSec, 60)
     assert.equal(a.lastReportPromptAt, null)
+    assert.equal(a.reportPromptCount, 0)
     // 可回读（DB 持久）
     assert.equal(tasks.get(a.id)!.reportIntervalSec, 60)
     // 改 5 秒
@@ -544,7 +564,7 @@ test('shouldPromptProgress: cooldown after prompt and reset on new report', asyn
   }
 })
 
-test('shouldPromptProgress: done task stops prompting', async () => {
+test('shouldPromptProgress: done or failed task stops prompting', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'tasks-'))
   const path = join(dir, 'tasks.sqlite')
   try {
@@ -559,6 +579,41 @@ test('shouldPromptProgress: done task stops prompting', async () => {
     const base = a.assignedAt!
     tasks.update(a.id, { status: 'done' })
     assert.equal(shouldPromptProgress(tasks.get(a.id)!, base + 200_000).shouldPrompt, false)
+    assert.equal(shouldPromptProgress(tasks.get(a.id)!, base + 200_000).shouldFail, false)
+    const b = tasks.create({
+      title: 'B',
+      creator: { kind: 'agent', sessionId: 'boss', name: 'Boss' },
+      assignee: { kind: 'agent', sessionId: 'worker', name: 'Worker' },
+      reportIntervalSec: 5,
+    })
+    tasks.update(b.id, { status: 'failed' })
+    assert.equal(tasks.get(b.id)!.status, 'failed')
+    assert.equal(shouldPromptProgress(tasks.get(b.id)!, b.assignedAt! + 200_000).shouldPrompt, false)
+    assert.equal(shouldPromptProgress(tasks.get(b.id)!, b.assignedAt! + 200_000).shouldFail, false)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('shouldPromptProgress: after max nags without a report, mark fail instead of asking again', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tasks-'))
+  const path = join(dir, 'tasks.sqlite')
+  try {
+    const ctx = new Context()
+    const tasks = new TasksService(ctx, path).open()
+    const a = tasks.create({
+      title: 'A',
+      creator: { kind: 'agent', sessionId: 'boss', name: 'Boss' },
+      assignee: { kind: 'agent', sessionId: 'worker', name: 'Worker' },
+      reportIntervalSec: 5,
+    })
+    const t1 = a.assignedAt! + 6_000
+    tasks.update(a.id, { lastReportPromptAt: t1, reportPromptCount: MAX_REPORT_PROMPTS })
+    assert.equal(shouldPromptProgress(tasks.get(a.id)!, t1 + 4_000).shouldPrompt, false)
+    assert.equal(shouldPromptProgress(tasks.get(a.id)!, t1 + 4_000).shouldFail, false)
+    const late = shouldPromptProgress(tasks.get(a.id)!, t1 + 6_000)
+    assert.equal(late.shouldPrompt, false)
+    assert.equal(late.shouldFail, true)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -704,74 +759,15 @@ test('trigger default state is idle and enabled=false (no auto-trigger for plain
   }
 })
 
-// ==================== 视图系统（Notion 风格）测试 ====================
-
-test('task_views: no builtin layout views; create / update / delete', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'tasks-views-'))
-  const path = join(dir, 'tasks.sqlite')
-  try {
-    const ctx = new Context()
-    const tasks = new TasksService(ctx, path).open()
-    assert.equal(tasks.listTaskViews().length, 0)
-
-    const v = tasks.createTaskView({
-      name: '  我的视图  ',
-      config: {
-        mode: 'gantt' as never,
-        filter: { project: 'biu', tags: ['a', 'a', ' '], time: '99d' },
-        sort: { field: 'bogus' as never, dir: 'side' as never },
-      },
-    })
-    assert.equal(v.name, '我的视图')
-    assert.equal(v.isBuiltin, false)
-    assert.deepEqual(v.config, {
-      mode: 'table',
-      filter: { project: 'biu', tags: ['a'], time: '' },
-      sort: { field: 'status', dir: 'asc' },
-    })
-
-    const tasks2 = new TasksService(new Context(), path).open()
-    assert.equal(tasks2.listTaskViews().length, 1)
-
-    const updated = tasks.updateTaskView(v.id, {
-      name: '高优看板',
-      config: { mode: 'board', filter: { project: 'biu-harness', tags: ['前端'], time: '7d' }, sort: { field: 'due', dir: 'asc' } },
-    })
-    assert.equal(updated.name, '高优看板')
-    assert.deepEqual(updated.config.filter, { project: 'biu-harness', tags: ['前端'], time: '7d' })
-    assert.deepEqual(updated.config.sort, { field: 'due', dir: 'asc' })
-
-    assert.throws(() => tasks.updateTaskView('nope', { name: 'x' }), /unknown view/)
-    assert.equal(tasks.deleteTaskView('nope'), false)
-    assert.equal(tasks.deleteTaskView(v.id), true)
-    assert.equal(tasks.getTaskView(v.id), undefined)
-    assert.equal(tasks.listTaskViews().length, 0)
-  } finally {
-    await rm(dir, { recursive: true, force: true })
-  }
-})
-
-test('task_views: open drops leftover builtin layout rows', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'tasks-views-drop-'))
-  const path = join(dir, 'tasks.sqlite')
-  try {
-    new TasksService(new Context(), path).open()
-    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite')
-    const db = new DatabaseSync(path)
-    const ts = Date.now()
-    db.prepare(
-      'INSERT INTO task_views (id, name, config_json, is_builtin, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)',
-    ).run(
-      'builtin-table',
-      '表格',
-      JSON.stringify({ mode: 'table', filter: { project: '', tags: [], time: '' }, sort: { field: 'status', dir: 'asc' } }),
-      ts,
-      ts,
-    )
-    db.close()
-    const again = new TasksService(new Context(), path).open()
-    assert.equal(again.listTaskViews().length, 0)
-  } finally {
-    await rm(dir, { recursive: true, force: true })
-  }
+test('task list scans lean columns and skips unused json blobs', () => {
+  const host = readFileSync(resolve(import.meta.dirname, './index.ts'), 'utf8')
+  const collection = readFileSync(resolve(import.meta.dirname, './collection.ts'), 'utf8')
+  assert.match(host, /const LIST_TASK_COLUMNS/)
+  assert.match(host, /SELECT \$\{LIST_TASK_COLUMNS\} FROM tasks/)
+  assert.doesNotMatch(host, /SELECT tasks\.\* FROM tasks/)
+  assert.match(host, /rows\.map\(\(row\) => mapRow\(row, true\)\)/)
+  assert.match(host, /function isBlankJson/)
+  assert.match(collection, /function missingLookup/)
+  assert.match(collection, /if \(!tree\)/)
+  assert.doesNotMatch(collection, /delete next\.reports/)
 })

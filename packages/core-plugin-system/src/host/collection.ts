@@ -1,7 +1,30 @@
 import type { CollectionSpec, DbRecord } from '@biu/type-file-system'
+import { recordBuiltinValues, REQUIRED_RECORD_FIELDS } from '@biu/type-file-system'
+import {
+  createArgs,
+  PLUGIN_PACK_DESCRIPTION,
+  PLUGIN_SANDBOX_DESCRIPTION,
+  PLUGIN_SANDBOX_PROPERTIES,
+} from './plugin-create.ts'
 import type { PluginStoreService, StoreListing } from './store.ts'
 
 type SandboxListing = Awaited<ReturnType<PluginStoreService['listSandboxes']>>[number]
+
+export const BIU_OFFICIAL_NAME = 'BIU官方'
+export const BIU_GITHUB = 'https://github.com/helloooooooooooooo97/biu'
+
+const BIU_OFFICIAL = { kind: 'user' as const, name: BIU_OFFICIAL_NAME, url: BIU_GITHUB }
+
+function withOfficial<T extends { builtin?: boolean; author: string; authorUrl: string }>(row: T) {
+  if (!row.builtin) return row
+  return {
+    ...row,
+    author: BIU_OFFICIAL_NAME,
+    authorUrl: BIU_GITHUB,
+    createdBy: BIU_OFFICIAL,
+    updatedBy: [BIU_OFFICIAL],
+  }
+}
 
 function omitEmpty(row: DbRecord): DbRecord {
   const next: DbRecord = { id: row.id }
@@ -11,10 +34,10 @@ function omitEmpty(row: DbRecord): DbRecord {
     if (Array.isArray(value) && value.length === 0) continue
     next[key] = value
   }
-  return next
+  return { ...next, ...recordBuiltinValues(row) }
 }
 
-function asInstalledRecord(row: StoreListing): DbRecord {
+function asInstalledRecord(row: StoreListing, store: PluginStoreService): DbRecord {
   const shell = row.shell
   return omitEmpty({
     id: row.id,
@@ -22,9 +45,9 @@ function asInstalledRecord(row: StoreListing): DbRecord {
     title: row.name,
     blurb: row.blurb,
     tags: row.tags,
-    author: row.author,
-    authorUrl: row.authorUrl,
+    ...withOfficial(row),
     installed: true,
+    pluginPath: store.pluginPath(row.id),
     enabled: row.enabled,
     running: row.running,
     bytes: row.bytes,
@@ -33,41 +56,63 @@ function asInstalledRecord(row: StoreListing): DbRecord {
     lastRunAt: row.lastRunAt,
     hasHost: row.hasHost,
     hasWeb: row.hasWeb,
-    shellWidth: shell.width,
-    shellHeight: shell.height,
-    shellMinWidth: shell.minWidth,
-    shellMinHeight: shell.minHeight,
-    shellResizable: shell.resizable,
+    codeVersion: row.codeVersion,
+    headless: row.headless === true,
+    ...(row.headless || !shell
+      ? {}
+      : {
+          shellWidth: shell.width,
+          shellHeight: shell.height,
+          shellMinWidth: shell.minWidth,
+          shellMinHeight: shell.minHeight,
+          shellResizable: shell.resizable,
+        }),
   })
 }
 
-function asSandboxRecord(row: SandboxListing): DbRecord {
+function asSandboxRecord(row: SandboxListing, store: PluginStoreService): DbRecord {
   return omitEmpty({
     id: row.id,
     name: row.name,
     title: row.name,
     blurb: row.blurb,
     tags: row.tags,
-    author: row.author,
-    authorUrl: row.authorUrl,
+    ...withOfficial(row),
     sandbox: true,
+    sandboxPath: store.sandboxPath(row.id),
     hasHost: row.hasHost,
     hasWeb: row.hasWeb,
+    headless: row.headless === true,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   })
 }
 
-function mergeLifecycle(installed: StoreListing | undefined, sandbox: SandboxListing | undefined): DbRecord {
+function mergeLifecycle(
+  installed: StoreListing | undefined,
+  sandbox: SandboxListing | undefined,
+  store: PluginStoreService,
+): DbRecord {
+  const builtin = Boolean(installed?.builtin || sandbox?.builtin)
+  const official = builtin
+    ? { builtin: true, author: BIU_OFFICIAL_NAME, authorUrl: BIU_GITHUB, createdBy: BIU_OFFICIAL, updatedBy: [BIU_OFFICIAL] }
+    : {}
+  const canManagePackage = !builtin || store.viewerIsSuperAdmin?.() !== false
   if (installed && sandbox) {
     return omitEmpty({
-      ...asInstalledRecord(installed),
+      ...asInstalledRecord(installed, store),
+      name: sandbox.name,
+      title: sandbox.name,
+      blurb: sandbox.blurb,
       sandbox: true,
+      sandboxPath: store.sandboxPath(sandbox.id),
       updatedAt: Math.max(installed.updatedAt, sandbox.updatedAt),
+      ...official,
+      canManagePackage,
     })
   }
-  if (installed) return asInstalledRecord(installed)
-  if (sandbox) return asSandboxRecord(sandbox)
+  if (installed) return { ...asInstalledRecord(installed, store), ...official, ...(canManagePackage ? { canManagePackage } : {}) }
+  if (sandbox) return { ...asSandboxRecord(sandbox, store), ...official, ...(canManagePackage ? { canManagePackage } : {}) }
   throw new Error('empty plugin row')
 }
 
@@ -79,9 +124,13 @@ export function pluginsCollection(store: PluginStoreService): CollectionSpec {
     const bySandbox = new Map(sandboxes.map((row) => [row.id, row]))
     return [...ids]
       .sort()
-      .map((id) => mergeLifecycle(byInstalled.get(id), bySandbox.get(id)))
+      .map((id) => mergeLifecycle(byInstalled.get(id), bySandbox.get(id), store))
   }
-  const find = async (id: string) => (await list()).find((row) => row.id === id) ?? null
+  const find = async (id: string) => {
+    const row = (await list()).find((item) => item.id === id) ?? null
+    if (!row) return null
+    return { ...row, readme: await store.readReadme(id) }
+  }
   return {
     id: 'plugins',
     path: '/plugins',
@@ -91,61 +140,99 @@ export function pluginsCollection(store: PluginStoreService): CollectionSpec {
       route: '/plugins',
       title: '插件',
       inspector: true,
-      blurb: '.plugin 已安装与 .plugin-dev 沙箱同一张表：没有的字段留空。窗口尺寸来自扁平列 shellWidth/shellHeight，不是 listing.shell。',
+      blurb: '这是插件（可安装的小程序），不是代理。用户说「再开一个 agent」请去 /agents db_create，不要在这张表 create。已安装（.plugin）和沙箱（.plugin-dev）同一张表。列表 db_list /plugins；sandboxPath 是源码绝对路径，pluginPath 是安装产物绝对路径，Session 绑定其他项目时也按这两个字段找代码。README 用 db_content /plugins/<id>。页面块插件先读介绍里的「示例写法」再写 :::pageBlock。name 等只读（标签仍可写）。不能 db_create。窗口尺寸看 shellWidth/shellHeight。codeVersion 是已安装 host.js+web.js 的内容短哈希，和加载 URL 的 v 参数相同。安装只能 sandbox 再 pack：先 db_action path=/plugins/<插件id> action=sandbox 建 .plugin-dev/<id>/（记录可以还不存在），写完代码再 action=pack 打进 .plugin。不要直写 .plugin。start=打开已安装插件窗口（when：installed 且未 running）；stop=关掉运行中的插件（when：installed 且 running）；uninstall=停止运行并删除已安装的 .plugin/<id>/（when：installed，和安装互斥）。沙箱还在则这行还在并改显示安装。',
       order: 30,
       icon: 'puzzle-piece',
     },
     records: { update: false, create: false, delete: true },
     schema: {
-      labelField: 'name',
+      labelField: 'title',
+      contentField: 'readme',
+      contentBackend: 'editorContent',
       columns: [
-        'name',
+        'title',
         'blurb',
         'installed',
         'sandbox',
+        'sandboxPath',
+        'pluginPath',
         'running',
         'enabled',
-        'tags',
-        'author',
+        'createdBy',
+        'updatedBy',
         'bytes',
         'shellWidth',
         'shellHeight',
         'hasHost',
         'hasWeb',
+        'codeVersion',
+        'headless',
       ],
       fields: {
-        name: { type: 'string', label: '名称' },
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', label: '标题' },
         blurb: { type: 'string', label: '简介' },
+        builtin: { type: 'boolean', label: '内置' },
         installed: { type: 'boolean', label: '已安装' },
         sandbox: { type: 'boolean', label: '沙箱' },
+        sandboxPath: { type: 'string', label: '源码路径' },
+        pluginPath: { type: 'string', label: '安装路径' },
         enabled: { type: 'boolean', label: '已打开' },
         running: { type: 'boolean', label: '运行中' },
-        tags: { type: 'multi-select', label: '标签' },
-        bytes: { type: 'bytes', label: '大小' },
+        bytes: { type: 'number', label: '大小' },
         createdAt: { type: 'datetime', label: '创建时间' },
         updatedAt: { type: 'datetime', label: '更新时间' },
         lastRunAt: { type: 'datetime', label: '上次运行' },
         hasHost: { type: 'boolean', label: 'Host' },
         hasWeb: { type: 'boolean', label: 'Web' },
-        author: { type: 'string', label: '作者' },
-        authorUrl: { type: 'url', label: '作者链接' },
+        codeVersion: { type: 'string', label: '代码版本' },
+        headless: { type: 'boolean', label: '无头' },
         shellWidth: { type: 'number', label: '窗口宽' },
         shellHeight: { type: 'number', label: '窗口高' },
         shellMinWidth: { type: 'number', label: '最小宽' },
         shellMinHeight: { type: 'number', label: '最小高' },
         shellResizable: { type: 'boolean', label: '可缩放' },
+        readme: { type: 'file', label: '介绍', writable: true },
       },
     },
     list,
     get: find,
-    remove: async (id) => {
-      await store.uninstall(id)
+    update: async (id, patch) => {
+      const extra = Object.keys(patch).filter((key) => key !== 'readme')
+      if (extra.length) throw new Error(`plugin fields not writable: ${extra.join(', ')}`)
+      if ('readme' in patch) await store.writeReadme(id, String(patch.readme ?? ''))
+      return (await find(id)) ?? (() => {
+        throw new Error(`unknown plugin: ${id}`)
+      })()
+    },
+    remove: async (query) => {
+      const ids = query.ids ?? []
+      for (const id of ids) await store.destroy(id)
+      return ids
     },
     actions: [
+      {
+        id: 'sandbox',
+        label: '开沙箱',
+        for: 'agent',
+        placement: [],
+        allowMissing: true,
+        requiredAction: 'resource:read',
+        description: PLUGIN_SANDBOX_DESCRIPTION,
+        parameters: {
+          type: 'object',
+          description: PLUGIN_SANDBOX_DESCRIPTION,
+          properties: PLUGIN_SANDBOX_PROPERTIES,
+          required: ['name'],
+        },
+        run: async (id, _record, args = {}) => store.initSandbox(createArgs({ ...args, id })),
+      },
       {
         id: 'start',
         label: '运行',
         when: { installed: true, running: false },
+        description: '为当前账号在这个空间加载已安装插件（无头则只挂 host）。别人的加载状态互不影响。when：installed 且未 running。不要对纯沙箱、未 pack 的行调用。',
+        requiredAction: 'resource:read',
         run: async (id) => {
           await store.openPlugin(id)
         },
@@ -154,24 +241,29 @@ export function pluginsCollection(store: PluginStoreService): CollectionSpec {
         id: 'stop',
         label: '停止',
         when: { installed: true, running: true },
+        description: '停止当前账号在这个空间加载的插件。别人如果还在用，他们的加载不受影响。when：installed 且 running。',
+        requiredAction: 'resource:read',
         run: async (id) => {
           await store.close(id)
         },
       },
       {
         id: 'pack',
-        label: '打包安装',
-        when: { sandbox: true },
-        run: async (id) => {
-          await store.pack(id)
-        },
+        label: '安装',
+        when: { sandbox: true, installed: false, canManagePackage: true },
+        description: PLUGIN_PACK_DESCRIPTION,
+        requiredAction: 'resource:read',
+        parameters: { type: 'object', description: PLUGIN_PACK_DESCRIPTION, properties: {} },
+        run: async (id) => store.pack(id),
       },
       {
         id: 'uninstall',
         label: '卸载',
         tone: 'danger',
-        confirm: '确定卸载这个插件？已安装的代码会被删掉。',
-        when: { installed: true },
+        confirm: '确定卸载？会停止运行，并删掉已安装的代码。沙箱源码还在的话可以再安装。',
+        when: { installed: true, canManagePackage: true },
+        description: '停止运行并删除 .plugin/<id>/。已安装才显示，和安装互斥。沙箱 .plugin-dev/<id>/ 还在的话行不会消失，installed 变 false，动作列改显示安装。内置插件只有超级管理员能卸，有人在用也可以卸。',
+        requiredAction: 'resource:read',
         run: async (id) => {
           await store.uninstall(id)
         },

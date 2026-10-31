@@ -2,7 +2,7 @@ import { Service, type Context } from 'cordis'
 import { basename, isAbsolute, resolve } from 'node:path'
 import { realpath, stat } from 'node:fs/promises'
 import { platform } from 'node:os'
-import { assistantContentForApi, type LlmMessage } from '@biu/host-llm'
+import { assistantContentForApi, isVisionImageUrl, stampMessageSeqs, type LlmMessage } from '@biu/host-llm'
 import type { AgentSendOptions, AgentHandle, AgentTurn } from '@biu/host-agents'
 import {
   SESSION_FORMAT_VERSION,
@@ -11,13 +11,15 @@ import {
   type SessionMascot,
   type SessionProject,
   type SessionRecord,
-  type SessionType,
+  type SessionSummary,
   type SessionConfig,
   type MessageSender,
   nameFromSessionMascot,
   mergeSessionConfig,
   normalizeSessionConfig,
-  normalizeSessionType,
+  isSessionCompactPoint,
+  sessionCompactSummaryText,
+  mergeContentEditFiles,
 } from '@biu/type-session'
 import {
   ensureSessionMascot,
@@ -28,96 +30,130 @@ import {
 } from './session-mascot.ts'
 import { rebuildHealedEvents } from './session-heal.ts'
 import { sessionsCollection } from './sessions-collection.ts'
+import type { AuthorizationService } from '@biu/host-account/authorization'
 
-export type { SessionEvent, SessionEventBody, SessionProject, SessionRecord, SessionMascot, SessionType, SessionConfig }
-export { SESSION_FORMAT_VERSION, normalizeSessionType, normalizeSessionConfig, mergeSessionConfig }
+export type { SessionEvent, SessionEventBody, SessionProject, SessionRecord, SessionMascot, SessionConfig }
+export { SESSION_FORMAT_VERSION, normalizeSessionConfig, mergeSessionConfig }
 export {
   findOpenTurnStep,
   healInterruptedTurnBodies,
   rebuildHealedEvents,
 } from './session-heal.ts'
 
-export function deriveMessages(events: SessionEvent[]): LlmMessage[] {
+function pushDerived(messages: LlmMessage[], message: LlmMessage, seq: number) {
+  messages.push(stampMessageSeqs(message, [seq]))
+}
+
+export function deriveMessages(events: SessionEvent[], omitImageSeqs?: Iterable<number>): LlmMessage[] {
+  const omit = new Set(omitImageSeqs)
   let system = ''
   const messages: LlmMessage[] = []
-  /** 最近一条带 tool_calls 的 assistant 之后，尚未配齐的 tool_call_id */
-  const pendingToolCalls = new Map<string, string>()
+  /** 当前 assistant.tool_calls 的声明顺序（接口要求 role:tool 必须按此顺序紧跟） */
+  let pendingOrder: string[] = []
+  const pendingNames = new Map<string, string>()
+  const readyDetail = new Map<string, { detail: string; seq: number }>()
+  /** 只有 partial、没有最终 result 时，用最后一片 detail 配平 */
+  const partialToolDetail = new Map<string, string>()
+
+  const emitReadyTools = () => {
+    while (pendingOrder.length && readyDetail.has(pendingOrder[0]!)) {
+      const id = pendingOrder.shift()!
+      const ready = readyDetail.get(id)!
+      pushDerived(messages, { role: 'tool', tool_call_id: id, content: ready.detail }, ready.seq)
+      readyDetail.delete(id)
+      pendingNames.delete(id)
+      partialToolDetail.delete(id)
+    }
+  }
 
   const flushOrphanTools = () => {
-    if (!pendingToolCalls.size) return
-    for (const [id, name] of pendingToolCalls) {
-      messages.push({
-        role: 'tool',
-        tool_call_id: id,
-        content: `interrupted: missing tool result for ${name}`,
-      })
+    if (!pendingOrder.length) return
+    for (const id of pendingOrder) {
+      const name = pendingNames.get(id) || id
+      const content =
+        readyDetail.get(id)?.detail ||
+        partialToolDetail.get(id) ||
+        `interrupted: missing tool result for ${name}`
+      pushDerived(messages, { role: 'tool', tool_call_id: id, content }, readyDetail.get(id)?.seq ?? 0)
     }
-    pendingToolCalls.clear()
+    pendingOrder = []
+    pendingNames.clear()
+    readyDetail.clear()
+    partialToolDetail.clear()
   }
 
   for (const event of events) {
-    // 压缩点：某次 context_compact_submit / session_compact / context_clear 的 tool/call 即压缩点。
-    // 从此处重起，丢弃该点之前的历史（避免重复发送旧 token）；摘要取该 tool 调用的 text 参数。
-    if (
-      event.type === 'tool/call' &&
-      (event.name === 'context_compact_submit' || event.name === 'session_compact' || event.name === 'context_clear')
-    ) {
+    // 压缩点：sessions 的 compact/clear（含旧独立工具名）。从此处重起，摘要取调用参数。
+    if (isSessionCompactPoint(event)) {
       messages.length = 0
-      pendingToolCalls.clear()
-      let text = ''
-      try {
-        const args = JSON.parse(event.arguments || '{}') as { text?: string }
-        text = String(args.text ?? '').trim()
-      } catch {
-        text = ''
-      }
+      pendingOrder = []
+      pendingNames.clear()
+      readyDetail.clear()
+      partialToolDetail.clear()
+      const text = sessionCompactSummaryText(event)
       if (text) {
-        messages.push({ role: 'system', content: `[已压缩的历史摘要] ${text}` })
+        pushDerived(messages, { role: 'system', content: `[已压缩的历史摘要] ${text}` }, event.seq)
       }
     } else if (event.type === 'system/prompt') {
       system = event.text
     } else if (event.type === 'user/message') {
       flushOrphanTools()
-      const images = event.images?.filter((item) => item?.url && item.url.startsWith('data:image/')) ?? []
+      const images = omit.has(event.seq)
+        ? []
+        : event.images?.filter((item) => item?.url && isVisionImageUrl(item.url)) ?? []
       if (images.length) {
-        messages.push({
-          role: 'user',
-          content: [
-            ...(event.text.trim() ? [{ type: 'text' as const, text: event.text }] : []),
-            ...images.map((item) => ({ type: 'image_url' as const, image_url: { url: item.url } })),
-          ],
-        })
+        pushDerived(
+          messages,
+          {
+            role: 'user',
+            content: [
+              ...(event.text.trim() ? [{ type: 'text' as const, text: event.text }] : []),
+              ...images.map((item) => ({ type: 'image_url' as const, image_url: { url: item.url } })),
+            ],
+          },
+          event.seq,
+        )
       } else {
-        messages.push({ role: 'user', content: event.text })
+        pushDerived(messages, { role: 'user', content: event.text }, event.seq)
       }
     } else if (event.type === 'assistant/message') {
       flushOrphanTools()
       const hasToolCalls = Boolean(event.tool_calls?.length)
-      messages.push({
-        role: 'assistant',
-        content: assistantContentForApi(event.text, hasToolCalls),
-        ...(hasToolCalls
-          ? {
-              tool_calls: event.tool_calls!.map((call) => ({
-                id: call.id,
-                type: 'function',
-                function: { name: call.name, arguments: call.arguments },
-              })),
-            }
-          : {}),
-      })
+      pushDerived(
+        messages,
+        {
+          role: 'assistant',
+          content: assistantContentForApi(event.text, hasToolCalls),
+          ...(hasToolCalls
+            ? {
+                tool_calls: event.tool_calls!.map((call) => ({
+                  id: call.id,
+                  type: 'function',
+                  function: { name: call.name, arguments: call.arguments },
+                })),
+              }
+            : {}),
+        },
+        event.seq,
+      )
       if (hasToolCalls) {
-        for (const call of event.tool_calls!) pendingToolCalls.set(call.id, call.name)
+        pendingOrder = event.tool_calls!.map((call) => call.id)
+        for (const call of event.tool_calls!) pendingNames.set(call.id, call.name)
       }
     } else if (event.type === 'tool/result') {
       // 错位/重复的 tool/result 不能进 LLM（否则报 tool 必须跟在 tool_calls 后）
-      if (!pendingToolCalls.has(event.id)) continue
-      messages.push({ role: 'tool', tool_call_id: event.id, content: event.detail })
-      pendingToolCalls.delete(event.id)
+      if (!pendingNames.has(event.id)) continue
+      if (event.partial) {
+        partialToolDetail.set(event.id, event.detail)
+        continue
+      }
+      readyDetail.set(event.id, { detail: event.detail, seq: event.seq })
+      emitReadyTools()
     }
   }
   flushOrphanTools()
-  return system ? [{ role: 'system', content: system }, ...messages] : messages
+  if (!system) return messages
+  return [stampMessageSeqs({ role: 'system', content: system }, [0]), ...messages]
 }
 
 export interface InputComposition {
@@ -135,15 +171,12 @@ export interface InputComposition {
  *   system prompt 计入本次。「历史(hist)」= 本次之前更早的所有 turn。
  * - 角色归类：user/message、assistant/message(含 tool_calls 的 arguments)、
  *   assistant/chunk、tool/call、tool/result 按所在 turn 计入；system/prompt、system/compact 计入当前 turn。
- * - 压缩点语义与 deriveMessages 对齐：context_compact_submit / session_compact 的
- *   tool/call 即压缩点，仅统计该点之后的事件（从压缩点重起）。
+ * - 压缩点语义与 deriveMessages 对齐：仅统计最后一个压缩点之后的事件。
  * - 字数用字符长度。total 为 0 时各 pct 返回 0。
  */
 export function statInputComposition(events: SessionEvent[]): InputComposition {
   const len = (s: string | null | undefined) => (s ? s.length : 0)
-  const isCompact = (e: SessionEvent) =>
-    e.type === 'tool/call' &&
-    (e.name === 'context_compact_submit' || e.name === 'session_compact' || e.name === 'context_clear')
+  const isCompact = (e: SessionEvent) => isSessionCompactPoint(e)
 
   // —— 第一遍：定位「本次(最近一次) turn」。
   //     与 deriveMessages 一致：仅统计最后一个压缩点之后的事件（无压缩点则全量）。
@@ -213,7 +246,7 @@ export function statInputComposition(events: SessionEvent[]): InputComposition {
         add(openTurn, len(event.arguments))
         break
       case 'tool/result':
-        add(openTurn, len(event.detail))
+        if (!event.partial) add(openTurn, len(event.detail))
         break
     }
   }
@@ -269,45 +302,122 @@ export function applyContextBudget(messages: LlmMessage[], budgetTokens: number,
   if (budgetTokens <= 0 || messages.length === 0) return messages
   const total = messages.reduce((s, m) => s + msgTokens(m), 0)
   if (total <= budgetTokens) return messages
-  // 保留最前 1 条(system/锚点) + 最近 N 条；其余丢弃
   const head = Math.max(1, messages[0]?.role === 'system' ? 1 : 0)
   const start = messages.slice(0, head)
-  const tail = messages.slice(-keepRecent)
+  const rest = messages.slice(head)
+  let from = Math.max(0, rest.length - keepRecent)
+  while (from > 0 && rest[from]?.role === 'tool') from -= 1
+  let tail = rest.slice(from)
+  while (tail.length && tail[0]?.role === 'tool') {
+    if (from === 0) break
+    from -= 1
+    tail = rest.slice(from)
+  }
+  while (tail.length) {
+    const last = tail[tail.length - 1]
+    if (last?.role === 'assistant' && last.tool_calls?.length) {
+      const need = last.tool_calls.length
+      const have = rest.length - (from + tail.length)
+      if (have >= need && rest.slice(from + tail.length, from + tail.length + need).every((item) => item.role === 'tool')) {
+        tail = rest.slice(from, from + tail.length + need)
+        break
+      }
+      tail = tail.slice(0, -1)
+      continue
+    }
+    break
+  }
   return [...start, ...tail]
+}
+
+/** 摘要用的标题：优先用户起的名字，否则用形象名，最后退回 id 前缀。 */
+function sessionTitleOf(record: SessionRecord): string {
+  const named = record.config?.title?.trim()
+  if (named) return named.slice(0, 80)
+  if (record.mascot) return nameFromSessionMascot(record.mascot)
+  return record.id.slice(0, 8)
 }
 
 export class SessionsService extends Service {
   private cache = new Map<string, SessionRecord>()
+  private defaultSessionPromise: Promise<string> | null = null
+  /** 视图授权能不能看见这条会话。由数据库在启动时接上。 */
+  viewAccess: (id: string, record?: { id?: unknown }) => boolean = () => false
 
   constructor(ctx: Context) {
     super(ctx, 'sessions')
     ctx.inject(['database'], (inner) => {
-      inner.database.register(sessionsCollection(this))
+      inner.database.register(
+        sessionsCollection({
+          listSummaries: () => this.listSummaries(),
+          peekSummary: (id) => this.peekSummary(id),
+          rename: (id, title) => this.rename(id, title),
+          patchConfig: (id, patch) => this.patchConfig(id, patch),
+          delete: (id) => this.delete(id),
+          create: (opts) => this.create(undefined, opts),
+          require: (id) => this.require(id),
+          setProject: (id, project) => this.setProject(id, project),
+          isBusy: (id) => {
+            try {
+              return Boolean(this.ctx.agents?.isBusy(id))
+            } catch {
+              return false
+            }
+          },
+          inboxPending: (id) => {
+            try {
+              return Number(this.ctx.agents?.inboxPending(id) ?? 0)
+            } catch {
+              return 0
+            }
+          },
+        }),
+      )
     })
   }
 
   async create(
     id: string = crypto.randomUUID(),
-    opts: { type?: SessionType; title?: string; config?: SessionConfig } = {},
+    opts: { title?: string; config?: SessionConfig } = {},
   ) {
     const used = await this.collectUsedMascots()
     const mascot = pickSessionMascot(id, used)
-    const type = normalizeSessionType(opts.type)
     const title = opts.title?.trim() || nameFromSessionMascot(mascot)
+    const now = Date.now()
     const seeded = normalizeSessionConfig({
       ...(opts.config ?? {}),
       title,
+      createdAt: Number(opts.config?.createdAt) > 0 ? opts.config.createdAt : now,
     })
     const record: SessionRecord = {
       id,
       version: SESSION_FORMAT_VERSION,
-      events: [{ type: 'session/open', version: SESSION_FORMAT_VERSION, seq: 0, ts: Date.now() }],
+      events: [{ type: 'session/open', version: SESSION_FORMAT_VERSION, seq: 0, ts: now }],
       mascot,
-      type,
       ...(seeded ? { config: seeded } : {}),
     }
     await this.persist(record)
+    this.attachSession(record.id)
+    const database = this.ctx.get('database') as { touchActor?: (collection: string, recordId: string) => Promise<void> } | undefined
+    await database?.touchActor?.('/agents', record.id)
     return record
+  }
+
+  /** 会话列表为空时补一条；并发刷新共用同一次创建，避免首屏产生多个默认会话。 */
+  async ensureDefaultSession() {
+    if (!this.defaultSessionPromise) {
+      this.defaultSessionPromise = (async () => {
+        const existing = await this.ctx.sessionStore.list()
+        if (existing[0]) return existing[0]
+        return (await this.create()).id
+      })()
+    }
+    const pending = this.defaultSessionPromise
+    try {
+      return await pending
+    } finally {
+      if (this.defaultSessionPromise === pending) this.defaultSessionPromise = null
+    }
   }
 
   /** 同步读缓存（Agent 工具解析会话项目根时用）。 */
@@ -322,7 +432,35 @@ export class SessionsService extends Service {
     if (!loaded) return loaded
     const healed = await this.healOpenTurnsOnLoad(loaded)
     this.cache.set(id, healed)
+    this.attachSession(id)
     return healed
+  }
+
+  /** 用来自受信任同步端的完整记录替换本地缓存与持久化副本。 */
+  async replace(record: SessionRecord) {
+    this.clearPersistTimer(record.id)
+    await this.persist(record)
+    this.attachSession(record.id)
+    return record
+  }
+
+  /** 启动时把磁盘上崩溃残留的 partial / 未闭合 turn 一次修完并写回。 */
+  async healPersistedLogs() {
+    let ids: string[] = []
+    try {
+      ids = await this.list()
+    } catch {
+      return
+    }
+    for (const id of ids) {
+      // 让出事件循环，登录和第一次打开会话不用等全部日志修完。
+      await new Promise((resolve) => setImmediate(resolve))
+      try {
+        await this.get(id)
+      } catch {
+        /* 单条坏日志不挡启动 */
+      }
+    }
   }
 
   /**
@@ -381,7 +519,12 @@ export class SessionsService extends Service {
   /** 合并写入会话配置；传 null/空字符串可清除 title / systemPrompt。 */
   async patchConfig(
     id: string,
-    patch: SessionConfig & { title?: string | null; systemPrompt?: string | null },
+    patch: SessionConfig & {
+      title?: string | null
+      systemPrompt?: string | null
+      inspector?: SessionConfig['inspector'] | null
+      goal?: SessionConfig['goal'] | null
+    },
   ) {
     const record = await this.require(id)
     const next = mergeSessionConfig(record.config, patch)
@@ -400,12 +543,62 @@ export class SessionsService extends Service {
     const event: SessionEvent = { ...body, seq: record.events.length, ts: Date.now() }
     record.events.push(event)
     this.cache.set(id, record)
-    // chunk 极高频：先内存追加并广播，落盘合并到下一帧/定时器，避免每 token 全量 JSON 写盘
+    // chunk / 进行中的 tool/call：先内存追加并广播，落盘合并到下一帧，避免把事件循环卡死
     if (body.type === 'assistant/chunk') {
       this.schedulePersist(id)
+    } else if (body.type === 'content/edits') {
+      const existing = record.events.slice(0, -1).findLast((item) => item.type === 'content/edits' && item.turn === body.turn)
+      if (existing && existing.type === 'content/edits') {
+        existing.files = mergeContentEditFiles(existing.files, body.files)
+        existing.ts = event.ts
+        record.events.pop()
+        this.schedulePersist(id)
+        this.ctx.emit('session/event', { sessionId: id, event: existing })
+        return existing
+      }
+      this.schedulePersist(id)
+    } else if (body.type === 'tool/call') {
+      const existing = record.events.slice(0, -1).findLast((item) => item.type === 'tool/call' && item.id === body.id)
+      if (existing && existing.type === 'tool/call') {
+        existing.name = body.name || existing.name
+        existing.arguments = body.arguments
+        existing.ts = event.ts
+        record.events.pop()
+        this.schedulePersist(id)
+        this.ctx.emit('session/event', { sessionId: id, event: existing })
+        return existing
+      }
+      this.schedulePersist(id)
+    } else if (body.type === 'tool/result') {
+      const existing = record.events.slice(0, -1).findLast((item) => item.type === 'tool/result' && item.id === body.id)
+      if (existing && existing.type === 'tool/result') {
+        existing.name = body.name || existing.name
+        existing.ok = body.ok
+        existing.detail = body.detail
+        existing.ts = event.ts
+        if (body.partial) existing.partial = true
+        else delete existing.partial
+        record.events.pop()
+        if (body.partial) this.schedulePersist(id)
+        else {
+          this.clearPersistTimer(id)
+          await this.persist(record)
+        }
+        this.ctx.emit('session/event', { sessionId: id, event: existing })
+        return existing
+      }
+      if (body.partial) this.schedulePersist(id)
+      else {
+        this.clearPersistTimer(id)
+        await this.persist(record)
+      }
+      this.ctx.emit('session/event', { sessionId: id, event })
+      return event
     } else {
+      this.ctx.emit('session/event', { sessionId: id, event })
       this.clearPersistTimer(id)
       await this.persist(record)
+      return event
     }
     this.ctx.emit('session/event', { sessionId: id, event })
     return event
@@ -414,7 +607,60 @@ export class SessionsService extends Service {
   deriveMessages(id: string) {
     const record = this.cache.get(id)
     if (!record) throw new Error(`unknown session: ${id}`)
-    return deriveMessages(record.events)
+    const omit = record.config?.omitImageSeqs
+    if (record.config?.skipLlmImages) {
+      const all = record.events.map((event) => event.seq)
+      return deriveMessages(record.events, all)
+    }
+    return deriveMessages(record.events, omit)
+  }
+
+  /** 供应商拒图后：从日志拿掉已贴图，下一轮 derive 不再带上，会话能继续打字。 */
+  async dropUserImages(id: string) {
+    const record = await this.require(id)
+    let dropped = 0
+    for (const event of record.events) {
+      if (event.type === 'user/message' && event.images?.length) {
+        delete event.images
+        dropped += 1
+      }
+    }
+    if (dropped) await this.persist(record)
+    return dropped
+  }
+
+  llmImagesBlocked(id: string) {
+    const config = this.cache.get(id)?.config
+    return config?.skipLlmImages === true || Boolean(config?.omitImageSeqs?.length)
+  }
+
+  /**
+   * 只把被点名的事件 seq 从模型投影里拿掉图。没有 seq 才整段 skip。
+   */
+  async quarantineLlmImages(id: string, seqs: number[] = []) {
+    const unique = [...new Set(seqs.filter((seq) => Number.isInteger(seq) && seq >= 0))]
+    if (unique.length) {
+      const prev = this.cache.get(id)?.config?.omitImageSeqs ?? []
+      await this.patchConfig(id, { omitImageSeqs: [...new Set([...prev, ...unique])] })
+      return
+    }
+    await this.patchConfig(id, { skipLlmImages: true })
+  }
+
+  async allowLlmImages(id: string) {
+    const config = this.cache.get(id)?.config
+    if (config?.skipLlmImages !== true) return
+    await this.patchConfig(id, { skipLlmImages: false })
+  }
+
+  /** 进程内也修一次崩溃残留（缺 tool/result），不只等下次从磁盘 load。 */
+  async healOpenLog(id: string) {
+    const record = await this.require(id)
+    const rebuilt = rebuildHealedEvents(record.events)
+    if (!rebuilt) return false
+    record.events = rebuilt
+    await this.persist(record)
+    return true
   }
 
   /** 统计当前事件日志的输入构成（历史/本次 turn 占比），与 deriveMessages 一致从压缩点后算。 */
@@ -428,19 +674,22 @@ export class SessionsService extends Service {
     const source = await this.require(sourceId)
     const used = await this.collectUsedMascots()
     const mascot = pickSessionMascot(childId, used)
+    const sourceConfig = { ...(source.config ?? {}) }
+    delete sourceConfig.inspector
     const record: SessionRecord = {
       id: childId,
       version: source.version,
       events: source.events.map((event) => ({ ...event })),
       ...(source.project ? { project: { ...source.project } } : {}),
       mascot,
-      type: normalizeSessionType(source.type),
       config: normalizeSessionConfig({
-        ...(source.config ?? {}),
+        ...sourceConfig,
         title: nameFromSessionMascot(mascot),
+        createdAt: Date.now(),
       }),
     }
     await this.persist(record)
+    this.attachSession(record.id)
     return record
   }
 
@@ -460,8 +709,62 @@ export class SessionsService extends Service {
     return this.ctx.sessionStore.list()
   }
 
+  /** 没有协同账号时全部可见；有当前工作区时只留下本区会话，未认领的旧会话只在「本机」出现。 */
+  inWorkspace(id: string, record?: { id?: unknown }) {
+    const authorization = this.authorization()
+    const actor = authorization?.currentActor()
+    if (authorization && actor) {
+      const allowed = authorization.authorize(actor, 'resource:read', {
+        type: 'record',
+        workspaceId: actor.workspaceId,
+        collection: '/agents',
+        recordId: id,
+      }).allowed
+      if (allowed) return true
+      return this.viewAccess(id, record)
+    }
+    const store = this.collabStore()
+    if (!store?.activeWorkspaceId()) return true
+    if (this.viewAccess(id, record)) return true
+    const membership = store.membership()
+    const key = `/agents\t${id}`
+    if (membership.mine.has(key)) return this.recordReadable(id)
+    if (membership.any.has(key)) return false
+    if (membership.strict) return false
+    if (membership.active !== membership.home) return false
+    return this.recordReadable(id)
+  }
+
+  private recordReadable(id: string) {
+    const store = this.collabStore()
+    if (!store || typeof store.canReadRecord !== 'function') return true
+    return store.canReadRecord('/agents', id)
+  }
+
+  /**
+   * 同步读一条会话的轻量摘要：只碰内存缓存，没有就按 id 单行查。
+   * 页面表格的创建人/编辑人列靠它拿 title + mascot，
+   * 绝不能走 require()/get() —— 那会把这条会话的整个 events 读出来。
+   */
+  peekSummary(id: string): SessionSummary | null {
+    const cached = this.cache.get(id)
+    if (cached) {
+      return {
+        id: cached.id,
+        version: cached.version,
+        eventCount: cached.events.length,
+        title: sessionTitleOf(cached),
+        updatedAt: cached.events.at(-1)?.ts ?? 0,
+        ...(cached.project ? { project: cached.project } : {}),
+        ...(cached.mascot ? { mascot: cached.mascot } : {}),
+        ...(cached.config ? { config: cached.config } : {}),
+      }
+    }
+    return this.ctx.sessionStore.peekSummary?.(id) ?? null
+  }
+
   async listSummaries() {
-    const items = await this.ctx.sessionStore.listSummaries()
+    const items = (await this.ctx.sessionStore.listSummaries()).filter((item) => this.inWorkspace(item.id, item))
     const out = []
     for (const item of items) {
       let next = item
@@ -488,17 +791,6 @@ export class SessionsService extends Service {
           next = { ...next, mascot: ensured }
         }
       }
-      const type = normalizeSessionType(next.type)
-      if (next.type !== type) {
-        const record = await this.require(item.id)
-        if (normalizeSessionType(record.type) !== type) {
-          record.type = type
-          await this.persist(record)
-        }
-        next = { ...next, type }
-      } else {
-        next = { ...next, type }
-      }
       if (next.mascot && next.title === item.id.slice(0, 8)) {
         next = { ...next, title: nameFromSessionMascot(next.mascot) }
       }
@@ -520,6 +812,40 @@ export class SessionsService extends Service {
     this.clearPersistTimer(id)
     this.cache.delete(id)
     return this.ctx.sessionStore.delete(id)
+  }
+
+  private collabStore() {
+    try {
+      return (
+        this.ctx.get('account') as
+          | {
+              store?: {
+                activeWorkspaceId(): string | null
+                membership(): { active: string | null; home: string | null; mine: Set<string>; any: Set<string>; strict?: boolean }
+                attach(workspaceId: string, collection: string, recordId: string): void
+                canReadRecord?(collection: string, recordId: string): boolean
+              }
+            }
+          | undefined
+      )?.store
+    } catch {
+      return undefined
+    }
+  }
+
+  private authorization() {
+    try {
+      return (this.ctx.get('account') as { authorization?: AuthorizationService } | undefined)?.authorization
+    } catch {
+      return undefined
+    }
+  }
+
+  private attachSession(id: string) {
+    const store = this.collabStore()
+    const workspaceId = store?.activeWorkspaceId()
+    if (!store || !workspaceId) return
+    store.attach(workspaceId, '/agents', id)
   }
 
   private persistTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -579,10 +905,14 @@ async function resolveHostProject(input: string): Promise<SessionProject> {
 }
 
 export { sessionsCollection } from './sessions-collection.ts'
+export { eventsCollection } from './events-collection.ts'
+export { lastUsageBeforeCompact, retrieveHistory } from './session-compact.ts'
+export { liftToolImages, MAX_TOOL_IMAGES } from './tool-images.ts'
 
 export const name = 'sessions'
 export const inject = ['sessionStore']
 
 export function apply(ctx: Context) {
-  new SessionsService(ctx)
+  const sessions = new SessionsService(ctx)
+  void sessions.healPersistedLogs()
 }

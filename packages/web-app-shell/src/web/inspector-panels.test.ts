@@ -1,6 +1,6 @@
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
-import { inspectorPanelMatches, inspectorViewProps, resolveInspectorTab } from './inspector-panels.ts'
+import { inspectorPanelMatches, inspectorViewProps, inspectorTabCollectionPath, inspectorTabIsOpen, pruneOpenedForCollections, resolveInspectorTab, rememberedInspectorTab } from './inspector-panels.ts'
 
 test('inspector only offers session panels when a session is selected', () => {
   const extra = { centerKinds: ['session'], requiresSession: true }
@@ -39,6 +39,24 @@ test('inspector selects a hanging tab instead of showing an empty pane', () => {
   assert.equal(resolveInspectorTab('database::a1', ['database'], ['database::a1']), 'database::a1')
 })
 
+test('inspector keeps the restored tab even before its panel is listed', () => {
+  assert.equal(
+    resolveInspectorTab('database:/tasks', ['traj'], ['database:/pages', 'database:/tasks']),
+    'database:/tasks',
+  )
+  assert.equal(
+    resolveInspectorTab('database:/tasks', [], ['database:/pages', 'database:/tasks']),
+    'database:/tasks',
+  )
+})
+
+test('remembered inspector tab prefers the locally clicked pane', () => {
+  const opened = ['database:/pages', 'database:/tasks']
+  assert.equal(rememberedInspectorTab(opened, 'database:/tasks', 'database:/pages'), 'database:/tasks')
+  assert.equal(rememberedInspectorTab(opened, '', 'database:/tasks'), 'database:/tasks')
+  assert.equal(rememberedInspectorTab(opened, 'database:/tasks::x', 'database:/tasks::old'), 'database:/tasks')
+})
+
 test('legacy untagged panels stay out of the inspector', () => {
   assert.equal(inspectorPanelMatches({}, 's1'), false)
   assert.equal(inspectorPanelMatches({ requiresSession: true }, null), false)
@@ -54,7 +72,23 @@ test('inspector view props drop tab chrome and databaseUi', () => {
     databaseUi: { boom: true },
     useSnapshot: 1,
     paneId: 'x',
+    sessionView: { fetchEventDetail: true },
     repeatable: true,
   })
-  assert.deepEqual(next, { paneId: 'x' })
+  assert.deepEqual(next, { paneId: 'x', sessionView: { fetchEventDetail: true } })
+})
+
+test('opened database tabs drop when the collection is gone', () => {
+  assert.equal(inspectorTabCollectionPath('database:/pages'), '/pages')
+  assert.equal(inspectorTabCollectionPath('database:/pages::a1'), '/pages')
+  assert.equal(inspectorTabCollectionPath('traj'), null)
+  assert.equal(inspectorTabIsOpen('database:/pages', ['database:/pages::a1', 'traj']), true)
+  assert.deepEqual(
+    pruneOpenedForCollections(['database:/pages', 'traj', 'database:/tasks::x'], [{ path: '/tasks' }]),
+    ['traj', 'database:/tasks::x'],
+  )
+  assert.deepEqual(
+    pruneOpenedForCollections(['database:/pages'], undefined),
+    ['database:/pages'],
+  )
 })

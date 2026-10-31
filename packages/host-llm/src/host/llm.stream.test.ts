@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'vitest'
-import { consumeChatCompletionSse } from '@biu/host-llm'
+import { consumeChatCompletionSse, attachProviderOptions } from '@biu/host-llm'
 
 function sseBody(chunks: string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
@@ -29,7 +29,28 @@ test('consumeChatCompletionSse yields text deltas and usage', async () => {
   assert.deepEqual(reply.usage, { inputTokens: 3, outputTokens: 2, totalTokens: 5 })
 })
 
-test('consumeChatCompletionSse accumulates tool_calls by index', async () => {
+test('consumeChatCompletionSse streams DeepSeek reasoning_content separately from the answer', async () => {
+  const reasoning: string[] = []
+  const deltas: string[] = []
+  const reply = await consumeChatCompletionSse(
+    sseBody([
+      'data: {"choices":[{"delta":{"reasoning_content":"先"}}]}\n\n',
+      'data: {"choices":[{"delta":{"reasoning_content":"想"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"短"}}]}\n\n',
+      'data: [DONE]\n\n',
+    ]),
+    {
+      onDelta: (text) => { deltas.push(text) },
+      onReasoningDelta: (text) => { reasoning.push(text) },
+    },
+  )
+  assert.deepEqual(reasoning, ['先', '想'])
+  assert.deepEqual(deltas, ['短'])
+  assert.equal(reply.content, '短')
+})
+
+test('consumeChatCompletionSse streams tool_calls before the stream ends', async () => {
+  const tools: Array<{ id: string; name: string; arguments: string }> = []
   const reply = await consumeChatCompletionSse(
     sseBody([
       'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"clock_now","arguments":""}}]}}]}\n\n',
@@ -37,9 +58,12 @@ test('consumeChatCompletionSse accumulates tool_calls by index', async () => {
       'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}\n\n',
       'data: [DONE]\n\n',
     ]),
+    { onToolDelta: (call) => { tools.push({ ...call }) } },
   )
-  assert.equal(reply.content, null)
-  assert.deepEqual(reply.toolCalls, [{ id: 'c1', name: 'clock_now', arguments: '{}' }])
+  assert.equal(reply.toolCalls[0]?.name, 'clock_now')
+  assert.ok(tools.length >= 2)
+  assert.equal(tools[0]?.name, 'clock_now')
+  assert.equal(tools.at(-1)?.arguments, '{}')
 })
 
 test('consumeChatCompletionSse aborts with signal', async () => {
@@ -51,4 +75,29 @@ test('consumeChatCompletionSse aborts with signal', async () => {
     },
   })
   await assert.rejects(() => consumeChatCompletionSse(stream, { signal: abort.signal }), /cancelled/)
+})
+
+test('attachProviderOptions disables DeepSeek thinking', () => {
+  const body: Record<string, unknown> = {}
+  attachProviderOptions(body, {
+    provider: 'deepseek',
+    apiKey: 'k',
+    model: 'deepseek-v4-flash',
+    thinking: 'disabled',
+  }, 'openai-compat')
+  assert.deepEqual(body.thinking, { type: 'disabled' })
+  assert.equal(body.reasoning_effort, undefined)
+})
+
+test('attachProviderOptions sends enabled thinking plus Max effort', () => {
+  const body: Record<string, unknown> = {}
+  attachProviderOptions(body, {
+    provider: 'deepseek',
+    apiKey: 'k',
+    model: 'deepseek-v4-flash',
+    thinking: 'enabled',
+    reasoningEffort: 'max',
+  }, 'openai-compat')
+  assert.deepEqual(body.thinking, { type: 'enabled' })
+  assert.equal(body.reasoning_effort, 'max')
 })

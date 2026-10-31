@@ -1,0 +1,264 @@
+import { test } from 'vitest'
+import assert from 'node:assert/strict'
+import { REQUIRED_RECORD_FIELDS, withBuiltinFields, type CollectionSchema } from '@biu/type-file-system'
+import { AgentDbCompact } from './agent-payload.ts'
+
+const pack = new AgentDbCompact()
+
+function notesSchema(): CollectionSchema {
+  const fields = withBuiltinFields({
+    ...REQUIRED_RECORD_FIELDS,
+    title: { type: 'string', writable: true },
+    status: { type: 'string', writable: true, enum: ['open', 'done'], description: 'open 或 done' },
+    pinned: { type: 'boolean' },
+  })
+  for (const [key, field] of Object.entries(fields)) {
+    fields[key] = field.computed ? { ...field, writable: false } : field
+  }
+  return {
+    labelField: 'title',
+    contentField: 'content',
+    fields,
+    records: { update: true, create: false, delete: false },
+    actions: [
+      { id: 'pin', label: '钉住', when: { pinned: false } },
+      { id: 'uiOnly', label: '仅界面', for: 'user' },
+    ],
+  }
+}
+
+test('compact schema drops identical builtins and user-only actions', () => {
+  const compact = pack.schema(notesSchema())
+  assert.equal('id' in ((compact.fields as object) ?? {}), false)
+  assert.equal('createdAt' in ((compact.fields as object) ?? {}), false)
+  assert.deepEqual((compact.fields as Record<string, unknown>).facet, {
+    type: 'facet',
+    label: '标签',
+    description:
+      '贴标签并填属性。一个标签：{tags:["facet-2"],values:{导演:"查泽雷"}}。多个标签 values 必须按 id 分组：{tags:["facet-2","awards"],values:{"facet-2":{导演:"查泽雷"},awards:{oscar:true}}}。省略 tags 只合并属性，不撕掉其它标签。读属性列：db_list columns=["facet::<标签id>::<字段key>"]，例如 facet::facet::category。',
+  })
+  assert.equal('title' in ((compact.fields as object) ?? {}), false)
+  assert.deepEqual((compact.fields as Record<string, unknown>).status, {
+    type: 'string',
+    enum: ['open', 'done'],
+    description: 'open 或 done',
+  })
+  assert.deepEqual((compact.fields as Record<string, unknown>).pinned, { type: 'boolean' })
+  assert.equal(compact.labelField, undefined)
+  assert.equal(compact.contentField, undefined)
+  const actions = compact.actions as Array<{ id: string }>
+  assert.equal(actions.some((item) => item.id === 'pin'), true)
+  assert.equal(actions.some((item) => item.id === 'uiOnly'), false)
+})
+
+test('compact schema keeps overrides of builtin labels', () => {
+  const fields = withBuiltinFields({
+    ...REQUIRED_RECORD_FIELDS,
+    parentId: { type: 'ref', label: '父任务', writable: true },
+  })
+  const compact = pack.schema({
+    labelField: 'title',
+    contentField: 'description',
+    parentField: 'parentId',
+    fields: { ...fields, description: { type: 'file', label: '描述', writable: true } },
+  })
+  assert.equal(compact.contentField, 'description')
+  assert.equal(compact.parentField, 'parentId')
+  assert.deepEqual((compact.fields as Record<string, unknown>).parentId, { type: 'ref', label: '父任务' })
+  assert.deepEqual((compact.fields as Record<string, unknown>).description, { type: 'file', label: '描述' })
+})
+
+test('compact list drops schema; compact stat keeps caps and slim schema', () => {
+  const listed = pack.query({
+    kind: 'collection',
+    path: '/notes',
+    id: 'notes',
+    label: '笔记',
+    schema: notesSchema(),
+    total: 2,
+    offset: 0,
+    limit: 50,
+    items: [{ id: 'n1', title: '草稿' }],
+  }) as Record<string, unknown>
+  assert.equal('schema' in listed, false)
+  assert.equal('items' in listed, false)
+  assert.equal(listed.total, 2)
+  assert.deepEqual(listed.columns, ['id', 'title'])
+  assert.deepEqual(listed.rows, [['n1', '草稿']])
+
+  const stat = pack.query({
+    kind: 'collection',
+    path: '/notes',
+    id: 'notes',
+    label: '笔记',
+    caps: ['list', 'read', 'update', 'content'],
+    schema: notesSchema(),
+  }) as Record<string, unknown>
+  assert.equal(stat.id, undefined)
+  assert.equal(stat.label, '笔记')
+  assert.deepEqual(stat.caps, ['list', 'read', 'update', 'content'])
+  assert.ok(stat.schema)
+  assert.equal('records' in (stat.schema as object), false)
+})
+
+test('compact record read omits schema', () => {
+  const read = pack.query({
+    kind: 'record',
+    path: '/notes/n1',
+    schema: notesSchema(),
+    value: { id: 'n1', title: '草稿' },
+  }) as Record<string, unknown>
+  assert.equal('schema' in read, false)
+  assert.deepEqual(read.value, { id: 'n1', title: '草稿' })
+})
+
+test('compact list keeps empty facet columns', () => {
+  const listed = pack.query({
+    kind: 'collection',
+    path: '/pages',
+    items: [{ id: 'p1', title: '页', 'facet::facet::category': null, path: '/pages/p1', kind: 'record' }],
+  }) as Record<string, unknown>
+  assert.deepEqual(listed.columns, ['id', 'title', 'facet::facet::category'])
+  assert.deepEqual(listed.rows, [['p1', '页', null]])
+})
+
+test('compact list uses columns once; drops empty and path/kind', () => {
+  const listed = pack.query({
+    kind: 'collection',
+    path: '/notes',
+    total: 2,
+    items: [
+      { id: 'n1', title: '草稿', tags: [], facet: {}, path: '/notes/n1', kind: 'record' },
+      { id: 'n2', title: '另一篇', tags: [], path: '/notes/n2', kind: 'record' },
+    ],
+  }) as Record<string, unknown>
+  assert.deepEqual(listed.columns, ['id', 'title'])
+  assert.deepEqual(listed.rows, [
+    ['n1', '草稿'],
+    ['n2', '另一篇'],
+  ])
+})
+
+test('compact list drops createdAt/people unless those are the projected columns', () => {
+  const listed = pack.query({
+    kind: 'collection',
+    path: '/notes',
+    items: [
+      {
+        id: 'n1',
+        title: '草稿',
+        createdAt: 1,
+        updatedAt: 2,
+        createdBy: { kind: 'user', name: '用户' },
+        path: '/notes/n1',
+        kind: 'record',
+      },
+    ],
+  }) as Record<string, unknown>
+  assert.deepEqual(listed.columns, ['id', 'title'])
+
+  const times = pack.query({
+    kind: 'collection',
+    path: '/notes',
+    items: [{ id: 'n1', createdAt: 1, path: '/notes/n1', kind: 'record' }],
+  }) as Record<string, unknown>
+  assert.deepEqual(times.columns, ['id', 'createdAt'])
+  assert.deepEqual(times.rows, [['n1', 1]])
+})
+
+test('compact root keeps view.blurb for the agent; drops route chrome', () => {
+  const root = pack.query({
+    kind: 'root',
+    path: '/',
+    items: [
+      {
+        id: 'notes',
+        path: '/notes',
+        kind: 'collection',
+        label: '笔记',
+        view: { moduleId: 'notes', route: '/notes', title: '笔记', blurb: '列表 db_list /notes。本表没有 db_action。' },
+      },
+      { id: 'views', path: '/views', kind: 'collection', label: 'views', view: null },
+    ],
+  }) as Record<string, unknown>
+  assert.deepEqual(root, {
+    kind: 'root',
+    items: [
+      { path: '/notes', label: '笔记', view: { blurb: '列表 db_list /notes。本表没有 db_action。' } },
+      { path: '/views' },
+    ],
+  })
+
+  const listed = pack.query({
+    kind: 'collection',
+    path: '/notes',
+    label: '笔记',
+    view: { moduleId: 'notes', route: '/notes', blurb: '列表 db_list /notes。' },
+    items: [{ id: 'n1', title: '草稿' }],
+  }) as Record<string, unknown>
+  assert.equal(listed.blurb, '列表 db_list /notes。')
+  assert.equal('view' in listed, false)
+
+  const written = pack.query({
+    kind: 'content',
+    path: '/notes/n1',
+    field: 'content',
+    command: 'write',
+    ok: true,
+  }) as Record<string, unknown>
+  assert.deepEqual(written, { ok: true, path: '/notes/n1' })
+
+  const replaced = pack.query({
+    kind: 'content',
+    path: '/notes/n1',
+    field: 'content',
+    command: 'str_replace',
+    ok: true,
+    start_line: 4,
+    end_line: 5,
+    text: '改动标题',
+  }) as Record<string, unknown>
+  assert.deepEqual(replaced, {
+    ok: true,
+    path: '/notes/n1',
+    command: 'str_replace',
+    start_line: 4,
+    end_line: 5,
+    text: '改动标题',
+  })
+
+  const assetWrite = pack.query({
+    kind: 'asset',
+    path: '/pages/p1',
+    command: 'write',
+    ok: true,
+    name: 'board.json',
+    etag: 'abc',
+  }) as Record<string, unknown>
+  assert.deepEqual(assetWrite, { ok: true, path: '/pages/p1', name: 'board.json', etag: 'abc' })
+})
+
+
+test('compact write drops full record; create keeps ids', () => {
+  const updated = pack.write({
+    kind: 'record',
+    path: '/notes/n1',
+    value: { id: 'n1', title: '草稿', status: 'open', createdAt: 'x' },
+  }) as Record<string, unknown>
+  assert.deepEqual(updated, { ok: true, path: '/notes/n1' })
+
+  const acted = pack.write({
+    kind: 'record',
+    path: '/notes/n1',
+    value: { id: 'n1', title: '草稿' },
+    result: { assigned: true },
+  }) as Record<string, unknown>
+  assert.deepEqual(acted, { ok: true, path: '/notes/n1', result: { assigned: true } })
+
+  const created = pack.write({
+    kind: 'created',
+    path: '/notes',
+    items: [{ kind: 'record', path: '/notes/n3', value: { id: 'n3', title: '新' } }],
+  }) as Record<string, unknown>
+  assert.deepEqual(created, { ok: true, path: '/notes', ids: ['n3'] })
+})

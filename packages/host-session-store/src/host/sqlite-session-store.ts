@@ -1,6 +1,6 @@
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
-import { createRequire } from 'node:module'
+import { configureSqlite, migrateEvents, openAndMigrateBiu, quoteSqlitePath, renameSessionsTableToAgents } from '@biu/host-plugin-loader/data-dir'
 import {
   SESSION_FORMAT_VERSION,
   type SessionEvent,
@@ -9,18 +9,14 @@ import {
   type SessionRecord,
   type SessionStore,
   type SessionSummary,
-  type SessionType,
   type SessionConfig,
   nameFromSessionMascot,
   normalizeSessionConfig,
-  normalizeSessionType,
   sessionDisplayTitle,
 } from '@biu/type-session'
 import { isSessionMascot, parseSessionMascot } from '@biu/host-sessions/mascot'
 
 type DatabaseSync = import('node:sqlite').DatabaseSync
-
-const require = createRequire(import.meta.url)
 
 type SessionRow = {
   id: string
@@ -28,10 +24,14 @@ type SessionRow = {
   project_json: string | null
   mascot_json: string | null
   config_json: string | null
-  type: string | null
   event_count: number
   title: string
   updated_at: number
+  first_event_at?: number
+}
+
+function tableColumns(db: DatabaseSync, table: string) {
+  return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name)
 }
 
 function parseProject(raw: string | null): SessionProject | undefined {
@@ -59,19 +59,24 @@ function parseConfig(raw: string | null): SessionConfig | undefined {
 
 /** SQLite session store：事件分行增量写入，避免整包 JSON 反复落盘。 */
 export class SqliteSessionStore implements SessionStore {
-  private db!: DatabaseSync
+  private sessions!: DatabaseSync
+  private splitEvents = false
 
-  constructor(private path: string) {}
+  constructor(
+    private path: string,
+    private eventsPath?: string,
+  ) {}
+
+  private eventsTable() {
+    return this.splitEvents ? 'eventsdb.events' : 'events'
+  }
 
   /** 懒打开，便于 apply() 里先 mkdir 再 init。 */
   open() {
-    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite')
-    this.db = new DatabaseSync(this.path)
-    this.db.exec('PRAGMA journal_mode = WAL')
-    this.db.exec('PRAGMA synchronous = NORMAL')
-    this.db.exec('PRAGMA foreign_keys = ON')
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS sessions (
+    this.sessions = openAndMigrateBiu(this.path)
+    renameSessionsTableToAgents(this.sessions)
+    this.sessions.exec(`
+      CREATE TABLE IF NOT EXISTS agents (
         id TEXT PRIMARY KEY,
         version INTEGER NOT NULL,
         project_json TEXT,
@@ -79,57 +84,72 @@ export class SqliteSessionStore implements SessionStore {
         title TEXT NOT NULL DEFAULT '',
         updated_at INTEGER NOT NULL DEFAULT 0
       );
-      CREATE TABLE IF NOT EXISTS events (
-        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    `)
+    this.splitEvents = Boolean(this.eventsPath && this.eventsPath !== this.path)
+    if (this.splitEvents) {
+      this.sessions.exec(`ATTACH DATABASE ${quoteSqlitePath(this.eventsPath!)} AS eventsdb`)
+      configureSqlite(this.sessions, { schema: 'eventsdb' })
+      migrateEvents(this.sessions, { schema: 'eventsdb' })
+      try {
+        this.sessions.exec('PRAGMA eventsdb.wal_checkpoint(TRUNCATE)')
+      } catch {
+        /* concurrent */
+      }
+    }
+    this.sessions.exec(`
+      CREATE TABLE IF NOT EXISTS ${this.eventsTable()} (
+        session_id TEXT NOT NULL${this.splitEvents ? '' : ' REFERENCES agents(id) ON DELETE CASCADE'},
         seq INTEGER NOT NULL,
         ts INTEGER NOT NULL,
         type TEXT NOT NULL,
         event_json TEXT NOT NULL,
         PRIMARY KEY (session_id, seq)
       );
-      CREATE INDEX IF NOT EXISTS events_session_seq ON events(session_id, seq);
     `)
+    this.sessions.exec(
+      this.splitEvents
+        ? 'CREATE INDEX IF NOT EXISTS eventsdb.events_session_seq ON events(session_id, seq)'
+        : 'CREATE INDEX IF NOT EXISTS events_session_seq ON events(session_id, seq)',
+    )
     try {
-      this.db.exec('ALTER TABLE sessions ADD COLUMN mascot_json TEXT')
+      this.sessions.exec('ALTER TABLE agents ADD COLUMN mascot_json TEXT')
     } catch {
       /* column already exists */
     }
     try {
-      this.db.exec(`ALTER TABLE sessions ADD COLUMN type TEXT NOT NULL DEFAULT 'chat'`)
+      this.sessions.exec('ALTER TABLE agents ADD COLUMN config_json TEXT')
     } catch {
       /* column already exists */
     }
-    try {
-      this.db.exec('ALTER TABLE sessions ADD COLUMN config_json TEXT')
-    } catch {
-      /* column already exists */
+    if (tableColumns(this.sessions, 'agents').includes('type')) {
+      try {
+        this.sessions.exec('ALTER TABLE agents DROP COLUMN type')
+      } catch {
+        /* older sqlite without DROP COLUMN */
+      }
     }
     return this
   }
 
   async load(id: string): Promise<SessionRecord | undefined> {
-    const row = this.db
-      .prepare('SELECT id, version, project_json, mascot_json, config_json, type FROM sessions WHERE id = ?')
-      .get(id) as
-      | Pick<SessionRow, 'id' | 'version' | 'project_json' | 'mascot_json' | 'config_json' | 'type'>
-      | undefined
+    const row = this.sessions
+      .prepare('SELECT id, version, project_json, mascot_json, config_json FROM agents WHERE id = ?')
+      .get(id) as Pick<SessionRow, 'id' | 'version' | 'project_json' | 'mascot_json' | 'config_json'> | undefined
     if (!row) return undefined
     if (row.version !== SESSION_FORMAT_VERSION) {
       throw new Error(`unsupported session version ${row.version}`)
     }
-    const eventRows = this.db
-      .prepare('SELECT event_json FROM events WHERE session_id = ? ORDER BY seq ASC')
+    const eventRows = this.sessions
+      .prepare(`SELECT event_json FROM ${this.eventsTable()} WHERE session_id = ? ORDER BY seq ASC`)
       .all(id) as Array<{ event_json: string }>
     const events = eventRows.map((item) => JSON.parse(item.event_json) as SessionEvent)
     const project = parseProject(row.project_json)
     const mascot = parseMascot(row.mascot_json)
     const config = parseConfig(row.config_json)
-    const type = normalizeSessionType(row.type) as SessionType
     return {
       id: row.id,
       version: row.version,
       events,
-      type,
       ...(project ? { project } : {}),
       ...(mascot ? { mascot } : {}),
       ...(config ? { config } : {}),
@@ -141,37 +161,37 @@ export class SqliteSessionStore implements SessionStore {
       throw new Error(`unsupported session version ${record.version}`)
     }
     const title = sessionDisplayTitle(record)
-    const updatedAt = Date.now()
+    const stamped = Number((record as { updatedAt?: number }).updatedAt)
+    const updatedAt = Number.isFinite(stamped) && stamped > 0 ? stamped : Date.now()
     const projectJson = record.project ? JSON.stringify(record.project) : null
     const mascotJson = record.mascot ? JSON.stringify(record.mascot) : null
     const configJson = record.config ? JSON.stringify(record.config) : null
-    const type = normalizeSessionType(record.type)
     const eventCount = record.events.length
+    const eventsTable = this.eventsTable()
 
-    const insertEvent = this.db.prepare(
-      'INSERT INTO events (session_id, seq, ts, type, event_json) VALUES (?, ?, ?, ?, ?)',
+    const insertEvent = this.sessions.prepare(
+      `INSERT INTO ${eventsTable} (session_id, seq, ts, type, event_json) VALUES (?, ?, ?, ?, ?)`,
     )
-    const upsertSession = this.db.prepare(`
-      INSERT INTO sessions (id, version, project_json, mascot_json, config_json, type, event_count, title, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    const upsertSession = this.sessions.prepare(`
+      INSERT INTO agents (id, version, project_json, mascot_json, config_json, event_count, title, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         version = excluded.version,
         project_json = excluded.project_json,
         mascot_json = excluded.mascot_json,
         config_json = excluded.config_json,
-        type = excluded.type,
         event_count = excluded.event_count,
         title = excluded.title,
         updated_at = excluded.updated_at
     `)
 
-    const existing = this.db.prepare('SELECT event_count FROM sessions WHERE id = ?').get(record.id) as
+    const existing = this.sessions.prepare('SELECT event_count FROM agents WHERE id = ?').get(record.id) as
       | { event_count: number }
       | undefined
     const storedCount = existing?.event_count ?? 0
 
     const replaceAll = () => {
-      this.db.prepare('DELETE FROM events WHERE session_id = ?').run(record.id)
+      this.sessions.prepare(`DELETE FROM ${eventsTable} WHERE session_id = ?`).run(record.id)
       for (const event of record.events) {
         insertEvent.run(record.id, event.seq, event.ts, event.type, JSON.stringify(event))
       }
@@ -184,7 +204,7 @@ export class SqliteSessionStore implements SessionStore {
       }
     }
 
-    this.db.exec('BEGIN IMMEDIATE')
+    this.sessions.exec('BEGIN IMMEDIATE')
     try {
       upsertSession.run(
         record.id,
@@ -192,7 +212,6 @@ export class SqliteSessionStore implements SessionStore {
         projectJson,
         mascotJson,
         configJson,
-        type,
         eventCount,
         title,
         updatedAt,
@@ -203,14 +222,14 @@ export class SqliteSessionStore implements SessionStore {
       } else if (eventCount < storedCount) {
         replaceAll()
       } else if (eventCount === storedCount) {
-        const last = this.db
-          .prepare('SELECT seq FROM events WHERE session_id = ? ORDER BY seq DESC LIMIT 1')
+        const last = this.sessions
+          .prepare(`SELECT seq FROM ${eventsTable} WHERE session_id = ? ORDER BY seq DESC LIMIT 1`)
           .get(record.id) as { seq: number } | undefined
         const expected = record.events.at(-1)?.seq
         if (last && expected != null && last.seq !== expected) replaceAll()
       } else {
-        const last = this.db
-          .prepare('SELECT seq FROM events WHERE session_id = ? ORDER BY seq DESC LIMIT 1')
+        const last = this.sessions
+          .prepare(`SELECT seq FROM ${eventsTable} WHERE session_id = ? ORDER BY seq DESC LIMIT 1`)
           .get(record.id) as { seq: number } | undefined
         const prev = record.events[storedCount - 1]
         if (!last || !prev || last.seq !== prev.seq) {
@@ -219,10 +238,10 @@ export class SqliteSessionStore implements SessionStore {
           appendTail(storedCount)
         }
       }
-      this.db.exec('COMMIT')
+      this.sessions.exec('COMMIT')
     } catch (error) {
       try {
-        this.db.exec('ROLLBACK')
+        this.sessions.exec('ROLLBACK')
       } catch {
         /* ignore */
       }
@@ -231,20 +250,40 @@ export class SqliteSessionStore implements SessionStore {
   }
 
   async list(): Promise<string[]> {
-    const rows = this.db.prepare('SELECT id FROM sessions ORDER BY updated_at DESC').all() as Array<{ id: string }>
+    const rows = this.sessions.prepare('SELECT id FROM agents ORDER BY updated_at DESC').all() as Array<{ id: string }>
     return rows.map((row) => row.id)
   }
 
   async listSummaries(): Promise<SessionSummary[]> {
-    const rows = this.db
+    const rows = this.sessions
       .prepare(
-        'SELECT id, version, project_json, mascot_json, config_json, type, event_count, title, updated_at FROM sessions ORDER BY updated_at DESC',
+        'SELECT id, version, project_json, mascot_json, config_json, event_count, title, updated_at FROM agents ORDER BY updated_at DESC',
       )
       .all() as SessionRow[]
+    const spokenBySession = new Map<string, number>()
+    const spoken = this.sessions
+      .prepare(
+        `SELECT session_id, MAX(ts) AS last_message_at FROM ${this.eventsTable()} WHERE type = 'user/message' GROUP BY session_id`,
+      )
+      .all() as Array<{ session_id: string; last_message_at: number }>
+    for (const row of spoken) spokenBySession.set(row.session_id, Number(row.last_message_at) || 0)
+    const firstBySession = new Map<string, number>()
+    const mins = this.sessions
+      .prepare(`SELECT session_id, MIN(ts) AS first_event_at FROM ${this.eventsTable()} GROUP BY session_id`)
+      .all() as Array<{ session_id: string; first_event_at: number }>
+    for (const row of mins) firstBySession.set(row.session_id, Number(row.first_event_at) || 0)
     return rows.map((row) => {
       const project = parseProject(row.project_json)
       const mascot = parseMascot(row.mascot_json)
       const config = parseConfig(row.config_json)
+      const createdAt = Number(config?.createdAt)
+      const firstEventAt = firstBySession.get(row.id) ?? 0
+      const stamp =
+        Number.isFinite(createdAt) && createdAt > 0
+          ? createdAt
+          : firstEventAt > 0
+            ? firstEventAt
+            : row.updated_at
       return {
         id: row.id,
         version: row.version,
@@ -256,25 +295,78 @@ export class SqliteSessionStore implements SessionStore {
               ? nameFromSessionMascot(mascot)
               : row.title || row.id.slice(0, 8),
         updatedAt: row.updated_at,
-        type: normalizeSessionType(row.type),
+        ...((spokenBySession.get(row.id) ?? 0) > 0 ? { lastMessageAt: spokenBySession.get(row.id) } : {}),
         ...(project ? { project } : {}),
         ...(mascot ? { mascot } : {}),
-        ...(config ? { config } : {}),
+        ...(config || stamp ? { config: { ...(config ?? {}), createdAt: stamp } } : {}),
       }
     })
   }
 
+  /**
+   * 按 id 同步读一条摘要：只查 sessions 表，不扫 events。
+   * 页面表格的创建人列只需要 title + mascot，别为它把整个会话日志读进内存。
+   */
+  peekSummary(id: string): SessionSummary | undefined {
+    const row = this.sessions
+      .prepare(
+        'SELECT id, version, project_json, mascot_json, config_json, event_count, title, updated_at FROM agents WHERE id = ?',
+      )
+      .get(id) as SessionRow | undefined
+    if (!row) return undefined
+    const project = parseProject(row.project_json)
+    const mascot = parseMascot(row.mascot_json)
+    const config = parseConfig(row.config_json)
+    const createdAt = Number(config?.createdAt)
+    const stamp = Number.isFinite(createdAt) && createdAt > 0 ? createdAt : row.updated_at
+    return {
+      id: row.id,
+      version: row.version,
+      eventCount: row.event_count,
+      title:
+        row.title && row.title !== row.id.slice(0, 8)
+          ? row.title
+          : mascot
+            ? nameFromSessionMascot(mascot)
+            : row.title || row.id.slice(0, 8),
+      updatedAt: row.updated_at,
+      ...(project ? { project } : {}),
+      ...(mascot ? { mascot } : {}),
+      ...(config || stamp ? { config: { ...(config ?? {}), createdAt: stamp } } : {}),
+    }
+  }
+
   async delete(id: string): Promise<boolean> {
-    const result = this.db.prepare('DELETE FROM sessions WHERE id = ?').run(id)
-    return Number(result.changes) > 0
+    this.sessions.exec('BEGIN IMMEDIATE')
+    try {
+      this.sessions.prepare(`DELETE FROM ${this.eventsTable()} WHERE session_id = ?`).run(id)
+      const result = this.sessions.prepare('DELETE FROM agents WHERE id = ?').run(id)
+      this.sessions.exec('COMMIT')
+      return Number(result.changes) > 0
+    } catch (error) {
+      try {
+        this.sessions.exec('ROLLBACK')
+      } catch {
+        /* ignore */
+      }
+      throw error
+    }
   }
 
   close() {
-    this.db.close()
+    if (this.splitEvents) {
+      try {
+        this.sessions.exec('DETACH DATABASE eventsdb')
+      } catch {
+        /* already closed */
+      }
+    }
+    this.sessions.close()
   }
 }
 
-export async function ensureSqliteSessionStore(path: string) {
+export async function ensureSqliteSessionStore(path: string, eventsPath?: string) {
   await mkdir(dirname(path), { recursive: true })
-  return new SqliteSessionStore(path).open()
+  if (eventsPath) await mkdir(dirname(eventsPath), { recursive: true })
+  return new SqliteSessionStore(path, eventsPath).open()
 }

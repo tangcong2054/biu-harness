@@ -3,7 +3,7 @@ import type { HubService } from '@biu/host-hub'
 import type { ToolsService, ToolRequest } from '@biu/host-tools'
 import type { LlmService } from '@biu/host-llm'
 import type { AgentLoopService } from '@biu/host-agent-loop'
-import type { PreStepReq } from '@biu/type-agent-loop'
+import type { PreStepReq, PostStepReq } from '@biu/type-agent-loop'
 import type { AgentsService } from '@biu/host-agents'
 import type { ApprovalsService } from '@biu/host-approvals'
 import type { SessionsService } from '@biu/host-sessions'
@@ -16,15 +16,16 @@ import type { SandboxService } from '@biu/host-sandbox'
 import type { ShellService } from '@biu/host-shell'
 import type { JobsService } from '@biu/host-jobs'
 import type { McpService } from '@biu/host-mcp'
+import type { SkillsService } from '@biu/host-skills'
 import type { TerminalService } from '@biu/host-terminal'
 import type { LspService } from '@biu/host-lsp'
+import type { WebService } from '@biu/host-web'
 import type { SubagentsService } from '@biu/host-subagents'
 import type { SnapshotService } from '@biu/web-snapshot'
 import type { SessionViewService } from '@biu/web-session-view'
 import type { ProjectViewService } from '@biu/web-project-view'
 import type { AppModulesService } from '@biu/web-app-modules'
 import type { SlotsService } from '@biu/web-slots'
-import type { DockService } from '@biu/core-dock'
 
 export type { Method, PageSpec, RouteContext, RouteHandler } from '@biu/type-http'
 
@@ -46,11 +47,12 @@ declare module 'cordis' {
     shell: ShellService
     jobs: JobsService
     mcp: McpService
+    skills: SkillsService
     terminals: TerminalService
     lsp: LspService
+    web: WebService
     subagents: SubagentsService
     slots: SlotsService
-    dock: DockService
     snapshot: SnapshotService
     sessionView: SessionViewService
     projectView: ProjectViewService
@@ -59,6 +61,7 @@ declare module 'cordis' {
 
   interface Events {
     'http/ready'(info: { port: number }): void
+    'http/share-ready'(info: { port: number }): void
     'hub/change'(): void
     'agent/status'(payload: { sessionId: string; status: 'idle' | 'running'; step?: number }): void
     'agent/inbox'(payload: {
@@ -66,6 +69,7 @@ declare module 'cordis' {
       inbox: Array<{ id: string; kind: 'wake' | 'inject'; text: string }>
     }): void
     'agent/pre-step'(req: PreStepReq, next: () => PreStepReq): PreStepReq
+    'agent/post-step'(req: PostStepReq, next: () => PostStepReq): PostStepReq
     'session/event'(payload: { sessionId: string; event: SessionEvent }): void
     'tools/pre-execute'(req: ToolRequest, next: () => ToolRequest): ToolRequest
     'tools/post-execute'(payload: { name: string; ok: boolean; detail: string }): void

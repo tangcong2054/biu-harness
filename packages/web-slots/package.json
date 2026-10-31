@@ -1,11 +1,15 @@
 {
   "name": "@biu/web-slots",
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "UI 缝运行时",
   "exports": {
     ".": "./src/web/index.ts"
+  },
+  "dependencies": {
+    "@biu/biu-ui": "0.1.0"
   },
   "peerDependencies": {
     "cordis": "4.0.0-rc.8",

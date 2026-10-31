@@ -1,0 +1,1959 @@
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { currentAccountId, currentRequestWorkspaceId, dataDir, dataHome, dataPath, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
+import { Service, type Context } from 'cordis'
+import type { ChatMessage } from './chat-types.ts'
+import { isAgentToolMode, normalizeAgentMode, type AgentToolMode } from '@biu/host-tools'
+import type { LlmConfig } from '@biu/host-llm'
+import { probeLlmConnection } from '@biu/host-llm'
+import { LLM_MODEL_CATALOG, LLM_ENDPOINT_PRESETS, describeProvider, defaultModelFor, CHAT_PROVIDERS, findEndpointPreset, normalizeBaseUrl, inferModelCapabilities, defaultModeValues, applyModeToLlm, hasKnob } from './model-catalog.ts'
+import type { ChatProvider, LlmModelDef, LlmEndpointDef, ReasoningEffort, ThinkingMode, ContextWindow, SpeedMode, ModelModeValues } from './model-catalog.ts'
+export type { ChatProvider, LlmModelDef, LlmEndpointDef, ReasoningEffort, ThinkingMode, ContextWindow, SpeedMode, ModelCapabilities } from './model-catalog.ts'
+export { LLM_ENDPOINT_PRESETS, LLM_MODEL_CATALOG } from './model-catalog.ts'
+import { currentSessionId } from '@biu/host-sessions/scope'
+import { isSessionCompactPoint, sanitizeLiveUiContext, type SessionConfig, type SessionEvent, type SessionRecord } from '@biu/type-session'
+import { DEFAULT_TAIL_TURNS, sliceBeforeTurns, sliceTailTurns } from '@biu/host-sessions/window'
+import {
+  DEFAULT_TRAJECTORY_TURNS,
+  buildRequestMessages,
+  buildTrajectoryBefore,
+  buildTrajectoryWindow,
+  findEvent,
+} from '@biu/host-sessions/trajectory'
+import { estimateTokens, liftToolImages } from '@biu/host-sessions'
+import { persistPastedImages, readArtifactFile, withPastedImagePicks } from '@biu/host-sessions/artifacts'
+import { collectLiveDispatchedTasks } from '@biu/host-live-sessions/usage'
+import { loadLiveDispatchTasks, registerChatInspectorRoutes } from './inspector.ts'
+import { forwardCloud } from '@biu/host-account/mirror'
+
+function workspaceIsCloud(ctx: Context) {
+  if (isOnlineRuntime()) return true
+  try {
+    const account = ctx.get('account') as {
+      workspaceLocation?: (id: string) => string
+      store?: { activeWorkspaceId?: () => string | null }
+    } | undefined
+    const workspaceId = currentRequestWorkspaceId() || account?.store?.activeWorkspaceId?.() || ''
+    return Boolean(workspaceId && account?.workspaceLocation?.(workspaceId) === 'cloud')
+  } catch {
+    return false
+  }
+}
+
+type CloudExecution = {
+  sessionId: string
+  leaseId: string
+  workspaceId: string
+  origin: string
+  token: string
+  heartbeat: ReturnType<typeof setInterval>
+  finishing?: Promise<void>
+}
+
+const CLOUD_SESSION_SECRET_KEYS = new Set(['apikey', 'apikeys', 'authorization', 'xapikey'])
+
+export function redactCloudSessionSecrets(record: SessionRecord): SessionRecord {
+  const scrub = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(scrub)
+    if (!value || typeof value !== 'object') return value
+    const out: Record<string, unknown> = {}
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      const normalized = key.toLowerCase().replace(/[-_]/g, '')
+      if (CLOUD_SESSION_SECRET_KEYS.has(normalized)) continue
+      out[key] = scrub(child)
+    }
+    return out
+  }
+  return scrub(record) as SessionRecord
+}
+
+function accountRuntime(ctx: Context) {
+  try {
+    return ctx.get('account') as {
+      cloudConnection?: (localAccountId: string) => { origin: string; token: string } | null
+      linkedCloud?: (localAccountId?: string) => { origin: string; token: string } | null
+      markRemote?: (collection: string, id: string) => void
+      workspaceLocation?: (workspaceId: string) => 'device' | 'cloud'
+      store?: {
+        activeWorkspaceId(): string | null
+        acquireExecutionLease(accountId: string, sessionId: string, executorId: string): { leaseId: string; expiresAt: number }
+        renewExecutionLease(accountId: string, sessionId: string, leaseId: string): unknown
+        requireExecutionLease(accountId: string, sessionId: string, leaseId: string): void
+        releaseExecutionLease(accountId: string, sessionId: string, leaseId: string): unknown
+        hasExecutionLease(sessionId: string): boolean
+      }
+    }
+  } catch {
+    return null
+  }
+}
+
+export type { ChatMessage }
+
+export type { AgentToolMode }
+
+const DEFAULT_PROVIDER: ChatProvider = 'deepseek'
+/** 当前选中入口 id；内置三家与 preset id 对齐，自定义入口为 custom-*。 */
+type EndpointId = string
+
+interface ChatConfig {
+  /** 入口 id（官方 / 中转 / 自定义）；兼容旧值 deepseek|openai|anthropic。 */
+  endpointId: EndpointId
+  /**
+   * 协议分流用的 provider（deepseek|openai|anthropic）。
+   * 由入口决定；保留字段以兼容旧持久化与会话覆盖。
+   */
+  provider: ChatProvider
+  /** 每个入口独立存一份 apiKey。 */
+  apiKeys: Record<string, string>
+  /** 用户覆盖的 baseUrl（未覆盖则用 preset / customEndpoints 默认）。 */
+  baseUrls: Record<string, string>
+  /** 用户自定义入口（中转站自建 URL 等）。 */
+  customEndpoints: LlmEndpointDef[]
+  /** 用户在某入口下追加的模型名。 */
+  customModels: LlmModelDef[]
+  /**
+   * 探测失败 / 用户主动断开的入口：强制视为未配置，
+   * 避免坏 Key（含环境变量）仍显示绿点并出现在模型下拉。
+   */
+  blockedEndpoints: string[]
+  model: string
+  systemPrompt: string
+  agentMode: AgentToolMode
+  /** 极简模式下常驻额外工具（不含 minimal 底座与 live 调度工具） */
+  extraTools: string[]
+  /** 当前模型的思考开关；能思考的模型默认 enabled（对齐上游）。 */
+  thinking: ThinkingMode
+  reasoningEffort: ReasoningEffort
+  contextWindow: ContextWindow
+  speed: SpeedMode
+  /** 按「入口::模型」记住档位，切模型时带回。 */
+  modelPrefs: Record<
+    string,
+    { thinking?: ThinkingMode; reasoningEffort?: ReasoningEffort; contextWindow?: ContextWindow; speed?: SpeedMode }
+  >
+}
+
+function configPath(accountId = '') {
+  const localAccount = !isOnlineRuntime() ? accountId.trim().replace(/[^a-zA-Z0-9_-]/g, '') : ''
+  return localAccount
+    ? dataPath(dataHome(), 'chat-config', `${localAccount}.json`)
+    : dataPath(dataHome(), 'chat-config.json')
+}
+
+function emptyKeys(): Record<string, string> {
+  return { deepseek: '', openai: '', anthropic: '', 'token-plan': '' }
+}
+
+function defaults(): ChatConfig {
+  const envKeys = emptyKeys()
+  if (process.env.DEEPSEEK_API_KEY) envKeys.deepseek = process.env.DEEPSEEK_API_KEY
+  if (process.env.OPENAI_API_KEY) envKeys.openai = process.env.OPENAI_API_KEY
+  if (process.env.ANTHROPIC_API_KEY) envKeys.anthropic = process.env.ANTHROPIC_API_KEY
+  if (process.env.TOKENHUB_API_KEY) envKeys['token-plan'] = process.env.TOKENHUB_API_KEY
+  const deepseek = Boolean(envKeys.deepseek)
+  const openai = Boolean(envKeys.openai)
+  const anthropic = Boolean(envKeys.anthropic)
+  const requestedEndpoint = process.env.CHAT_ENDPOINT_ID?.trim()
+  const endpointId = requestedEndpoint || (process.env.TOKENHUB_API_KEY ? 'token-plan' : '')
+  const endpoint = endpointId ? findEndpointPreset(endpointId) : undefined
+  const envProvider = parseProvider(process.env.CHAT_PROVIDER)
+  const provider: ChatProvider = endpoint?.provider ?? envProvider ?? (deepseek ? 'deepseek' : openai ? 'openai' : anthropic ? 'anthropic' : 'deepseek')
+  return {
+    endpointId: endpoint?.id ?? provider,
+    provider,
+    apiKeys: envKeys,
+    baseUrls: {},
+    customEndpoints: [],
+    customModels: [],
+    blockedEndpoints: [],
+    model:
+      process.env.CHAT_MODEL ||
+      (endpoint?.id === 'token-plan'
+        ? 'deepseek/deepseek-v4-flash'
+        : provider === 'openai'
+          ? 'gpt-4o-mini'
+          : provider === 'anthropic'
+            ? 'claude-3-5-sonnet-20241022'
+            : 'deepseek-v4-flash'),
+    systemPrompt: '你是控制台里的助手。需要时调用当前已注册的 tools；插件卸载后对应 tool 会消失。回答简洁。',
+    agentMode: 'standard',
+    extraTools: [],
+    thinking: 'enabled',
+    reasoningEffort: 'high',
+    contextWindow: '200k',
+    speed: 'slow',
+    modelPrefs: {},
+  }
+}
+
+function hint(key: string) {
+  if (!key) return ''
+  if (key.length <= 8) return '已配置'
+  return `${key.slice(0, 3)}…${key.slice(-4)}`
+}
+
+function readPersisted(accountId = ''): Partial<ChatConfig> | null {
+  try {
+    return cloudSafePersistedConfig(
+      JSON.parse(readFileSync(configPath(accountId), 'utf8')) as Partial<ChatConfig>,
+    )
+  } catch {
+    return null
+  }
+}
+
+export function cloudSafePersistedConfig(
+  saved: Partial<ChatConfig> | null,
+  online = isOnlineRuntime(),
+): Partial<ChatConfig> | null {
+  if (!saved || !online) return saved
+  const safe = { ...saved, apiKeys: emptyKeys() } as Partial<ChatConfig> & { apiKey?: unknown }
+  delete safe.apiKey
+  return safe
+}
+
+export function persistedChatConfig(config: ChatConfig, online = isOnlineRuntime()) {
+  return {
+    endpointId: config.endpointId,
+    provider: config.provider,
+    model: config.model,
+    systemPrompt: config.systemPrompt,
+    agentMode: config.agentMode,
+    extraTools: config.extraTools,
+    thinking: config.thinking,
+    reasoningEffort: config.reasoningEffort,
+    contextWindow: config.contextWindow,
+    speed: config.speed,
+    modelPrefs: config.modelPrefs,
+    ...(!online ? { apiKeys: config.apiKeys } : {}),
+    baseUrls: config.baseUrls,
+    customEndpoints: config.customEndpoints,
+    customModels: config.customModels,
+    blockedEndpoints: config.blockedEndpoints,
+  }
+}
+
+function writePersisted(config: ChatConfig, accountId = '') {
+  const path = configPath(accountId)
+  const dir = dataDir(dataHome())
+  mkdirSync(dir, { recursive: true })
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, `${JSON.stringify(persistedChatConfig(config), null, 2)}\n`, 'utf8')
+}
+
+function parseAgentMode(value: unknown, fallback: AgentToolMode): AgentToolMode {
+  return normalizeAgentMode(value, fallback)
+}
+
+function parseProvider(value: unknown): ChatProvider | null {
+  return CHAT_PROVIDERS.includes(value as ChatProvider) ? (value as ChatProvider) : null
+}
+
+function prefKey(endpointId: string, model: string) {
+  return `${endpointId}::${model}`
+}
+
+function parseThinking(value: unknown): ThinkingMode | undefined {
+  return value === 'enabled' || value === 'disabled' ? value : undefined
+}
+
+function parseEffort(value: unknown): ReasoningEffort | undefined {
+  return value === 'high' || value === 'max' ? value : undefined
+}
+
+function parseContext(value: unknown): ContextWindow | undefined {
+  return value === '200k' || value === '1m' ? value : undefined
+}
+
+function parseSpeed(value: unknown): SpeedMode | undefined {
+  return value === 'fast' || value === 'slow' ? value : undefined
+}
+
+function mergeModelPrefs(saved: Partial<ChatConfig> | null): ChatConfig['modelPrefs'] {
+  const out: ChatConfig['modelPrefs'] = {}
+  if (!saved?.modelPrefs || typeof saved.modelPrefs !== 'object') return out
+  for (const [key, raw] of Object.entries(saved.modelPrefs)) {
+    if (!raw || typeof raw !== 'object') continue
+    const thinking = parseThinking(raw.thinking)
+    const reasoningEffort = parseEffort(raw.reasoningEffort)
+    const contextWindow = parseContext((raw as { contextWindow?: unknown }).contextWindow)
+    const speed = parseSpeed((raw as { speed?: unknown }).speed)
+    if (thinking || reasoningEffort || contextWindow || speed) {
+      out[key] = {
+        ...(thinking ? { thinking } : {}),
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+        ...(contextWindow ? { contextWindow } : {}),
+        ...(speed ? { speed } : {}),
+      }
+    }
+  }
+  return out
+}
+
+function hydrateModelMode(config: ChatConfig) {
+  const caps = inferModelCapabilities(config.model, config.provider)
+  const saved = config.modelPrefs[prefKey(config.endpointId, config.model)]
+  const defaults = defaultModeValues(caps)
+  config.thinking = saved?.thinking ?? defaults.thinking
+  config.reasoningEffort = saved?.reasoningEffort ?? defaults.effort
+  config.contextWindow = saved?.contextWindow ?? defaults.context
+  config.speed =
+    saved?.speed ??
+    (hasKnob(caps, 'speed') && config.thinking === 'disabled' ? 'fast' : defaults.speed)
+}
+
+function rememberModelPrefs(config: ChatConfig) {
+  config.modelPrefs[prefKey(config.endpointId, config.model)] = {
+    thinking: config.thinking,
+    reasoningEffort: config.reasoningEffort,
+    contextWindow: config.contextWindow,
+    speed: config.speed,
+  }
+}
+
+function isLocalEndpoint(endpoint: LlmEndpointDef): boolean {
+  return endpoint.group === 'local'
+}
+
+/** 取某个入口的持久化 key；环境变量始终优先（不会被磁盘文件覆盖 UI 清空）。 */
+function keyFor(endpointId: string, saved: Partial<ChatConfig> | null): string {
+  const envMap: Record<string, string | undefined> = {
+    deepseek: process.env.DEEPSEEK_API_KEY,
+    openai: process.env.OPENAI_API_KEY,
+    anthropic: process.env.ANTHROPIC_API_KEY,
+    'token-plan': process.env.TOKENHUB_API_KEY,
+  }
+  if (envMap[endpointId]) return envMap[endpointId]!
+  const savedKeys = saved?.apiKeys
+  if (savedKeys && typeof savedKeys === 'object' && typeof savedKeys[endpointId] === 'string') {
+    const key = savedKeys[endpointId] || ''
+    if (key.trim()) return key.trim()
+  }
+  // 老格式：单一 apiKey 迁移到 deepseek（或默认 provider 所在）
+  const legacy = saved as unknown as { apiKey?: unknown; provider?: unknown } | null
+  if (legacy && typeof legacy.apiKey === 'string' && legacy.apiKey.trim()) {
+    const owner =
+      legacy.provider && CHAT_PROVIDERS.includes(legacy.provider as ChatProvider)
+        ? (legacy.provider as ChatProvider)
+        : DEFAULT_PROVIDER
+    if (endpointId === owner) return legacy.apiKey.trim()
+  }
+  return ''
+}
+
+function mergeCustomEndpoints(saved: Partial<ChatConfig> | null): LlmEndpointDef[] {
+  if (!Array.isArray(saved?.customEndpoints)) return []
+  const out: LlmEndpointDef[] = []
+  for (const raw of saved.customEndpoints) {
+    if (!raw || typeof raw !== 'object') continue
+    const id = typeof raw.id === 'string' ? raw.id.trim() : ''
+    const label = typeof raw.label === 'string' ? raw.label.trim() : ''
+    const baseUrl = typeof raw.baseUrl === 'string' ? normalizeBaseUrl(raw.baseUrl) : ''
+    if (!id || !label || !baseUrl) continue
+    const protocol = raw.protocol === 'anthropic' ? 'anthropic' : 'openai-compat'
+    const provider: ChatProvider =
+      raw.provider === 'deepseek' || raw.provider === 'anthropic' || raw.provider === 'openai'
+        ? raw.provider
+        : protocol === 'anthropic'
+          ? 'anthropic'
+          : 'openai'
+    out.push({
+      id,
+      label,
+      group: 'custom',
+      protocol,
+      baseUrl,
+      provider,
+      note: typeof raw.note === 'string' ? raw.note : undefined,
+      placeholder: typeof raw.placeholder === 'string' ? raw.placeholder : 'sk-…',
+      builtin: false,
+    })
+  }
+  return out
+}
+
+function mergeCustomModels(saved: Partial<ChatConfig> | null): LlmModelDef[] {
+  if (!Array.isArray(saved?.customModels)) return []
+  const out: LlmModelDef[] = []
+  for (const raw of saved.customModels) {
+    if (!raw || typeof raw !== 'object') continue
+    const id = typeof raw.id === 'string' ? raw.id.trim() : ''
+    const model = typeof raw.model === 'string' ? raw.model.trim() : ''
+    const endpointId = typeof raw.endpointId === 'string' ? raw.endpointId.trim() : ''
+    if (!id || !model || !endpointId) continue
+    const provider: ChatProvider =
+      raw.provider === 'deepseek' || raw.provider === 'openai' || raw.provider === 'anthropic'
+        ? raw.provider
+        : 'openai'
+    out.push({
+      id,
+      label: typeof raw.label === 'string' && raw.label.trim() ? raw.label.trim() : model,
+      endpointId,
+      provider,
+      model,
+      category: typeof raw.category === 'string' ? raw.category : 'custom',
+      note: typeof raw.note === 'string' ? raw.note : undefined,
+      builtin: false,
+    })
+  }
+  return out
+}
+
+function mergePersisted(base: ChatConfig, saved: Partial<ChatConfig> | null): ChatConfig {
+  if (!saved) return base
+  const customEndpoints = mergeCustomEndpoints(saved)
+  const customModels = mergeCustomModels(saved)
+  const apiKeys: Record<string, string> = { ...emptyKeys() }
+  // 合并所有已知入口的 key
+  const allEndpointIds = new Set<string>([
+    ...CHAT_PROVIDERS,
+    ...LLM_ENDPOINT_PRESETS.map((e) => e.id),
+    ...customEndpoints.map((e) => e.id),
+    ...(saved.apiKeys && typeof saved.apiKeys === 'object' ? Object.keys(saved.apiKeys) : []),
+  ])
+  for (const id of allEndpointIds) apiKeys[id] = keyFor(id, saved)
+
+  const baseUrls: Record<string, string> = {}
+  if (saved.baseUrls && typeof saved.baseUrls === 'object') {
+    for (const [id, url] of Object.entries(saved.baseUrls)) {
+      if (typeof url === 'string' && url.trim()) baseUrls[id] = normalizeBaseUrl(url)
+    }
+  }
+
+  const envProvider = parseProvider(process.env.CHAT_PROVIDER)
+  const envEndpointId =
+    process.env.CHAT_ENDPOINT_ID?.trim() ||
+    (process.env.TOKENHUB_API_KEY ? 'token-plan' : envProvider ?? '')
+  const endpointId =
+    envEndpointId ||
+    (typeof saved.endpointId === 'string' && saved.endpointId.trim()
+      ? saved.endpointId.trim()
+      : parseProvider(saved.provider) ?? base.endpointId)
+
+  const endpoint =
+    findEndpointPreset(endpointId) ??
+    customEndpoints.find((e) => e.id === endpointId) ??
+    findEndpointPreset(base.endpointId)
+  const requestedModel =
+    process.env.CHAT_MODEL ||
+    (typeof saved.model === 'string' && saved.model.trim() ? saved.model.trim() : base.model)
+  const knownModels = [...LLM_MODEL_CATALOG, ...customModels]
+  const model =
+    envEndpointId && !process.env.CHAT_MODEL && !knownModels.some((item) => item.endpointId === endpointId && item.model === requestedModel)
+      ? knownModels.find((item) => item.endpointId === endpointId)?.model ?? requestedModel
+      : requestedModel
+
+  const next: ChatConfig = {
+    endpointId,
+    provider: endpoint?.provider ?? envProvider ?? parseProvider(saved.provider) ?? base.provider,
+    apiKeys,
+    baseUrls,
+    customEndpoints,
+    customModels,
+    blockedEndpoints: Array.isArray(saved.blockedEndpoints)
+      ? [...new Set(saved.blockedEndpoints.map((id) => String(id).trim()).filter(Boolean))]
+      : [],
+    model,
+    systemPrompt: typeof saved.systemPrompt === 'string' ? saved.systemPrompt : base.systemPrompt,
+    agentMode: parseAgentMode(saved.agentMode, base.agentMode),
+    extraTools: Array.isArray(saved.extraTools)
+      ? [...new Set(saved.extraTools.map((name) => String(name).trim()).filter(Boolean))]
+      : base.extraTools,
+    thinking: parseThinking(saved.thinking) ?? base.thinking,
+    reasoningEffort: parseEffort(saved.reasoningEffort) ?? base.reasoningEffort,
+    contextWindow: parseContext(saved.contextWindow) ?? base.contextWindow,
+    speed: parseSpeed(saved.speed) ?? base.speed,
+    modelPrefs: mergeModelPrefs(saved),
+  }
+  hydrateModelMode(next)
+  return next
+}
+
+function allEndpoints(config: ChatConfig): LlmEndpointDef[] {
+  const customIds = new Set(config.customEndpoints.map((e) => e.id))
+  return [
+    ...LLM_ENDPOINT_PRESETS.filter((e) => !customIds.has(e.id)),
+    ...config.customEndpoints,
+  ]
+}
+
+function allModels(config: ChatConfig): LlmModelDef[] {
+  const customIds = new Set(config.customModels.map((m) => m.id))
+  return [
+    ...LLM_MODEL_CATALOG.filter((m) => !customIds.has(m.id)),
+    ...config.customModels,
+  ]
+}
+
+function resolveEndpoint(config: ChatConfig, endpointId: string): LlmEndpointDef | undefined {
+  return allEndpoints(config).find((e) => e.id === endpointId)
+}
+
+function effectiveBaseUrl(config: ChatConfig, endpoint: LlmEndpointDef): string {
+  const override = config.baseUrls[endpoint.id]
+  return override?.trim() ? normalizeBaseUrl(override) : endpoint.baseUrl
+}
+
+/** 入口是否已配置：有 Key，且未被探测失败拉黑。本地入口不自动算已接入。 */
+function endpointConfigured(config: ChatConfig, endpoint: LlmEndpointDef): boolean {
+  if (config.blockedEndpoints.includes(endpoint.id)) return false
+  return Boolean((config.apiKeys[endpoint.id] ?? '').trim())
+}
+
+function unblockEndpoint(config: ChatConfig, id: string) {
+  config.blockedEndpoints = config.blockedEndpoints.filter((x) => x !== id)
+}
+
+function blockEndpoint(config: ChatConfig, id: string) {
+  if (!config.blockedEndpoints.includes(id)) config.blockedEndpoints.push(id)
+}
+
+export class ChatService extends Service {
+  private activeAccountId = ''
+  private config = mergePersisted(defaults(), readPersisted())
+
+  constructor(ctx: Context) {
+    super(ctx, 'chat')
+    ctx.systemPrompt.register('chat.persona', () => {
+      const sessionId = currentSessionId()
+      if (sessionId) {
+        const override = this.ctx.sessions.peek(sessionId)?.config?.systemPrompt
+        if (typeof override === 'string' && override.trim()) return override
+      }
+      return this.config.systemPrompt
+    })
+    ctx.systemPrompt.register('chat.goal', () => {
+      const sessionId = currentSessionId()
+      if (!sessionId) return ''
+      const goal = this.ctx.sessions.peek(sessionId)?.config?.goal
+      if (!goal || goal.status !== 'pursuing') return ''
+      return [
+        '用户用 /goal 挂上了当前目标。持续推进直到完成，不要停在计划或口头「差不多了」。',
+        `目标：${goal.objective}`,
+        `goal_id=${goal.id}`,
+        '完成后必须调用 goal_complete({ goal_id, summary })，summary 写具体证据（测试、文件、验收）。',
+        '只有真正卡住才调用 goal_blocked({ goal_id, reason, evidence })。',
+        '这与极简 / 标准 / 数据工具模式无关：Goal 是代理上的目标合同，工具集仍由当前 Agent 模式决定。',
+      ].join('\n')
+    })
+    this.syncLlm()
+    this.syncToolsMode()
+  }
+
+  activateAccount(accountId = currentAccountId()) {
+    const next = isOnlineRuntime() ? '' : accountId
+    if (next === this.activeAccountId) return
+    this.activeAccountId = next
+    this.config = mergePersisted(defaults(), readPersisted(next))
+    this.syncLlm()
+    this.syncToolsMode()
+  }
+
+  publicView() {
+    const endpoints = allEndpoints(this.config)
+    const models = allModels(this.config)
+    const current = resolveEndpoint(this.config, this.config.endpointId)
+    const providers: Record<string, { label: string; configured: boolean; hint: string; baseUrl: string; group: string; protocol: string }> = {}
+    for (const ep of endpoints) {
+      providers[ep.id] = {
+        label: ep.label,
+        configured: endpointConfigured(this.config, ep),
+        hint: hint(this.config.apiKeys[ep.id] ?? ''),
+        baseUrl: effectiveBaseUrl(this.config, ep),
+        group: ep.group,
+        protocol: ep.protocol,
+      }
+    }
+    // 兼容旧前端：三家协议维度也暴露
+    for (const p of CHAT_PROVIDERS) {
+      if (!providers[p]) {
+        providers[p] = {
+          label: describeProvider(p),
+          configured: Boolean((this.config.apiKeys[p] ?? '').trim()),
+          hint: hint(this.config.apiKeys[p] ?? ''),
+          baseUrl: findEndpointPreset(p)?.baseUrl ?? '',
+          group: 'official',
+          protocol: p === 'anthropic' ? 'anthropic' : 'openai-compat',
+        }
+      }
+    }
+    return {
+      endpointId: this.config.endpointId,
+      provider: this.config.provider,
+      model: this.config.model,
+      systemPrompt: this.config.systemPrompt,
+      agentMode: this.config.agentMode,
+      thinking: this.config.thinking,
+      reasoningEffort: this.config.reasoningEffort,
+      contextWindow: this.config.contextWindow,
+      speed: this.config.speed,
+      capabilities: inferModelCapabilities(this.config.model, this.config.provider),
+      /** 当前默认入口是否已配置（兼容旧语义，供 banner 等使用）。 */
+      configured: current ? endpointConfigured(this.config, current) : Boolean((this.config.apiKeys[this.config.provider] ?? '').trim()),
+      acceptsApiKeys: !isOnlineRuntime(),
+      secretsLocalOnly: true,
+      hint: hint(this.config.apiKeys[this.config.endpointId] ?? this.config.apiKeys[this.config.provider] ?? ''),
+      baseUrl: current ? effectiveBaseUrl(this.config, current) : '',
+      /** 各入口是否已配置 key + baseUrl。 */
+      providers,
+      endpoints: endpoints.map((ep) => ({
+        id: ep.id,
+        label: ep.label,
+        group: ep.group,
+        protocol: ep.protocol,
+        provider: ep.provider,
+        baseUrl: effectiveBaseUrl(this.config, ep),
+        defaultBaseUrl: ep.baseUrl,
+        configured: endpointConfigured(this.config, ep),
+        hint: hint(this.config.apiKeys[ep.id] ?? ''),
+        placeholder: ep.placeholder ?? 'sk-…',
+        note: ep.note,
+        builtin: ep.builtin !== false && ep.group !== 'custom',
+      })),
+      modelCatalog: models.map((m) => ({
+        ...m,
+        capabilities: inferModelCapabilities(m.model, m.provider),
+        // 方便前端按入口过滤
+        endpointConfigured: (() => {
+          const ep = resolveEndpoint(this.config, m.endpointId)
+          return ep ? endpointConfigured(this.config, ep) : false
+        })(),
+      })),
+      tools: this.ctx.tools.names(),
+      toolCatalog: [
+        {
+          name: 'goal',
+          description: '挂上目标并一直做到完成。/goal 目标；/goal pause、resume、clear',
+          origin: 'core' as const,
+        },
+        ...this.ctx.tools.catalog().filter((item) => item.name !== 'goal'),
+      ],
+      extraTools: this.config.extraTools,
+    }
+  }
+
+  /** 全局默认 + 会话覆盖（不含 apiKey）。 */
+  resolveEffective(sessionId?: string | null) {
+    const defaultsView = {
+      endpointId: this.config.endpointId,
+      provider: this.config.provider,
+      model: this.config.model,
+      systemPrompt: this.config.systemPrompt,
+      agentMode: this.config.agentMode,
+      extraTools: [...this.config.extraTools],
+    }
+    if (!sessionId) return { defaults: defaultsView, config: undefined as SessionConfig | undefined, effective: defaultsView }
+    const config = this.ctx.sessions.peek(sessionId)?.config
+    // 会话仍可覆盖 provider/model；endpoint 跟随模型所属入口或全局
+    const provider = (config?.provider as ChatProvider | undefined) ?? defaultsView.provider
+    const model = config?.model ?? defaultsView.model
+    let endpointId = defaultsView.endpointId
+    const matched = allModels(this.config).find((m) => m.model === model && m.provider === provider)
+    if (matched) endpointId = matched.endpointId
+    else if (config?.provider && CHAT_PROVIDERS.includes(config.provider as ChatProvider)) {
+      endpointId = config.provider as string
+    }
+    const effective = {
+      endpointId,
+      provider,
+      model,
+      systemPrompt:
+        typeof config?.systemPrompt === 'string' ? config.systemPrompt : defaultsView.systemPrompt,
+      agentMode: config?.agentMode ?? defaultsView.agentMode,
+      extraTools: config?.extraTools ? [...config.extraTools] : [...defaultsView.extraTools],
+      ...(config?.title ? { title: config.title } : {}),
+    }
+    return { defaults: defaultsView, config, effective }
+  }
+
+  /** 这条会话当前模型实际用的上下文窗口。 */
+  contextWindowFor(sessionId?: string | null): ContextWindow {
+    const { effective } = this.resolveEffective(sessionId)
+    const provider = effective.provider as ChatProvider
+    const caps = inferModelCapabilities(effective.model, provider)
+    const endpointId = (effective as { endpointId?: string }).endpointId ?? this.config.endpointId
+    const prefs = this.config.modelPrefs[prefKey(endpointId, effective.model)]
+    if (hasKnob(caps, 'context')) return prefs?.contextWindow ?? this.config.contextWindow
+    return '200k'
+  }
+
+  resolverKey(provider: ChatProvider): string {
+    return this.config.apiKeys[provider] ?? ''
+  }
+
+  /** 根据有效入口取对应 apiKey + baseUrl。 */
+  resolveLlm(sessionId?: string | null): LlmConfig {
+    const { effective } = this.resolveEffective(sessionId)
+    const endpointId = (effective as { endpointId?: string }).endpointId ?? this.config.endpointId
+    const endpoint = resolveEndpoint(this.config, endpointId) ?? resolveEndpoint(this.config, effective.provider)
+    const provider: ChatProvider = endpoint?.provider ?? effective.provider
+    const apiKey =
+      (endpoint ? this.config.apiKeys[endpoint.id] : undefined) ??
+      this.config.apiKeys[provider] ??
+      ''
+    // 本地入口允许空 Key：上游常不校验，填占位避免部分网关拒空 Authorization
+    const key = apiKey.trim() || (endpoint && isLocalEndpoint(endpoint) ? 'local' : '')
+    const caps = inferModelCapabilities(effective.model, provider)
+    const prefs = this.config.modelPrefs[prefKey(endpointId, effective.model)]
+    const mode: ModelModeValues = {
+      thinking: prefs?.thinking ?? this.config.thinking,
+      speed: prefs?.speed ?? this.config.speed,
+      effort: prefs?.reasoningEffort ?? this.config.reasoningEffort,
+      context: prefs?.contextWindow ?? this.config.contextWindow,
+    }
+    return {
+      provider,
+      apiKey: key,
+      model: effective.model,
+      ...(endpoint ? { baseUrl: effectiveBaseUrl(this.config, endpoint) } : {}),
+      ...applyModeToLlm(caps, mode),
+    }
+  }
+
+  /** 探测指定入口连通性；可临时覆盖草稿 Key / URL / model（不落盘）。 */
+  async testConnection(opts?: {
+    endpointId?: string
+    apiKey?: string
+    baseUrl?: string
+    model?: string
+  }) {
+    const endpointId = (opts?.endpointId || this.config.endpointId || this.config.provider).trim()
+    const endpoint = resolveEndpoint(this.config, endpointId)
+    if (!endpoint) {
+      return { ok: false as const, latencyMs: 0, detail: `未知入口：${endpointId}`, endpointId }
+    }
+    const draftKey = typeof opts?.apiKey === 'string' ? opts.apiKey.trim() : ''
+    const storedKey = (this.config.apiKeys[endpointId] ?? '').trim()
+    const apiKey = draftKey || storedKey || (isLocalEndpoint(endpoint) ? 'local' : '')
+    const baseUrl =
+      typeof opts?.baseUrl === 'string' && opts.baseUrl.trim()
+        ? normalizeBaseUrl(opts.baseUrl)
+        : effectiveBaseUrl(this.config, endpoint)
+    const model =
+      (typeof opts?.model === 'string' && opts.model.trim()) ||
+      allModels(this.config).find((m) => m.endpointId === endpointId)?.model ||
+      this.config.model ||
+      defaultModelFor(endpoint.provider)
+
+    const result = await probeLlmConnection({
+      provider: endpoint.provider,
+      apiKey,
+      model,
+      baseUrl,
+    })
+    return { ...result, endpointId, baseUrl, model }
+  }
+
+  /**
+   * 探测失败：拉黑入口（绿点变灰、模型下拉不可选）。
+   * 保留已存 Key 便于改 URL 后重试；若当前默认就是该入口，切到其它已配置入口。
+   */
+  invalidateEndpoint(endpointId: string, opts?: { persist?: boolean }) {
+    const id = endpointId.trim()
+    if (!id) return this.publicView()
+    blockEndpoint(this.config, id)
+    if (this.config.endpointId === id) {
+      const fallback =
+        allEndpoints(this.config).find((ep) => ep.id !== id && endpointConfigured(this.config, ep)) ??
+        findEndpointPreset(DEFAULT_PROVIDER)
+      if (fallback) {
+        this.config.endpointId = fallback.id
+        this.config.provider = fallback.provider
+        this.config.model =
+          allModels(this.config).find((m) => m.endpointId === fallback.id)?.model ??
+          defaultModelFor(fallback.provider)
+      }
+    }
+    this.syncLlm()
+    if (opts?.persist !== false) {
+      try {
+        writePersisted(this.config, this.activeAccountId)
+      } catch (error) {
+        console.warn('[chat] failed to persist config', error)
+      }
+    }
+    return this.publicView()
+  }
+
+  /** 探测成功：解除拉黑（Key 仍由调用方决定是否写入）。 */
+  markEndpointReachable(endpointId: string, opts?: { persist?: boolean; apiKey?: string; baseUrl?: string }) {
+    const id = endpointId.trim()
+    if (!id) return this.publicView()
+    unblockEndpoint(this.config, id)
+    if (typeof opts?.apiKey === 'string' && opts.apiKey.trim()) {
+      this.config.apiKeys[id] = opts.apiKey.trim()
+    }
+    if (typeof opts?.baseUrl === 'string' && opts.baseUrl.trim()) {
+      this.config.baseUrls[id] = normalizeBaseUrl(opts.baseUrl)
+    }
+    this.syncLlm()
+    if (opts?.persist !== false) {
+      try {
+        writePersisted(this.config, this.activeAccountId)
+      } catch (error) {
+        console.warn('[chat] failed to persist config', error)
+      }
+    }
+    return this.publicView()
+  }
+
+  /**
+   * 更新配置。endpointId/provider/model/systemPrompt/agentMode/extraTools 直接覆盖；
+   * setApiKey / setBaseUrl 按入口写入；空串表示保留原值，仅非空时更新。
+   * addEndpoint / addModel / removeCustom* 管理自定义入口与模型。
+   */
+  patch(
+    next: Partial<{
+      endpointId: string
+      provider: ChatProvider
+      apiKey: string
+      model: string
+      baseUrl: string
+      systemPrompt: string
+      agentMode: AgentToolMode
+      extraTools: string[]
+      thinking: ThinkingMode
+      reasoningEffort: ReasoningEffort
+      contextWindow: ContextWindow
+      speed: SpeedMode
+      /** 按入口更新 key；空串 / null 清除 */
+      setApiKey: Partial<Record<string, string | null>>
+      /** 按入口覆盖 baseUrl；空串清除覆盖、回到 preset 默认 */
+      setBaseUrl: Partial<Record<string, string | null>>
+      /** 追加自定义入口 */
+      addEndpoint: { id?: string; label: string; baseUrl: string; protocol?: 'openai-compat' | 'anthropic'; provider?: ChatProvider; note?: string }
+      /** 追加模型到某入口 */
+      addModel: { endpointId: string; model: string; label?: string; note?: string }
+      removeCustomEndpoint: string
+      removeCustomModel: string
+    }>,
+    opts?: { persist?: boolean },
+  ) {
+    const beforeKey = prefKey(this.config.endpointId, this.config.model)
+    rememberModelPrefs(this.config)
+    if (typeof next.endpointId === 'string' && next.endpointId.trim()) {
+      const id = next.endpointId.trim()
+      const ep = resolveEndpoint(this.config, id)
+      this.config.endpointId = id
+      if (ep) this.config.provider = ep.provider
+      // 未指定 model 时，切到该入口第一个模型
+      if (!modelLocked && (typeof next.model !== 'string' || !next.model.trim())) {
+        const first = allModels(this.config).find((m) => m.endpointId === id)
+        if (first) this.config.model = first.model
+        else if (ep) this.config.model = defaultModelFor(ep.provider)
+      }
+    } else if (next.provider && !endpointLocked) {
+      this.config.provider = next.provider
+      this.config.endpointId = next.provider
+      if (!modelLocked && (typeof next.model !== 'string' || !next.model.trim())) {
+        this.config.model = defaultModelFor(next.provider)
+      }
+    }
+    if (!modelLocked && typeof next.model === 'string' && next.model.trim()) {
+      this.config.model = next.model.trim()
+    }
+    if (typeof next.systemPrompt === 'string') this.config.systemPrompt = next.systemPrompt
+    if (typeof next.baseUrl === 'string' && next.baseUrl.trim()) {
+      this.config.baseUrls[this.config.endpointId] = normalizeBaseUrl(next.baseUrl)
+    }
+    if (next.setApiKey && typeof next.setApiKey === 'object') {
+      for (const [id, key] of Object.entries(next.setApiKey)) {
+        // 空串 / null：清除 Key（测试失败或断开时用）
+        if (key === null || key === '') {
+          delete this.config.apiKeys[id]
+          blockEndpoint(this.config, id)
+        } else if (typeof key === 'string' && key.trim()) {
+          this.config.apiKeys[id] = key.trim()
+          unblockEndpoint(this.config, id)
+        }
+      }
+    }
+    if (next.setBaseUrl && typeof next.setBaseUrl === 'object') {
+      for (const [id, url] of Object.entries(next.setBaseUrl)) {
+        if (url === null || url === '') {
+          delete this.config.baseUrls[id]
+        } else if (typeof url === 'string' && url.trim()) {
+          this.config.baseUrls[id] = normalizeBaseUrl(url)
+        }
+      }
+    }
+    // 兼容旧调用：单一 apiKey 写入当前入口
+    if (typeof next.apiKey === 'string' && next.apiKey.trim()) {
+      this.config.apiKeys[this.config.endpointId] = next.apiKey.trim()
+      unblockEndpoint(this.config, this.config.endpointId)
+    }
+    if (next.addEndpoint && typeof next.addEndpoint === 'object') {
+      const label = String(next.addEndpoint.label ?? '').trim()
+      const baseUrl = normalizeBaseUrl(String(next.addEndpoint.baseUrl ?? ''))
+      if (label && baseUrl) {
+        const protocol = next.addEndpoint.protocol === 'anthropic' ? 'anthropic' : 'openai-compat'
+        const provider: ChatProvider =
+          next.addEndpoint.provider === 'deepseek' ||
+          next.addEndpoint.provider === 'anthropic' ||
+          next.addEndpoint.provider === 'openai'
+            ? next.addEndpoint.provider
+            : protocol === 'anthropic'
+              ? 'anthropic'
+              : 'openai'
+        const id =
+          (typeof next.addEndpoint.id === 'string' && next.addEndpoint.id.trim()) ||
+          `custom-${Date.now().toString(36)}`
+        const existing = this.config.customEndpoints.findIndex((e) => e.id === id)
+        const def: LlmEndpointDef = {
+          id,
+          label,
+          group: 'custom',
+          protocol,
+          baseUrl,
+          provider,
+          note: next.addEndpoint.note,
+          placeholder: 'sk-…',
+          builtin: false,
+        }
+        if (existing >= 0) this.config.customEndpoints[existing] = def
+        else this.config.customEndpoints.push(def)
+        this.config.endpointId = id
+        this.config.provider = provider
+        // 自定义入口默认挂一批常用模型名，避免下拉空空如也
+        const hasModels = allModels(this.config).some((m) => m.endpointId === id)
+        if (!hasModels) {
+          const seeds = [
+            'gpt-4o',
+            'gpt-4o-mini',
+            'gpt-4.1',
+            'o3-mini',
+            'claude-sonnet-4-20250514',
+            'claude-opus-4-20250514',
+            'gemini-2.5-pro',
+            'deepseek-chat',
+            'deepseek-reasoner',
+          ]
+          for (const modelName of seeds) {
+            this.config.customModels.push({
+              id: `custom-model-${id}-${modelName}`.replace(/[^a-zA-Z0-9._:-]+/g, '-'),
+              label: modelName,
+              endpointId: id,
+              provider,
+              model: modelName,
+              category: 'custom',
+              builtin: false,
+            })
+          }
+          this.config.model = seeds[0]!
+        }
+      }
+    }
+    if (next.addModel && typeof next.addModel === 'object') {
+      const endpointId = String(next.addModel.endpointId ?? '').trim()
+      const model = String(next.addModel.model ?? '').trim()
+      if (endpointId && model) {
+        const ep = resolveEndpoint(this.config, endpointId)
+        const provider = ep?.provider ?? 'openai'
+        const id = `custom-model-${endpointId}-${model}`.replace(/[^a-zA-Z0-9._:-]+/g, '-')
+        const def: LlmModelDef = {
+          id,
+          label: (next.addModel.label ?? model).trim() || model,
+          endpointId,
+          provider,
+          model,
+          category: 'custom',
+          note: next.addModel.note,
+          builtin: false,
+        }
+        const existing = this.config.customModels.findIndex((m) => m.id === id || (m.endpointId === endpointId && m.model === model))
+        if (existing >= 0) this.config.customModels[existing] = def
+        else this.config.customModels.push(def)
+        this.config.endpointId = endpointId
+        this.config.provider = provider
+        this.config.model = model
+      }
+    }
+    if (typeof next.removeCustomEndpoint === 'string' && next.removeCustomEndpoint.trim()) {
+      const id = next.removeCustomEndpoint.trim()
+      this.config.customEndpoints = this.config.customEndpoints.filter((e) => e.id !== id)
+      this.config.customModels = this.config.customModels.filter((m) => m.endpointId !== id)
+      delete this.config.apiKeys[id]
+      delete this.config.baseUrls[id]
+      unblockEndpoint(this.config, id)
+      if (this.config.endpointId === id) {
+        this.config.endpointId = DEFAULT_PROVIDER
+        this.config.provider = DEFAULT_PROVIDER
+        this.config.model = defaultModelFor(DEFAULT_PROVIDER)
+      }
+    }
+    if (typeof next.removeCustomModel === 'string' && next.removeCustomModel.trim()) {
+      const id = next.removeCustomModel.trim()
+      this.config.customModels = this.config.customModels.filter((m) => m.id !== id)
+    }
+    if (isAgentToolMode(next.agentMode)) this.config.agentMode = next.agentMode
+    if (Array.isArray(next.extraTools)) {
+      this.config.extraTools = [...new Set(next.extraTools.map((name) => String(name).trim()).filter(Boolean))]
+    }
+    const afterKey = prefKey(this.config.endpointId, this.config.model)
+    const thinkingPatch = parseThinking(next.thinking)
+    const effortPatch = parseEffort(next.reasoningEffort)
+    const contextPatch = parseContext(next.contextWindow)
+    const speedPatch = parseSpeed(next.speed)
+    if (
+      afterKey !== beforeKey &&
+      thinkingPatch == null &&
+      effortPatch == null &&
+      contextPatch == null &&
+      speedPatch == null
+    ) {
+      hydrateModelMode(this.config)
+    }
+    if (thinkingPatch) this.config.thinking = thinkingPatch
+    if (effortPatch) this.config.reasoningEffort = effortPatch
+    if (contextPatch) this.config.contextWindow = contextPatch
+    if (speedPatch) this.config.speed = speedPatch
+    rememberModelPrefs(this.config)
+    this.syncLlm()
+    this.syncToolsMode()
+    if (opts?.persist !== false) {
+      try {
+        writePersisted(this.config, this.activeAccountId)
+      } catch (error) {
+        console.warn('[chat] failed to persist config', error)
+      }
+    }
+    return this.publicView()
+  }
+
+  async complete(messages: ChatMessage[], sessionId?: string) {
+    this.syncLlm()
+    this.syncToolsMode()
+    const last = messages.filter((item) => item.role === 'user').at(-1)?.content?.trim() ?? ''
+    const agent = await this.ctx.agents.create(sessionId)
+    const result = await agent.send(last)
+    return { text: result.text, sessionId: agent.sessionId, steps: result.steps }
+  }
+
+  private syncLlm() {
+    const llm = this.resolveLlm()
+    this.ctx.agents.configure(llm)
+  }
+
+  private syncToolsMode() {
+    this.ctx.tools.setMode(this.config.agentMode)
+    this.ctx.tools.setPinnedExtras(this.config.extraTools)
+  }
+}
+
+export interface TurnStat {
+  turn: number
+  stepCount: number
+  startTs?: number
+  endTs?: number
+  durationMs?: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  totalTokens: number
+}
+
+/**
+ * 按 turn 计算会话运行统计（纯函数）：
+ * - stepCount：该 turn 内 step/start 数
+ * - startTs/endTs/durationMs：turn/start → turn/end 的起止与耗时
+ * - 额度消耗：该 turn 内所有 assistant/message 事件 usage 的 input/output/cacheRead 汇总
+ * targetTurn 传入时只计算/返回该 turn 的单条统计；否则返回 { turn → stat } 映射。
+ */
+export function computeTurnStats(events: SessionEvent[], targetTurn?: number): Record<string, TurnStat> | TurnStat {
+  const stats: Record<string, TurnStat> = {}
+  let turn: number | null = null
+  let stepCount = 0
+  let startTs: number | null = null
+  let endTs: number | null = null
+  let inputTokens = 0
+  let outputTokens = 0
+  let cacheReadTokens = 0
+  let totalTokens = 0
+  const flush = (t: number) => {
+    if (!turn || turn !== t) return
+    if (targetTurn != null && turn !== targetTurn) return
+    stats[String(turn)] = {
+      turn,
+      stepCount,
+      ...(startTs != null ? { startTs } : {}),
+      ...(endTs != null ? { endTs } : {}),
+      ...(startTs != null && endTs != null ? { durationMs: endTs - startTs } : {}),
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      totalTokens,
+    }
+  }
+  for (const event of events) {
+    if (event.type === 'turn/start') {
+      if (turn != null) flush(turn)
+      turn = event.turn
+      stepCount = 0
+      startTs = event.ts
+      endTs = null
+      inputTokens = 0
+      outputTokens = 0
+      cacheReadTokens = 0
+      totalTokens = 0
+    } else if (event.type === 'turn/end' && turn === event.turn) {
+      endTs = event.ts
+    } else if (event.type === 'step/start' && turn === event.turn) {
+      stepCount += 1
+    } else if (event.type === 'assistant/message' && event.usage && turn != null) {
+      inputTokens += event.usage.inputTokens || 0
+      outputTokens += event.usage.outputTokens || 0
+      cacheReadTokens += event.usage.cacheReadTokens || 0
+      totalTokens += event.usage.totalTokens || (event.usage.inputTokens || 0) + (event.usage.outputTokens || 0)
+    }
+  }
+  if (turn != null) flush(turn)
+  if (targetTurn != null) return stats[String(targetTurn)]
+  return stats
+}
+
+export const name = 'chat'
+export const inject = ['http', 'hub', 'agents', 'sessions', 'systemPrompt', 'tools', 'tasks']
+
+function databaseOf(ctx: Context) {
+  return ctx.get('database') as
+    | {
+        facets: { isDeleted: (collection: string, id: string) => boolean; deletedIds: (collection: string) => Set<string> }
+        remove: (path: string, query: { ids: string[] }) => Promise<unknown>
+      }
+    | undefined
+}
+
+function liveSessionItems<T extends { id: string }>(ctx: Context, items: T[]) {
+  const hidden = databaseOf(ctx)?.facets.deletedIds('/agents')
+  if (!hidden?.size) return items
+  return items.filter((item) => !hidden.has(item.id))
+}
+
+declare module 'cordis' {
+  interface Context {
+    chat: ChatService
+  }
+}
+
+export async function openSessionHttpPayload(ctx: Context, id: string, limitTurns: number) {
+  const record = await ctx.sessions.get(id)
+  if (!record || !ctx.sessions.inWorkspace(id)) return { status: 404 as const, body: { error: 'unknown session' } }
+  if (databaseOf(ctx)?.facets.isDeleted('/agents', record.id)) {
+    return { status: 404 as const, body: { error: 'unknown session' } }
+  }
+  const window = sliceTailTurns(record.events, limitTurns)
+  const payload: Record<string, unknown> = {
+    id: record.id,
+    version: record.version,
+    events: window.events,
+    hasMore: window.hasMore,
+    totalTurns: window.totalTurns,
+    totalEvents: window.totalEvents,
+    oldestSeq: window.oldestSeq,
+    newestSeq: window.newestSeq,
+    ...(record.project ? { project: record.project } : {}),
+    ...(record.mascot ? { mascot: record.mascot } : {}),
+    ...(record.config ? { config: record.config } : {}),
+  }
+  let liveTasks: Awaited<ReturnType<typeof loadLiveDispatchTasks>> = []
+  try {
+    liveTasks = await loadLiveDispatchTasks(ctx, record.id)
+  } catch {
+    liveTasks = []
+  }
+  const workerIds = new Set(
+    liveTasks.map((task) => task.sessionId).filter((id) => id && id !== record.id),
+  )
+  let summaries: Awaited<ReturnType<typeof ctx.sessions.listSummaries>> = []
+  if (workerIds.size) {
+    try {
+      summaries = liveSessionItems(ctx, await ctx.sessions.listSummaries())
+    } catch {
+      summaries = []
+    }
+  }
+  const workers = []
+  const titles = new Map<string, string>()
+  const mascots = new Map<string, NonNullable<(typeof summaries)[number]['mascot']>>()
+  const projects = new Map<string, { name: string; path?: string }>()
+  for (const item of summaries) {
+    if (!workerIds.has(item.id)) continue
+    titles.set(item.id, item.title)
+    if (item.mascot) mascots.set(item.id, item.mascot)
+    if (item.project?.name) {
+      projects.set(item.id, {
+        name: item.project.name,
+        ...(item.project.path ? { path: item.project.path } : {}),
+      })
+    }
+  }
+  for (const id of workerIds) {
+    try {
+      const worker = await ctx.sessions.require(id)
+      workers.push({ id, events: worker.events })
+    } catch {
+      // 执行会话读失败不能挡住当前这条。
+    }
+  }
+  const dispatched = collectLiveDispatchedTasks(record.id, record.events, workers, liveTasks)
+  payload.dispatchedUsage = dispatched.total
+  payload.dispatchedUsageByTurn = Object.fromEntries(
+    Object.entries(dispatched.byLiveTurn).map(([key, value]) => [key, value.usage]),
+  )
+  payload.dispatchedTasksByTurn = Object.fromEntries(
+    Object.entries(dispatched.byLiveTurn).map(([key, value]) => [
+      key,
+      value.tasks.map((task) => ({
+        ...task,
+        title: titles.get(task.sessionId) ?? task.sessionId.slice(0, 8),
+        ...(mascots.get(task.sessionId) ? { mascot: mascots.get(task.sessionId) } : {}),
+        ...(projects.get(task.sessionId) ? { project: projects.get(task.sessionId) } : {}),
+      })),
+    ]),
+  )
+  return { status: 200 as const, body: payload }
+}
+
+export function apply(ctx: Context) {
+  const chat = new ChatService(ctx)
+  const cloudExecutions = new Map<string, CloudExecution>()
+
+  const beginCloudExecution = async (sessionId: string) => {
+    if (isOnlineRuntime() || !workspaceIsCloud(ctx)) return null
+    const previous = cloudExecutions.get(sessionId)
+    if (previous) {
+      if (!previous.finishing) return previous
+      await previous.finishing
+    }
+    const localAccountId = currentAccountId()
+    const runtime = accountRuntime(ctx)
+    const connection = runtime?.linkedCloud?.(localAccountId) ?? (localAccountId ? runtime?.cloudConnection?.(localAccountId) : null)
+    if (!connection) throw new Error('请先登录云端账号')
+    const workspaceId = runtime?.store?.activeWorkspaceId() ?? ''
+    const response = await fetch(`${connection.origin}/api/agents/${encodeURIComponent(sessionId)}/execution-lease`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${connection.token}`,
+        'content-type': 'application/json',
+        ...(workspaceId ? { 'x-biu-workspace-id': workspaceId } : {}),
+      },
+      body: JSON.stringify({ executorId: `desktop:${localAccountId}` }),
+    })
+    const payload = (await response.json().catch(() => ({}))) as { leaseId?: string; error?: string }
+    if (!response.ok || !payload.leaseId) throw new Error(payload.error || '无法取得云端代理执行权')
+    const heartbeat = setInterval(() => {
+      void fetch(`${connection.origin}/api/agents/${encodeURIComponent(sessionId)}/execution-lease`, {
+        method: 'PATCH',
+        headers: {
+          authorization: `Bearer ${connection.token}`,
+          'content-type': 'application/json',
+          ...(workspaceId ? { 'x-biu-workspace-id': workspaceId } : {}),
+        },
+        body: JSON.stringify({ leaseId: payload.leaseId }),
+      }).catch(() => undefined)
+    }, 30_000)
+    const execution = {
+      sessionId,
+      leaseId: payload.leaseId,
+      workspaceId,
+      origin: connection.origin,
+      token: connection.token,
+      heartbeat,
+    }
+    cloudExecutions.set(sessionId, execution)
+    return execution
+  }
+
+  const finishCloudExecution = async (sessionId: string) => {
+    const execution = cloudExecutions.get(sessionId)
+    if (!execution) return
+    if (execution.finishing) return execution.finishing
+    execution.finishing = (async () => {
+      clearInterval(execution.heartbeat)
+      try {
+        const record = await ctx.sessions.get(sessionId)
+        if (record) {
+          const cloudRecord = redactCloudSessionSecrets(record)
+          delete cloudRecord.project
+          const response = await fetch(
+            `${execution.origin}/api/agents/${encodeURIComponent(sessionId)}/execution-sync`,
+            {
+              method: 'POST',
+              headers: {
+                authorization: `Bearer ${execution.token}`,
+                'content-type': 'application/json',
+                ...(execution.workspaceId ? { 'x-biu-workspace-id': execution.workspaceId } : {}),
+              },
+              body: JSON.stringify({ leaseId: execution.leaseId, record: cloudRecord }),
+            },
+          )
+          if (!response.ok) {
+            const body = (await response.json().catch(() => ({}))) as { error?: string }
+            console.warn('[chat] cloud session sync failed', sessionId, body.error || response.status)
+          }
+        }
+      } catch (error) {
+        console.warn('[chat] cloud session sync failed', sessionId, error)
+      } finally {
+        await fetch(`${execution.origin}/api/agents/${encodeURIComponent(sessionId)}/execution-lease`, {
+          method: 'DELETE',
+          headers: {
+            authorization: `Bearer ${execution.token}`,
+            'content-type': 'application/json',
+            ...(execution.workspaceId ? { 'x-biu-workspace-id': execution.workspaceId } : {}),
+          },
+          body: JSON.stringify({ leaseId: execution.leaseId }),
+        }).catch(() => undefined)
+        if (cloudExecutions.get(sessionId) === execution) cloudExecutions.delete(sessionId)
+      }
+    })()
+    return execution.finishing
+  }
+
+  ctx.on('agent/status', (event) => {
+    const payload = event as { sessionId?: string; status?: string }
+    const sessionId = String(payload.sessionId ?? '')
+    if (
+      sessionId &&
+      payload.status === 'idle' &&
+      !ctx.agents.isBusy(sessionId) &&
+      ctx.agents.inboxPending(sessionId) === 0
+    ) {
+      void finishCloudExecution(sessionId)
+    }
+  })
+  ctx.on('dispose', () => {
+    for (const execution of cloudExecutions.values()) clearInterval(execution.heartbeat)
+    cloudExecutions.clear()
+  })
+
+  ctx.hub.register({
+    id: 'chat',
+    title: '对话',
+    subtitle: 'session + ctx.agents',
+    plugin: 'chat',
+    kind: 'chat',
+  })
+
+  ctx.http.route('GET', '/api/chat/config', (route) => {
+    chat.activateAccount()
+    route.send(200, chat.publicView())
+  })
+  ctx.http.route('POST', '/api/chat/config', async (route) => {
+    chat.activateAccount()
+    const payload = (await route.json()) as Partial<{
+      endpointId: string
+      provider: ChatProvider
+      apiKey: string
+      model: string
+      baseUrl: string
+      systemPrompt: string
+      agentMode: AgentToolMode
+      extraTools: string[]
+      setApiKey: Partial<Record<string, string | null>>
+      setBaseUrl: Partial<Record<string, string | null>>
+      addEndpoint: { id?: string; label: string; baseUrl: string; protocol?: 'openai-compat' | 'anthropic'; provider?: ChatProvider; note?: string }
+      addModel: { endpointId: string; model: string; label?: string; note?: string }
+      removeCustomEndpoint: string
+      removeCustomModel: string
+    }>
+    const includesSecret =
+      typeof payload.apiKey === 'string' ||
+      Boolean(payload.setApiKey && Object.values(payload.setApiKey).some((value) => typeof value === 'string' && value.length > 0))
+    if (isOnlineRuntime() && includesSecret) {
+      route.send(403, { error: 'AI API Token 只能保存在运行 Agent 的设备上' })
+      return
+    }
+    route.send(200, chat.patch(payload ?? {}))
+  })
+  ctx.http.route('POST', '/api/chat/config/test', async (route) => {
+    chat.activateAccount()
+    const payload = ((await route.json().catch(() => null)) ?? {}) as {
+      endpointId?: string
+      apiKey?: string
+      baseUrl?: string
+      model?: string
+    }
+    try {
+      if (isOnlineRuntime() && typeof payload.apiKey === 'string' && payload.apiKey.trim()) {
+        route.send(403, { ok: false, detail: 'AI API Token 只能在本机测试，不能发送到云端' })
+        return
+      }
+      const result = await chat.testConnection(payload)
+      if (result.ok) {
+        const config = chat.markEndpointReachable(result.endpointId, {
+          ...(typeof payload.apiKey === 'string' && payload.apiKey.trim()
+            ? { apiKey: payload.apiKey.trim() }
+            : {}),
+          ...(typeof payload.baseUrl === 'string' && payload.baseUrl.trim()
+            ? { baseUrl: payload.baseUrl.trim() }
+            : {}),
+        })
+        route.send(200, { ...result, config })
+        return
+      }
+      const config = chat.invalidateEndpoint(result.endpointId)
+      route.send(400, { ...result, config })
+    } catch (error) {
+      route.send(500, { ok: false, detail: String(error) })
+    }
+  })
+  ctx.http.route('POST', '/api/agents', async (route) => {
+    const payload = ((await route.json().catch(() => null)) ?? {}) as {
+      title?: string
+      id?: string
+    }
+    let sessionId =
+      typeof payload.id === 'string' && /^[0-9a-f-]{36}$/i.test(payload.id)
+        ? payload.id
+        : globalThis.crypto.randomUUID()
+    if (!isOnlineRuntime()) {
+      const runtime = accountRuntime(ctx)
+      const workspaceId = runtime?.store?.activeWorkspaceId() ?? ''
+      if (workspaceId && runtime?.workspaceLocation?.(workspaceId) === 'cloud') {
+        const localAccountId = currentAccountId()
+        const connection = runtime.linkedCloud?.(localAccountId) ?? (localAccountId ? runtime.cloudConnection?.(localAccountId) : null)
+        if (!connection) return route.send(401, { error: '请先登录云端账号' })
+        let remote: Response
+        try {
+          remote = await fetch(`${connection.origin}/api/agents`, {
+            method: 'POST',
+            headers: {
+              authorization: `Bearer ${connection.token}`,
+              'content-type': 'application/json',
+              'x-biu-workspace-id': workspaceId,
+            },
+            body: JSON.stringify({ id: sessionId, title: payload.title }),
+          })
+        } catch {
+          return route.send(503, { error: '云端暂时连不上' })
+        }
+        const remoteBody = (await remote.json().catch(() => ({}))) as { id?: string; error?: string }
+        if (!remote.ok || !remoteBody.id) {
+          return route.send(remote.status, { error: remoteBody.error || '创建云端代理失败' })
+        }
+        sessionId = remoteBody.id
+      }
+    }
+    const record = await ctx.sessions.create(sessionId, {
+      ...(typeof payload.title === 'string' ? { title: payload.title } : {}),
+    })
+    if (!isOnlineRuntime()) {
+      const runtime = accountRuntime(ctx)
+      const workspaceId = runtime?.store?.activeWorkspaceId() ?? ''
+      if (workspaceId && runtime?.workspaceLocation?.(workspaceId) === 'cloud') {
+        runtime.markRemote?.('/agents', record.id)
+      }
+    }
+    route.send(201, {
+      id: record.id,
+      version: record.version,
+      title: record.config?.title,
+      ...(record.mascot ? { mascot: record.mascot } : {}),
+      ...(record.config ? { config: record.config } : {}),
+    })
+  })
+  ctx.http.route('PATCH', '/api/agents/:id/config', async (route) => {
+    try {
+      const payload = ((await route.json().catch(() => null)) ?? {}) as Record<string, unknown>
+      const patch: {
+        title?: string | null
+        model?: string
+        provider?: SessionConfig['provider']
+        systemPrompt?: string | null
+        agentMode?: AgentToolMode
+        extraTools?: string[]
+        facet?: SessionConfig['facet']
+        tags?: string[]
+        pinned?: boolean
+        autoCompactInputTokens?: number | null
+        inspector?: SessionConfig['inspector'] | null
+      } = {}
+      if (typeof payload.title === 'string' || payload.title === null) patch.title = payload.title as string | null
+      if (typeof payload.model === 'string') patch.model = payload.model
+      if (payload.provider === 'deepseek' || payload.provider === 'openai' || payload.provider === 'anthropic') {
+        patch.provider = payload.provider
+      }
+      if (typeof payload.systemPrompt === 'string' || payload.systemPrompt === null) {
+        patch.systemPrompt = payload.systemPrompt as string | null
+      }
+      if (isAgentToolMode(payload.agentMode)) patch.agentMode = payload.agentMode
+      if (Array.isArray(payload.extraTools)) patch.extraTools = payload.extraTools.map((name) => String(name))
+      if (payload.facet && typeof payload.facet === 'object' && !Array.isArray(payload.facet)) {
+        patch.facet = payload.facet as SessionConfig['facet']
+      }
+      if (Array.isArray(payload.tags)) patch.tags = payload.tags.map((name) => String(name))
+      if (typeof payload.pinned === 'boolean') patch.pinned = payload.pinned
+      if (typeof payload.autoCompactInputTokens === 'number') {
+        const cap = chat.contextWindowFor(route.params.id) === '1m' ? 1_000_000 : 200_000
+        patch.autoCompactInputTokens = Math.min(Math.max(1, Math.floor(payload.autoCompactInputTokens)), cap)
+      }
+      if (payload.inspector === null) patch.inspector = null
+      else if (payload.inspector && typeof payload.inspector === 'object' && !Array.isArray(payload.inspector)) {
+        patch.inspector = payload.inspector as SessionConfig['inspector']
+      }
+      const record = await ctx.sessions.patchConfig(
+        route.params.id,
+        patch as SessionConfig & { title?: string | null; systemPrompt?: string | null; inspector?: SessionConfig['inspector'] | null },
+      )
+      const resolved = chat.resolveEffective(record.id)
+      route.send(200, {
+        id: record.id,
+        config: record.config ?? null,
+        defaults: resolved.defaults,
+        effective: resolved.effective,
+      })
+    } catch (error) {
+      route.send(400, { error: String(error) })
+    }
+  })
+  ctx.http.route('GET', '/api/agents', async (route) => {
+    await ctx.sessions.ensureDefaultSession()
+    let items = liveSessionItems(ctx, await ctx.sessions.listSummaries())
+    if (!items.length) {
+      await ctx.sessions.create()
+      items = liveSessionItems(ctx, await ctx.sessions.listSummaries())
+    }
+    route.send(200, {
+      sessions: items.map((item) => ({
+        id: item.id,
+        version: item.version,
+        eventCount: item.eventCount,
+        title: item.title,
+        updatedAt: item.updatedAt,
+        ...(item.lastMessageAt ? { lastMessageAt: item.lastMessageAt } : {}),
+        busy: ctx.agents.isBusy(item.id),
+        ...(item.project ? { project: item.project } : {}),
+        ...(item.mascot ? { mascot: item.mascot } : {}),
+        ...(item.config?.facet ? { facet: item.config.facet } : {}),
+        pinned: Boolean(item.config?.pinned),
+        ...(item.config?.inspector ? { inspector: item.config.inspector } : {}),
+        ...(item.config?.goal ? { goal: item.config.goal } : {}),
+      })),
+    })
+  })
+  const visibleSession = async (id: string) => {
+    const record = await ctx.sessions.get(id)
+    return record && ctx.sessions.inWorkspace(id) ? record : null
+  }
+  ctx.http.route('POST', '/api/agents/:id/execution-lease', async (route) => {
+    try {
+      if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
+      const accountId = currentAccountId()
+      const store = accountRuntime(ctx)?.store
+      if (!accountId || !store) return route.send(401, { error: '需要登录' })
+      const body = (await route.json().catch(() => ({}))) as { executorId?: string }
+      route.send(201, store.acquireExecutionLease(accountId, route.params.id, String(body.executorId ?? 'device')))
+    } catch (error) {
+      const status = Number((error as { status?: number }).status) || 400
+      route.send(status, { error: error instanceof Error ? error.message : String(error) })
+    }
+  })
+  ctx.http.route('PATCH', '/api/agents/:id/execution-lease', async (route) => {
+    try {
+      const accountId = currentAccountId()
+      const store = accountRuntime(ctx)?.store
+      if (!accountId || !store) return route.send(401, { error: '需要登录' })
+      const body = (await route.json().catch(() => ({}))) as { leaseId?: string }
+      route.send(200, store.renewExecutionLease(accountId, route.params.id, String(body.leaseId ?? '')))
+    } catch (error) {
+      const status = Number((error as { status?: number }).status) || 400
+      route.send(status, { error: error instanceof Error ? error.message : String(error) })
+    }
+  })
+  ctx.http.route('DELETE', '/api/agents/:id/execution-lease', async (route) => {
+    try {
+      const accountId = currentAccountId()
+      const store = accountRuntime(ctx)?.store
+      if (!accountId || !store) return route.send(401, { error: '需要登录' })
+      const body = (await route.json().catch(() => ({}))) as { leaseId?: string }
+      route.send(200, store.releaseExecutionLease(accountId, route.params.id, String(body.leaseId ?? '')))
+    } catch (error) {
+      route.send(400, { error: error instanceof Error ? error.message : String(error) })
+    }
+  })
+  ctx.http.route('POST', '/api/agents/:id/execution-sync', async (route) => {
+    try {
+      if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
+      const accountId = currentAccountId()
+      const store = accountRuntime(ctx)?.store
+      if (!accountId || !store) return route.send(401, { error: '需要登录' })
+      const body = (await route.json().catch(() => ({}))) as { leaseId?: string; record?: SessionRecord }
+      store.requireExecutionLease(accountId, route.params.id, String(body.leaseId ?? ''))
+      if (!body.record || body.record.id !== route.params.id || !Array.isArray(body.record.events)) {
+        return route.send(400, { error: '无效的代理记录' })
+      }
+      const record = { ...body.record }
+      delete record.project
+      await ctx.sessions.replace(record)
+      store.releaseExecutionLease(accountId, route.params.id, String(body.leaseId ?? ''))
+      route.send(200, { ok: true, eventCount: record.events.length })
+    } catch (error) {
+      const status = Number((error as { status?: number }).status) || 400
+      route.send(status, { error: error instanceof Error ? error.message : String(error) })
+    }
+  })
+  ctx.http.route('GET', '/api/agents/:id', async (route) => {
+    const turnsRaw = route.query.get('turns')
+    const limitTurns =
+      turnsRaw == null || turnsRaw === ''
+        ? DEFAULT_TAIL_TURNS
+        : turnsRaw === 'all'
+          ? 0
+          : Math.max(0, Number(turnsRaw) || DEFAULT_TAIL_TURNS)
+    const result = await openSessionHttpPayload(ctx, route.params.id, limitTurns)
+    route.send(result.status, result.body)
+  })
+  ctx.http.route('GET', '/api/agents/:id/events', async (route) => {
+    const record = await visibleSession(route.params.id)
+    if (!record) return route.send(404, { error: 'unknown session' })
+    const beforeSeq = Number(route.query.get('beforeSeq'))
+    if (!Number.isFinite(beforeSeq)) return route.send(400, { error: 'beforeSeq required' })
+    const turnsRaw = route.query.get('turns')
+    const limitTurns =
+      turnsRaw == null || turnsRaw === ''
+        ? DEFAULT_TAIL_TURNS
+        : Math.max(1, Number(turnsRaw) || DEFAULT_TAIL_TURNS)
+    const window = sliceBeforeTurns(record.events, beforeSeq, limitTurns)
+    route.send(200, {
+      id: record.id,
+      events: window.events,
+      hasMore: window.hasMore,
+      totalTurns: window.totalTurns,
+      totalEvents: window.totalEvents,
+      oldestSeq: window.oldestSeq,
+      newestSeq: window.newestSeq,
+    })
+  })
+  ctx.http.route('GET', '/api/agents/:id/trajectory', async (route) => {
+    const record = await visibleSession(route.params.id)
+    if (!record) return route.send(404, { error: 'unknown session' })
+    const beforeSeqRaw = route.query.get('beforeSeq')
+    const turnsRaw = route.query.get('turns')
+    const limitTurns =
+      turnsRaw == null || turnsRaw === ''
+        ? DEFAULT_TRAJECTORY_TURNS
+        : turnsRaw === 'all'
+          ? 0
+          : Math.max(0, Number(turnsRaw) || DEFAULT_TRAJECTORY_TURNS)
+    const window =
+      beforeSeqRaw != null && beforeSeqRaw !== ''
+        ? buildTrajectoryBefore(record.events, Number(beforeSeqRaw), limitTurns || DEFAULT_TRAJECTORY_TURNS)
+        : buildTrajectoryWindow(record.events, limitTurns)
+    route.send(200, {
+      id: record.id,
+      rows: window.rows,
+      hasMore: window.hasMore,
+      totalTurns: window.totalTurns,
+      totalEvents: window.totalEvents,
+      oldestSeq: window.oldestSeq,
+      newestSeq: window.newestSeq,
+    })
+  })
+  // 全量 usage 趋势：提取本会话所有 step（assistant/message 带 usage）的 input/output/cacheRead，供前端折线图。
+  ctx.http.route('GET', '/api/agents/:id/usage-trend', async (route) => {
+    const record = await visibleSession(route.params.id)
+    if (!record) return route.send(404, { error: 'unknown session' })
+    const points: Array<{ seq: number; turn: number; input: number; output: number; cache: number }> = []
+    const compactions: number[] = []
+    let turn = 0
+    for (const event of record.events) {
+      if (event.type === 'step/start') turn = event.turn
+      if (isSessionCompactPoint(event)) {
+        compactions.push(event.seq)
+        continue
+      }
+      if (event.type !== 'assistant/message' || !event.usage) continue
+      points.push({
+        seq: event.seq,
+        turn,
+        input: event.usage.inputTokens || 0,
+        output: event.usage.outputTokens || 0,
+        cache: event.usage.cacheReadTokens || 0,
+      })
+    }
+    route.send(200, { points, compactions })
+  })
+  // 按 turn 取跨 session 统计：给定某 turn，返回 step 数 / 起止 / 耗时 / token 与额度消耗。
+  // 供任务面板在展示 task_report 回传条时定位到 report.sessionId 所属 session 的该 turn 运行统计。
+  ctx.http.route('GET', '/api/agents/:id/turn-stats', async (route) => {
+    const record = await visibleSession(route.params.id)
+    if (!record) return route.send(404, { error: 'unknown session' })
+    const turnsRaw = route.query.get('turn')
+    const targetTurn =
+      turnsRaw != null && turnsRaw !== '' && Number.isFinite(Number(turnsRaw)) ? Number(turnsRaw) : undefined
+    const result = computeTurnStats(record.events, targetTurn)
+    if (targetTurn != null) {
+      if (!result) return route.send(404, { error: 'unknown turn' })
+      return route.send(200, result)
+    }
+    route.send(200, { turns: result as Record<string, TurnStat> })
+  })
+  ctx.http.route('GET', '/api/agents/:id/artifacts/:name', async (route) => {
+    const record = await visibleSession(route.params.id)
+    if (!record) return route.send(404, { error: 'unknown session' })
+    const file = await readArtifactFile(route.params.id, route.params.name)
+    if (!file) return route.send(404, { error: 'unknown artifact' })
+    if (route.res.headersSent) return
+    route.res.writeHead(200, {
+      'content-type': file.mime,
+      'cache-control': 'private, max-age=3600',
+      'content-length': file.data.byteLength,
+    })
+    route.res.end(file.data)
+  })
+  ctx.http.route('GET', '/api/agents/:id/events/:seq', async (route) => {
+    const record = await visibleSession(route.params.id)
+    if (!record) return route.send(404, { error: 'unknown session' })
+    const seq = Number(route.params.seq)
+    if (!Number.isFinite(seq)) return route.send(400, { error: 'invalid seq' })
+    const event = findEvent(record.events, seq)
+    if (!event) return route.send(404, { error: 'unknown event' })
+    route.send(200, { id: record.id, event })
+  })
+  ctx.http.route('GET', '/api/agents/:id/events/:seq/request', async (route) => {
+    const record = await visibleSession(route.params.id)
+    if (!record) return route.send(404, { error: 'unknown session' })
+    const seq = Number(route.params.seq)
+    if (!Number.isFinite(seq)) return route.send(400, { error: 'invalid seq' })
+    const event = findEvent(record.events, seq)
+    if (!event) return route.send(404, { error: 'unknown event' })
+    if (event.type !== 'assistant/message') {
+      return route.send(400, { error: 'request derivation only for assistant/message' })
+    }
+    // 工具定义 token 估算：当前可见工具集合 schema 序列化后的估算值（轨迹回放时各 step 近似恒定）。
+    // 与 agent-loop 实际传给 LLM 的 ctx.tools.schemas() 对齐，作为第 4 类「工具定义」占比基线。
+    const toolsSchemaTokens = estimateTokens(JSON.stringify(ctx.tools.schemas()))
+    route.send(200, {
+      id: record.id,
+      seq,
+      messages: await liftToolImages(buildRequestMessages(record.events, seq), record.id),
+      toolsTokens: toolsSchemaTokens,
+    })
+  })
+  ctx.http.route('PUT', '/api/agents/:id/project', async (route) => {
+    if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
+    const payload = (await route.json()) as { path?: string | null; name?: string | null }
+    try {
+      // path 优先；兼容旧客户端误传 name=null 解绑
+      const rawPath = payload.path !== undefined ? payload.path : payload.name
+      if (rawPath == null || rawPath === '') {
+        await ctx.sessions.setProject(route.params.id, null)
+        return route.send(200, { ok: true, project: null })
+      }
+      const project = await ctx.sessions.setProject(route.params.id, { path: String(rawPath) })
+      route.send(200, { ok: true, project })
+    } catch (error) {
+      route.send(400, { error: String(error) })
+    }
+  })
+  ctx.http.route('POST', '/api/agents/:id/project/pick', async (route) => {
+    try {
+      const record = await visibleSession(route.params.id)
+      if (!record) return route.send(404, { error: 'unknown session' })
+      const { pickHostDirectory } = await import('@biu/host-fs/workspace-pick')
+      const current = record.project?.path
+      const path = await pickHostDirectory(current)
+      const project = await ctx.sessions.setProject(route.params.id, { path })
+      route.send(200, { ok: true, project })
+    } catch (error) {
+      const name = error instanceof Error ? error.name : ''
+      if (name === 'DirectoryPickCancelled') return route.send(200, { ok: false, cancelled: true })
+      if (name === 'DirectoryPickUnavailable') return route.send(501, { error: String(error) })
+      route.send(400, { error: String(error) })
+    }
+  })
+  ctx.http.route('POST', '/api/agents/:id/fork', async (route) => {
+    try {
+      if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
+      const child = await ctx.sessions.fork(route.params.id)
+      route.send(201, {
+        id: child.id,
+        version: child.version,
+        parentId: route.params.id,
+        ...(child.mascot ? { mascot: child.mascot } : {}),
+      })
+    } catch (error) {
+      route.send(400, { error: String(error) })
+    }
+  })
+  ctx.http.route('DELETE', '/api/agents/:id', async (route) => {
+    const id = route.params.id
+    const forwarded = await forwardCloud(ctx, '/agents', id, `/api/agents/${id}`, { method: 'DELETE' })
+    if (forwarded) {
+      if (forwarded.status < 300) await ctx.sessions.delete(id)
+      route.send(forwarded.status, forwarded.body)
+      return
+    }
+    const record = await visibleSession(id)
+    if (!record) return route.send(404, { error: 'unknown session' })
+    const db = databaseOf(ctx)
+    if (db?.facets.isDeleted('/agents', id)) return route.send(404, { error: 'unknown session' })
+    ctx.agents.get(id)?.dispose()
+    if (db?.remove) {
+      await db.remove('/agents', { ids: [id] })
+      route.send(200, { ok: true, id, trash: true })
+      return
+    }
+    const ok = await ctx.sessions.delete(id)
+    if (!ok) return route.send(404, { error: 'unknown session' })
+    route.send(200, { ok: true, id })
+  })
+  ctx.http.route('POST', '/api/agents/:id/messages', async (route) => {
+    chat.activateAccount()
+    const payload = (await route.json()) as {
+      text?: string
+      kind?: 'wake' | 'inject'
+      wait?: boolean
+      extraTools?: string[]
+      images?: Array<{ name?: string; mime?: string; url?: string }>
+      liveContext?: unknown
+    }
+    if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
+    if (isOnlineRuntime() && accountRuntime(ctx)?.store?.hasExecutionLease(route.params.id)) {
+      return route.send(409, { error: '这个代理正在桌面设备上运行' })
+    }
+    const shouldExecute = payload.kind !== 'inject' || ctx.agents.isBusy(route.params.id)
+    if (shouldExecute) {
+      try {
+        await beginCloudExecution(route.params.id)
+      } catch (error) {
+        return route.send(409, { error: error instanceof Error ? error.message : String(error) })
+      }
+    }
+    const agent = await ctx.agents.create(route.params.id)
+    // re-sync in-memory LLM without rewriting disk
+    chat.patch({}, { persist: false })
+    const extraTools = Array.isArray(payload.extraTools)
+      ? [...new Set(payload.extraTools.map((name) => String(name).trim()).filter(Boolean))]
+      : []
+    const incomingImages = Array.isArray(payload.images)
+      ? payload.images
+          .map((img) => ({
+            name: String(img.name ?? '').trim(),
+            mime: String(img.mime ?? '').trim(),
+            url: String(img.url ?? '').trim(),
+          }))
+          .filter((img) => img.name && img.mime && img.url)
+      : []
+    let images = incomingImages
+    let text = payload.text ?? ''
+    if (incomingImages.length) {
+      try {
+        images = await persistPastedImages(route.params.id, incomingImages)
+        text = withPastedImagePicks(text, images)
+      } catch {
+        return route.send(400, { error: '粘贴的图片未能保存到本地，请重试' })
+      }
+    }
+    const liveContext = sanitizeLiveUiContext(payload.liveContext)
+    const sendOpts = {
+      ...(extraTools.length ? { extraTools } : {}),
+      // 默认不等待整回合：聊天要靠 WS 推 chunk。显式 wait:true 才阻塞 HTTP。
+      wait: payload.wait === true,
+      ...(images.length ? { images } : {}),
+      ...(liveContext ? { liveContext } : {}),
+    }
+    if (payload.kind === 'inject') {
+      agent.inject(text, sendOpts)
+      return route.send(200, {
+        sessionId: agent.sessionId,
+        queued: true,
+        inbox: ctx.agents.listInbox(agent.sessionId),
+      })
+    }
+    try {
+        const turn = await agent.send(text, sendOpts)
+      route.send(200, {
+        sessionId: agent.sessionId,
+        text: turn.text,
+        steps: turn.steps,
+        queued: Boolean(sendOpts.wait === false || ctx.agents.isBusy(agent.sessionId)),
+        inbox: ctx.agents.listInbox(agent.sessionId),
+      })
+    } catch (error) {
+      void finishCloudExecution(route.params.id)
+      route.send(500, { error: String(error) })
+    }
+  })
+  ctx.http.route('GET', '/api/agents/:id/inbox', async (route) => {
+    const id = route.params.id
+    if (!(await visibleSession(id))) return route.send(404, { error: 'unknown session' })
+    await ctx.agents.create(id)
+    route.send(200, { sessionId: id, inbox: ctx.agents.listInbox(id) })
+  })
+  ctx.http.route('POST', '/api/agents/:id/inbox/drop', async (route) => {
+    const id = route.params.id
+    if (!(await visibleSession(id))) return route.send(404, { error: 'unknown session' })
+    await ctx.agents.create(id)
+    const payload = ((await route.json().catch(() => null)) ?? {}) as { id?: string }
+    const itemId = typeof payload.id === 'string' ? payload.id : ''
+    if (!ctx.agents.dropInbox(id, itemId)) {
+      return route.send(404, { error: 'unknown inbox item' })
+    }
+    route.send(200, { ok: true, sessionId: id, inbox: ctx.agents.listInbox(id) })
+  })
+  ctx.http.route('POST', '/api/agents/:id/inbox/patch', async (route) => {
+    const id = route.params.id
+    if (!(await visibleSession(id))) return route.send(404, { error: 'unknown session' })
+    await ctx.agents.create(id)
+    const payload = ((await route.json().catch(() => null)) ?? {}) as { id?: string; text?: string }
+    const itemId = typeof payload.id === 'string' ? payload.id : ''
+    const text = typeof payload.text === 'string' ? payload.text : ''
+    if (!ctx.agents.patchInbox(id, itemId, text)) {
+      return route.send(404, { error: 'unknown inbox item' })
+    }
+    route.send(200, { ok: true, sessionId: id, inbox: ctx.agents.listInbox(id) })
+  })
+  ctx.http.route('POST', '/api/agents/:id/goal', async (route) => {
+    const id = route.params.id
+    if (!(await visibleSession(id))) return route.send(404, { error: 'unknown session' })
+    const payload = ((await route.json().catch(() => null)) ?? {}) as { action?: string }
+    const action = payload.action
+    if (action !== 'pause' && action !== 'resume' && action !== 'clear') {
+      return route.send(400, { error: 'action must be pause, resume, or clear' })
+    }
+    try {
+      const result = await ctx.agents.controlGoal(id, action)
+      route.send(200, result)
+    } catch (error) {
+      route.send(400, { error: String(error) })
+    }
+  })
+  ctx.http.route('POST', '/api/agents/:id/cancel', async (route) => {
+    const id = route.params.id
+    if (!(await visibleSession(id))) return route.send(404, { error: 'unknown session' })
+    const agent = await ctx.agents.create(id)
+    agent.cancel()
+    route.send(200, { ok: true })
+  })
+  ctx.http.route('POST', '/api/agents/:id/inbox/flush', async (route) => {
+    const id = route.params.id
+    if (!(await visibleSession(id))) return route.send(404, { error: 'unknown session' })
+    const agent = await ctx.agents.create(id)
+    chat.patch({}, { persist: false })
+    try {
+      const result = await agent.flush({ wait: false })
+      route.send(200, {
+        sessionId: id,
+        flushed: result.flushed,
+        inbox: ctx.agents.listInbox(id),
+      })
+    } catch (error) {
+      route.send(500, { error: String(error) })
+    }
+  })
+  ctx.http.route('POST', '/api/chat', async (route) => {
+    const payload = (await route.json()) as { messages?: ChatMessage[]; sessionId?: string; text?: string }
+    const messages = Array.isArray(payload?.messages)
+      ? payload.messages
+      : [{ role: 'user' as const, content: payload.text ?? '' }]
+    try {
+      route.send(200, await chat.complete(messages, payload.sessionId))
+    } catch (error) {
+      route.send(500, { error: String(error) })
+    }
+  })
+  registerChatInspectorRoutes(ctx)
+}

@@ -1,8 +1,12 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type Ref } from 'react'
+import { useEffect, useMemo, useRef, useState, type PointerEvent, type RefObject } from 'react'
 import { createPortal } from 'react-dom'
 import { MagnifyingGlassIcon, PlusIcon } from '@heroicons/react/16/solid'
+import { HeadlessDismiss } from '@biu/biu-ui/headless-dismiss'
+import { overlayPortalRoot } from '@biu/biu-ui/overlay-portal'
+import { delayCrumbQuery, pullCrumbRecords, recordChoicesFromRows } from './crumb-records.ts'
 import { CrumbItemGlyph, TableGlyph } from './nav-glyphs.tsx'
-import { crumbButtonAction, type Crumb, type CrumbTarget } from './sidebar-nav.ts'
+import { crumbButtonAction, type Crumb, type CrumbChoice, type CrumbTarget } from './sidebar-nav.ts'
+import { pullSavedViews } from './view-storage.ts'
 
 function canOpenCrumbMenu(crumb: Crumb) {
   return crumb.kind === 'collection' || crumb.kind === 'view' || crumb.kind === 'record'
@@ -17,50 +21,101 @@ function createKindOf(crumb: Crumb): 'view' | 'record' | null {
 function CrumbMenu({
   crumb,
   crumbs,
-  pos,
   onPick,
   onOpenId,
   onCreate,
   canCreateView,
   canCreateRecord,
+  trailRef,
 }: {
   crumb: Crumb
   crumbs: Crumb[]
-  pos: { left: number; top: number }
   onPick: (target: CrumbTarget) => void
   onOpenId: (id: string | null) => void
   onCreate?: (kind: 'view' | 'record') => void
   canCreateView?: boolean
   canCreateRecord?: boolean
+  trailRef: RefObject<HTMLElement | null>
 }) {
-  const searchRef = useRef<HTMLInputElement>(null)
   const [query, setQuery] = useState('')
+  const [remote, setRemote] = useState<CrumbChoice[] | null>(null)
+  const [loading, setLoading] = useState(crumb.kind === 'record' || crumb.kind === 'view')
+  const crumbRef = useRef(crumb)
+  crumbRef.current = crumb
   const q = query.trim().toLowerCase()
+  const source = remote ?? crumb.choices
   const filtered = useMemo(
-    () => crumb.choices.filter((item) => !q || item.label.toLowerCase().includes(q) || item.id.toLowerCase().includes(q)),
-    [crumb.choices, q],
+    () =>
+      crumb.kind === 'record'
+        ? source
+        : source.filter((item) => !q || item.label.toLowerCase().includes(q) || item.id.toLowerCase().includes(q)),
+    [crumb.kind, q, source],
   )
+  const shown = filtered
+  const recordCollection = crumb.target.kind === 'record' ? crumb.target.collection : ''
+  const recordViewId = crumb.target.kind === 'record' ? crumb.target.viewId : undefined
+  const viewCollection = crumb.target.kind === 'view' ? crumb.target.collection : ''
+  useEffect(() => {
+    let live = true
+    if (crumb.kind === 'view' && viewCollection) {
+      setLoading(true)
+      void pullSavedViews([viewCollection])
+        .then(() => {
+          if (!live) return
+          window.dispatchEvent(new CustomEvent('fsdb:change', { detail: { views: true } }))
+          window.dispatchEvent(new Event('fsdb:crumb-labels'))
+        })
+        .finally(() => {
+          if (live) setLoading(false)
+        })
+      return () => {
+        live = false
+      }
+    }
+    if (crumb.kind !== 'record' || !recordCollection) {
+      setLoading(false)
+      return
+    }
+    const qtext = query.trim()
+    setLoading(true)
+    const run = () => {
+      void pullCrumbRecords({ collection: recordCollection, viewId: recordViewId, query: qtext })
+        .then((rows) => {
+          if (!live) return
+          setRemote(recordChoicesFromRows(crumbRef.current, rows))
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (live) setLoading(false)
+        })
+    }
+    if (!qtext) {
+      run()
+      return () => {
+        live = false
+      }
+    }
+    const cancel = delayCrumbQuery(run)
+    return () => {
+      live = false
+      cancel()
+    }
+  }, [crumb.kind, query, recordCollection, recordViewId, viewCollection])
   const createKind = createKindOf(crumb)
   const showCreate =
     (createKind === 'view' && canCreateView && onCreate) || (createKind === 'record' && canCreateRecord && onCreate)
 
-  useEffect(() => {
-    const id = window.setTimeout(() => searchRef.current?.focus(), 0)
-    return () => window.clearTimeout(id)
-  }, [])
-
   return (
+    <HeadlessDismiss onDismiss={() => onOpenId(null)} insideRef={trailRef}>
     <div
       className="fsdb-crumb-menu is-fixed"
       role="menu"
       data-fsdb-crumb-menu=""
-      style={{ left: pos.left, top: pos.top }}
       onMouseDown={(event) => event.stopPropagation()}
     >
       <label className="fsdb-crumb-search">
         <MagnifyingGlassIcon aria-hidden className="size-[14px]" />
         <input
-          ref={searchRef}
           value={query}
           placeholder="搜索"
           aria-label="搜索"
@@ -79,8 +134,9 @@ function CrumbMenu({
         />
       </label>
       <div className="fsdb-crumb-menu-list">
-        {filtered.length === 0 ? <div className="fsdb-crumb-empty">没有匹配项</div> : null}
-        {filtered.map((choice) => {
+        {loading && shown.length === 0 ? <div className="fsdb-crumb-empty">加载中…</div> : null}
+        {!loading && shown.length === 0 ? <div className="fsdb-crumb-empty">没有匹配项</div> : null}
+        {shown.map((choice) => {
           const viewId = crumbs.find((item) => item.kind === 'view')?.id
           const active =
             choice.target.kind === 'view'
@@ -103,7 +159,15 @@ function CrumbMenu({
                 onOpenId(null)
               }}
             >
-              <CrumbItemGlyph kind={glyphKind} icon={choice.icon} mode={choice.mode} emoji={choice.emoji} />
+              <CrumbItemGlyph
+                kind={glyphKind}
+                icon={choice.icon}
+                mode={choice.mode}
+                emoji={choice.emoji}
+                mascot={choice.mascot}
+                collection={choice.target.kind === 'record' ? choice.target.collection : undefined}
+                recordId={choice.target.kind === 'record' ? choice.target.recordId : undefined}
+              />
               <span className="chat-view-project-name">{choice.label}</span>
             </button>
           )
@@ -127,13 +191,12 @@ function CrumbMenu({
         </div>
       ) : null}
     </div>
+    </HeadlessDismiss>
   )
 }
 
 export function CrumbTrail({
   crumbs,
-  openId,
-  onOpenId,
   onPick,
   onActivate,
   onCreate,
@@ -144,10 +207,9 @@ export function CrumbTrail({
   label,
   allowMenu = true,
   lockRootCrumb = false,
+  collapseToLeaf = false,
 }: {
   crumbs: Crumb[]
-  openId: string | null
-  onOpenId: (id: string | null) => void
   onPick: (target: CrumbTarget) => void
   onActivate?: () => void
   onCreate?: (kind: 'view' | 'record') => void
@@ -160,25 +222,51 @@ export function CrumbTrail({
   allowMenu?: boolean
   /** 右侧检查器：一级只显示图标且不可点选，从第二级开始切换 */
   lockRootCrumb?: boolean
+  /** 宽度不够时只显示最后一级，避免顶栏挤成一排省略号 */
+  collapseToLeaf?: boolean
 }) {
-  const btnRefs = useRef(new Map<string, HTMLButtonElement>())
-  const [menuPos, setMenuPos] = useState<{ left: number; top: number } | null>(null)
+  const trailRef = useRef<HTMLElement | null>(null)
+  const [openId, setOpenId] = useState<string | null>(null)
+  const [leafOnly, setLeafOnly] = useState(false)
   const openCrumb = crumbs.find((item) => item.id === openId)
   const tableCrumb = crumbs.find((item) => item.kind === 'collection')
   const tableIcon = tableCrumb?.icon
 
-  useLayoutEffect(() => {
-    if (!openId) {
-      setMenuPos(null)
+  useEffect(() => {
+    if (!allowMenu) setOpenId(null)
+  }, [allowMenu])
+
+  useEffect(() => {
+    if (!collapseToLeaf) {
+      setLeafOnly(false)
       return
     }
-    const box = btnRefs.current.get(openId)?.getBoundingClientRect()
-    if (!box) return
-    setMenuPos({ left: Math.max(8, box.left), top: box.bottom + 4 })
-  }, [openId, crumbs])
+    const node = trailRef.current
+    const host = node?.parentElement
+    if (!node || !host) return
+    const measure = () => {
+      setLeafOnly(false)
+      requestAnimationFrame(() => {
+        if (!trailRef.current || !host.isConnected) return
+        setLeafOnly(trailRef.current.scrollWidth > host.clientWidth + 1)
+      })
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(host)
+    return () => ro.disconnect()
+  }, [collapseToLeaf, crumbs])
 
   return (
-    <nav className={className ?? 'fsdb-crumbs'} aria-label={label ?? '位置'} ref={navRef}>
+    <nav
+      className={`${className ?? 'fsdb-crumbs'}${leafOnly ? ' is-leaf-only' : ''}`}
+      aria-label={label ?? '位置'}
+      ref={(node) => {
+        trailRef.current = node
+        if (typeof navRef === 'function') navRef(node)
+        else if (navRef) navRef.current = node
+      }}
+    >
       {crumbs.map((crumb, index) => {
         const rootLocked = lockRootCrumb && index === 0 && crumbs.length > 1
         const canPick = allowMenu && !rootLocked && canOpenCrumbMenu(crumb)
@@ -186,8 +274,16 @@ export function CrumbTrail({
         const current = crumb.choices.find((item) => item.id === crumb.id)
         const glyph = (
           <>
-            {!allowMenu && crumb.kind === 'view' ? <TableGlyph icon={tableIcon} /> : null}
-            <CrumbItemGlyph kind={crumb.kind} icon={crumb.icon ?? current?.icon} mode={current?.mode} emoji={current?.emoji} />
+            {!allowMenu && !lockRootCrumb && crumb.kind === 'view' ? <TableGlyph icon={tableIcon} /> : null}
+            <CrumbItemGlyph
+              kind={crumb.kind}
+              icon={crumb.icon ?? current?.icon}
+              mode={current?.mode}
+              emoji={current?.emoji ?? crumb.emoji}
+              mascot={current?.mascot ?? crumb.mascot}
+              collection={crumb.kind === 'record' && crumb.target.kind === 'record' ? crumb.target.collection : undefined}
+              recordId={crumb.kind === 'record' && crumb.target.kind === 'record' ? crumb.target.recordId : undefined}
+            />
             {rootLocked ? null : <span className="chat-view-project-name">{crumb.label}</span>}
           </>
         )
@@ -196,35 +292,33 @@ export function CrumbTrail({
             {index && !(lockRootCrumb && index === 1) ? <span className="fsdb-crumb-sep" aria-hidden>/</span> : null}
             <span className="fsdb-crumb-pick">
               {rootLocked ? (
-                <span className="fsdb-crumb-btn is-static" title={crumb.label} aria-label={crumb.label}>
+                <span className="fsdb-crumb-btn is-static" aria-label={crumb.label}>
                   {glyph}
                 </span>
               ) : (
               <button
                 type="button"
-                ref={(el) => {
-                  if (el) btnRefs.current.set(crumb.id, el)
-                  else btnRefs.current.delete(crumb.id)
-                }}
                 className={`fsdb-crumb-btn${open ? ' is-open' : ''}`}
-                title={crumb.label}
+                aria-label={crumb.label}
                 aria-haspopup={canPick ? 'menu' : undefined}
                 aria-expanded={canPick ? open : undefined}
-                onClick={(event: MouseEvent) => {
+                onPointerDown={(event: PointerEvent<HTMLButtonElement>) => {
+                  if (event.button !== 0) return
                   event.preventDefault()
                   event.stopPropagation()
-                  onActivate?.()
                   if (!allowMenu) {
-                    onOpenId(null)
+                    onActivate?.()
+                    setOpenId(null)
                     return
                   }
                   const action = crumbButtonAction(crumb, index ? crumbs[index - 1] : undefined)
                   if (action === 'menu') {
-                    onOpenId(open ? null : crumb.id)
+                    setOpenId(open ? null : crumb.id)
                     return
                   }
+                  onActivate?.()
                   onPick(action)
-                  onOpenId(null)
+                  setOpenId(null)
                 }}
               >
                 {glyph}
@@ -234,20 +328,22 @@ export function CrumbTrail({
           </span>
         )
       })}
-      {allowMenu && openCrumb && canOpenCrumbMenu(openCrumb) && menuPos && typeof document !== 'undefined'
+      {allowMenu && openCrumb && canOpenCrumbMenu(openCrumb) && typeof document !== 'undefined'
         ? createPortal(
             <CrumbMenu
               key={openCrumb.id}
               crumb={openCrumb}
               crumbs={crumbs}
-              pos={menuPos}
+              trailRef={trailRef}
               onPick={onPick}
-              onOpenId={onOpenId}
+              onOpenId={(id) => {
+                if (!id) setOpenId(null)
+              }}
               onCreate={onCreate}
               canCreateView={canCreateView}
               canCreateRecord={canCreateRecord}
             />,
-            document.body,
+            overlayPortalRoot() ?? document.body,
           )
         : null}
     </nav>

@@ -4,6 +4,12 @@ import {
   chatColumnWidth,
   inspectorWidthForExpandedChat,
   allocateShellColumns,
+  applyShellColumnCssVars,
+  commitShellLayoutSnap,
+  publishShellLayout,
+  shellLayoutFromEvent,
+  shellLayoutFromElement,
+  shellColumnStartWidth,
   CHAT_OVERLAY_ENTER,
   CENTER_MIN,
   INSPECTOR_MIN,
@@ -16,8 +22,12 @@ import {
   setChatOverlay,
   closeChatOverlay,
   getOverlayThread,
+  isChatPagePath,
   openOverlayComposer,
   revealOverlayThread,
+  toggleOverlayThread,
+  setOverlayThread,
+  shouldCloseOverlayOnOutside,
   getOverlayAutohide,
   setOverlayAutohide,
   requestOverlayAutohide,
@@ -32,13 +42,16 @@ import {
   readOverlayWinState,
   writeOverlayWinState,
   OVERLAY_CHAT_HEIGHT_MIN,
-  OVERLAY_DOCK_CLEARANCE,
   OVERLAY_WIN_MIN_H,
   OVERLAY_WIN_MIN_W,
   inspectorTabFromEvent,
   inspectorActionFromEvent,
   requestInspectorTab,
   requestInspectorAction,
+  requestComposerFocus,
+  isComposerFocusPending,
+  consumeComposerFocusPending,
+  focusComposerEditor,
 } from './chat-overlay.ts'
 
 test('collapsed chat sidebar disappears instead of leaving a thin rail', () => {
@@ -76,7 +89,70 @@ test('sidebar stays a normal pane at min width, never an icon rail', () => {
   assert.equal(atMin.left, SIDEBAR_MIN)
 })
 
-test('narrow viewport hides the left pane outright, then shrinks inspector, then center', () => {
+test('commitShellLayoutSnap writes collapse before the next render', () => {
+  const snap = {
+    leftPane: true,
+    inspectorVisible: true,
+    inspectorWidth: 320,
+    sidebarWidth: 240,
+    sidebarCollapsed: false,
+  }
+  const afterCollapse = commitShellLayoutSnap(snap, { sidebarCollapsed: true })
+  assert.equal(afterCollapse.sidebarCollapsed, true)
+  assert.equal(afterCollapse.sidebarWidth, 240)
+  assert.equal(snap.sidebarCollapsed, false)
+  const afterWidth = commitShellLayoutSnap(afterCollapse, { inspectorWidth: 400 })
+  assert.equal(afterWidth.inspectorWidth, 400)
+  assert.equal(afterWidth.sidebarCollapsed, true)
+})
+
+test('applyShellColumnCssVars writes grid tracks without React state', () => {
+  const el = document.createElement('div')
+  applyShellColumnCssVars(el, { left: 240, inspector: 320 })
+  assert.equal(el.style.getPropertyValue('--sidebar-col'), '240px')
+  assert.equal(el.style.getPropertyValue('--inspector-width'), '320px')
+})
+
+test('shell column drag starts from CSS tracks, not a fractional bounding box', () => {
+  const shell = document.createElement('div')
+  shell.setAttribute('data-testid', 'app-shell')
+  applyShellColumnCssVars(shell, { left: 240, inspector: 320 })
+  const handle = document.createElement('div')
+  handle.className = 'sidebar-resize'
+  shell.appendChild(handle)
+  document.body.appendChild(shell)
+  handle.getBoundingClientRect = () => ({
+    x: 0,
+    y: 0,
+    top: 0,
+    left: 0,
+    right: 239.4,
+    bottom: 800,
+    width: 239.4,
+    height: 800,
+    toJSON() {
+      return {}
+    },
+  })
+  assert.equal(shellColumnStartWidth(handle, 'left', 160), 240)
+  assert.equal(shellColumnStartWidth(handle, 'inspector', 240), 320)
+  assert.deepEqual(shellLayoutFromElement(shell), { left: 240, inspector: 320 })
+  shell.remove()
+})
+
+test('publishShellLayout reports painted column widths', () => {
+  const seen: Array<{ left: number; inspector: number }> = []
+  const onLayout = (event: Event) => {
+    const cols = shellLayoutFromEvent(event)
+    if (cols) seen.push(cols)
+  }
+  window.addEventListener('biu:shell-layout', onLayout)
+  publishShellLayout({ left: 0, inspector: 320 })
+  window.removeEventListener('biu:shell-layout', onLayout)
+  assert.deepEqual(seen, [{ left: 0, inspector: 320 }])
+})
+
+test('narrow viewport shrinks center and inspector first; left hides last', () => {
   const wide = allocateShellColumns({
     viewportWidth: 1600,
     leftPane: true,
@@ -87,38 +163,38 @@ test('narrow viewport hides the left pane outright, then shrinks inspector, then
   assert.equal(wide.inspector, 320)
   assert.equal(wide.center, 1600 - SIDEBAR_MAX - 320)
 
-  const hideLeft = allocateShellColumns({
+  const keepLeft = allocateShellColumns({
     viewportWidth: SIDEBAR_MAX + CENTER_MIN + 320 - 100,
     leftPane: true,
     inspectorOpen: true,
     inspectorWidth: 320,
   })
+  assert.equal(keepLeft.left, SIDEBAR_MAX)
+  assert.equal(keepLeft.inspector, INSPECTOR_MIN)
+  assert.equal(keepLeft.center, SIDEBAR_MAX + CENTER_MIN + 320 - 100 - SIDEBAR_MAX - INSPECTOR_MIN)
+
+  const squeezeInspector = allocateShellColumns({
+    viewportWidth: SIDEBAR_MAX + 200 + INSPECTOR_MIN,
+    leftPane: true,
+    inspectorOpen: true,
+    inspectorWidth: 320,
+  })
+  assert.equal(squeezeInspector.left, SIDEBAR_MAX)
+  assert.equal(squeezeInspector.inspector, INSPECTOR_MIN)
+  assert.equal(squeezeInspector.center, 200)
+
+  const hideLeft = allocateShellColumns({
+    viewportWidth: SIDEBAR_MIN + INSPECTOR_MIN - 1,
+    leftPane: true,
+    inspectorOpen: true,
+    inspectorWidth: 320,
+  })
   assert.equal(hideLeft.left, 0)
-  assert.equal(hideLeft.inspector, 320)
-  assert.equal(hideLeft.center, SIDEBAR_MAX + CENTER_MIN + 320 - 100 - 320)
-
-  const stealInspector = allocateShellColumns({
-    viewportWidth: CENTER_MIN + INSPECTOR_MIN,
-    leftPane: true,
-    inspectorOpen: true,
-    inspectorWidth: 320,
-  })
-  assert.equal(stealInspector.left, 0)
-  assert.equal(stealInspector.inspector, INSPECTOR_MIN)
-  assert.equal(stealInspector.center, CENTER_MIN)
-
-  const squeezeCenter = allocateShellColumns({
-    viewportWidth: CENTER_MIN + INSPECTOR_MIN - 80,
-    leftPane: true,
-    inspectorOpen: true,
-    inspectorWidth: 320,
-  })
-  assert.equal(squeezeCenter.left, 0)
-  assert.equal(squeezeCenter.inspector, INSPECTOR_MIN)
-  assert.equal(squeezeCenter.center, CENTER_MIN - 80)
+  assert.equal(hideLeft.inspector, INSPECTOR_MIN)
+  assert.equal(hideLeft.center, SIDEBAR_MIN + INSPECTOR_MIN - 1 - INSPECTOR_MIN)
 })
 
-test('center min is two thirds of the old 768 so side panes stay visible longer', () => {
+test('center min is two thirds of the old 768; inspector shrinks before the left pane', () => {
   assert.equal(CENTER_MIN, 512)
   const keepBoth = allocateShellColumns({
     viewportWidth: SIDEBAR_MAX + 600 + 320,
@@ -156,24 +232,188 @@ test('overlay starts closed', () => {
   setChatOverlay(false)
 })
 
+test('chat page paths skip the overlay', () => {
+  assert.equal(isChatPagePath('/'), true)
+  assert.equal(isChatPagePath('/agents/abc'), true)
+  assert.equal(isChatPagePath('/agents/abc/debug'), true)
+  assert.equal(isChatPagePath('/s/abc'), false)
+  assert.equal(isChatPagePath('/database'), false)
+  assert.equal(isChatPagePath('/tasks'), false)
+})
+
 test('pick-attached only opens; closing stays closed even if chips remain', () => {
   setChatOverlay(false)
+  history.replaceState(null, '', '/database')
   window.dispatchEvent(new Event('biu:pick-attached'))
   assert.equal(getChatOverlay(), true)
   closeChatOverlay()
   assert.equal(getChatOverlay(), false)
 })
 
-test('pick opens a compose-only overlay; send reveals the thread', () => {
+test('pick-attached on the chat page focuses composer instead of overlay', async () => {
   setChatOverlay(false)
-  openOverlayComposer({ revealThread: false })
+  history.replaceState(null, '', '/agents/session-1')
+  let focused = 0
+  const onFocus = () => {
+    focused += 1
+  }
+  window.addEventListener('biu:composer-focus', onFocus)
+  window.dispatchEvent(new Event('biu:pick-attached'))
+  assert.equal(focused, 0)
+  assert.equal(isComposerFocusPending(), true)
+  await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)))
+  window.removeEventListener('biu:composer-focus', onFocus)
+  assert.equal(getChatOverlay(), false)
+  assert.ok(focused > 0)
+})
+
+test('requestComposerFocus does not dispatch in the same tick', () => {
+  consumeComposerFocusPending()
+  let focused = 0
+  const onFocus = () => {
+    focused += 1
+  }
+  window.addEventListener('biu:composer-focus', onFocus)
+  requestComposerFocus()
+  window.removeEventListener('biu:composer-focus', onFocus)
+  assert.equal(focused, 0)
+  assert.equal(isComposerFocusPending(), true)
+  consumeComposerFocusPending()
+})
+
+test('focusComposerEditor ignores a null or destroyed editor', () => {
+  consumeComposerFocusPending()
+  requestComposerFocus()
+  assert.equal(focusComposerEditor(null), false)
+  assert.equal(isComposerFocusPending(), true)
+  assert.equal(focusComposerEditor({ isDestroyed: true, commands: { focus() {} } }), false)
+  const exploded = {
+    isDestroyed: false,
+    get commands() {
+      return (null as unknown as { commands: { focus: () => void } }).commands
+    },
+  }
+  assert.equal(focusComposerEditor(exploded), false)
+  assert.equal(isComposerFocusPending(), true)
+  let focused = 0
+  assert.equal(
+    focusComposerEditor({
+      isDestroyed: false,
+      commands: {
+        focus() {
+          focused += 1
+        },
+      },
+    }),
+    true,
+  )
+  assert.equal(focused, 1)
+  assert.equal(isComposerFocusPending(), false)
+})
+
+test('openOverlayComposer on a database page requests composer focus', () => {
+  consumeComposerFocusPending()
+  setChatOverlay(false)
+  history.replaceState(null, '', '/database/pages/p1')
+  openOverlayComposer({ revealThread: true })
+  assert.equal(getChatOverlay(), true)
+  assert.equal(getOverlayThread(), true)
+  assert.equal(isComposerFocusPending(), true)
+  consumeComposerFocusPending()
+  setChatOverlay(false)
+})
+
+test('openOverlayComposer on the chat page does not open a window', () => {
+  setChatOverlay(false)
+  history.replaceState(null, '', '/agents/session-1')
+  openOverlayComposer({ revealThread: true })
+  assert.equal(getChatOverlay(), false)
+})
+
+test('pick opens a compose-only overlay; only the expand control reveals the thread', () => {
+  setOverlayThread(false)
+  setChatOverlay(false)
+  history.replaceState(null, '', '/database')
+  openOverlayComposer()
   assert.equal(getChatOverlay(), true)
   assert.equal(getOverlayThread(), false)
   assert.equal(getOverlayAutohide(), false)
-  revealOverlayThread()
+  toggleOverlayThread()
   assert.equal(getOverlayThread(), true)
   setChatOverlay(false)
+  assert.equal(getOverlayThread(), true)
+})
+
+test('reopening the overlay restores the last thread expand state', () => {
+  setOverlayThread(true)
+  setChatOverlay(true)
+  setChatOverlay(false)
+  history.replaceState(null, '', '/database')
+  openOverlayComposer()
+  assert.equal(getChatOverlay(), true)
+  assert.equal(getOverlayThread(), true)
+  setOverlayThread(false)
+  setChatOverlay(false)
+  openOverlayComposer()
   assert.equal(getOverlayThread(), false)
+  setChatOverlay(false)
+})
+
+test('toggleOverlayThread expands and collapses the overlay transcript', () => {
+  setChatOverlay(true)
+  setOverlayThread(false)
+  toggleOverlayThread()
+  assert.equal(getOverlayThread(), true)
+  toggleOverlayThread()
+  assert.equal(getOverlayThread(), false)
+  setChatOverlay(false)
+})
+
+test('collapsed overlay closes on outside click; expanded overlay stays', () => {
+  setChatOverlay(true)
+  setOverlayThread(false)
+  window.dispatchEvent(new CustomEvent('biu:pick-mode', { detail: { picking: false } }))
+  const panel = document.createElement('div')
+  panel.setAttribute('data-testid', 'chat-overlay-panel')
+  const flyout = document.createElement('div')
+  flyout.className = 'composer-model-flyout'
+  const chip = document.createElement('div')
+  chip.setAttribute('data-testid', 'pick-chip-data')
+  document.body.append(panel, flyout, chip)
+  assert.equal(shouldCloseOverlayOnOutside(panel), false)
+  assert.equal(shouldCloseOverlayOnOutside(flyout), false)
+  assert.equal(shouldCloseOverlayOnOutside(chip), false)
+  assert.equal(shouldCloseOverlayOnOutside(document.body), true)
+  setOverlayThread(true)
+  assert.equal(shouldCloseOverlayOnOutside(document.body), false)
+  panel.remove()
+  flyout.remove()
+  chip.remove()
+  setChatOverlay(false)
+})
+
+test('pick mode opens the overlay and blocks outside dismiss', () => {
+  setOverlayThread(false)
+  setChatOverlay(false)
+  history.replaceState(null, '', '/database')
+  window.dispatchEvent(new CustomEvent('biu:pick-mode', { detail: { picking: true } }))
+  assert.equal(getChatOverlay(), true)
+  assert.equal(getOverlayThread(), false)
+  assert.equal(shouldCloseOverlayOnOutside(document.body), false)
+  window.dispatchEvent(new CustomEvent('biu:pick-mode', { detail: { picking: false } }))
+  assert.equal(shouldCloseOverlayOnOutside(document.body), true)
+  setChatOverlay(false)
+})
+
+test('pick on an already-open overlay keeps the revealed thread', () => {
+  setChatOverlay(false)
+  history.replaceState(null, '', '/database')
+  openOverlayComposer()
+  revealOverlayThread()
+  assert.equal(getOverlayThread(), true)
+  openOverlayComposer()
+  assert.equal(getOverlayThread(), true)
+  setChatOverlay(false)
 })
 
 test('closeChatOverlay is a no-op when already closed', () => {
@@ -209,32 +449,38 @@ test('autohide resets when overlay closes', () => {
   assert.equal(getOverlayAutohide(), false)
 })
 
-test('overlay window geom clamps and sits above the dock by default', () => {
+test('overlay window geom clamps and docks to the right, bottom-aligned by default', () => {
   const def = defaultOverlayWinGeom(1280, 800)
+  assert.equal(OVERLAY_WIN_MIN_W, 420)
   assert.ok(def.w >= OVERLAY_WIN_MIN_W)
   assert.ok(def.h >= OVERLAY_WIN_MIN_H)
-  assert.ok(def.y + def.h <= 800 - OVERLAY_DOCK_CLEARANCE)
+  assert.equal(def.x, 1280 - def.w - 12)
+  assert.equal(def.y, 800 - def.h - 12)
+  assert.ok(def.y + def.h <= 800)
   const tiny = clampOverlayWinGeom({ x: -400, y: -20, w: 10, h: 10 }, 1280, 800)
   assert.equal(tiny.w, OVERLAY_WIN_MIN_W)
   assert.equal(tiny.h, OVERLAY_WIN_MIN_H)
+  const short = clampOverlayWinGeom({ x: 12, y: 12, w: 420, h: 520 }, 1280, 400)
+  assert.ok(short.h <= 400 - 24)
+  assert.ok(short.h >= OVERLAY_CHAT_HEIGHT_MIN)
 })
 
-test('layout presets pin the overlay to the viewport', () => {
+test('layout always pins the overlay to the right of the viewport', () => {
   const prev = { x: 100, y: 80, w: 420, h: 400 }
   const bottom = overlayLayoutGeom('bottom', prev, 1280, 800)
-  assert.equal(bottom.x, Math.round((1280 - 420) / 2))
+  assert.equal(bottom.x, 1280 - 420 - 12)
   assert.equal(bottom.w, 420)
-  assert.equal(bottom.y + bottom.h, 800 - OVERLAY_DOCK_CLEARANCE)
+  assert.equal(bottom.y, 80)
   const wide = overlayLayoutGeom('bottom', { ...prev, w: 640 }, 1600, 900)
-  assert.equal(wide.x, Math.round((1600 - 640) / 2))
+  assert.equal(wide.x, 1600 - 640 - 12)
   assert.equal(wide.w, 640)
   const right = overlayLayoutGeom('right', prev, 1280, 800)
   assert.equal(right.x, 1280 - 420 - 12)
   assert.equal(right.h, 400)
-  assert.equal(right.y, Math.round((800 - OVERLAY_DOCK_CLEARANCE - 400) / 2))
+  assert.equal(right.y, 80)
   const tall = overlayLayoutGeom('right', { ...prev, h: 560 }, 1280, 900)
   assert.equal(tall.h, 560)
-  assert.equal(tall.y, Math.round((900 - OVERLAY_DOCK_CLEARANCE - 560) / 2))
+  assert.equal(tall.y, 80)
 })
 
 test('saved layout recomputes when the viewport changes', () => {
@@ -248,19 +494,20 @@ test('saved layout recomputes when the viewport changes', () => {
   assert.equal(state.layout, 'right')
   assert.equal(state.x, 1600 - state.w - 12)
   assert.equal(state.h, 400)
-  assert.equal(state.y, Math.round((900 - OVERLAY_DOCK_CLEARANCE - 400) / 2))
+  assert.equal(state.y, 12)
   writeOverlayWinState({ x: 0, y: 0, w: 500, h: 360, layout: 'bottom' })
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1400 })
   Object.defineProperty(window, 'innerHeight', { configurable: true, value: 820 })
   const bottom = readOverlayWinState()
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: original.innerWidth })
   Object.defineProperty(window, 'innerHeight', { configurable: true, value: original.innerHeight })
-  assert.equal(bottom.layout, 'bottom')
+  assert.equal(bottom.layout, 'right')
   assert.equal(bottom.w, 500)
-  assert.equal(bottom.x, Math.round((1400 - 500) / 2))
-  assert.equal(parseOverlayLayout('nope'), 'free')
-  assert.equal(parseOverlayLayout('center'), 'free')
-  assert.equal(parseOverlayLayout('left'), 'free')
+  assert.equal(bottom.x, 1400 - 500 - 12)
+  assert.equal(parseOverlayLayout('nope'), 'right')
+  assert.equal(parseOverlayLayout('free'), 'right')
+  assert.equal(parseOverlayLayout('left'), 'right')
+  assert.equal(parseOverlayLayout('bottom'), 'right')
 })
 
 test('overlay chat height clamps', () => {

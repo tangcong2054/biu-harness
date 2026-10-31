@@ -2,12 +2,29 @@ import { test } from 'vitest'
 import assert from 'node:assert/strict'
 import { Context, Service } from 'cordis'
 import * as tools from '@biu/host-tools'
-import { DatabaseService, apply as applyFileSystem } from './index.ts'
-import type { CollectionSpec } from '@biu/type-file-system'
+import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { DatabaseService, apply as applyFileSystem, databaseHttpFailure, listNeedsMatchOverlay, specListQuery } from './index.ts'
+import { FileSystemAssets } from './assets-store.ts'
+import type { CollectionSpec, DbRecord } from '@biu/type-file-system'
+import { REQUIRED_RECORD_FIELDS } from '@biu/type-file-system'
+import { facetsCollection } from './facets-collection.ts'
+import { SavedViewsStore, viewsCollection } from './saved-views.ts'
+import { trashCollection } from './trash-collection.ts'
+import { runWithSession } from '@biu/host-sessions/scope'
+import { openAndMigrateBiu, runWithAccount } from '@biu/host-plugin-loader/data-dir'
+import { CollabStore } from '@biu/host-account/store'
+import { workspaceMembersCollection } from '@biu/host-account/workspace-members-collection'
+import { builtinAllViewId, stubBuiltinAllView, stubBuiltinMemberView } from '../catalog-views.ts'
+import { matchListFilterRecord } from '../query-logic.ts'
+import { savedViewRecordPath } from '../paths.ts'
 
 function notesCollection(): CollectionSpec {
   const rows = new Map<string, { id: string; title: string; status: string; pinned: boolean }>()
   rows.set('n1', { id: 'n1', title: '草稿', status: 'open', pinned: false })
+  rows.set('n2', { id: 'n2', title: '另一篇', status: 'open', pinned: false })
   return {
     id: 'notes',
     path: '/notes',
@@ -16,6 +33,7 @@ function notesCollection(): CollectionSpec {
     schema: {
       labelField: 'title',
       fields: {
+        ...REQUIRED_RECORD_FIELDS,
         title: { type: 'string', writable: true },
         status: { type: 'string', writable: true, enum: ['open', 'done'] },
         pinned: { type: 'boolean' },
@@ -46,6 +64,21 @@ function notesCollection(): CollectionSpec {
   }
 }
 
+test('database HTTP failures distinguish missing resources from bad requests', () => {
+  assert.deepEqual(databaseHttpFailure(new Error('unknown record: /pages/p008')), {
+    status: 404,
+    body: { error: 'not found', code: 'NOT_FOUND' },
+  })
+  assert.deepEqual(databaseHttpFailure(new Error('permission denied: INSUFFICIENT_PERMISSION')), {
+    status: 403,
+    body: { error: 'permission denied', code: 'FORBIDDEN' },
+  })
+  assert.deepEqual(databaseHttpFailure(new Error('cannot read: /pages/p008/child')), {
+    status: 400,
+    body: { error: 'Error: cannot read: /pages/p008/child', code: 'BAD_REQUEST' },
+  })
+})
+
 test('root lists registered collections; record read/update follows schema', async () => {
   const ctx = new Context()
   const db = new DatabaseService(ctx)
@@ -62,8 +95,25 @@ test('root lists registered collections; record read/update follows schema', asy
   const listed = await db.list('/notes')
   assert.equal(listed.kind, 'collection')
   if (listed.kind !== 'collection') return
-  assert.equal(listed.items.length, 1)
+  assert.equal(listed.items.length, 2)
   assert.equal(listed.items[0]?.title, '草稿')
+
+  const slim = await db.list('/notes', undefined, { columns: ['title'] })
+  assert.equal(slim.kind, 'collection')
+  if (slim.kind !== 'collection') return
+  const row = slim.items[0]
+  assert.equal(row?.id, 'n1')
+  assert.equal(row?.title, '草稿')
+  assert.equal(row?.path, '/notes/n1')
+  assert.equal(row?.kind, 'record')
+  assert.equal('status' in (row ?? {}), false)
+  assert.equal(row?.pinned, false)
+  const labeled = await db.list('/notes', undefined, { columns: ['label'] })
+  assert.equal(labeled.kind, 'collection')
+  if (labeled.kind !== 'collection') return
+  assert.equal(labeled.items[0]?.title, '草稿')
+  assert.equal('status' in (labeled.items[0] ?? {}), false)
+  assert.equal(labeled.items[0]?.pinned, false)
 
   const read = await db.read('/notes/n1')
   assert.equal(read.kind, 'record')
@@ -72,8 +122,70 @@ test('root lists registered collections; record read/update follows schema', asy
 
   const written = await db.update('/notes/n1', { status: 'done' })
   assert.equal(written.value.status, 'done')
+  await assert.rejects(() => db.update('/notes/n1', { status: 'invalid' }), /value not in enum/)
   await assert.rejects(() => db.update('/notes/n1', { pinned: true }), /not writable/)
-  await assert.rejects(() => db.update('/notes/n1', { nope: 1 }), /unknown field/)
+  await assert.rejects(() => db.update('/notes/n1', { nope: 1 }), /unknown field: nope\. writable: /)
+})
+
+test('html banner is stored by file system and never written as a table field', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const notes = notesCollection()
+  const seen: Record<string, unknown>[] = []
+  const innerUpdate = notes.update!
+  notes.update = async (id, patch) => {
+    seen.push({ ...patch })
+    return innerUpdate(id, patch)
+  }
+  db.register(notes)
+  const written = await db.update('/notes/n1', { banner: { kind: 'html', html: '<div>cover</div>' } })
+  assert.deepEqual(written.value.banner, { kind: 'html', html: '<div>cover</div>' })
+  assert.equal(seen.length, 0)
+  const read = await db.read('/notes/n1')
+  if (read.kind !== 'record') return
+  assert.deepEqual(read.value.banner, { kind: 'html', html: '<div>cover</div>' })
+  assert.equal('banner' in (await notes.get!('n1') ?? {}), false)
+  const listed = await db.list('/notes')
+  if (listed.kind !== 'collection') return
+  assert.equal('banner' in (listed.items.find((row) => row.id === 'n1') ?? {}), false)
+  await db.update('/notes/n1', { banner: null })
+  const cleared = await db.read('/notes/n1')
+  if (cleared.kind !== 'record') return
+  assert.equal('banner' in cleared.value, false)
+})
+
+test('each view keeps its own html banner outside list rows', async () => {
+  const ctx = new Context()
+  await ctx.plugin(tools)
+  class HttpStub extends Service {
+    constructor(c: Context) {
+      super(c, 'http')
+    }
+    route() {}
+    broadcast() {}
+  }
+  new HttpStub(ctx)
+  await ctx.plugin({ inject: ['tools', 'http'], apply: applyFileSystem })
+  const db = ctx.get('database') as DatabaseService
+  db.register(notesCollection())
+  const allPath = savedViewRecordPath('/notes', builtinAllViewId('/notes'))
+  await db.update(allPath, { banner: { kind: 'html', html: '<div>all</div>' } })
+  const all = await db.read(allPath)
+  if (all.kind !== 'record') return
+  assert.deepEqual(all.value.banner, { kind: 'html', html: '<div>all</div>' })
+  const created = await db.create('/views', [{ title: '看板', tablePath: '/notes', mode: 'graph' }])
+  const boardPath = created.items[0]?.path
+  assert.equal(typeof boardPath, 'string')
+  await db.update(boardPath!, { banner: { kind: 'htmlframe', html: '<div>board</div>' } })
+  const board = await db.read(boardPath!)
+  if (board.kind !== 'record') return
+  assert.deepEqual(board.value.banner, { kind: 'htmlframe', html: '<div>board</div>' })
+  const again = await db.read(allPath)
+  if (again.kind !== 'record') return
+  assert.deepEqual(again.value.banner, { kind: 'html', html: '<div>all</div>' })
+  const listed = await db.list('/views')
+  if (listed.kind !== 'collection') return
+  assert.ok(listed.items.every((row) => !('banner' in row)))
 })
 
 test('computed fields come from list and cannot be written', async () => {
@@ -84,6 +196,7 @@ test('computed fields come from list and cannot be written', async () => {
     path: '/stats',
     schema: {
       fields: {
+        ...REQUIRED_RECORD_FIELDS,
         title: { type: 'string', writable: true },
         score: { type: 'number', computed: true },
       },
@@ -111,7 +224,7 @@ test('stat returns schema; list can filter by any field', async () => {
   if (stat.kind !== 'collection') return
   assert.equal(stat.schema.fields.status?.enum?.[0], 'open')
   const filtered = await db.list('/notes', { status: 'open' })
-  assert.equal(filtered.items.length, 1)
+  assert.equal(filtered.items.length, 2)
   const empty = await db.list('/notes', { status: 'done' })
   assert.equal(empty.items.length, 0)
 })
@@ -130,9 +243,187 @@ test('every collection schema includes id, title, createdAt and updatedAt', asyn
   assert.equal(stat.schema.fields.updatedAt?.label, '更新时间')
   assert.equal(stat.schema.fields.content?.type, 'file')
   assert.equal(stat.schema.fields.emoji?.writable, true)
+  assert.equal(stat.schema.fields.tags, undefined)
+  assert.equal(stat.schema.fields.facet?.type, 'facet')
+  assert.equal(stat.schema.fields.facet?.label, '标签')
+  assert.equal(stat.schema.fields.facet?.writable, true)
+  assert.equal(stat.schema.fields.parentId?.type, 'ref')
+  assert.equal(stat.schema.fields.parentId?.writable, true)
+  assert.equal(stat.schema.fields.parentId?.label, '父级')
+  assert.equal(stat.schema.fields.dependsOn?.type, 'multi-ref')
+  assert.equal(stat.schema.fields.dependsOn?.writable, true)
+  assert.equal(stat.schema.fields.dependsOn?.label, '依赖')
+  assert.equal(stat.schema.fields.createdBy?.type, 'person')
+  assert.equal(stat.schema.fields.createdBy?.writable, false)
+  assert.equal(stat.schema.fields.createdBy?.label, '创建人')
+  assert.equal(stat.schema.fields.updatedBy?.type, 'person')
+  assert.equal(stat.schema.fields.updatedBy?.writable, false)
+  assert.equal(stat.schema.fields.updatedBy?.multiple, true)
+  assert.equal(stat.schema.fields.updatedBy?.label, '编辑人')
   assert.equal(stat.schema.contentField, 'content')
+  const tagged = await db.update('/notes/n1', { facet: { tags: ['dp'], values: { dp: { complexity: 'O(n)' } } } })
+  assert.deepEqual(tagged.value.facet, { tags: ['dp'], values: { dp: { complexity: 'O(n)' } } })
+  db.facets.replace([{ id: 'dp', label: '动态规划', fields: [] }])
+  const byLabel = await db.list('/notes', undefined, { q: '动态规划' })
+  assert.equal(byLabel.items.length, 1)
+  const byFilter = await db.list('/notes', { facet: 'dp' })
+  assert.equal(byFilter.items.length, 1)
   await assert.rejects(() => db.update('/notes/n1', { createdAt: Date.now() }), /not writable/)
+  await assert.rejects(() => db.update('/notes/n1', { createdBy: { kind: 'system', name: '系统' } }), /not writable/)
+  await assert.rejects(() => db.update('/notes/n1', { updatedBy: { kind: 'system', name: '系统' } }), /not writable/)
   await assert.rejects(() => db.update('/notes/n1', { id: 'other' }), /not writable/)
+})
+
+test('parentId is a ref and dependsOn is a multi-ref within the same table', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.register(notesCollection())
+  const parented = await db.update('/notes/n1', { parentId: 'n2' })
+  assert.equal(parented.value.parentId, 'n2')
+  const deps = await db.update('/notes/n1', { dependsOn: ['n2'] })
+  assert.deepEqual(deps.value.dependsOn, ['n2'])
+  await assert.rejects(() => db.update('/notes/n1', { parentId: 'missing' }), /unknown record/)
+  await assert.rejects(() => db.update('/notes/n1', { dependsOn: ['missing'] }), /unknown record/)
+  await assert.rejects(() => db.update('/notes/n1', { parentId: 'n1' }), /itself/)
+  await assert.rejects(() => db.update('/notes/n1', { dependsOn: ['n1'] }), /itself/)
+})
+
+test('custom ref fields also stay inside the same table', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, Record<string, unknown>>([
+    ['n1', { id: 'n1', title: 'a', related: '' }],
+    ['n2', { id: 'n2', title: 'b', related: '' }],
+  ])
+  db.register({
+    id: 'refs',
+    path: '/notes',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+        related: { type: 'ref', writable: true },
+        also: { type: 'multi-ref', writable: true },
+      },
+    },
+    list: () => [...rows.values()] as { id: string }[],
+    get: (id) => rows.get(id) as { id: string } | undefined,
+    records: { update: true },
+    update: (id, patch) => {
+      const next = { ...rows.get(id), ...patch, id }
+      rows.set(id, next)
+      return next as { id: string }
+    },
+  })
+  const linked = await db.update('/notes/n1', { related: 'n2', also: ['n2'] })
+  assert.equal(linked.value.related, 'n2')
+  assert.deepEqual(linked.value.also, ['n2'])
+  await assert.rejects(() => db.update('/notes/n1', { related: 'missing' }), /unknown record/)
+})
+
+test('stamps agent createdBy with the session title from /sessions', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.register(notesCollection())
+  const mascot = { shape: 'pebble', color: 'orange', eye: 1 }
+  const sessions = new Map<string, { id: string; title: string; mascot: typeof mascot }>([
+    ['sess-agent-1', { id: 'sess-agent-1', title: '蓝团爱', mascot }],
+  ])
+  db.register({
+    id: 'sessions',
+    path: '/agents',
+    schema: {
+      labelField: 'title',
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+      },
+    },
+    list: () => [...sessions.values()],
+    get: (id) => sessions.get(id) ?? null,
+    peek: (id: string) => sessions.get(id),
+  } as CollectionSpec)
+  const written = await runWithSession('sess-agent-1', () => db.update('/notes/n1', { status: 'done' }))
+  const actor = { kind: 'agent', name: '蓝团爱', sessionId: 'sess-agent-1', mascot }
+  assert.deepEqual(written.value.createdBy, actor)
+  assert.deepEqual(written.value.updatedBy, [actor])
+  sessions.set('sess-agent-1', { id: 'sess-agent-1', title: '蓝团爱改名', mascot: { shape: 'cube', color: 'blue', eye: 2 } })
+  const listed = await db.list('/notes', undefined, { columns: ['title', 'createdBy', 'updatedBy'] })
+  assert.deepEqual(listed.items[0]?.createdBy, {
+    kind: 'agent',
+    name: '蓝团爱改名',
+    sessionId: 'sess-agent-1',
+    mascot: { shape: 'cube', color: 'blue', eye: 2 },
+  })
+})
+
+test('updates stamp createdBy and updatedBy from the current actor', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.register(notesCollection())
+  const written = await db.update('/notes/n1', { status: 'done' })
+  assert.deepEqual(written.value.createdBy, { kind: 'user', name: '用户' })
+  assert.deepEqual(written.value.updatedBy, [{ kind: 'user', name: '用户' }])
+  await assert.rejects(() => db.update('/notes/n1', { updatedBy: { kind: 'system', name: '系统' } }), /not writable/)
+  const again = await db.update('/notes/n1', { status: 'open' })
+  assert.deepEqual(again.value.createdBy, { kind: 'user', name: '用户' })
+  assert.deepEqual(again.value.updatedBy, [{ kind: 'user', name: '用户' }])
+})
+
+test('later editors append to updatedBy and leave createdBy alone', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.register(notesCollection())
+  db.register({
+    id: 'sessions',
+    path: '/agents',
+    schema: {
+      labelField: 'title',
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+      },
+    },
+    list: () => [{ id: 'sess-a', title: '甲' }],
+    get: (id) => (id === 'sess-a' ? { id: 'sess-a', title: '甲' } : null),
+    peek: (id: string) => (id === 'sess-a' ? { id: 'sess-a', title: '甲' } : undefined),
+  } as CollectionSpec)
+  await db.update('/notes/n1', { status: 'done' })
+  const second = await runWithSession('sess-a', () => db.update('/notes/n1', { status: 'open' }))
+  assert.deepEqual(second.value.createdBy, { kind: 'user', name: '用户' })
+  assert.deepEqual(second.value.updatedBy, [
+    { kind: 'user', name: '用户' },
+    { kind: 'agent', name: '甲', sessionId: 'sess-a' },
+  ])
+})
+
+test('person fields accept user system and agent values', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, Record<string, unknown>>([['n1', { id: 'n1', title: 'a', owner: null }]])
+  db.register({
+    id: 'people',
+    path: '/people',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+        owner: { type: 'person', writable: true },
+      },
+    },
+    list: () => [...rows.values()] as { id: string }[],
+    get: (id) => rows.get(id) as { id: string } | undefined,
+    records: { update: true },
+    update: (id, patch) => {
+      const next = { ...rows.get(id), ...patch, id }
+      rows.set(id, next)
+      return next as { id: string }
+    },
+  })
+  const written = await db.update('/people/n1', { owner: { kind: 'agent', name: '指挥', sessionId: 'sess-1' } })
+  assert.deepEqual(written.value.owner, { kind: 'agent', name: '指挥', sessionId: 'sess-1' })
+  const system = await db.update('/people/n1', { owner: '系统' })
+  assert.deepEqual(system.value.owner, { kind: 'system', name: '系统' })
 })
 
 test('update accepts url image and attachment values', async () => {
@@ -146,6 +437,7 @@ test('update accepts url image and attachment values', async () => {
     path: '/media',
     schema: {
       fields: {
+        ...REQUIRED_RECORD_FIELDS,
         title: { type: 'string', writable: true },
         link: { type: 'url', writable: true },
         cover: { type: 'image', writable: true },
@@ -167,10 +459,25 @@ test('update accepts url image and attachment values', async () => {
     file: { name: 'a.pdf', href: 'https://example.com/a.pdf' },
   })
   assert.equal(written.value.link, 'https://example.com')
+  const bare = await db.update('/media/n1', { link: 'example.com/x' })
+  assert.equal(bare.value.link, 'https://example.com/x')
+  const emptied = await db.update('/media/n1', { link: '' })
+  assert.equal(emptied.value.link, '')
   assert.equal(written.value.cover, 'https://example.com/a.png')
   assert.equal((written.value.file as { name: string }).name, 'a.pdf')
   const local = await db.update('/media/n1', { cover: '/page-covers/red.png' })
   assert.equal(local.value.cover, '/page-covers/red.png')
+  const many = await db.update('/media/n1', { cover: ['/page-covers/red.png', 'https://example.com/b.png'] })
+  assert.deepEqual(many.value.cover, ['/page-covers/red.png', 'https://example.com/b.png'])
+  const manyFiles = await db.update('/media/n1', {
+    file: [
+      { name: 'a.pdf', href: 'https://cdn.example/a.pdf' },
+      { name: 'b.pdf', href: 'https://cdn.example/b.pdf' },
+    ],
+  })
+  assert.equal(Array.isArray(manyFiles.value.file), true)
+  const emptyPack = await db.update('/media/n1', { file: '' })
+  assert.equal(emptyPack.value.file, '')
   await assert.rejects(() => db.update('/media/n1', { link: 'javascript:alert(1)' }), /expected url/)
   await assert.rejects(() => db.update('/media/n1', { cover: 'javascript:alert(1)' }), /expected image/)
 })
@@ -186,6 +493,7 @@ test('content is omitted from list/read and served on its own path', async () =>
     path: '/docs',
     schema: {
       fields: {
+        ...REQUIRED_RECORD_FIELDS,
         title: { type: 'string', writable: true },
         content: { type: 'file', writable: true },
       },
@@ -209,6 +517,379 @@ test('content is omitted from list/read and served on its own path', async () =>
   assert.deepEqual(body.value, { kind: 'note', body: { a: 1 } })
   const written = await db.writeContent('/docs/n1', { kind: 'note', body: { a: 2 } })
   assert.deepEqual(written.value, { kind: 'note', body: { a: 2 } })
+  const cleared = await db.writeContent('/docs/n1', '')
+  assert.equal(cleared.value, '')
+  assert.equal((await db.content('/docs/n1')).value, '')
+})
+
+test('editor content exposes a version and rejects stale writes', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const row = { id: 'p1', title: 'Page', content: '' }
+  db.register({
+    id: 'pages',
+    path: '/pages',
+    schema: {
+      contentField: 'content',
+      contentBackend: 'editorContent',
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        content: { type: 'file', writable: true },
+      },
+    },
+    list: () => [row],
+    get: () => row,
+    update: (_id, patch) => Object.assign(row, patch),
+  })
+  const initial = await db.content('/pages/p1')
+  assert.equal(initial.version, 0)
+  const first = await db.writeContent('/pages/p1', 'one', initial.version)
+  assert.equal(first.version, 1)
+  assert.ok(Number(first.updatedAt) > 0)
+  await assert.rejects(() => db.writeContent('/pages/p1', 'stale', initial.version), /正文版本冲突/)
+  const current = await db.content('/pages/p1')
+  assert.equal(current.value, 'one')
+  assert.equal(current.version, 1)
+})
+
+test('writeContent string fields keep JSON objects instead of [object Object]', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, Record<string, unknown>>([
+    ['b1', { id: 'b1', title: '块', data: '{"html":"old"}' }],
+  ])
+  db.register({
+    id: 'page-blocks',
+    path: '/page-blocks',
+    schema: {
+      contentField: 'data',
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string' },
+        data: { type: 'string', writable: true },
+      },
+    },
+    records: { update: true },
+    list: () => [...rows.values()] as { id: string }[],
+    get: (id) => rows.get(id) as { id: string } | undefined,
+    update: (id, patch) => {
+      const next = { ...rows.get(id), ...patch, id }
+      rows.set(id, next)
+      return next as { id: string }
+    },
+  })
+  const written = await db.writeContent('/page-blocks/b1', { html: '<p>new</p>', deck: false })
+  assert.equal(written.field, 'data')
+  assert.equal(written.value, '{"html":"<p>new</p>","deck":false}')
+  const updated = await db.update('/page-blocks/b1', { data: { html: '<b>via update</b>' } })
+  assert.equal(updated.value.data, '{"html":"<b>via update</b>"}')
+})
+
+test('page-block records whose id starts with / still read from /page-blocks/', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const id = '/pages::p001::ab12cd34'
+  const row = { id, title: '刊头', collection: '/pages', pageId: 'p001', blockId: 'ab12cd34' }
+  db.register({
+    id: 'page-blocks',
+    path: '/page-blocks',
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string' } } },
+    list: () => [row],
+    get: (next) => (next === id ? row : undefined),
+  })
+  const got = await db.read(`/page-blocks/${id}`)
+  assert.equal(got.kind, 'record')
+  assert.equal((got as { value?: { id?: string } }).value?.id, id)
+})
+
+test('editContent view/str_replace/replace_lines/insert/write', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, Record<string, unknown>>([
+    ['n1', { id: 'n1', title: 'a', content: 'one\ntwo\nthree\nfour' }],
+  ])
+  db.register({
+    id: 'docs',
+    path: '/docs',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+        content: { type: 'file', writable: true },
+      },
+    },
+    list: () => [...rows.values()] as { id: string }[],
+    get: (id) => rows.get(id) as { id: string } | undefined,
+    records: { update: true },
+    update: (id, patch) => {
+      const next = { ...rows.get(id), ...patch, id }
+      rows.set(id, next)
+      return next as { id: string }
+    },
+  })
+  const viewed = await db.editContent('/docs/n1', { command: 'view', view_range: [2, 3] })
+  assert.equal(viewed.command, 'view')
+  assert.equal(viewed.truncated, true)
+  assert.match(String(viewed.text), /2\ttwo/)
+  assert.equal('value' in viewed, false)
+  const replaced = await db.editContent('/docs/n1', { command: 'str_replace', old_str: 'two', new_str: 'TWO' })
+  assert.equal(replaced.ok, true)
+  assert.equal(replaced.start_line, 2)
+  assert.equal(replaced.end_line, 2)
+  assert.equal('value' in replaced, false)
+  assert.equal((await db.content('/docs/n1')).value, 'one\nTWO\nthree\nfour')
+  const lined = await db.editContent('/docs/n1', { command: 'replace_lines', start_line: 3, end_line: 4, new_str: 'C\nD' })
+  assert.equal(lined.start_line, 3)
+  assert.equal(lined.end_line, 4)
+  assert.equal((await db.content('/docs/n1')).value, 'one\nTWO\nC\nD')
+  const inserted = await db.editContent('/docs/n1', { command: 'insert', insert_line: 1, new_str: 'mid' })
+  assert.equal(inserted.start_line, 2)
+  assert.equal((await db.content('/docs/n1')).value, 'one\nmid\nTWO\nC\nD')
+  const written = await db.editContent('/docs/n1', { command: 'write', value: 'done' })
+  assert.equal(written.start_line, 1)
+  assert.equal((await db.content('/docs/n1')).value, 'done')
+})
+
+test('editContent find_replace supports unique, all and regex modes', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, Record<string, unknown>>([
+    ['n1', { id: 'n1', title: 'a', content: 'one two two\nthree two' }],
+  ])
+  db.register({
+    id: 'docs',
+    path: '/docs',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+        content: { type: 'file', writable: true },
+      },
+    },
+    list: () => [...rows.values()] as { id: string }[],
+    get: (id) => rows.get(id) as { id: string } | undefined,
+    records: { update: true },
+    update: (id, patch) => {
+      const next = { ...rows.get(id), ...patch, id }
+      rows.set(id, next)
+      return next as { id: string }
+    },
+  })
+  // all=false still enforces uniqueness
+  await assert.rejects(
+    () => db.editContent('/docs/n1', { command: 'find_replace', old_str: 'two', new_str: 'X' }),
+    /not unique/,
+  )
+  const all = await db.editContent('/docs/n1', { command: 'find_replace', old_str: 'two', new_str: 'X', all: true })
+  assert.equal(all.ok, true)
+  assert.equal(all.replaced, 3)
+  assert.equal((await db.content('/docs/n1')).value, 'one X X\nthree X')
+  const regex = await db.editContent('/docs/n1', {
+    command: 'find_replace',
+    old_str: '\\s+',
+    new_str: ' ',
+    regex: true,
+    all: true,
+  })
+  assert.equal(regex.replaced, 4)
+  assert.equal((await db.content('/docs/n1')).value, 'one X X three X')
+})
+
+test('editContent write accepts from a local file and rejects value+from together', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, Record<string, unknown>>([
+    ['n1', { id: 'n1', title: 'a', content: 'old' }],
+  ])
+  db.register({
+    id: 'docs',
+    path: '/docs',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+        content: { type: 'file', writable: true },
+      },
+    },
+    list: () => [...rows.values()] as { id: string }[],
+    get: (id) => rows.get(id) as { id: string } | undefined,
+    records: { update: true },
+    update: (id, patch) => {
+      const next = { ...rows.get(id), ...patch, id }
+      rows.set(id, next)
+      return next as { id: string }
+    },
+  })
+  const dir = await mkdtemp(join(tmpdir(), 'db-content-from-'))
+  const file = join(dir, 'body.md')
+  await writeFile(file, '# 来自文件\n\n正文内容\n')
+  const written = await db.editContent('/docs/n1', { command: 'write', from: file })
+  assert.equal(written.ok, true)
+  assert.equal((await db.content('/docs/n1')).value, '# 来自文件\n\n正文内容\n')
+  const both = await db.editContent('/docs/n1', { command: 'write', from: file, value: 'x' })
+  assert.equal(both.ok, true)
+  assert.equal((await db.content('/docs/n1')).value, '# 来自文件\n\n正文内容\n')
+  await assert.rejects(() => db.editContent('/docs/n1', { command: 'write', from: join(dir, 'nope.md') }), /cannot read from/)
+})
+
+test('editContent insert/str_replace/replace_lines accept from in place of new_str', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, Record<string, unknown>>([
+    ['n1', { id: 'n1', title: 'a', content: 'one\ntwo\nthree' }],
+  ])
+  db.register({
+    id: 'docs',
+    path: '/docs',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+        content: { type: 'file', writable: true },
+      },
+    },
+    list: () => [...rows.values()] as { id: string }[],
+    get: (id) => rows.get(id) as { id: string } | undefined,
+    records: { update: true },
+    update: (id, patch) => {
+      const next = { ...rows.get(id), ...patch, id }
+      rows.set(id, next)
+      return next as { id: string }
+    },
+  })
+  const dir = await mkdtemp(join(tmpdir(), 'db-content-from-edit-'))
+  const insertFile = join(dir, 'insert.md')
+  const replaceFile = join(dir, 'replace.md')
+  const linesFile = join(dir, 'lines.md')
+  await writeFile(insertFile, 'mid-from-file')
+  await writeFile(replaceFile, 'TWO')
+  await writeFile(linesFile, 'C\nD')
+  const inserted = await db.editContent('/docs/n1', {
+    command: 'insert',
+    insert_line: 1,
+    from: insertFile,
+    new_str: 'ignored-short',
+  })
+  assert.equal(inserted.ok, true)
+  assert.equal((await db.content('/docs/n1')).value, 'one\nmid-from-file\ntwo\nthree')
+  const replaced = await db.editContent('/docs/n1', { command: 'str_replace', old_str: 'two', from: replaceFile })
+  assert.equal((await db.content('/docs/n1')).value, 'one\nmid-from-file\nTWO\nthree')
+  const lined = await db.editContent('/docs/n1', { command: 'replace_lines', start_line: 4, end_line: 4, from: linesFile })
+  assert.equal((await db.content('/docs/n1')).value, 'one\nmid-from-file\nTWO\nC\nD')
+  assert.equal(lined.start_line, 4)
+  assert.equal(lined.end_line, 5)
+})
+
+test('editAsset views and writes referenced attachments as content-addressed files', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.assets = new FileSystemAssets(await mkdtemp(join(tmpdir(), 'db-asset-')))
+  const rows = new Map<string, Record<string, unknown>>([
+    ['p1', { id: 'p1', title: '页', notes: '{"file":"assets/board.json"}' }],
+  ])
+  db.register({
+    id: 'pages',
+    path: '/pages',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+        notes: { type: 'file', writable: true },
+      },
+    },
+    list: () => [...rows.values()] as { id: string }[],
+    get: (id) => rows.get(id) as { id: string } | undefined,
+    records: { update: true },
+    update: (id, patch) => {
+      const next = { ...rows.get(id), ...patch, id }
+      rows.set(id, next)
+      return next as { id: string }
+    },
+  })
+  const listed = await db.editAsset('/pages/p1', { command: 'view' })
+  assert.equal(listed.command, 'view')
+  const missing = (listed as { assets: Array<{ name: string; missing?: boolean }> }).assets
+  assert.equal(missing[0]?.name, 'board.json')
+  assert.equal(missing[0]?.missing, true)
+  const written = await db.editAsset('/pages/p1', {
+    command: 'write',
+    name: 'board.json',
+    value: '{"elements":[]}',
+    block_id: 'e4945888',
+    kind: 'core',
+    source: 'block:e4945888:board',
+  })
+  assert.equal(written.ok, true)
+  assert.match(String(written.name), /^[a-f0-9]{64}\.json$/)
+  const viewed = await db.editAsset('/pages/p1', { command: 'view', name: written.name })
+  assert.equal(viewed.etag, written.name)
+  const dump = join(await mkdtemp(join(tmpdir(), 'db-asset-from-')), 'scene.json')
+  await writeFile(dump, '{"elements":[{"id":"a"}]}')
+  const fromFile = await db.editAsset('/pages/p1', {
+    command: 'write',
+    name: 'board.json',
+    from: dump,
+    block_id: 'e4945888',
+    source: 'block:e4945888:board',
+  })
+  assert.notEqual(fromFile.name, written.name)
+  const again = await db.editAsset('/pages/p1', { command: 'view', name: fromFile.name })
+  assert.match(String((again as { text?: string }).text), /"id":"a"/)
+  await assert.rejects(() => db.editAsset('/pages/p1', { command: 'write', name: 'board.json', etag: again.etag }), /value or from/)
+  await assert.rejects(() => db.editAsset('/pages/p1', { command: 'view', name: 'nope.json' }), /not referenced/)
+})
+
+test('editAsset can create a new image then reference it from content', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.assets = new FileSystemAssets(await mkdtemp(join(tmpdir(), 'db-asset-img-')))
+  const rows = new Map<string, Record<string, unknown>>([
+    ['p1', { id: 'p1', title: '页', notes: 'hello' }],
+  ])
+  db.register({
+    id: 'pages',
+    path: '/pages',
+    schema: {
+      contentField: 'notes',
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+        notes: { type: 'file', writable: true },
+      },
+    },
+    list: () => [...rows.values()] as { id: string }[],
+    get: (id) => rows.get(id) as { id: string } | undefined,
+    records: { update: true },
+    update: (id, patch) => {
+      const next = { ...rows.get(id), ...patch, id }
+      rows.set(id, next)
+      return next as { id: string }
+    },
+  })
+  const dump = join(await mkdtemp(join(tmpdir(), 'db-img-from-')), 'hero.png')
+  await writeFile(dump, Buffer.from([0x89, 0x50, 0x4e, 0x47]))
+  const created = await db.editAsset('/pages/p1', {
+    command: 'write',
+    name: 'hero.png',
+    from: dump,
+  })
+  assert.equal(created.ok, true)
+  assert.match(String(created.name), /^[a-f0-9]{64}\.png$/)
+  await db.editContent('/pages/p1', {
+    command: 'insert',
+    insert_line: 1,
+    new_str: `![封面](/api/db/file/${created.name})`,
+  })
+  assert.match(String((await db.content('/pages/p1')).value), new RegExp(created.name.replace('.', '\\.')))
+  const missingRef = await db.editContent('/pages/p1', {
+    command: 'insert',
+    insert_line: 2,
+    new_str: '![缺](/api/db/file/soon.png)',
+  })
+  assert.equal(missingRef.ok, true)
+  const viewed = await db.editAsset('/pages/p1', { command: 'view', name: 'soon.png' })
+  assert.equal(viewed.missing, true)
+  assert.equal(viewed.etag, '')
 })
 
 test('list paginates collection records and reports total', async () => {
@@ -219,7 +900,7 @@ test('list paginates collection records and reports total', async () => {
   db.register({
     id: 'paged',
     path: '/paged',
-    schema: { fields: { title: { type: 'string', writable: true } } },
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string', writable: true } } },
     list: () => [...rows.values()],
     get: (id) => rows.get(id) ?? null,
   })
@@ -227,9 +908,9 @@ test('list paginates collection records and reports total', async () => {
   assert.equal(first.kind, 'collection')
   if (first.kind !== 'collection') return
   assert.equal(first.total, 60)
-  assert.equal(first.limit, 50)
+  assert.equal(first.limit, 20)
   assert.equal(first.offset, 0)
-  assert.equal(first.items.length, 50)
+  assert.equal(first.items.length, 20)
   const second = await db.list('/paged', undefined, { limit: 20, offset: 50, sortField: 'title', sortDir: 'asc' })
   assert.equal(second.kind, 'collection')
   if (second.kind !== 'collection') return
@@ -240,6 +921,28 @@ test('list paginates collection records and reports total', async () => {
   if (found.kind !== 'collection') return
   assert.equal(found.total, 1)
   assert.equal(found.items[0]?.id, 'n7')
+})
+
+test('list defaults to title so start/stop cannot reshuffle the table', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.register({
+    id: 'plug',
+    path: '/plug',
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string' } } },
+    list: () => [
+      { id: 'b', title: 'Beta', updatedAt: 9 },
+      { id: 'a', title: 'Alpha', updatedAt: 1 },
+    ],
+    get: () => null,
+  })
+  const listed = await db.list('/plug')
+  assert.equal(listed.kind, 'collection')
+  if (listed.kind !== 'collection') return
+  assert.deepEqual(
+    listed.items.map((item) => item.id),
+    ['a', 'b'],
+  )
 })
 
 test('apply registers db_* tools', async () => {
@@ -254,11 +957,262 @@ test('apply registers db_* tools', async () => {
   new HttpStub(ctx)
   await ctx.plugin({ inject: ['tools', 'http'], apply: applyFileSystem })
   const names = ctx.tools.names()
-  for (const name of ['db_list', 'db_read', 'db_update', 'db_create', 'db_delete', 'db_stat', 'db_action', 'db_content']) {
+  for (const name of ['db_list', 'db_read', 'db_update', 'db_create', 'db_delete', 'db_restore', 'db_stat', 'db_action', 'db_content', 'db_asset', 'db_doc']) {
     assert.equal(names.includes(name), true, name)
   }
+  for (const name of ['db_list', 'db_read', 'db_stat']) {
+    assert.equal(ctx.tools.executionMode(name), 'parallel', name)
+  }
+  assert.equal(ctx.tools.executionMode('db_update'), 'exclusive')
+  assert.equal(ctx.tools.executionMode('db_content', { path: '/pages/p1', command: 'view' }), 'parallel')
+  assert.equal(ctx.tools.executionMode('db_content', { path: '/pages/p1', command: 'write', value: 'x' }), 'exclusive')
+  assert.equal(ctx.tools.executionMode('db_asset', { path: '/pages/p1', command: 'view' }), 'parallel')
+  assert.equal(ctx.tools.executionMode('db_asset', { path: '/pages/p1', command: 'write', value: 'x' }), 'exclusive')
   const listed = await ctx.tools.invoke('db_list', { path: '/' })
   assert.equal((listed as { kind: string }).kind, 'root')
+  const items = ((listed as { items: Array<{ path: string; view?: { blurb?: string } }> }).items ?? [])
+  const paths = items.map((item) => item.path)
+  assert.equal(paths.includes('/views'), true)
+  assert.equal(paths.includes('/facets'), true)
+  assert.equal(paths.includes('/notices'), false)
+  assert.equal(paths.includes('/asset-gc'), false)
+  assert.equal(paths.includes('/trash'), true)
+  const views = items.find((item) => item.path === '/views')
+  assert.match(String(views?.view?.blurb ?? ''), /db_list \/views/)
+  assert.match(String(views?.view?.blurb ?? ''), /filterTree/)
+  assert.match(String(views?.view?.blurb ?? ''), /kind":"rule"/)
+  const facets = items.find((item) => item.path === '/facets')
+  assert.match(String(facets?.view?.blurb ?? ''), /db_list \/facets/)
+})
+
+test('db_create tool ignores empty companion records instead of creating blank rows', async () => {
+  const ctx = new Context()
+  await ctx.plugin(tools)
+  class HttpStub extends Service {
+    constructor(c: Context) {
+      super(c, 'http')
+    }
+    route() {}
+  }
+  new HttpStub(ctx)
+  await ctx.plugin({ inject: ['tools', 'http'], apply: applyFileSystem })
+  const received: Array<Record<string, unknown>> = []
+  const db = ctx.get('database') as DatabaseService
+  db.register({
+    id: 'drafts',
+    path: '/drafts',
+    schema: {
+      labelField: 'title',
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+      },
+    },
+    records: { create: true },
+    list: () => [],
+    get: () => null,
+    create: (rows) => {
+      received.push(...rows)
+      return rows.map((row, index) => ({ id: `draft-${index}`, ...row }))
+    },
+  })
+
+  await ctx.tools.invoke('db_create', {
+    path: '/drafts',
+    records: [{ title: '目标技能' }, {}],
+  })
+
+  assert.deepEqual(received, [{ title: '目标技能' }])
+  received.length = 0
+  await db.create('/drafts', [{}, {}])
+  assert.deepEqual(received, [{}])
+})
+
+test('title-only plugin list still returns action when flags', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = [
+    { id: 'run', title: '运行中', installed: true, running: true, sandbox: true, builtin: true },
+    { id: 'idle', title: '已装', installed: true, sandbox: true },
+    { id: 'dev', title: '沙箱', sandbox: true },
+  ]
+  db.register({
+    id: 'plugins',
+    path: '/plugins',
+    label: '插件',
+    schema: {
+      labelField: 'title',
+      fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string' }, builtin: { type: 'boolean' } },
+    },
+    list: () => rows,
+    get: (id) => rows.find((row) => row.id === id) ?? null,
+    actions: [
+      { id: 'start', label: '运行', when: { installed: true, running: false }, run: async () => ({}) },
+      { id: 'stop', label: '停止', when: { installed: true, running: true }, run: async () => ({}) },
+      { id: 'pack', label: '安装', when: { sandbox: true, installed: false }, run: async () => ({}) },
+      { id: 'uninstall', label: '卸载', when: { installed: true }, run: async () => ({}) },
+    ],
+  })
+  const listed = await db.list('/plugins', undefined, { columns: ['title'] })
+  assert.equal(listed.kind, 'collection')
+  if (listed.kind !== 'collection') return
+  const run = listed.items.find((row) => row.id === 'run')
+  const idle = listed.items.find((row) => row.id === 'idle')
+  const dev = listed.items.find((row) => row.id === 'dev')
+  assert.equal(run?.title, '运行中')
+  assert.equal(run?.installed, true)
+  assert.equal(run?.running, true)
+  assert.equal(run?.sandbox, true)
+  assert.equal(run?.builtin, true)
+  assert.equal(idle?.installed, true)
+  assert.equal(idle?.sandbox, true)
+  assert.equal(dev?.sandbox, true)
+  assert.equal('status' in (run ?? {}), false)
+})
+
+test('db_list columns returns only those fields plus id', async () => {
+  const ctx = new Context()
+  await ctx.plugin(tools)
+  class HttpStub extends Service {
+    constructor(c: Context) {
+      super(c, 'http')
+    }
+    route() {}
+  }
+  new HttpStub(ctx)
+  await ctx.plugin({ inject: ['tools', 'http'], apply: applyFileSystem })
+  const db = ctx.get('database') as DatabaseService
+  db.register(notesCollection())
+  const listed = await ctx.tools.invoke('db_list', { path: '/notes', columns: ['label'] }) as {
+    columns: string[]
+    rows: unknown[][]
+  }
+  assert.deepEqual(listed.columns, ['id', 'title', 'pinned'])
+  assert.deepEqual(listed.rows[0], ['n1', '草稿', false])
+})
+
+test('agent db_stat omits builtin fields; service stat and list still include them', async () => {
+  const ctx = new Context()
+  await ctx.plugin(tools)
+  class HttpStub extends Service {
+    constructor(c: Context) {
+      super(c, 'http')
+    }
+    route() {}
+  }
+  new HttpStub(ctx)
+  await ctx.plugin({ inject: ['tools', 'http'], apply: applyFileSystem })
+  const db = ctx.get('database') as DatabaseService
+  db.register(notesCollection())
+  const serviceStat = await db.stat('/notes')
+  if (serviceStat.kind !== 'collection') return
+  assert.equal(serviceStat.schema.fields.id?.type, 'string')
+  assert.equal(serviceStat.schema.fields.facet?.type, 'facet')
+  const listed = await db.list('/notes')
+  assert.ok(listed.schema.fields.status)
+  const agentStat = (await ctx.tools.invoke('db_stat', { path: '/notes' })) as {
+    schema?: { fields?: Record<string, unknown>; records?: unknown }
+    caps?: string[]
+  }
+  assert.equal(agentStat.schema?.fields && 'id' in agentStat.schema.fields, false)
+  assert.equal((agentStat.schema?.fields as { facet?: { type?: string } } | undefined)?.facet?.type, 'facet')
+  assert.ok(agentStat.schema?.fields && 'status' in agentStat.schema.fields)
+  assert.equal(agentStat.schema?.records, undefined)
+  assert.ok(agentStat.caps?.includes('list'))
+  const agentList = (await ctx.tools.invoke('db_list', { path: '/notes' })) as {
+    schema?: unknown
+    columns?: string[]
+    rows?: unknown[][]
+    items?: unknown
+  }
+  assert.equal(agentList.schema, undefined)
+  assert.equal(agentList.items, undefined)
+  assert.ok(agentList.columns?.includes('id'))
+  assert.ok(agentList.columns?.includes('title'))
+  assert.equal(agentList.columns?.includes('path'), false)
+  assert.ok((agentList.rows?.length ?? 0) >= 1)
+  const updated = (await ctx.tools.invoke('db_update', { path: '/notes/n1', content: { status: 'done' } })) as {
+    ok?: boolean
+    path?: string
+    value?: unknown
+  }
+  assert.deepEqual(updated, { ok: true, path: '/notes/n1' })
+})
+
+
+test('db_list on a table broadcasts inspector working then done', async () => {
+  const seen: Array<{ type: string; payload: unknown }> = []
+  const ctx = new Context()
+  await ctx.plugin(tools)
+  class HttpStub extends Service {
+    constructor(c: Context) {
+      super(c, 'http')
+    }
+    route() {}
+    broadcast(type: string, payload: unknown) {
+      seen.push({ type, payload })
+    }
+  }
+  new HttpStub(ctx)
+  await ctx.plugin({ inject: ['tools', 'http'], apply: applyFileSystem })
+  await runWithSession('s1', () => ctx.tools.invoke('db_list', { path: '/views' }))
+  const reveals = seen.filter((item) => {
+    const payload = item.payload as { reveal?: { collection?: string }; phase?: string }
+    return item.type === 'database' && payload?.reveal?.collection === '/views'
+  })
+  assert.equal((reveals[0]?.payload as { phase?: string; sessionId?: string }).phase, 'working')
+  assert.equal((reveals[0]?.payload as { sessionId?: string }).sessionId, 's1')
+  assert.equal((reveals.at(-1)?.payload as { phase?: string; sessionId?: string }).phase, 'done')
+  assert.equal((reveals.at(-1)?.payload as { sessionId?: string }).sessionId, 's1')
+  const before = seen.length
+  await ctx.tools.invoke('db_list', { path: '/' })
+  const extra = seen.slice(before).filter((item) => {
+    const payload = item.payload as { reveal?: unknown }
+    return item.type === 'database' && payload?.reveal
+  })
+  assert.equal(extra.length, 0)
+})
+
+test('db_create /views reveals the source table and view', async () => {
+  const seen: Array<{ type: string; payload: unknown }> = []
+  const ctx = new Context()
+  await ctx.plugin(tools)
+  class HttpStub extends Service {
+    constructor(c: Context) {
+      super(c, 'http')
+    }
+    route() {}
+    broadcast(type: string, payload: unknown) {
+      seen.push({ type, payload })
+    }
+  }
+  new HttpStub(ctx)
+  await ctx.plugin({ inject: ['tools', 'http'], apply: applyFileSystem })
+  const db = ctx.get('database') as DatabaseService
+  db.register(notesCollection())
+  const created = await runWithSession('s1', () =>
+    ctx.tools.invoke('db_create', {
+      path: '/views',
+      records: [{ tablePath: '/notes', title: '看板', mode: 'graph' }],
+    }),
+  ) as { ids?: string[] }
+  const id = created.ids?.[0]
+  assert.equal(typeof id, 'string')
+  const viewId = String(id).split('::')[1]
+  assert.equal(typeof viewId, 'string')
+  const done = [...seen].reverse().find((item) => {
+    const payload = item.payload as { phase?: string; reveal?: { collection?: string; viewId?: string } }
+    return item.type === 'database' && payload?.phase === 'done' && payload.reveal?.collection === '/notes'
+  })
+  const payload = done?.payload as {
+    sessionId?: string
+    reveal?: { collection?: string; viewId?: string }
+    savedView?: { name?: string; mode?: string }
+  }
+  assert.equal(payload.sessionId, 's1')
+  assert.equal(payload.reveal?.viewId, viewId)
+  assert.equal(payload.savedView?.name, '看板')
+  assert.equal(payload.savedView?.mode, 'graph')
 })
 
 test('register rejects duplicate view route and nav title', async () => {
@@ -277,6 +1231,33 @@ test('register rejects duplicate view route and nav title', async () => {
   assert.throws(() => db.register(dupName), /名称重复/)
 })
 
+test('allowMissing actions can run before the record exists', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, { id: string; title: string }>()
+  db.register({
+    id: 'notes',
+    path: '/notes',
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string' } } },
+    list: () => [...rows.values()],
+    get: (id) => rows.get(id) ?? null,
+    actions: [
+      {
+        id: 'seed',
+        label: 'seed',
+        allowMissing: true,
+        run: (id) => {
+          rows.set(id, { id, title: 'seeded' })
+          return { id }
+        },
+      },
+    ],
+  })
+  const done = await db.action('/notes/n9', 'seed')
+  assert.deepEqual(done.result, { id: 'n9' })
+  assert.equal((await db.read('/notes/n9')).kind, 'record')
+})
+
 test('registered actions run when when-clause matches', async () => {
   const ctx = new Context()
   const db = new DatabaseService(ctx)
@@ -286,9 +1267,27 @@ test('registered actions run when when-clause matches', async () => {
   if (stat.kind !== 'collection') return
   assert.equal(stat.schema.actions?.[0]?.id, 'pin')
   assert.equal('run' in (stat.schema.actions?.[0] ?? {}), false)
-  const done = await db.action('/notes/n1', 'pin')
-  assert.equal((done.value as unknown as { pinned: boolean }).pinned, true)
+  const pinned = await db.action('/notes/n1', 'pin')
+  assert.equal((pinned.value as unknown as { pinned: boolean }).pinned, true)
   await assert.rejects(() => db.action('/notes/n1', 'pin'), /not available/)
+})
+
+test('agent-only actions stay in schema but have empty placement', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.register({
+    ...notesCollection(),
+    actions: [
+      { id: 'pin', label: '钉住', when: { pinned: false }, run: async () => ({}) },
+      { id: 'progress', label: '进度', for: 'agent', run: async () => ({}) },
+    ],
+  })
+  const stat = await db.stat('/notes')
+  if (stat.kind !== 'collection') return
+  const progress = stat.schema.actions?.find((item) => item.id === 'progress')
+  assert.equal(progress?.for, 'agent')
+  assert.deepEqual(progress?.placement, [])
+  assert.equal(JSON.parse(JSON.stringify(progress)).for, 'agent')
 })
 
 test('create and delete follow records caps declared at register', async () => {
@@ -299,18 +1298,23 @@ test('create and delete follow records caps declared at register', async () => {
   db.register({
     id: 'notes',
     path: '/notes',
-    schema: { fields: { title: { type: 'string', writable: true } } },
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string', writable: true } } },
     records: { create: true, delete: true },
     list: () => [...rows.values()],
     get: (id) => rows.get(id) ?? null,
-    create: (fields = {}) => {
-      const id = `n${rows.size + 1}`
-      const row = { id, title: typeof fields.title === 'string' ? fields.title : '未命名' }
-      rows.set(id, row)
-      return row
-    },
-    remove: (id) => {
-      if (!rows.delete(id)) throw new Error('unknown')
+    create: (incoming) =>
+      incoming.map((fields) => {
+        const id = `n${rows.size + 1}`
+        const row = { id, title: typeof fields.title === 'string' ? fields.title : '未命名' }
+        rows.set(id, row)
+        return row
+      }),
+    remove: (query) => {
+      const ids = query.ids ?? []
+      for (const id of ids) {
+        if (!rows.delete(id)) throw new Error('unknown')
+      }
+      return ids
     },
   })
   const stat = await db.stat('/notes')
@@ -320,15 +1324,434 @@ test('create and delete follow records caps declared at register', async () => {
   assert.equal(stat.schema.records?.delete, true)
   assert.equal((stat.caps as string[]).includes('create'), true)
   assert.equal((stat.caps as string[]).includes('delete'), true)
-  const created = await db.create('/notes', { title: '新笔记' })
-  assert.equal(created.value.title, '新笔记')
+  const created = await db.create('/notes', [{ title: '新笔记' }, { title: '第二篇' }])
+  assert.equal(created.items.length, 2)
+  assert.equal(created.items[0]?.value.title, '新笔记')
   const listed = await db.list('/notes')
   if (listed.kind !== 'collection') return
-  assert.equal(listed.items.length, 2)
-  await db.remove(`${created.path}`)
+  assert.equal(listed.items.length, 3)
+  await db.remove('/notes', { ids: [String(created.items[0]?.value.id)] })
+  const afterOne = await db.list('/notes')
+  if (afterOne.kind !== 'collection') return
+  assert.equal(afterOne.items.length, 2)
+  await db.remove('/notes', { q: '第二篇' })
   const after = await db.list('/notes')
   if (after.kind !== 'collection') return
   assert.equal(after.items.length, 1)
+  await assert.rejects(() => db.remove('/notes', {}), /delete requires/)
+})
+
+test('delete parks records in trash and restore puts them back', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, { id: string; title: string }>([['n1', { id: 'n1', title: '草稿' }]])
+  db.register({
+    id: 'notes',
+    path: '/notes',
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string', writable: true } } },
+    records: { create: true, delete: true },
+    list: () => [...rows.values()],
+    get: (id) => rows.get(id) ?? null,
+    create: () => [],
+    remove: (query) => {
+      const ids = query.ids ?? []
+      for (const id of ids) rows.delete(id)
+      return ids
+    },
+  })
+  const gone = await db.remove('/notes', { ids: ['n1'] })
+  assert.equal((gone as { trash?: boolean }).trash, true)
+  const listed = await db.list('/notes')
+  if (listed.kind !== 'collection') return
+  assert.equal(listed.items.length, 0)
+  assert.equal(rows.has('n1'), true)
+  await assert.rejects(() => db.read('/notes/n1'), /unknown record/)
+  const bin = await db.listTrash()
+  assert.equal(bin.items.length, 1)
+  assert.equal(bin.items[0]?.title, '草稿')
+  await db.restore('/notes', { ids: ['n1'] })
+  const back = await db.list('/notes')
+  if (back.kind !== 'collection') return
+  assert.equal(back.items.length, 1)
+  await db.remove('/notes', { ids: ['n1'], purge: true })
+  assert.equal(rows.has('n1'), false)
+})
+
+test('sessions delete parks in trash until purge', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, { id: string; title: string }>([['s1', { id: 's1', title: '代理' }]])
+  db.register({
+    id: 'sessions',
+    path: '/agents',
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string', writable: true } } },
+    records: { create: true, delete: true },
+    list: () => [...rows.values()],
+    get: (id) => rows.get(id) ?? null,
+    create: () => [],
+    remove: (query) => {
+      const ids = query.ids ?? []
+      for (const id of ids) rows.delete(id)
+      return ids
+    },
+  })
+  const gone = await db.remove('/agents', { ids: ['s1'] })
+  assert.equal((gone as { trash?: boolean }).trash, true)
+  assert.equal(rows.has('s1'), true)
+  const listed = await db.list('/agents')
+  if (listed.kind !== 'collection') return
+  assert.equal(listed.items.length, 0)
+  await db.restore('/agents', { ids: ['s1'] })
+  const back = await db.list('/agents')
+  if (back.kind !== 'collection') return
+  assert.equal(back.items.length, 1)
+  await db.remove('/agents', { ids: ['s1'], purge: true })
+  assert.equal(rows.has('s1'), false)
+})
+
+test('trash collection lists deleted rows and restore/delete actions', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, { id: string; title: string }>([['n1', { id: 'n1', title: '草稿' }]])
+  db.register({
+    id: 'notes',
+    path: '/notes',
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string', writable: true } } },
+    records: { create: true, delete: true },
+    list: () => [...rows.values()],
+    get: (id) => rows.get(id) ?? null,
+    create: () => [],
+    remove: (query) => {
+      const ids = query.ids ?? []
+      for (const id of ids) rows.delete(id)
+      return ids
+    },
+  })
+  db.register(trashCollection(db))
+  await db.remove('/notes', { ids: ['n1'] })
+  const listed = await db.list('/trash')
+  if (listed.kind !== 'collection') return
+  assert.equal(listed.items.length, 1)
+  assert.equal(listed.items[0]?.id, 'notes::n1')
+  assert.equal(listed.items[0]?.title, '草稿')
+  assert.equal(listed.items[0]?.table, 'notes')
+  const actions = listed.schema.actions?.map((item) => item.id) ?? []
+  assert.deepEqual(actions, ['restore', 'delete'])
+  await db.action('/trash/notes::n1', 'restore')
+  const live = await db.list('/notes')
+  if (live.kind !== 'collection') return
+  assert.equal(live.items.length, 1)
+  const empty = await db.list('/trash')
+  if (empty.kind !== 'collection') return
+  assert.equal(empty.items.length, 0)
+  await db.remove('/notes', { ids: ['n1'] })
+  await db.action('/trash/notes::n1', 'delete')
+  assert.equal(rows.has('n1'), false)
+  const gone = await db.list('/trash')
+  if (gone.kind !== 'collection') return
+  assert.equal(gone.items.length, 0)
+})
+
+test('facet catalog is workspace-wide and collect uses sqlite stamps', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.register(notesCollection())
+  const pages = new Map<string, Record<string, unknown>>([['p1', { id: 'p1', title: '首页' }]])
+  db.register({
+    id: 'pages',
+    path: '/pages',
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string', writable: true } } },
+    records: { update: true },
+    list: () => [...pages.values()] as { id: string }[],
+    get: (id) => pages.get(id) as { id: string } | undefined,
+    update: (id, patch) => {
+      const next = { ...pages.get(id), ...patch, id }
+      pages.set(id, next)
+      return next as { id: string }
+    },
+  })
+  db.facets.replace([{ id: 'dp', label: '动态规划', fields: [] }])
+  await db.update('/notes/n1', { facet: { tags: ['dp'], values: {} } })
+  await db.update('/pages/p1', { facet: { tags: ['dp'], values: {} } })
+  const collected = await db.collectFacet('动态规划')
+  assert.equal(collected.facet?.id, 'dp')
+  assert.equal(collected.items.length, 2)
+  assert.deepEqual(collected.items.map((item) => item.path).sort(), ['/notes/n1', '/pages/p1'])
+})
+
+test('listing /facets with tag filter returns stamped records as a table', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.register(notesCollection())
+  db.register(facetsCollection(db.facets, () => [{ id: 'notes', path: '/notes', label: '笔记' }]))
+  db.facets.replace([{ id: 'dp', label: '动态规划', fields: [{ key: 'complexity', type: 'string', label: '复杂度' }] }])
+  await db.update('/notes/n1', { facet: { tags: ['dp'], values: { dp: { 复杂度: 'O(n)' } } } })
+  const listed = await db.list('/facets', { facetId: 'dp' })
+  if (listed.kind !== 'collection') return
+  assert.equal(listed.items.length, 1)
+  assert.equal(listed.items[0]?.id, 'notes::n1')
+  assert.equal(listed.items[0]?.table, '笔记')
+  assert.equal(listed.items[0]?.sourceId, 'n1')
+  assert.equal(listed.items[0]?.complexity, 'O(n)')
+  assert.equal(listed.schema.fields.complexity?.label, '复杂度')
+  assert.deepEqual(listed.schema.columns, ['title', 'table', 'complexity'])
+})
+
+test('facet list filter asks the collection only for stamped ids', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, Record<string, unknown>>([
+    ['a', { id: 'a', title: 'A' }],
+    ['b', { id: 'b', title: 'B' }],
+  ])
+  let listed: string[] | undefined
+  db.register({
+    id: 'notes',
+    path: '/notes',
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string', writable: true } } },
+    records: { update: true },
+    list: (query) => {
+      listed = query?.ids
+      if (query?.ids) return query.ids.map((id) => rows.get(id)).filter(Boolean) as { id: string }[]
+      return [...rows.values()] as { id: string }[]
+    },
+    get: (id) => rows.get(id) as { id: string } | undefined,
+    update: (id, patch) => {
+      const next = { ...rows.get(id), ...patch, id }
+      rows.set(id, next)
+      return next as { id: string }
+    },
+  })
+  const empty = await db.list('/notes', { facet: 'dp' })
+  if (empty.kind !== 'collection') return
+  assert.equal(empty.items.length, 0)
+  assert.equal(listed, undefined)
+  db.facets.replace([{ id: 'dp', label: '动态规划', fields: [] }])
+  await db.update('/notes/a', { facet: { tags: ['dp'], values: {} } })
+  listed = undefined
+  const filtered = await db.list('/notes', { facet: 'dp' })
+  if (filtered.kind !== 'collection') return
+  assert.deepEqual(listed, ['a'])
+  assert.equal(filtered.items.length, 1)
+  assert.equal(filtered.items[0]?.id, 'a')
+})
+
+test('facet schema can be written on tables that cannot update other fields', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, Record<string, unknown>>([['p1', { id: 'p1', title: 'Demo' }]])
+  db.register({
+    id: 'plugins',
+    path: '/plugins',
+    label: '插件',
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string' } } },
+    records: { update: false, delete: true },
+    list: () => [...rows.values()] as { id: string }[],
+    get: (id) => (rows.get(id) as { id: string } | undefined) ?? null,
+    remove: (query) => query.ids ?? [],
+  })
+  db.facets.replace([{ id: 'dp', label: '动态规划', fields: [{ key: 'complexity', type: 'string', label: '复杂度' }] }])
+  await assert.rejects(() => db.update('/plugins/p1', { title: '改名' }), /cannot update/)
+  const written = await db.update('/plugins/p1', { facet: { tags: ['dp'], values: { dp: { 复杂度: 'O(n)' } } } })
+  assert.deepEqual((written.value as { facet?: { tags?: string[] } }).facet?.tags, ['dp'])
+  const read = await db.read('/plugins/p1')
+  if (read.kind !== 'record') return
+  assert.equal((read.value.facet as { values?: { dp?: { complexity?: string } } }).values?.dp?.complexity, 'O(n)')
+  const listed = await db.list('/plugins')
+  if (listed.kind !== 'collection') return
+  assert.deepEqual((listed.items[0]?.facet as { tags?: string[] })?.tags, ['dp'])
+  const collected = await db.collectFacet('dp')
+  assert.equal(collected.items.length, 1)
+  assert.equal(collected.items[0]?.path, '/plugins/p1')
+  await db.update('/plugins/p1', { emoji: '🔌' })
+  const withEmoji = await db.read('/plugins/p1')
+  if (withEmoji.kind !== 'record') return
+  assert.equal(withEmoji.value.emoji, '🔌')
+  assert.deepEqual((withEmoji.value.facet as { tags?: string[] })?.tags, ['dp'])
+  await db.update('/plugins/p1', { banner: { kind: 'htmlframe', html: '<script></script>' } })
+  const withBanner = await db.read('/plugins/p1')
+  if (withBanner.kind !== 'record') return
+  assert.deepEqual(withBanner.value.banner, { kind: 'htmlframe', html: '<script></script>' })
+  assert.equal(withBanner.value.emoji, '🔌')
+})
+
+test('writeContent can persist intro on tables that cannot update other fields', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, Record<string, unknown>>([['p1', { id: 'p1', title: 'Demo', readme: '' }]])
+  db.register({
+    id: 'plugins',
+    path: '/plugins',
+    label: '插件',
+    schema: {
+      contentField: 'readme',
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string' },
+        readme: { type: 'file', label: '介绍', writable: true },
+      },
+    },
+    records: { update: false, delete: true },
+    list: () => [...rows.values()] as { id: string }[],
+    get: (id) => (rows.get(id) as { id: string } | undefined) ?? null,
+    update: async (id, patch) => {
+      const extra = Object.keys(patch).filter((key) => key !== 'readme')
+      if (extra.length) throw new Error(`plugin fields not writable: ${extra.join(', ')}`)
+      const next = { ...rows.get(id), ...patch, id }
+      rows.set(id, next)
+      return next as { id: string }
+    },
+    remove: (query) => query.ids ?? [],
+  })
+  await assert.rejects(() => db.update('/plugins/p1', { title: '改名' }), /cannot update/)
+  const written = await db.writeContent('/plugins/p1', '# Demo\n')
+  assert.equal(written.field, 'readme')
+  assert.equal(written.value, '# Demo\n')
+  const body = await db.content('/plugins/p1')
+  assert.equal(body.value, '# Demo\n')
+})
+
+test('db_update /facets writes facet field packs', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.register(facetsCollection(db.facets))
+  const created = await db.create('/facets', [{ title: '动态规划' }])
+  const id = String(created.items[0]?.value.id)
+  const asArray = await db.update(`/facets/${id}`, {
+    fields: [{ key: 'complexity', type: 'string', label: '复杂度' }],
+  })
+  assert.equal(asArray.value.fieldCount, 1)
+  assert.equal(db.facets.get(id)?.fields[0]?.key, 'complexity')
+  assert.equal(db.facets.get(id)?.fields[0]?.label, '复杂度')
+  const updated = await db.update(`/facets/${id}`, {
+    fields: JSON.stringify([{ key: 'complexity', type: 'string', label: '复杂度' }]),
+  })
+  assert.equal(updated.value.fieldCount, 1)
+  assert.equal(db.facets.get(id)?.fields[0]?.key, 'complexity')
+  await assert.rejects(
+    () => db.update(`/facets/${id}`, { fields: [{ key: 'oops', type: 'text' }] }),
+    /unknown field type: text\. allowed: /,
+  )
+  await assert.rejects(
+    () => db.update(`/facets/${id}`, { fields: [{ key: '1', type: 'string', label: '甲' }, { key: '2', type: 'number', label: '甲' }] }),
+    /duplicate field name/,
+  )
+  const stat = await db.stat('/facets')
+  if (stat.kind === 'collection') {
+    assert.equal(stat.schema.fields.fields?.example, '[{"key":"类别","type":"string"}]')
+    assert.match(String(stat.schema.fields.fields?.description), /facet::<本标签id>::<字段key>/)
+  }
+  const body = await db.writeContent(`/facets/${id}`, '# 标签说明')
+  assert.equal(body.field, 'notes')
+  assert.equal(body.value, '# 标签说明')
+  const listed = await db.list('/facets')
+  if (listed.kind !== 'collection') return
+  assert.equal('notes' in listed.items[0]!, false)
+  const read = await db.content(`/facets/${id}`)
+  assert.equal(read.value, '# 标签说明')
+})
+
+test('db_update page facet stores flat property values on the stamp', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const pages = new Map<string, Record<string, unknown>>([['p1', { id: 'p1', title: '爱乐之城' }]])
+  db.register({
+    id: 'pages',
+    path: '/pages',
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string', writable: true } } },
+    records: { update: true },
+    list: () => [...pages.values()] as { id: string }[],
+    get: (id) => pages.get(id) as { id: string } | undefined,
+    update: (id, patch) => {
+      const next = { ...pages.get(id), ...patch, id }
+      pages.set(id, next)
+      return next as { id: string }
+    },
+  })
+  db.register(facetsCollection(db.facets))
+  const created = await db.create('/facets', [{ title: '电影' }])
+  const id = String(created.items[0]?.value.id)
+  await db.update(`/facets/${id}`, {
+    fields: JSON.stringify([
+      { key: 'director', type: 'string', label: '导演' },
+      { key: 'year', type: 'number', label: '年份' },
+      { key: 'score', type: 'number', label: '评分' },
+    ]),
+  })
+  const tagged = await db.update('/pages/p1', {
+    facet: { tags: [id], values: { 导演: '查泽雷', 年份: 2016, 评分: 8.6 } },
+  })
+  assert.deepEqual(tagged.value.facet, {
+    tags: [id],
+    values: { [id]: { director: '查泽雷', year: 2016, score: 8.6 } },
+  })
+  assert.equal(db.facets.recordFacet('/pages', 'p1')?.values[id]?.director, '查泽雷')
+  const merged = await db.update('/pages/p1', { facet: { values: { 导演: 'Damien Chazelle' } } })
+  assert.equal(merged.value.facet.values[id].director, 'Damien Chazelle')
+  assert.equal(merged.value.facet.values[id].year, 2016)
+  const cleared = await db.update('/pages/p1', { facet: { values: { 导演: '' } } })
+  assert.equal(cleared.value.facet.values[id].director, '')
+  assert.equal(cleared.value.facet.values[id].year, 2016)
+
+  const awards = await db.create('/facets', [{ title: '奖项' }])
+  const awardId = String(awards.items[0]?.value.id)
+  await db.update(`/facets/${awardId}`, {
+    fields: JSON.stringify([{ key: 'oscar', type: 'boolean', label: '奥斯卡' }]),
+  })
+  const both = await db.update('/pages/p1', {
+    facet: {
+      tags: [id, awardId],
+      values: {
+        [id]: { 导演: '查泽雷' },
+        [awardId]: { 奥斯卡: true },
+      },
+    },
+  })
+  assert.deepEqual(both.value.facet.tags, [id, awardId])
+  assert.equal(both.value.facet.values[id].director, '查泽雷')
+  assert.equal(both.value.facet.values[id].year, 2016)
+  assert.equal(both.value.facet.values[awardId].oscar, true)
+  const onlyAward = await db.update('/pages/p1', { facet: { values: { [awardId]: { oscar: false } } } })
+  assert.equal(onlyAward.value.facet.values[awardId].oscar, false)
+  assert.equal(onlyAward.value.facet.values[id].director, '查泽雷')
+  const col = `facet::${id}::director`
+  const listed = await db.list('/pages', undefined, { columns: [col] })
+  if (listed.kind !== 'collection') return
+  assert.equal(listed.items[0]?.[col], '查泽雷')
+})
+
+test('db_update /views columns accepts array or JSON array and rejects fragments', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const store = new SavedViewsStore()
+  db.register({
+    id: 'pages',
+    path: '/pages',
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string', writable: true } } },
+    list: () => [],
+    get: () => null,
+  })
+  db.register(
+    viewsCollection(store, () => [
+      { path: '/pages', id: 'pages', kind: 'collection', label: '页面', view: { title: '页面' } },
+    ]),
+  )
+  const created = await db.create('/views', [{ title: '需求', tablePath: '/pages', columns: ['title'] }])
+  const id = String(created.items[0]?.value.id)
+  const asArray = await db.update(`/views/${id}`, { columns: ['title', 'facet'] })
+  assert.deepEqual(asArray.value.columns, ['title', 'facet'])
+  const asJson = await db.update(`/views/${id}`, { columns: '["title","facet","facet::facet::category"]' })
+  assert.deepEqual(asJson.value.columns, ['title', 'facet', 'facet::facet::category'])
+  await assert.rejects(
+    () => db.update(`/views/${id}`, { columns: '["title","facet"' }),
+    /expected string list as JSON array/,
+  )
+  const read = await db.read(`/views/${id}`)
+  if (read.kind !== 'record') return
+  assert.deepEqual(read.value.columns, ['title', 'facet', 'facet::facet::category'])
+  const stat = await db.stat('/views')
+  if (stat.kind !== 'collection') return
+  assert.deepEqual(stat.schema.fields.columns?.example, ['title', 'facet', 'facet::facet::category'])
 })
 
 test('tables without records.create/delete reject create and delete', async () => {
@@ -340,17 +1763,1289 @@ test('tables without records.create/delete reject create and delete', async () =
   assert.equal(stat.schema.records?.create, false)
   assert.equal(stat.schema.records?.delete, false)
   await assert.rejects(() => db.create('/notes'), /cannot create/)
-  await assert.rejects(() => db.remove('/notes/n1'), /cannot delete/)
+  await assert.rejects(() => db.remove('/notes', { ids: ['n1'] }), /cannot delete/)
   assert.throws(
     () =>
       db.register({
         id: 'broken',
         path: '/broken',
-        schema: { fields: {} },
+        schema: { fields: { ...REQUIRED_RECORD_FIELDS } },
         records: { create: true },
         list: () => [],
         get: () => null,
       }),
     /必须提供 create/,
+  )
+})
+
+test('db tools follow the same workspace boundary as the file-system UI', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.register(notesCollection())
+  let active = 'ws-b'
+  const home = 'ws-home'
+  const mine = new Set<string>()
+  const any = new Set(['/notes\tn1'])
+  class FakeAccount extends Service {
+    store = {
+      activeWorkspaceId: () => active,
+      homeWorkspaceId: () => home,
+      membership: () => ({ active, home, mine, any }),
+      attach() {},
+    }
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  await ctx.plugin(FakeAccount)
+
+  const hidden = await db.list('/notes')
+  assert.equal(hidden.kind, 'collection')
+  if (hidden.kind === 'collection') assert.deepEqual(hidden.items.map((item) => item.id), [])
+  for (const op of [
+    () => db.read('/notes/n1'),
+    () => db.update('/notes/n1', { status: 'done' }),
+    () => db.stat('/notes/n1'),
+    () => db.content('/notes/n1'),
+    () => db.editContent('/notes/n1', { command: 'view' }),
+    () => db.editAsset('/notes/n1'),
+    () => db.editDoc('/notes/n1'),
+    () => db.action('/notes/n1', 'pin'),
+  ]) {
+    await assert.rejects(op, /unknown record/)
+  }
+  mine.add('/notes\tn1')
+  const own = await db.read('/notes/n1')
+  assert.equal(own.kind, 'record')
+  mine.delete('/notes\tn1')
+  db.facets.markDeleted('/notes', 'n1')
+  const restored = await db.restore('/notes', { ids: ['n1'] })
+  assert.equal(restored.kind, 'restored')
+  if (restored.kind === 'restored') assert.deepEqual(restored.ids, [])
+  const bin = await db.listTrash()
+  assert.deepEqual(bin.items.map((item) => item.id), [])
+
+  active = home
+  const homeList = await db.list('/notes')
+  if (homeList.kind === 'collection') assert.deepEqual(homeList.items.map((item) => item.id), ['n2'])
+})
+
+test('file-system CRUD uses the unified account authorization decision', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.register(notesCollection())
+  const dir = mkdtempSync(join(tmpdir(), 'biu-db-authz-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    workspaceLocation = () => 'cloud' as const
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  await ctx.plugin(AccountBridge)
+  const ada = collab.register('', Date.now(), 'secret1', 'ada@example.com')
+  const bob = collab.register('', Date.now(), 'secret1', 'bob@example.com')
+  const workspace = collab.createWorkspace(ada.id, 'Shared')
+  collab.addMemberByEmail(ada.id, workspace.id, bob.email)
+  collab.setActive(ada.id, workspace.id)
+  collab.setActive(bob.id, workspace.id)
+  runWithAccount(ada.id, () => collab.attach(workspace.id, '/notes', 'n1'))
+  runWithAccount(bob.id, () => collab.attach(workspace.id, '/notes', 'n2'))
+  collab.saveWorkspaceProfile(ada.id, { name: 'Ada 空间昵称', avatar: '' })
+
+  const adaList = await runWithAccount(ada.id, () => db.list('/notes'))
+  const bobList = await runWithAccount(bob.id, () => db.list('/notes'))
+  if (adaList.kind === 'collection') assert.deepEqual(adaList.items.map((row) => row.id), ['n1'])
+  if (bobList.kind === 'collection') assert.deepEqual(bobList.items.map((row) => row.id), ['n2'])
+  const stamped = await runWithAccount(ada.id, () => db.update('/notes/n1', { status: 'done' }))
+  assert.deepEqual(stamped.value.createdBy, { kind: 'user', name: 'Ada 空间昵称', accountId: ada.id })
+  assert.deepEqual(stamped.value.updatedBy, [{ kind: 'user', name: 'Ada 空间昵称', accountId: ada.id }])
+  await assert.rejects(
+    () => runWithAccount(bob.id, () => db.update('/notes/n1', { title: '偷改' })),
+    /unknown record/,
+  )
+  db.facets.replaceContentRefs('/notes', 'n1', ['private.png'])
+  assert.doesNotThrow(() => runWithAccount(ada.id, () => db.requireAsset('private.png', 'resource:read')))
+  assert.throws(
+    () => runWithAccount(bob.id, () => db.requireAsset('private.png', 'resource:read')),
+    /permission denied/,
+  )
+  collab.authorization.grant(
+    ada.id,
+    { type: 'record', workspaceId: workspace.id, collection: '/notes', recordId: 'n1' },
+    'account',
+    bob.id,
+    'viewer',
+  )
+  assert.doesNotThrow(() => runWithAccount(bob.id, () => db.requireAsset('private.png', 'resource:read')))
+  assert.throws(
+    () => runWithAccount(bob.id, () => db.requireAsset('private.png', 'resource:update')),
+    /permission denied/,
+  )
+})
+
+test('create scope separates personal and workspace records and viewers stay read-only', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, DbRecord>()
+  let seq = 0
+  db.register({
+    id: 'docs',
+    path: '/docs',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+      },
+    },
+    records: { create: true, update: true },
+    list: () => [...rows.values()],
+    get: (id) => rows.get(id) ?? null,
+    create: (records) => records.map((record) => {
+      const row = { id: `d${++seq}`, title: String(record.title ?? `Doc ${seq}`) }
+      rows.set(row.id, row)
+      return row
+    }),
+    update: (id, patch) => {
+      const row = { ...rows.get(id)!, ...patch, id }
+      rows.set(id, row)
+      return row
+    },
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'biu-db-create-scope-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    workspaceLocation = () => 'cloud' as const
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  await ctx.plugin(AccountBridge)
+  const ada = collab.register('', Date.now(), 'secret1', 'scope-ada@example.com')
+  const bob = collab.register('', Date.now(), 'secret1', 'scope-bob@example.com')
+  const workspace = collab.createWorkspace(ada.id, 'Scoped')
+  collab.addMemberByEmail(ada.id, workspace.id, bob.email)
+  collab.setActive(ada.id, workspace.id)
+  collab.setActive(bob.id, workspace.id)
+  collab.authorization.setMemberViewMatcher((workspaceId, viewId, accountId) => {
+    return viewId === builtinAllViewId('/workspace-members') && collab.isMember(accountId, workspaceId)
+  })
+
+  await runWithAccount(ada.id, () => db.create('/docs', [{ title: 'Private' }], { scope: 'personal' }))
+  await runWithAccount(ada.id, () => db.create('/docs', [{ title: 'Shared' }], { scope: 'workspace' }))
+  const personal = await runWithAccount(ada.id, () => db.list('/docs', { $scope: 'personal' }))
+  const shared = await runWithAccount(ada.id, () => db.list('/docs', { $scope: 'workspace' }))
+  assert.deepEqual(personal.items.map((row) => row.title), ['Private'])
+  assert.deepEqual(shared.items.map((row) => row.title), ['Shared'])
+  assert.deepEqual((await runWithAccount(bob.id, () => db.list('/docs'))).items.map((row) => row.title), ['Shared'])
+  const granted = runWithAccount(ada.id, () => collab.recordAccess(ada.id, '/docs', 'd2'))
+  assert.equal(granted.memberViews.find((row) => row.id === builtinAllViewId('/workspace-members'))?.role, 'editor')
+  assert.equal((await runWithAccount(ada.id, () => db.list('/docs'))).items.find((row) => row.title === 'Shared')?.shareScope, '空间')
+  const edited = await runWithAccount(bob.id, () => db.update('/docs/d2', { title: 'Shared edited' }))
+  assert.equal(edited.kind, 'record')
+
+  collab.updateMemberRole(ada.id, workspace.id, bob.id, 'viewer')
+  const viewerStat = await runWithAccount(bob.id, () => db.stat('/docs'))
+  assert.equal(viewerStat.kind, 'collection')
+  if (viewerStat.kind === 'collection') {
+    assert.equal(viewerStat.schema.records?.create, false)
+    assert.equal(viewerStat.schema.fields.title?.writable, false)
+  }
+  await assert.rejects(
+    () => runWithAccount(bob.id, () => db.create('/docs', [{ title: 'Blocked' }], { scope: 'workspace' })),
+    /permission denied/,
+  )
+  await assert.rejects(
+    () => runWithAccount(bob.id, () => db.update('/docs/d2', { title: 'Blocked' })),
+    /unknown record/,
+  )
+})
+
+test('shared create is a public view link', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.shares.open(':memory:')
+  const rows = new Map<string, DbRecord>()
+  db.register({
+    id: 'docs',
+    path: '/docs',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+      },
+    },
+    records: { create: true },
+    list: () => [...rows.values()],
+    get: (id) => rows.get(id) ?? null,
+    create: (records) => records.map((record) => {
+      const row = { id: 'pub', title: String(record.title ?? 'Doc') }
+      rows.set(row.id, row)
+      return row
+    }),
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'biu-db-public-share-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    workspaceLocation = () => 'cloud' as const
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  await ctx.plugin(AccountBridge)
+  const ada = collab.register('', Date.now(), 'secret1', 'public-ada@example.com')
+  const workspace = collab.createWorkspace(ada.id, 'Public')
+  collab.setActive(ada.id, workspace.id)
+  const created = await runWithAccount(ada.id, () => db.create('/docs', [{ title: '公开' }], { scope: 'shared' }))
+  assert.equal(created.kind, 'created')
+  if (created.kind !== 'created') return
+  assert.equal(created.items[0]?.value.shareScope, '共享')
+  const link = db.shares.find('record', '/docs', '', 'pub')
+  assert.ok(link)
+  assert.equal(link?.hasPassword, false)
+  assert.equal(link?.allowCopy, false)
+  const listed = await runWithAccount(ada.id, () => db.list('/docs', { $scope: 'shared' }))
+  assert.deepEqual(listed.items.map((row) => row.title), ['公开'])
+})
+
+test('device workspace share column is only personal or shared', async () => {
+  const previous = process.env.BIU_ONLINE
+  process.env.BIU_ONLINE = '0'
+  try {
+    const ctx = new Context()
+    const db = new DatabaseService(ctx)
+    const rows = new Map<string, DbRecord>()
+    let seq = 0
+    db.register({
+      id: 'docs',
+      path: '/docs',
+      schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string', writable: true } } },
+      records: { create: true },
+      list: () => [...rows.values()],
+      get: (id) => rows.get(id) ?? null,
+      create: (records) => records.map((record) => {
+        const row = { id: `d${++seq}`, title: String(record.title ?? 'Doc') }
+        rows.set(row.id, row)
+        return row
+      }),
+    })
+    const dir = mkdtempSync(join(tmpdir(), 'biu-db-local-owner-'))
+    const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+    const localIds = new Set<string>()
+    class AccountBridge extends Service {
+      store = collab
+      authorization = collab.authorization
+      workspaceLocation = () => 'device' as const
+      constructor(inner: Context) {
+        super(inner, 'account')
+      }
+      isLocal(_collection: string, id: string) {
+        return localIds.has(id)
+      }
+      markLocal(_collection: string, id: string) {
+        localIds.add(id)
+      }
+    }
+    await ctx.plugin(AccountBridge)
+    const ada = collab.register('', Date.now(), 'secret1', 'local-ada@example.com')
+    const workspace = collab.createWorkspace(ada.id, 'Local')
+    collab.setActive(ada.id, workspace.id)
+    const personal = await runWithAccount(ada.id, () => db.create('/docs', [{ title: '私人' }], { scope: 'personal' }))
+    const space = await runWithAccount(ada.id, () => db.create('/docs', [{ title: '空间' }], { scope: 'workspace' }))
+    const local = await runWithAccount(ada.id, () => db.create('/docs', [{ title: '本机' }], { scope: 'local' }))
+    assert.equal(personal.kind === 'created' && personal.items[0]?.value.shareScope, '私人')
+    assert.equal(space.kind === 'created' && space.items[0]?.value.shareScope, '私人')
+    assert.equal(local.kind === 'created' && local.items[0]?.value.shareScope, '私人')
+    const listed = await runWithAccount(ada.id, () => db.list('/docs'))
+    assert.equal(listed.schema.fields.shareScope?.enum?.join(','), '私人,共享')
+    assert.equal(listed.items.some((row) => row.shareScope === '空间'), false)
+    const shared = await runWithAccount(ada.id, () => db.create('/docs', [{ title: '局域网' }], { scope: 'shared' }))
+    assert.equal(shared.kind === 'created' && shared.items[0]?.value.shareScope, '共享')
+    if (shared.kind === 'created') {
+      const id = String(shared.items[0]?.value.id)
+      assert.equal(localIds.has(id), true)
+      assert.ok(db.shares.findRecord('/docs', id))
+    }
+    rows.set('side-created', { id: 'side-created', title: '旁路创建' })
+    await runWithAccount(ada.id, () => db.touchActor('/docs', 'side-created'))
+    assert.equal(localIds.has('side-created'), true)
+    const owner = collab.collectionRecordOwners?.(workspace.id, '/docs')
+    if (local.kind === 'created') assert.equal(owner?.get(String(local.items[0]?.value.id)), ada.id)
+  } finally {
+    if (previous === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previous
+  }
+})
+
+test('a builtin member view grant lets the other workspace member read personal records', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, DbRecord>()
+  db.register({
+    id: 'docs',
+    path: '/docs',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+      },
+    },
+    records: { create: true, update: true },
+    list: () => [...rows.values()],
+    get: (id) => rows.get(id) ?? null,
+    create: (records) => records.map((record) => {
+      const row = { id: 'inherited', title: String(record.title ?? 'Inherited') }
+      rows.set(row.id, row)
+      return row
+    }),
+    update: (id, patch) => {
+      const row = { ...rows.get(id)!, ...patch, id }
+      rows.set(id, row)
+      return row
+    },
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'biu-db-view-inherit-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    workspaceLocation = () => 'cloud' as const
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  await ctx.plugin(AccountBridge)
+  const ada = collab.register('', Date.now(), 'secret1', 'inherit-ada@example.com')
+  const bob = collab.register('', Date.now(), 'secret1', 'inherit-bob@example.com')
+  const workspace = collab.createWorkspace(ada.id, 'Inherited')
+  collab.addMemberByEmail(ada.id, workspace.id, bob.email)
+  collab.setActive(ada.id, workspace.id)
+  collab.setActive(bob.id, workspace.id)
+  db.viewCatalog = { viewsFor: () => [] }
+  collab.authorization.setMemberViewMatcher((workspaceId, viewId, accountId) => {
+    const view = stubBuiltinMemberView(viewId) ?? stubBuiltinAllView(viewId)
+    if (!view) return false
+    const member = collab.members(accountId, workspaceId).find((item) => item.id === accountId)
+    if (!member) return false
+    return matchListFilterRecord(
+      {
+        id: member.id,
+        title: member.name,
+        name: member.name,
+        email: member.email,
+        role: member.role,
+        membershipKind: member.member_kind,
+        joinedAt: member.created_at,
+      },
+      view.filters,
+    )
+  })
+  await runWithAccount(ada.id, () => db.create('/docs', [{ title: 'Ada private' }], { scope: 'personal' }))
+  await runWithAccount(ada.id, () => collab.grantViewMemberView(ada.id, '/docs', builtinAllViewId('/docs'), 'builtin-member:member', 'editor'))
+  const seen = await runWithAccount(bob.id, () => db.list('/docs'))
+  assert.deepEqual(seen.items.map((row) => row.title), ['Ada private'])
+})
+
+test('granting the all-members view lets the other member read the owner private records', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, DbRecord>()
+  let seq = 0
+  db.register({
+    id: 'tasks',
+    path: '/tasks',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+      },
+    },
+    records: { create: true, update: true },
+    list: () => [...rows.values()],
+    get: (id) => rows.get(id) ?? null,
+    create: (records) => records.map((record) => {
+      const row = { id: `m${++seq}`, title: String(record.title ?? `Task ${seq}`) }
+      rows.set(row.id, row)
+      return row
+    }),
+    update: (id, patch) => {
+      const row = { ...rows.get(id)!, ...patch, id }
+      rows.set(id, row)
+      return row
+    },
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'biu-db-all-members-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    workspaceLocation = () => 'cloud' as const
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  await ctx.plugin(AccountBridge)
+  const ada = collab.register('', Date.now(), 'secret1', 'all-members-ada@example.com')
+  const bob = collab.register('', Date.now(), 'secret1', 'all-members-bob@example.com')
+  const workspace = collab.createWorkspace(ada.id, 'All members')
+  collab.addMemberByEmail(ada.id, workspace.id, bob.email)
+  collab.setActive(ada.id, workspace.id)
+  collab.setActive(bob.id, workspace.id)
+  db.viewCatalog = { viewsFor: () => [] }
+  collab.authorization.setMemberViewMatcher((workspaceId, viewId, accountId) => {
+    const view = stubBuiltinMemberView(viewId) ?? stubBuiltinAllView(viewId)
+    if (!view) return false
+    const member = collab.members(accountId, workspaceId).find((item) => item.id === accountId)
+    if (!member) return false
+    return matchListFilterRecord(
+      {
+        id: member.id,
+        title: member.name,
+        name: member.name,
+        email: member.email,
+        role: member.role,
+        membershipKind: member.member_kind,
+        joinedAt: member.created_at,
+      },
+      view.filters,
+    )
+  })
+  await runWithAccount(ada.id, () => db.create('/tasks', [{ title: 'A空间' }], { scope: 'workspace' }))
+  await runWithAccount(ada.id, () => db.create('/tasks', [{ title: 'A私人' }], { scope: 'personal' }))
+  await runWithAccount(ada.id, () => collab.grantViewMemberView(
+    ada.id,
+    '/tasks',
+    builtinAllViewId('/tasks'),
+    builtinAllViewId('/workspace-members'),
+    'editor',
+  ))
+  const bobList = await runWithAccount(bob.id, () => db.list('/tasks'))
+  assert.deepEqual(bobList.items.map((row) => row.title).sort(), ['A私人', 'A空间'])
+  assert.equal(bobList.items.find((row) => row.title === 'A私人')?.shareScope, '空间')
+  assert.equal(bobList.items.find((row) => row.title === 'A私人')?.shareRole, '编辑')
+  assert.equal(bobList.items.find((row) => row.title === 'A空间')?.shareRole, '编辑')
+  const adaList = await runWithAccount(ada.id, () => db.list('/tasks'))
+  assert.equal(adaList.items.find((row) => row.title === 'A私人')?.shareScope, '空间')
+  assert.equal(adaList.items.find((row) => row.title === 'A私人')?.shareRole, '管理')
+  assert.equal(adaList.schema.fields.shareRole?.label, '权限')
+  assert.equal(adaList.schema.fields.shareRole?.enum?.join(','), '管理,编辑,阅读')
+  const spaceId = String(bobList.items.find((row) => row.title === 'A空间')?.id ?? '')
+  const privateId = String(bobList.items.find((row) => row.title === 'A私人')?.id ?? '')
+  const spaceChain = runWithAccount(bob.id, () => collab.recordAccess(bob.id, '/tasks', spaceId)).roleChain
+  assert.equal(spaceChain[0]?.detail, '通过成员视图授权')
+  assert.equal(spaceChain[0]?.role, 'editor')
+  const ownChain = runWithAccount(ada.id, () => collab.recordAccess(ada.id, '/tasks', privateId)).roleChain
+  assert.equal(ownChain[0]?.detail, '你是创建者')
+  assert.equal(ownChain[0]?.role, 'owner')
+  db.facets.replaceContentRefs('/tasks', privateId, ['via-view.png'])
+  assert.doesNotThrow(() => runWithAccount(bob.id, () => db.requireAsset('via-view.png', 'resource:read')))
+})
+
+test('sharing one person all-tasks view does not reclassify the other person private tasks', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, DbRecord>()
+  let seq = 0
+  db.register({
+    id: 'tasks',
+    path: '/tasks',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+      },
+    },
+    records: { create: true, update: true },
+    list: () => [...rows.values()],
+    get: (id) => rows.get(id) ?? null,
+    create: (records) => records.map((record) => {
+      const row = { id: `t${++seq}`, title: String(record.title ?? `Task ${seq}`) }
+      rows.set(row.id, row)
+      return row
+    }),
+    update: (id, patch) => {
+      const row = { ...rows.get(id)!, ...patch, id }
+      rows.set(id, row)
+      return row
+    },
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'biu-db-all-view-owner-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    workspaceLocation = () => 'cloud' as const
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  await ctx.plugin(AccountBridge)
+  const ada = collab.register('', Date.now(), 'secret1', 'all-ada@example.com')
+  const bob = collab.register('', Date.now(), 'secret1', 'all-bob@example.com')
+  const workspace = collab.createWorkspace(ada.id, 'All tasks')
+  collab.addMemberByEmail(ada.id, workspace.id, bob.email)
+  collab.setActive(ada.id, workspace.id)
+  collab.setActive(bob.id, workspace.id)
+  db.viewCatalog = { viewsFor: () => [] }
+  collab.authorization.setMemberViewMatcher((workspaceId, viewId, accountId) => {
+    const view = stubBuiltinMemberView(viewId) ?? stubBuiltinAllView(viewId)
+    if (!view) return false
+    const member = collab.members(accountId, workspaceId).find((item) => item.id === accountId)
+    if (!member) return false
+    return matchListFilterRecord(
+      {
+        id: member.id,
+        title: member.name,
+        name: member.name,
+        email: member.email,
+        role: member.role,
+        membershipKind: member.member_kind,
+        joinedAt: member.created_at,
+      },
+      view.filters,
+    )
+  })
+
+  await runWithAccount(ada.id, () => db.create('/tasks', [{ title: 'A空间' }], { scope: 'workspace' }))
+  await runWithAccount(ada.id, () => db.create('/tasks', [{ title: 'A私人' }], { scope: 'personal' }))
+  await runWithAccount(bob.id, () => db.create('/tasks', [{ title: 'B空间' }], { scope: 'workspace' }))
+  await runWithAccount(bob.id, () => db.create('/tasks', [{ title: 'B私人' }], { scope: 'personal' }))
+  await runWithAccount(bob.id, () => collab.grantViewMemberView(
+    bob.id,
+    '/tasks',
+    builtinAllViewId('/tasks'),
+    'builtin-member:member',
+    'editor',
+  ))
+
+  const scopeOf = (items: DbRecord[], title: string) => items.find((row) => row.title === title)?.shareScope
+  const adaList = await runWithAccount(ada.id, () => db.list('/tasks'))
+  assert.deepEqual(adaList.items.map((row) => row.title).sort(), ['A私人', 'A空间', 'B私人', 'B空间'])
+  assert.equal(scopeOf(adaList.items, 'A私人'), '私人')
+  assert.equal(scopeOf(adaList.items, 'A空间'), '空间')
+  assert.equal(scopeOf(adaList.items, 'B私人'), '空间')
+  assert.equal(scopeOf(adaList.items, 'B空间'), '空间')
+
+  const bobList = await runWithAccount(bob.id, () => db.list('/tasks'))
+  assert.deepEqual(bobList.items.map((row) => row.title).sort(), ['A空间', 'B私人', 'B空间'])
+  assert.equal(scopeOf(bobList.items, 'B私人'), '空间')
+  assert.equal(bobList.items.some((row) => row.title === 'A私人'), false)
+})
+
+test('workspace member emoji overlay does not change role', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const dir = mkdtempSync(join(tmpdir(), 'biu-member-emoji-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    workspaceLocation = () => 'cloud' as const
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  await ctx.plugin(AccountBridge)
+  db.register(workspaceMembersCollection(collab))
+  const ada = collab.register('', Date.now(), 'secret1', 'ada-tags@example.com')
+  const bob = collab.register('', Date.now(), 'secret1', 'bob-tags@example.com')
+  const workspace = collab.createWorkspace(ada.id, 'Tags')
+  collab.addMemberByEmail(ada.id, workspace.id, bob.email)
+  collab.setActive(ada.id, workspace.id)
+
+  const updated = await runWithAccount(ada.id, () =>
+    db.update(`/workspace-members/${bob.id}`, { emoji: '👋' }),
+  )
+  assert.equal(updated.value.emoji, '👋')
+  assert.equal('tags' in updated.value && updated.value.tags != null, false)
+  assert.equal(collab.members(ada.id, workspace.id).find((row) => row.id === bob.id)?.role, 'member')
+})
+
+test('index rows follow the user records each person can read and omit share', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const pages = new Map<string, { id: string; title: string }>()
+  const blocks: Array<{ id: string; title: string; collection: string; pageId: string }> = []
+  db.register({
+    id: 'pages',
+    path: '/pages',
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string', writable: true } } },
+    records: { create: true, update: true },
+    list: () => [...pages.values()],
+    get: (id) => pages.get(id) ?? null,
+    create: (records) => records.map((record) => {
+      const row = { id: `p${pages.size + 1}`, title: String(record.title ?? '') }
+      pages.set(row.id, row)
+      blocks.push({ id: `pages::${row.id}::b`, title: `${row.title}组件`, collection: '/pages', pageId: row.id })
+      return row
+    }),
+    update: (id, patch) => {
+      const row = { ...pages.get(id)!, ...patch, id }
+      pages.set(id, row)
+      return row
+    },
+  })
+  db.register({
+    id: 'page-blocks',
+    path: '/page-blocks',
+    schema: { fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string' }, collection: { type: 'string' }, pageId: { type: 'string' } } },
+    list: () => blocks,
+    get: (id) => blocks.find((row) => row.id === id) ?? null,
+  })
+  db.register(facetsCollection(db.facets, () => [{ id: 'pages', path: '/pages', label: '页面' }]))
+  const dir = mkdtempSync(join(tmpdir(), 'biu-db-index-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    workspaceLocation = () => 'cloud' as const
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  await ctx.plugin(AccountBridge)
+  const ada = collab.register('', Date.now(), 'secret1', 'index-ada@example.com')
+  const bob = collab.register('', Date.now(), 'secret1', 'index-bob@example.com')
+  const workspace = collab.createWorkspace(ada.id, 'Index')
+  collab.addMemberByEmail(ada.id, workspace.id, bob.email)
+  collab.setActive(ada.id, workspace.id)
+  collab.setActive(bob.id, workspace.id)
+  collab.authorization.setMemberViewMatcher((workspaceId, viewId, accountId) => {
+    const view = stubBuiltinAllView(viewId)
+    if (!view) return false
+    return collab.isMember(accountId, workspaceId)
+  })
+
+  const personal = await runWithAccount(ada.id, () => db.create('/pages', [{ title: '私人' }], { scope: 'personal' }))
+  const shared = await runWithAccount(ada.id, () => db.create('/pages', [{ title: '空间' }], { scope: 'workspace' }))
+  const personalId = personal.items[0]!.value.id
+  const sharedId = shared.items[0]!.value.id
+  const hidden = await runWithAccount(ada.id, () => db.create('/facets', [{ title: '只贴私人' }]))
+  const shown = await runWithAccount(ada.id, () => db.create('/facets', [{ title: '贴在空间' }]))
+  const hiddenId = String(hidden.items[0]!.value.id)
+  const shownId = String(shown.items[0]!.value.id)
+  await runWithAccount(ada.id, () => db.update(`/pages/${personalId}`, { facet: { tags: [hiddenId], values: {} } }))
+  await runWithAccount(ada.id, () => db.update(`/pages/${sharedId}`, { facet: { tags: [shownId], values: {} } }))
+
+  const adaBlocks = await runWithAccount(ada.id, () => db.list('/page-blocks'))
+  const bobBlocks = await runWithAccount(bob.id, () => db.list('/page-blocks'))
+  assert.deepEqual(adaBlocks.items.map((row) => row.title).sort(), ['私人组件', '空间组件'])
+  assert.deepEqual(bobBlocks.items.map((row) => row.title), ['空间组件'])
+  assert.equal(adaBlocks.items[0]?.shareScope, undefined)
+  const blockStat = await runWithAccount(ada.id, () => db.stat('/page-blocks'))
+  if (blockStat.kind === 'collection') assert.equal(blockStat.schema.fields.shareScope, undefined)
+
+  const adaFacets = await runWithAccount(ada.id, () => db.list('/facets'))
+  const bobFacets = await runWithAccount(bob.id, () => db.list('/facets'))
+  assert.deepEqual(adaFacets.items.map((row) => row.id).sort(), [hiddenId, shownId].sort())
+  assert.deepEqual(bobFacets.items.map((row) => row.id), [shownId])
+  const bobStamps = await runWithAccount(bob.id, () => db.list('/facets', { facetId: hiddenId }))
+  assert.equal(bobStamps.items.length, 0)
+  const adaStamps = await runWithAccount(ada.id, () => db.list('/facets', { facetId: hiddenId }))
+  assert.equal(adaStamps.items.length, 1)
+})
+
+test('builtin plugins stay visible in the workspace plugin list', async () => {
+  const previous = process.env.BIU_ONLINE
+  process.env.BIU_ONLINE = '1'
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.register({
+    id: 'plugins',
+    path: '/plugins',
+    schema: {
+      labelField: 'title',
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string' },
+        builtin: { type: 'boolean' },
+      },
+    },
+    list: () => [
+      { id: 'api-playground', title: 'API 调试块', builtin: true, author: 'BIU官方' },
+      { id: 'my-draft', title: '我的草稿', author: 'Ada' },
+    ],
+    get: (id) => (id === 'api-playground'
+      ? { id, title: 'API 调试块', builtin: true }
+      : null),
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'biu-db-builtin-plugin-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    workspaceLocation = () => 'cloud' as const
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  try {
+    await ctx.plugin(AccountBridge)
+    const ada = collab.register('', Date.now(), 'secret1', 'plugin-ada@example.com')
+    const bob = collab.register('', Date.now(), 'secret1', 'plugin-bob@example.com')
+    const workspace = collab.createWorkspace(ada.id, 'Plugins')
+    collab.addMemberByEmail(ada.id, workspace.id, bob.email)
+    collab.setActive(ada.id, workspace.id)
+    collab.setActive(bob.id, workspace.id)
+    const bobList = await runWithAccount(bob.id, () => db.list('/plugins'))
+    assert.deepEqual(bobList.items.map((row) => row.id), ['api-playground'])
+    assert.equal(bobList.items[0]?.shareScope, '共享')
+    assert.equal(bobList.items[0]?.shareRole, '阅读')
+    assert.equal(bobList.items[0]?.createdBy && (bobList.items[0].createdBy as { name?: string }).name, 'BIU官方')
+    assert.equal((bobList.items[0]?.createdBy as { url?: string }).url, 'https://github.com/helloooooooooooooo97/biu')
+    assert.equal((bobList.items[0]?.updatedBy as Array<{ url?: string }>)[0]?.url, 'https://github.com/helloooooooooooooo97/biu')
+    const read = await runWithAccount(bob.id, () => db.read('/plugins/api-playground'))
+    assert.equal(read.kind === 'record' && read.value.id, 'api-playground')
+    const sharedOnly = await runWithAccount(bob.id, () => db.list('/plugins', { $scope: 'shared' }))
+    assert.deepEqual(sharedOnly.items.map((row) => row.id), ['api-playground'])
+    await assert.rejects(
+      () => runWithAccount(bob.id, () => db.update('/plugins/api-playground', { title: '改掉' })),
+      /INSUFFICIENT_PERMISSION/,
+    )
+    db.facets.markDeleted('/plugins', 'api-playground')
+    const stillListed = await runWithAccount(bob.id, () => db.list('/plugins'))
+    assert.deepEqual(stillListed.items.map((item) => item.id), ['api-playground'])
+    const stillRead = await runWithAccount(bob.id, () => db.read('/plugins/api-playground'))
+    assert.equal(stillRead.kind === 'record' && stillRead.value.id, 'api-playground')
+    const bin = await runWithAccount(bob.id, () => db.listTrash())
+    assert.deepEqual(bin.items.map((item) => item.id), [])
+  } finally {
+    if (previous === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previous
+  }
+})
+
+test('reinstalling a builtin plugin does not claim another workspace record', async () => {
+  const previous = process.env.BIU_ONLINE
+  process.env.BIU_ONLINE = '1'
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const packed: string[] = []
+  db.register({
+    id: 'plugins',
+    path: '/plugins',
+    schema: {
+      labelField: 'title',
+      fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string' }, builtin: { type: 'boolean' } },
+    },
+    list: () => [{ id: 'page-sandbox', title: 'HTML', builtin: true }],
+    get: (id) => (id === 'page-sandbox' ? { id, title: 'HTML', builtin: true } : null),
+    actions: [
+      {
+        id: 'pack',
+        label: '安装',
+        requiredAction: 'resource:read',
+        run: async (id) => {
+          packed.push(id)
+        },
+      },
+    ],
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'biu-db-repack-builtin-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    workspaceLocation = () => 'device' as const
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  try {
+    await ctx.plugin(AccountBridge)
+    const ada = collab.register('', Date.now(), 'secret1', 'repack-ada@example.com')
+    const home = collab.createWorkspace(ada.id, '先建的空间')
+    const local = collab.createWorkspace(ada.id, '本机空间')
+    collab.setActive(ada.id, home.id)
+    runWithAccount(ada.id, () => collab.attach(home.id, '/plugins', 'page-sandbox'))
+    collab.setActive(ada.id, local.id)
+    await runWithAccount(ada.id, () => db.action('/plugins/page-sandbox', 'pack'))
+    assert.deepEqual(packed, ['page-sandbox'])
+    assert.equal(collab.recordIds(local.id, '/plugins').has('page-sandbox'), false)
+    assert.equal(collab.recordIds(home.id, '/plugins').has('page-sandbox'), true)
+  } finally {
+    if (previous === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previous
+  }
+})
+
+test('a member sandbox is private until the owner shares it', async () => {
+  const previous = process.env.BIU_ONLINE
+  process.env.BIU_ONLINE = '1'
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, { id: string; title: string; sandbox: boolean }>()
+  db.register({
+    id: 'plugins',
+    path: '/plugins',
+    schema: {
+      labelField: 'title',
+      fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string' }, sandbox: { type: 'boolean' } },
+    },
+    list: () => [...rows.values()],
+    get: (id) => rows.get(id) ?? null,
+    actions: [
+      {
+        id: 'sandbox',
+        label: '开沙箱',
+        allowMissing: true,
+        requiredAction: 'resource:read',
+        run: async (id) => {
+          rows.set(id, { id, title: id, sandbox: true })
+        },
+      },
+      {
+        id: 'pack',
+        label: '安装',
+        requiredAction: 'resource:read',
+        run: async (id) => rows.get(id),
+      },
+    ],
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'biu-db-private-plugin-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    workspaceLocation = () => 'cloud' as const
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  try {
+    await ctx.plugin(AccountBridge)
+    const ada = collab.register('', Date.now(), 'secret1', 'private-ada@example.com')
+    const bob = collab.register('', Date.now(), 'secret1', 'private-bob@example.com')
+    const cara = collab.register('', Date.now(), 'secret1', 'private-cara@example.com')
+    const workspace = collab.createWorkspace(ada.id, 'Plugins')
+    collab.addMemberByEmail(ada.id, workspace.id, bob.email)
+    collab.addMemberByEmail(ada.id, workspace.id, cara.email)
+    collab.updateMemberRole(ada.id, workspace.id, cara.id, 'viewer')
+    collab.setActive(ada.id, workspace.id)
+    collab.setActive(bob.id, workspace.id)
+    collab.setActive(cara.id, workspace.id)
+    await runWithAccount(cara.id, () => db.action('/plugins/cara-plug', 'sandbox'))
+    await runWithAccount(ada.id, () => db.action('/plugins/ada-plug', 'sandbox'))
+    const adaList = await runWithAccount(ada.id, () => db.list('/plugins'))
+    assert.deepEqual(adaList.items.map((row) => row.id), ['ada-plug'])
+    assert.equal(adaList.items[0]?.shareScope, '私人')
+    assert.deepEqual(adaList.items[0]?.createdBy, { kind: 'user', name: ada.name, accountId: ada.id })
+    assert.deepEqual(adaList.items[0]?.updatedBy, [{ kind: 'user', name: ada.name, accountId: ada.id }])
+    const bobList = await runWithAccount(bob.id, () => db.list('/plugins'))
+    assert.deepEqual(bobList.items.map((row) => row.id), [])
+    await assert.rejects(() => runWithAccount(bob.id, () => db.action('/plugins/ada-plug', 'pack')), /unknown record/)
+    collab.authorization.grant(
+      ada.id,
+      { type: 'record', workspaceId: workspace.id, collection: '/plugins', recordId: 'ada-plug' },
+      'account',
+      bob.id,
+      'viewer',
+      Date.now(),
+    )
+    const shared = await runWithAccount(bob.id, () => db.list('/plugins'))
+    assert.deepEqual(shared.items.map((row) => row.id), ['ada-plug'])
+    await runWithAccount(bob.id, () => db.action('/plugins/ada-plug', 'pack'))
+    const edited = await runWithAccount(ada.id, () => db.list('/plugins'))
+    assert.deepEqual(edited.items[0]?.createdBy, { kind: 'user', name: ada.name, accountId: ada.id })
+    assert.deepEqual(edited.items[0]?.updatedBy, [
+      { kind: 'user', name: ada.name, accountId: ada.id },
+      { kind: 'user', name: bob.name, accountId: bob.id },
+    ])
+    const caraList = await runWithAccount(cara.id, () => db.list('/plugins'))
+    assert.deepEqual(caraList.items.map((row) => row.id), ['cara-plug'])
+  } finally {
+    if (previous === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previous
+  }
+})
+
+test('a lan view share marks matching records shared without stamping ownership', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, DbRecord>([
+    ['open1', { id: 'open1', title: '进行中', status: 'open' }],
+    ['done1', { id: 'done1', title: '已完成', status: 'done' }],
+  ])
+  db.register({
+    id: 'docs',
+    path: '/docs',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+        status: { type: 'string', writable: true },
+      },
+    },
+    list: () => [...rows.values()],
+    get: (id) => rows.get(id) ?? null,
+  })
+  db.viewCatalog = {
+    viewsFor: (path) => path === '/docs' ? [{ id: 'open', name: '进行中', filters: { status: 'open' } }] : [],
+  }
+  const scopeOf = (items: DbRecord[], title: string) => items.find((row) => row.title === title)?.shareScope
+  assert.equal(scopeOf((await db.list('/docs')).items, '进行中'), '私人')
+  db.shares.upsert({ kind: 'view', collection: '/docs', viewId: 'open' })
+  const listed = await db.list('/docs')
+  assert.equal(scopeOf(listed.items, '进行中'), '共享')
+  assert.equal(scopeOf(listed.items, '已完成'), '私人')
+  const roleOf = (items: DbRecord[], title: string) => items.find((row) => row.title === title)?.shareRole
+  assert.equal(roleOf(listed.items, '进行中'), '管理')
+  assert.equal(roleOf(listed.items, '已完成'), '管理')
+  assert.equal(db.shares.findRecord('/docs', 'open1'), null)
+  db.shares.revokeView('/docs', 'open')
+  assert.equal(scopeOf((await db.list('/docs')).items, '进行中'), '私人')
+  db.shares.upsert({ kind: 'record', collection: '/docs', recordId: 'done1' })
+  db.shares.upsert({ kind: 'view', collection: '/docs', viewId: 'open' })
+  const mixed = await db.list('/docs')
+  assert.equal(scopeOf(mixed.items, '进行中'), '共享')
+  assert.equal(scopeOf(mixed.items, '已完成'), '共享')
+  db.shares.revokeView('/docs', 'open')
+  const keepRecord = await db.list('/docs')
+  assert.equal(scopeOf(keepRecord.items, '进行中'), '私人')
+  assert.equal(scopeOf(keepRecord.items, '已完成'), '共享')
+  db.viewCatalog = {
+    viewsFor: (path) => path === '/docs' ? [{ id: 'open', name: '进行中', filters: { status: 'done' } }] : [],
+  }
+  db.shares.upsert({ kind: 'view', collection: '/docs', viewId: 'open' })
+  const shifted = await db.list('/docs')
+  assert.equal(scopeOf(shifted.items, '进行中'), '私人')
+  assert.equal(scopeOf(shifted.items, '已完成'), '共享')
+  db.shares.revokeView('/docs', 'open')
+  db.shares.revokeRecord('/docs', 'done1')
+  db.shares.upsert({ kind: 'view', collection: '/docs', viewId: builtinAllViewId('/docs') })
+  const all = await db.list('/docs')
+  assert.equal(scopeOf(all.items, '进行中'), '共享')
+  assert.equal(scopeOf(all.items, '已完成'), '共享')
+})
+
+test('$scope packs follow shareScope labels for public and lan shares', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  db.shares.open(':memory:')
+  const rows = new Map<string, DbRecord>()
+  db.register({
+    id: 'docs',
+    path: '/docs',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+        status: { type: 'string', writable: true },
+      },
+    },
+    records: { create: true },
+    list: () => [...rows.values()],
+    get: (id) => rows.get(id) ?? null,
+    create: (records) => records.map((record) => {
+      const row = {
+        id: `d${rows.size + 1}`,
+        title: String(record.title ?? 'Doc'),
+        status: String(record.status ?? 'open'),
+      }
+      rows.set(row.id, row)
+      return row
+    }),
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'biu-db-scope-share-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    workspaceLocation = () => 'cloud' as const
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  await ctx.plugin(AccountBridge)
+  const ada = collab.register('', Date.now(), 'secret1', 'scope-share-ada@example.com')
+  const workspace = collab.createWorkspace(ada.id, 'Share pack')
+  collab.setActive(ada.id, workspace.id)
+
+  await runWithAccount(ada.id, () => db.create('/docs', [{ title: '只私人' }], { scope: 'personal' }))
+  await runWithAccount(ada.id, () => db.create('/docs', [{ title: '公开链接' }], { scope: 'personal' }))
+  db.shares.upsert({ kind: 'record', collection: '/docs', recordId: 'd2' })
+  db.notifyShareChange()
+
+  const titles = (listed: { items: DbRecord[] }) => listed.items.map((row) => row.title).sort()
+  const personal = await runWithAccount(ada.id, () => db.list('/docs', { $scope: 'personal' }))
+  const shared = await runWithAccount(ada.id, () => db.list('/docs', { $scope: 'shared' }))
+  assert.deepEqual(titles(personal), ['只私人'])
+  assert.deepEqual(titles(shared), ['公开链接'])
+  assert.equal(personal.items[0]?.shareScope, '私人')
+  assert.equal(shared.items[0]?.shareScope, '共享')
+
+  db.shares.upsert({ kind: 'view', collection: '/docs', viewId: builtinAllViewId('/docs') })
+  db.notifyShareChange()
+  const afterView = await runWithAccount(ada.id, () => db.list('/docs', { $scope: 'shared' }))
+  const personalAfter = await runWithAccount(ada.id, () => db.list('/docs', { $scope: 'personal' }))
+  assert.deepEqual(titles(afterView), ['公开链接', '只私人'])
+  assert.deepEqual(titles(personalAfter), [])
+})
+
+test('list match overlay is only loaded for overlay fields or tree filters', () => {
+  assert.equal(listNeedsMatchOverlay(undefined, '', 'title'), false)
+  assert.equal(listNeedsMatchOverlay({ status: 'open', $scope: 'personal' }, '', 'title'), false)
+  assert.equal(listNeedsMatchOverlay({ shareScope: '私人' }, '', 'title'), false)
+  assert.equal(listNeedsMatchOverlay(undefined, '笔记', 'title'), false)
+  assert.equal(listNeedsMatchOverlay({ tags: 'host-ui' }, '', 'title'), false)
+  assert.equal(listNeedsMatchOverlay(undefined, '', 'emoji'), true)
+  assert.equal(listNeedsMatchOverlay(undefined, '', 'title', [{ field: 'createdBy', dir: 'asc' }]), true)
+  assert.equal(listNeedsMatchOverlay({ $tree: { root: 'n1' } }, '', 'title'), true)
+  assert.equal(listNeedsMatchOverlay(undefined, '', 'title', [{ field: 'facet::movie::导演', dir: 'asc' }]), true)
+})
+
+test('list with columns skips shareRole decorate', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = [{ id: 'n1', title: '笔记', status: 'open' }]
+  db.register({
+    id: 'notes',
+    path: '/notes',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+        status: { type: 'string', writable: true },
+      },
+    },
+    list: () => rows,
+    get: (id) => rows.find((row) => row.id === id) ?? null,
+  })
+  const listed = await db.list('/notes', undefined, { limit: 20, columns: ['title', 'status'] })
+  assert.equal(listed.kind, 'collection')
+  if (listed.kind !== 'collection') return
+  assert.equal(listed.items[0]?.title, '笔记')
+  assert.equal(listed.items[0]?.shareRole, undefined)
+  assert.equal(listed.items[0]?.status, 'open')
+  const full = await db.list('/notes', undefined, { limit: 20 })
+  assert.equal(full.kind, 'collection')
+  if (full.kind !== 'collection') return
+  assert.equal(full.items[0]?.shareRole, '管理')
+})
+
+test('spec.list query keeps facet and session filters and drops group filters', () => {
+  assert.deepEqual(specListQuery({ q: 'hi', trash: true, ids: ['a'], filter: { status: 'open', $scope: 'personal' } }), {
+    q: 'hi',
+    trash: true,
+    ids: ['a'],
+  })
+  assert.deepEqual(specListQuery({ filter: { facetId: 'work', status: 'open' } }), { filter: { facetId: 'work' } })
+  assert.deepEqual(specListQuery({ filter: { sessionId: 's1' } }), { filter: { sessionId: 's1' } })
+})
+
+test('concurrent lists share a scan even when spec.list is synchronous', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = Array.from({ length: 8 }, (_, index) => ({
+    id: `n${index}`,
+    title: `笔记${index}`,
+    status: index % 2 ? 'open' : 'done',
+  }))
+  let lists = 0
+  db.register({
+    id: 'notes',
+    path: '/notes',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+        status: { type: 'string', writable: true, enum: ['open', 'done'] },
+      },
+    },
+    list: async () => {
+      lists += 1
+      return [...rows]
+    },
+    get: (id) => rows.find((row) => row.id === id) ?? null,
+  })
+  const [open, done, personal] = await Promise.all([
+    db.list('/notes', { status: 'open' }, { limit: 20 }),
+    db.list('/notes', { status: 'done' }, { limit: 20 }),
+    db.list('/notes', { $scope: 'personal' }, { limit: 20 }),
+  ])
+  assert.equal(lists, 1)
+  assert.equal(open.kind, 'collection')
+  assert.equal(done.kind, 'collection')
+  assert.equal(personal.kind, 'collection')
+  if (open.kind !== 'collection' || done.kind !== 'collection' || personal.kind !== 'collection') return
+  assert.equal(open.items.length, 4)
+  assert.equal(done.items.length, 4)
+  assert.equal(personal.items.length, 8)
+})
+
+test('concurrent lists of one collection share a single spec.list scan', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = Array.from({ length: 12 }, (_, index) => ({
+    id: `n${index}`,
+    title: `笔记${index}`,
+    status: index % 2 ? 'open' : 'done',
+  }))
+  let lists = 0
+  db.register({
+    id: 'notes',
+    path: '/notes',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+        status: { type: 'string', writable: true, enum: ['open', 'done'] },
+      },
+    },
+    list: async () => {
+      lists += 1
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      return [...rows]
+    },
+    get: (id) => rows.find((row) => row.id === id) ?? null,
+  })
+  const [open, done, again, personal, workspace] = await Promise.all([
+    db.list('/notes', { status: 'open' }, { limit: 20 }),
+    db.list('/notes', { status: 'done' }, { limit: 20 }),
+    db.list('/notes', { status: 'open' }, { limit: 1 }),
+    db.list('/notes', { $scope: 'personal' }, { limit: 20 }),
+    db.list('/notes', { $scope: 'workspace' }, { limit: 20 }),
+  ])
+  assert.equal(lists, 1)
+  assert.equal(open.kind, 'collection')
+  assert.equal(done.kind, 'collection')
+  assert.equal(again.kind, 'collection')
+  assert.equal(personal.kind, 'collection')
+  assert.equal(workspace.kind, 'collection')
+  if (
+    open.kind !== 'collection' ||
+    done.kind !== 'collection' ||
+    again.kind !== 'collection' ||
+    personal.kind !== 'collection' ||
+    workspace.kind !== 'collection'
+  ) {
+    return
+  }
+  assert.equal(open.items.length, 6)
+  assert.equal(done.items.length, 6)
+  assert.equal(again.items.length, 1)
+  assert.equal(again.total, 6)
+  assert.equal(personal.items.length, 12)
+  assert.equal(workspace.items.length, 12)
+})
+
+test('db_content points agents at plugin intros for pageBlock fences', () => {
+  const host = readFileSync(resolve(import.meta.dirname, './index.ts'), 'utf8')
+  assert.match(host, /写 :::pageBlock 前先 db_content \/plugins\/<plugin> 读介绍里的「示例写法」/)
+  assert.equal(host.includes('kind=html 或 htmlframe'), false)
+})
+
+test('collection list preloads authorization scans and releases them', () => {
+  const host = readFileSync(resolve(import.meta.dirname, './index.ts'), 'utf8')
+  assert.match(host, /auth\.preloadCollection\(actor\.workspaceId, spec\.path, actor\.accountId\)/)
+  assert.match(host, /private inflightMatches/)
+  assert.match(host, /private inflightScans/)
+  assert.match(host, /private inflightVisible/)
+  assert.match(host, /private visibleCache/)
+  assert.match(host, /auth\.onInvalidate\(\(\) => this\.bump\(\)\)/)
+  assert.match(host, /visibleSortedCollectionRows/)
+  assert.match(host, /partitionVisibleRows/)
+  assert.match(host, /this\.shareScopeLabel\(collection, id, row, stored\)/)
+  assert.match(host, /notifyShareChange\(\)/)
+  assert.match(host, /listRecords\(collection\)/)
+  assert.match(host, /shareInflight/)
+  assert.match(host, /setImmediate\(\(\) => \{\s*setImmediate/)
+  assert.match(host, /inflightVisible\.clear\(\)/)
+  assert.match(host, /visibleCache\.clear\(\)/)
+  assert.match(host, /specListQuery\(query\)/)
+  assert.match(host, /listDecorateNeed/)
+  assert.match(host, /decorateSlice\(spec, sorted.slice\(offset, offset \+ limit\), columnKeys\)/)
+  assert.match(
+    host,
+    /try \{\s*const overlay = listNeedsMatchOverlay\(liveFilter, q, sortField, page\?\.sorts\)[\s\S]*?\} finally \{\s*if \(auth && actor\) \{[\s\S]*?releaseCollection\(actor\.workspaceId, spec\.path, actor\.accountId\)/,
+  )
+})
+
+test('sequential lists reuse the authorized collection pack until bump', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const rows = new Map<string, DbRecord>([
+    ['n1', { id: 'n1', title: '草稿', status: 'open' }],
+    ['n2', { id: 'n2', title: '另一篇', status: 'open' }],
+  ])
+  let lists = 0
+  db.register({
+    id: 'notes',
+    path: '/notes',
+    schema: {
+      fields: {
+        ...REQUIRED_RECORD_FIELDS,
+        title: { type: 'string', writable: true },
+      },
+    },
+    records: { create: true },
+    list: () => {
+      lists += 1
+      return [...rows.values()]
+    },
+    get: (id) => rows.get(id) ?? null,
+    create: (records) =>
+      records.map((record, index) => {
+        const row = { id: `c${index}`, title: String(record.title ?? '新') }
+        rows.set(row.id, row)
+        return row
+      }),
+  })
+  const first = await db.list('/notes', undefined, { limit: 20 })
+  const again = await db.list('/notes', undefined, { limit: 20, offset: 0 })
+  assert.equal(lists, 1)
+  assert.equal(first.kind, 'collection')
+  assert.equal(again.kind, 'collection')
+  if (first.kind !== 'collection' || again.kind !== 'collection') return
+  assert.equal(first.items.length, 2)
+  assert.equal(again.items.length, 2)
+  await db.create('/notes', [{ title: '第三篇' }])
+  const after = await db.list('/notes', undefined, { limit: 20 })
+  assert.equal(lists, 2)
+  assert.equal(after.kind, 'collection')
+  if (after.kind !== 'collection') return
+  assert.equal(after.items.length, 3)
+})
+
+test('deleting a /views row is a hard delete and drops the stored view', async () => {
+  const ctx = new Context()
+  await ctx.plugin(tools)
+  class HttpStub extends Service {
+    constructor(c: Context) {
+      super(c, 'http')
+    }
+    route() {}
+    broadcast() {}
+  }
+  new HttpStub(ctx)
+  await ctx.plugin({ inject: ['tools', 'http'], apply: applyFileSystem })
+  const db = ctx.get('database') as DatabaseService
+  db.register(notesCollection())
+  const created = await db.create('/views', [{ title: '会被删掉', tablePath: '/notes', mode: 'table' }])
+  const row = created.items[0]?.value as { id?: unknown; viewId?: unknown }
+  const viewId = String(row.viewId ?? '')
+  const listed = await db.list('/views')
+  if (listed.kind !== 'collection') return
+  assert.equal(listed.items.some((item) => item.viewId === viewId), true)
+
+  const gone = await db.remove('/views', { ids: [String(row.id)] })
+  assert.equal((gone as { trash?: boolean }).trash, undefined)
+  // 硬删：不进回收站，行也不在列表里
+  const after = await db.list('/views')
+  if (after.kind !== 'collection') return
+  assert.equal(after.items.some((item) => item.viewId === viewId), false)
+  const bin = await db.listTrash()
+  assert.equal(bin.items.some((item) => item.collection === '/views'), false)
+  // 视图本体没了：再读应当未知，下次拉取也不会把它吐回来
+  await assert.rejects(() => db.read(`/views/${String(row.id)}`), /unknown/)
+  assert.deepEqual(
+    db.viewCatalog!.viewsFor('/notes').map((view) => view.id).filter((id) => id === viewId),
+    [],
   )
 })

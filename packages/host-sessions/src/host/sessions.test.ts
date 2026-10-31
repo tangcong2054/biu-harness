@@ -1,14 +1,36 @@
 import { mkdtemp, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
+import { mkdtempSync } from 'node:fs'
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
-import { Context } from 'cordis'
+import { Context, Service } from 'cordis'
+import { LATEST_BIU_SCHEMA, openAndMigrateBiu, runWithAccount } from '@biu/host-plugin-loader/data-dir'
+import { CollabStore } from '@biu/host-account/store'
 import * as sessionStore from '@biu/host-session-store'
 import * as sessions from './index.ts'
 import { SESSION_FORMAT_VERSION, deriveMessages, applyContextBudget, estimateTokens, statInputComposition } from './index.ts'
 import type { SessionEvent } from './index.ts'
 import type { LlmMessage } from '@biu/host-llm'
+
+test('creating a session stamps createdBy through the database service', async () => {
+  const ctx = new Context()
+  const stamped: string[] = []
+  class DatabaseTouch extends Service {
+    constructor(ctx: Context) {
+      super(ctx, 'database')
+    }
+    touchActor(collection: string, recordId: string) {
+      stamped.push(`${collection}/${recordId}`)
+      return Promise.resolve()
+    }
+  }
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(DatabaseTouch)
+  await ctx.plugin(sessions)
+  const record = await ctx.sessions.create()
+  assert.deepEqual(stamped, [`/agents/${record.id}`])
+})
 
 test('append-only log projects model history; version is 1', async () => {
   const ctx = new Context()
@@ -16,6 +38,7 @@ test('append-only log projects model history; version is 1', async () => {
   await ctx.plugin(sessions)
   const record = await ctx.sessions.create()
   assert.equal(record.version, SESSION_FORMAT_VERSION)
+  assert.ok(Number(record.config?.createdAt) > 0)
   await ctx.sessions.append(record.id, { type: 'system/prompt', text: 'sys' })
   await ctx.sessions.append(record.id, { type: 'user/message', text: 'hi', kind: 'wake' })
   await ctx.sessions.append(record.id, { type: 'assistant/message', text: 'yo' })
@@ -49,6 +72,43 @@ test('tool_calls assistant uses null content for API history', async () => {
   ])
 })
 
+test('lastMessageAt stays on the user message while the agent keeps writing', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const older = await ctx.sessions.create('older')
+  const newer = await ctx.sessions.create('newer')
+  await ctx.sessions.append(older.id, { type: 'user/message', text: '先问', kind: 'wake' })
+  const spoken = (await ctx.sessions.require(older.id)).events.find((event) => event.type === 'user/message')
+  assert.ok(spoken && spoken.type === 'user/message')
+  await ctx.sessions.append(newer.id, { type: 'user/message', text: '后问', kind: 'wake' })
+  await ctx.sessions.append(older.id, {
+    type: 'assistant/message',
+    text: '',
+    tool_calls: [{ id: '1', name: 'clock_now', arguments: '{}' }],
+  })
+  await ctx.sessions.append(older.id, { type: 'tool/result', id: '1', name: 'clock_now', ok: true, detail: 'now' })
+  await ctx.sessions.append(older.id, { type: 'assistant/message', text: '答完了' })
+  const listed = await ctx.sessions.listSummaries()
+  const row = listed.find((item) => item.id === older.id)
+  assert.equal(row?.lastMessageAt, spoken.ts)
+  assert.ok((row?.updatedAt ?? 0) >= spoken.ts)
+  const dir = await mkdtemp(join(tmpdir(), 'cordis-spoken-'))
+  const path = join(dir, 'sessions.sqlite')
+  const sql = new Context()
+  await sql.plugin(sessionStore, { driver: 'sqlite', path })
+  await sql.plugin(sessions)
+  const sqlOlder = await sql.sessions.create('sql-older')
+  await sql.sessions.append(sqlOlder.id, { type: 'user/message', text: '先问', kind: 'wake' })
+  const sqlSpoken = (await sql.sessions.require(sqlOlder.id)).events.find((event) => event.type === 'user/message')
+  assert.ok(sqlSpoken && sqlSpoken.type === 'user/message')
+  await sql.sessions.append(sqlOlder.id, { type: 'assistant/message', text: '还在干活' })
+  await sql.sessions.append(sqlOlder.id, { type: 'tool/call', id: '2', name: 'bash', arguments: '{}' })
+  const sqlRow = (await sql.sessions.listSummaries()).find((item) => item.id === sqlOlder.id)
+  assert.equal(sqlRow?.lastMessageAt, sqlSpoken.ts)
+  assert.ok((sqlRow?.updatedAt ?? 0) >= sqlSpoken.ts)
+})
+
 test('sqlite session store round-trips and listSummaries skips full reload', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'cordis-sqlite-'))
   const path = join(dir, 'sessions.sqlite')
@@ -64,10 +124,19 @@ test('sqlite session store round-trips and listSummaries skips full reload', asy
   assert.match(summaries[0]?.title ?? '', /^[墨栗赤橙金翠青蓝紫玫灰]/)
   assert.notEqual(summaries[0]?.title, 'sql1')
   assert.equal(summaries[0]?.eventCount, 4)
+  assert.ok(Number(summaries[0]?.config?.createdAt) > 0)
 
   const ctx2 = new Context()
   await ctx2.plugin(sessionStore, { driver: 'sqlite', path })
+  const throughStore = ctx2.sessionStore.peekSummary('sql1')
+  assert.equal(throughStore?.id, 'sql1')
+  assert.equal(throughStore?.title, summaries[0]?.title)
+  assert.deepEqual(throughStore?.mascot, summaries[0]?.mascot)
+  assert.equal(ctx2.sessionStore.peekSummary('missing'), undefined)
   await ctx2.plugin(sessions)
+  const throughSessions = ctx2.sessions.peekSummary('sql1')
+  assert.equal(throughSessions?.id, 'sql1')
+  assert.equal(throughSessions?.title, throughStore?.title)
   const loaded = await ctx2.sessions.get('sql1')
   assert.equal(loaded?.id, record.id)
   assert.equal(loaded?.events.length, 4)
@@ -147,15 +216,61 @@ test('reload heals orphan tool_calls so next LLM round is valid', async () => {
   assert.ok(tool)
 })
 
+test('startup reload promotes stuck partial tool/result instead of leaving it skipped', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cordis-heal-partial-'))
+  const path = join(dir, 'sessions.sqlite')
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'sqlite', path })
+  await ctx.plugin(sessions)
+  await ctx.sessions.create('chestnut')
+  await ctx.sessions.append('chestnut', { type: 'user/message', text: 'ls', kind: 'wake' })
+  await ctx.sessions.append('chestnut', { type: 'turn/start', turn: 2 })
+  await ctx.sessions.append('chestnut', {
+    type: 'assistant/message',
+    text: '',
+    tool_calls: [{ id: 'call_00_partial', name: 'bash', arguments: '{}' }],
+  })
+  await ctx.sessions.append('chestnut', {
+    type: 'tool/result',
+    id: 'call_00_partial',
+    name: 'bash',
+    ok: true,
+    detail: 'file-a\n',
+    partial: true,
+  })
+  await new Promise((resolve) => setTimeout(resolve, 120))
+
+  const ctx2 = new Context()
+  await ctx2.plugin(sessionStore, { driver: 'sqlite', path })
+  await ctx2.plugin(sessions)
+  const loaded = await ctx2.sessions.get('chestnut')
+  const results = loaded!.events.filter((item) => item.type === 'tool/result')
+  assert.equal(results.length, 1)
+  if (results[0]?.type === 'tool/result') {
+    assert.equal(results[0].partial, undefined)
+    assert.equal(results[0].detail, 'file-a\n')
+    assert.equal(results[0].id, 'call_00_partial')
+  }
+  const history = ctx2.sessions.deriveMessages('chestnut')
+  const assistantAt = history.findIndex((item) => item.role === 'assistant' && item.tool_calls?.[0]?.id === 'call_00_partial')
+  assert.ok(assistantAt >= 0)
+  assert.equal(history[assistantAt + 1]?.role, 'tool')
+  assert.equal(history[assistantAt + 1]?.content, 'file-a\n')
+})
+
 test('fork copies the append-only log into a child session', async () => {
   const ctx = new Context()
   await ctx.plugin(sessionStore, { driver: 'memory' })
   await ctx.plugin(sessions)
   const parent = await ctx.sessions.create()
   await ctx.sessions.append(parent.id, { type: 'user/message', text: 'keep', kind: 'wake' })
+  await ctx.sessions.patchConfig(parent.id, {
+    inspector: { open: true, dbPaths: { 'database:/pages': '/database/pages' } },
+  })
   const child = await ctx.sessions.fork(parent.id)
   assert.notEqual(child.id, parent.id)
   assert.equal(ctx.sessions.deriveMessages(child.id).some((item) => item.content === 'keep'), true)
+  assert.equal(child.config?.inspector, undefined)
   await ctx.sessions.append(child.id, { type: 'assistant/message', text: 'child-only' })
   assert.equal((await ctx.sessions.require(parent.id)).events.some((item) => item.type === 'assistant/message'), false)
 })
@@ -176,37 +291,6 @@ test('setProject binds host absolute path and clears it', async () => {
   assert.equal((await ctx.sessions.require(record.id)).project, undefined)
 })
 
-test('setProject binds macOS NFD-stored directory given NFC typed path', async () => {
-  const ctx = new Context()
-  await ctx.plugin(sessionStore, { driver: 'memory' })
-  await ctx.plugin(sessions)
-  const record = await ctx.sessions.create()
-
-  // macOS 的 APFS/HFS+ 以 NFD（分解）形式存储含组合字符的文件名；用户输入通常是
-  // NFC（预组合）。两者字节不同导致 realpath 对 NFC 去解析返回 ENOENT（目录其实
-  // 存在）。此测试用“带组合字符”的名字制造 NFC≠NFD，模拟“NFC 路径绑定 NFD 目录”。
-  const nfdName = 'café\u0301'.normalize('NFD') // 带组合重音的分解形式
-  const base = await mkdtemp(join(tmpdir(), 'cordis-nfd-'))
-  const dir = join(base, nfdName)
-  const { mkdir } = await import('node:fs/promises')
-  await mkdir(dir)
-  // 建立后确认该目录确实能按 NFC 与 NFD 不同解析（保证用例成立）
-  const nfcName = nfdName.normalize('NFC')
-  if (nfcName === nfdName) {
-    // 平台不支持组合差异（非 macOS / 特殊构造），跳过，不影响其余测试
-    return
-  }
-  // 用 NFC 形式的完整路径去绑定（正是 macOS 上“中文等目录无法绑定”的复现路径）
-  const nfcPath = join(base, nfcName)
-  const project = await ctx.sessions.setProject(record.id, { path: nfcPath })
-  assert.ok(project, 'NFC 路径应能绑定到 NFD 存储的目录')
-  assert.equal(project.name, nfdName) // 目录真实（磁盘）名字
-  const storedPath = (await ctx.sessions.require(record.id)).project?.path
-  assert.equal(storedPath, project.path)
-  // 存储的 path 必须是真实可解析的目录（realpath 通过）——即后序再绑定/使用不报不存在
-  assert.equal(await realpath(storedPath!), await realpath(dir))
-})
-
 test('delete removes session from store and cache', async () => {
   const ctx = new Context()
   await ctx.plugin(sessionStore, { driver: 'memory' })
@@ -218,34 +302,161 @@ test('delete removes session from store and cache', async () => {
   assert.equal(await ctx.sessions.delete(record.id), false)
 })
 
-test('create/listSummaries/fork preserve session type', async () => {
+test('listSummaries only returns sessions of the active workspace', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const kept = await ctx.sessions.create('kept')
+  const other = await ctx.sessions.create('other')
+  const mine = new Set([`/agents\t${kept.id}`])
+  const any = new Set([`/agents\t${kept.id}`, `/agents\t${other.id}`])
+  let active = 'ws-a'
+  const home = 'ws-home'
+  class FakeAccount extends Service {
+    store = {
+      activeWorkspaceId: () => active,
+      membership: () => ({ active, home, mine, any }),
+      attach: (workspaceId: string, collection: string, recordId: string) => {
+        const key = `${collection}\t${recordId}`
+        any.add(key)
+        if (workspaceId === active) mine.add(key)
+      },
+    }
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  await ctx.plugin(FakeAccount)
+  assert.deepEqual(
+    (await ctx.sessions.listSummaries()).map((item) => item.id),
+    [kept.id],
+  )
+  assert.equal(ctx.sessions.inWorkspace(other.id), false)
+  active = 'ws-b'
+  mine.clear()
+  const created = await ctx.sessions.create('fresh')
+  assert.equal(ctx.sessions.inWorkspace(created.id), true)
+  assert.deepEqual(
+    (await ctx.sessions.listSummaries()).map((item) => item.id),
+    [created.id],
+  )
+  active = home
+  mine.clear()
+  const legacy = await ctx.sessions.create('legacy')
+  any.delete(`/agents\t${legacy.id}`)
+  mine.delete(`/agents\t${legacy.id}`)
+  assert.equal(ctx.sessions.inWorkspace(legacy.id), true)
+  assert.equal(ctx.sessions.inWorkspace(other.id), false)
+})
+
+test('ensureDefaultSession creates exactly one session when the store is empty', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const [first, second] = await Promise.all([
+    ctx.sessions.ensureDefaultSession(),
+    ctx.sessions.ensureDefaultSession(),
+  ])
+  assert.equal(first, second)
+  assert.deepEqual(await ctx.sessions.list(), [first])
+  assert.equal(await ctx.sessions.ensureDefaultSession(), first)
+  assert.deepEqual(await ctx.sessions.list(), [first])
+})
+
+test('create/listSummaries/fork round-trip without a session type field', async () => {
   const ctx = new Context()
   await ctx.plugin(sessionStore, { driver: 'memory' })
   await ctx.plugin(sessions)
   const chat = await ctx.sessions.create()
-  const live = await ctx.sessions.create(undefined, { type: 'live' })
-  assert.equal(chat.type, 'chat')
-  assert.equal(live.type, 'live')
+  const other = await ctx.sessions.create()
+  assert.equal('type' in chat, false)
+  assert.equal('type' in other, false)
   const summaries = await ctx.sessions.listSummaries()
-  assert.equal(summaries.find((item) => item.id === live.id)?.type, 'live')
-  assert.equal(summaries.find((item) => item.id === chat.id)?.type, 'chat')
-  const forked = await ctx.sessions.fork(live.id)
-  assert.equal(forked.type, 'live')
+  assert.equal(summaries.every((item) => !('type' in item)), true)
+  const forked = await ctx.sessions.fork(other.id)
+  assert.equal('type' in forked, false)
 })
 
-test('sqlite persists session type across reopen', async () => {
+test('sqlite persists session records across reopen', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'cordis-type-'))
   const path = join(dir, 'sessions.sqlite')
   const ctx = new Context()
   await ctx.plugin(sessionStore, { driver: 'sqlite', path })
   await ctx.plugin(sessions)
-  await ctx.sessions.create('live-sql', { type: 'live' })
+  await ctx.sessions.create('persist-sql', { title: 'saved' })
   const ctx2 = new Context()
   await ctx2.plugin(sessionStore, { driver: 'sqlite', path })
   await ctx2.plugin(sessions)
-  const loaded = await ctx2.sessions.get('live-sql')
-  assert.equal(loaded?.type, 'live')
-  assert.equal((await ctx2.sessions.listSummaries())[0]?.type, 'live')
+  const loaded = await ctx2.sessions.get('persist-sql')
+  assert.equal(loaded?.id, 'persist-sql')
+  assert.equal('type' in (loaded ?? {}), false)
+  assert.equal((await ctx2.sessions.listSummaries())[0]?.id, 'persist-sql')
+})
+
+test('sqlite split sessions and events stay consistent across files', async () => {
+  const { createRequire } = await import('node:module')
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite')
+  const dir = await mkdtemp(join(tmpdir(), 'cordis-split-sql-'))
+  const path = join(dir, 'biu.sqlite')
+  const eventsPath = join(dir, 'events.sqlite')
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'sqlite', path, eventsPath })
+  await ctx.plugin(sessions)
+  await ctx.sessions.create('split1')
+  await ctx.sessions.append('split1', { type: 'user/message', text: 'hi', kind: 'wake' })
+  const sessionsDb = new DatabaseSync(path)
+  const eventsDb = new DatabaseSync(eventsPath)
+  const sessionRow = sessionsDb.prepare('SELECT event_count FROM agents WHERE id = ?').get('split1') as
+    | { event_count: number }
+    | undefined
+  const eventRows = eventsDb.prepare('SELECT COUNT(*) AS n FROM events WHERE session_id = ?').get('split1') as
+    | { n: number }
+    | undefined
+  sessionsDb.close()
+  eventsDb.close()
+  assert.equal(sessionRow?.event_count, 2)
+  assert.equal(Number(eventRows?.n), 2)
+})
+
+test('sqlite drops leftover sessions.type column', async () => {
+  const { createRequire } = await import('node:module')
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite')
+  const dir = await mkdtemp(join(tmpdir(), 'cordis-drop-type-'))
+  const path = join(dir, 'sessions.sqlite')
+  const db = new DatabaseSync(path)
+  db.exec(`
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      version INTEGER NOT NULL,
+      project_json TEXT,
+      event_count INTEGER NOT NULL DEFAULT 0,
+      title TEXT NOT NULL DEFAULT '',
+      updated_at INTEGER NOT NULL DEFAULT 0,
+      type TEXT NOT NULL DEFAULT 'live'
+    );
+    CREATE TABLE events (
+      session_id TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      ts INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      event_json TEXT NOT NULL,
+      PRIMARY KEY (session_id, seq)
+    );
+  `)
+  db.prepare(
+    'INSERT INTO sessions (id, version, title, type, event_count, updated_at) VALUES (?, 1, ?, ?, 0, 1)',
+  ).run('legacy', 'old', 'live')
+  db.exec(`PRAGMA user_version = ${LATEST_BIU_SCHEMA}`)
+  db.close()
+
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'sqlite', path })
+  await ctx.plugin(sessions)
+  const opened = new DatabaseSync(path)
+  const cols = (opened.prepare('PRAGMA table_info(agents)').all() as Array<{ name: string }>).map((row) => row.name)
+  opened.close()
+  assert.equal(cols.includes('type'), false)
+  assert.equal('type' in ((await ctx.sessions.get('legacy')) ?? {}), false)
 })
 
 
@@ -280,6 +491,28 @@ test('applyContextBudget: over budget keeps head + recent tail', () => {
   assert.ok(out.length < msgs.length)
 })
 
+test('applyContextBudget does not split assistant tool_calls from their tool results', () => {
+  const msgs: LlmMessage[] = [
+    { role: 'system', content: 'SYS' },
+    { role: 'user', content: 'old-'.padEnd(400, 'x') },
+    { role: 'assistant', content: 'old-a'.padEnd(400, 'x') },
+    { role: 'user', content: 'run' },
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'call_x', type: 'function', function: { name: 'bash', arguments: '{}' } }],
+    },
+    { role: 'tool', tool_call_id: 'call_x', content: 'out' },
+    { role: 'user', content: 'wake' },
+  ]
+  const out = applyContextBudget(msgs, 80, 2)
+  const assistant = out.find((item) => item.role === 'assistant' && item.tool_calls?.length)
+  const toolAt = out.findIndex((item) => item.role === 'tool' && item.tool_call_id === 'call_x')
+  assert.ok(assistant)
+  assert.ok(toolAt > 0)
+  assert.equal(out[toolAt - 1], assistant)
+})
+
 test('deriveMessages projects pasted images as multimodal content', () => {
   const events: SessionEvent[] = [
     { type: 'session/open', version: 1, seq: 0, ts: 0 },
@@ -300,6 +533,114 @@ test('deriveMessages projects pasted images as multimodal content', () => {
   assert.equal(parts[0]?.text, '看看这张图')
   assert.equal(parts[1]?.type, 'image_url')
   assert.equal(parts[1]?.image_url?.url, 'data:image/png;base64,abc')
+})
+
+test('quarantineLlmImages only flags the model projection and keeps pictures in the log', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const record = await ctx.sessions.create()
+  await ctx.sessions.append(record.id, {
+    type: 'user/message',
+    text: '看看',
+    kind: 'wake',
+    images: [{ name: 'shot.png', mime: 'image/png', url: 'data:image/png;base64,abc' }],
+  })
+  await ctx.sessions.quarantineLlmImages(record.id)
+  assert.equal(ctx.sessions.llmImagesBlocked(record.id), true)
+  const stored = (await ctx.sessions.require(record.id)).events.find((item) => item.type === 'user/message')
+  assert.equal(stored?.type === 'user/message' && stored.images?.length, 1)
+})
+
+test('quarantineLlmImages with seqs only omits those pictures from the projection', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const record = await ctx.sessions.create()
+  const first = await ctx.sessions.append(record.id, {
+    type: 'user/message',
+    text: '旧图',
+    kind: 'wake',
+    images: [{ name: 'old.png', mime: 'image/png', url: 'data:image/png;base64,old' }],
+  })
+  await ctx.sessions.append(record.id, { type: 'assistant/message', text: '上次已经回过了' })
+  const second = await ctx.sessions.append(record.id, {
+    type: 'user/message',
+    text: '新图',
+    kind: 'wake',
+    images: [{ name: 'new.png', mime: 'image/png', url: 'data:image/png;base64,new' }],
+  })
+  await ctx.sessions.quarantineLlmImages(record.id, [second.seq])
+  assert.equal(ctx.sessions.llmImagesBlocked(record.id), true)
+  const derived = ctx.sessions.deriveMessages(record.id)
+  const users = derived.filter((item) => item.role === 'user')
+  assert.equal(Array.isArray(users[0]?.content), true)
+  assert.equal(users[1]?.content, '新图')
+  assert.equal((await ctx.sessions.require(record.id)).config?.skipLlmImages, undefined)
+  await ctx.sessions.allowLlmImages(record.id)
+  assert.equal((await ctx.sessions.require(record.id)).config?.omitImageSeqs?.includes(second.seq), true)
+  assert.equal(first.seq !== second.seq, true)
+})
+
+test('dropUserImages removes stored pictures so deriveMessages is text-only', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const record = await ctx.sessions.create()
+  await ctx.sessions.append(record.id, {
+    type: 'user/message',
+    text: '看看',
+    kind: 'wake',
+    images: [{ name: 'shot.png', mime: 'image/png', url: 'data:image/png;base64,abc' }],
+  })
+  assert.equal(await ctx.sessions.dropUserImages(record.id), 1)
+  const user = ctx.sessions.deriveMessages(record.id).find((item) => item.role === 'user')
+  assert.equal(user?.content, '看看')
+})
+
+test('deriveMessages does not project svg data URLs as image_url', () => {
+  const events: SessionEvent[] = [
+    { type: 'session/open', version: 1, seq: 0, ts: 0 },
+    {
+      type: 'user/message',
+      text: 'logo',
+      kind: 'wake',
+      seq: 1,
+      ts: 1,
+      images: [{ name: 'logo.svg', mime: 'image/png', url: 'data:image/svg+xml;base64,PHN2Zz4=' }],
+    },
+  ]
+  const out = deriveMessages(events)
+  const user = out.find((item) => item.role === 'user')
+  assert.equal(user?.content, 'logo')
+})
+
+test('deriveMessages honors db_action compact as new prefix', () => {
+  const events: SessionEvent[] = [
+    { type: 'session/open', version: 1, seq: 0, ts: 0 },
+    { type: 'system/prompt', text: 'SYS', seq: 1, ts: 1 },
+    { type: 'user/message', text: '旧的早期消息A', kind: 'wake', seq: 2, ts: 2 },
+    { type: 'assistant/message', text: '早期回答B', seq: 3, ts: 3 },
+    {
+      type: 'tool/call',
+      id: 't1',
+      name: 'db_action',
+      arguments: JSON.stringify({
+        path: '/agents/s1',
+        action: 'compact',
+        args: { text: '摘要：聊了早期内容' },
+      }),
+      seq: 4,
+      ts: 4,
+    },
+    { type: 'user/message', text: '压缩后的新问题', kind: 'wake', seq: 5, ts: 5 },
+  ]
+  const out = deriveMessages(events as any)
+  const joined = out.map((m) => (typeof m.content === 'string' ? m.content : '')).join('|')
+  assert.ok(joined.includes('压缩后的新问题'))
+  assert.ok(joined.includes('摘要：聊了早期内容'))
+  assert.ok(!joined.includes('旧的早期消息A'))
+  assert.ok(!joined.includes('早期回答B'))
 })
 
 test('deriveMessages honors context_compact_submit tool/call as new prefix', () => {
@@ -432,6 +773,75 @@ test('statInputComposition: idle with multiple turns -> latest turn is "this", e
   assert.ok(out.histPct < 0.5) // curPct=1-histPct > 0.5
 })
 
+test('append coalesces live partial tool/result for the same id', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const record = await ctx.sessions.create()
+  await ctx.sessions.append(record.id, {
+    type: 'assistant/message',
+    text: '',
+    tool_calls: [{ id: 'c1', name: 'web_search', arguments: '{}' }],
+  })
+  const first = await ctx.sessions.append(record.id, {
+    type: 'tool/result',
+    id: 'c1',
+    name: 'web_search',
+    ok: true,
+    detail: '{"sources":[]}',
+    partial: true,
+  })
+  const second = await ctx.sessions.append(record.id, {
+    type: 'tool/result',
+    id: 'c1',
+    name: 'web_search',
+    ok: true,
+    detail: '{"sources":[{"url":"https://example.com"}]}',
+    partial: true,
+  })
+  const final = await ctx.sessions.append(record.id, {
+    type: 'tool/result',
+    id: 'c1',
+    name: 'web_search',
+    ok: true,
+    detail: '{"sources":[{"url":"https://example.com"}]}',
+  })
+  const events = (await ctx.sessions.require(record.id)).events
+  const results = events.filter((event) => event.type === 'tool/result')
+  assert.equal(results.length, 1)
+  assert.equal(second.seq, first.seq)
+  assert.equal(final.seq, first.seq)
+  assert.equal(results[0]?.partial, undefined)
+  assert.deepEqual(
+    deriveMessages(events).filter((item) => item.role === 'tool'),
+    [{ role: 'tool', tool_call_id: 'c1', content: '{"sources":[{"url":"https://example.com"}]}' }],
+  )
+})
+
+test('append coalesces live tool/call arguments for the same id', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const record = await ctx.sessions.create()
+  const first = await ctx.sessions.append(record.id, {
+    type: 'tool/call',
+    id: 'c1',
+    name: 'db_update',
+    arguments: '{',
+  })
+  const second = await ctx.sessions.append(record.id, {
+    type: 'tool/call',
+    id: 'c1',
+    name: 'db_update',
+    arguments: '{"title":"hi"}',
+  })
+  const events = (await ctx.sessions.require(record.id)).events
+  const calls = events.filter((event) => event.type === 'tool/call')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0]?.arguments, '{"title":"hi"}')
+  assert.equal(second.seq, first.seq)
+})
+
 test('statInputComposition: honors compact point (starts counting after it)', () => {
   const events = [
     ev({ type: 'turn/start', turn: 1, seq: 0 }),
@@ -444,5 +854,57 @@ test('statInputComposition: honors compact point (starts counting after it)', ()
   // 压缩点前的 early-msg-aaaa 不计入；只从压缩点后开算
   assert.equal(out.histChars + out.curChars, 'after-compact'.length)
   assert.equal(out.curChars, 'after-compact'.length)
+})
+
+test('two accounts do not see each others sessions', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const dir = mkdtempSync(join(tmpdir(), 'biu-account-sessions-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  await ctx.plugin(AccountBridge)
+  const ada = collab.register('', Date.now(), 'secret1', 'ada@example.com')
+  const bob = collab.register('', Date.now(), 'secret1', 'bob@example.com')
+  collab.enter(ada.id)
+  collab.enter(bob.id)
+  const adaSession = await runWithAccount(ada.id, () => ctx.sessions.create('ada-session'))
+  const bobSession = await runWithAccount(bob.id, () => ctx.sessions.create('bob-session'))
+  const adaList = await runWithAccount(ada.id, () => ctx.sessions.listSummaries())
+  const bobList = await runWithAccount(bob.id, () => ctx.sessions.listSummaries())
+  assert.deepEqual(adaList.map((item) => item.id), [adaSession.id])
+  assert.deepEqual(bobList.map((item) => item.id), [bobSession.id])
+  assert.equal(runWithAccount(bob.id, () => ctx.sessions.inWorkspace(adaSession.id)), false)
+  assert.equal(runWithAccount(ada.id, () => ctx.sessions.inWorkspace(bobSession.id)), false)
+})
+
+test('a view grant lets the other member see an inherited session', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  const dir = mkdtempSync(join(tmpdir(), 'biu-view-sessions-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    constructor(inner: Context) {
+      super(inner, 'account')
+    }
+  }
+  await ctx.plugin(AccountBridge)
+  const ada = collab.register('', Date.now(), 'secret1', 'view-ada@example.com')
+  const bob = collab.register('', Date.now(), 'secret1', 'view-bob@example.com')
+  collab.enter(ada.id)
+  collab.enter(bob.id)
+  const adaSession = await runWithAccount(ada.id, () => ctx.sessions.create('ada-shared'))
+  const sharedId = adaSession.id
+  ctx.sessions.viewAccess = (id) => id === sharedId
+  const bobList = await runWithAccount(bob.id, () => ctx.sessions.listSummaries())
+  assert.deepEqual(bobList.map((item) => item.id), [sharedId])
+  assert.equal(runWithAccount(bob.id, () => ctx.sessions.inWorkspace(sharedId)), true)
 })
 

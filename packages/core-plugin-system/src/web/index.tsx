@@ -11,31 +11,25 @@ import type { Context } from 'cordis'
 import { useSlotEntries, type SlotsService } from '@biu/web-slots'
 import type { SlotProps } from '@biu/type-slots'
 
-import {
-  XMarkIcon,
-  MinusIcon,
-  ArrowsPointingOutIcon,
-  ArrowsPointingInIcon,
-  PuzzlePieceIcon,
-  Bars2Icon,
-  ExclamationTriangleIcon,
-} from '@heroicons/react/16/solid'
+import { XMarkIcon, MinusIcon, ArrowsPointingOutIcon, ArrowsPointingInIcon, Bars2Icon, ExclamationTriangleIcon } from '@heroicons/react/16/solid'
 import type { DatabaseUi } from '@biu/type-file-system/ui'
-import type { DockService } from '@biu/core-dock'
 import { pluginsChrome } from './chrome.tsx'
+import { listenEnablePageBlockPlugin, watchInstalledPageBlocks, watchRunningWindowPlugins } from './page-block-plugin.ts'
+import { PluginTrayPortal, type PluginTrayItem } from './plugin-tray.tsx'
 import {
   WIN_CHROME_H,
   centeredGeom,
   clampGeom,
+  listingIsHeadless,
   storeShellFromRecord,
   type StoreShell,
   type WinGeom,
 } from '../shell.ts'
 
 export const name = 'core-plugin-system-ui'
-export const inject = ['slots', 'databaseUi', 'dock']
+export const inject = ['slots', 'databaseUi']
 
-type StoreListing = { id: string; name: string; shell?: StoreShell }
+type StoreListing = { id: string; name: string; shell?: StoreShell; headless?: boolean }
 
 async function readJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, init)
@@ -147,6 +141,7 @@ function PluginAppWindow({
   pluginId,
   shell,
   fullscreen,
+  minimized,
   onClose,
   onMinimize,
   onToggleFullscreen,
@@ -157,6 +152,7 @@ function PluginAppWindow({
   pluginId: string
   shell: StoreShell
   fullscreen: boolean
+  minimized: boolean
   onClose: () => void
   onMinimize: () => void
   onToggleFullscreen: () => void
@@ -278,6 +274,11 @@ function PluginAppWindow({
     ? { top: 0, left: 0, width: '100vw', height: '100vh', zIndex: z + 8 }
     : { top: geom.y, left: geom.x, width: geom.w, height: geom.h, zIndex: z }
 
+  if (minimized) {
+    // 缩小只藏窗口，不卸 React：终端/画板卸掉会断连接、清掉内存里的历史。
+    Object.assign(style, { visibility: 'hidden', pointerEvents: 'none' })
+  }
+
   const handles: Array<{ key: string; className: string; edge: ResizeEdge }> = [
     { key: 'n', className: 'absolute inset-x-2 top-0 h-1.5 cursor-n-resize', edge: { north: true } },
     { key: 's', className: 'absolute inset-x-2 bottom-0 h-1.5 cursor-s-resize', edge: { south: true } },
@@ -292,18 +293,22 @@ function PluginAppWindow({
   return (
     <section
       ref={boxRef}
-      className="group/win pointer-events-auto fixed flex min-h-0 min-w-0 flex-col overflow-visible bg-transparent text-(--dsw-label)"
+      className="group/win pointer-events-auto fixed flex min-h-0 min-w-0 flex-col overflow-visible bg-transparent text-(--biu-color-text)"
       style={style}
       data-testid={`plugin-app-window-${extraId}`}
       data-plugin-id={pluginId}
+      data-biu-plugin={pluginId}
       data-shell-width={shell.width}
       data-shell-height={shell.height}
       data-shell-resizable={shell.resizable ? '1' : '0'}
       data-fullscreen={fullscreen || undefined}
       data-controls={controlsOpen ? 'open' : undefined}
+      data-minimized={minimized || undefined}
+      aria-hidden={minimized || undefined}
+      inert={minimized || undefined}
       onPointerDown={bringFront}
-      onPointerEnter={fullscreen ? undefined : openControls}
-      onPointerLeave={fullscreen ? undefined : closeControlsSoon}
+      onPointerEnter={fullscreen || minimized ? undefined : openControls}
+      onPointerLeave={fullscreen || minimized ? undefined : closeControlsSoon}
     >
       <div className="plugin-store-window-body relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-transparent">
         {children}
@@ -355,22 +360,17 @@ function PluginAppWindow({
         >
           <MinusIcon className="size-5" />
         </button>
+        {shell.resizable ? (
         <button
           type="button"
-          className={`flex size-8 items-center justify-center rounded-md border-0 bg-transparent p-0 transition-colors ${
-            shell.resizable
-              ? 'cursor-pointer text-neutral-500 hover:bg-black/5 hover:text-neutral-800'
-              : 'cursor-not-allowed text-neutral-400/50'
-          }`}
-          title={shell.resizable ? (fullscreen ? '还原' : '全屏') : '固定尺寸，不能放大'}
-          aria-label={
-            shell.resizable ? (fullscreen ? `还原 ${title}` : `全屏 ${title}`) : `${title} 固定尺寸，不能放大`
-          }
-          disabled={!shell.resizable}
-          onClick={shell.resizable ? onToggleFullscreen : undefined}
+          className="flex size-8 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent p-0 text-neutral-500 transition-colors hover:bg-black/5 hover:text-neutral-800"
+          title={fullscreen ? '还原' : '全屏'}
+          aria-label={fullscreen ? `还原 ${title}` : `全屏 ${title}`}
+          onClick={onToggleFullscreen}
         >
           {fullscreen ? <ArrowsPointingInIcon className="size-5" /> : <ArrowsPointingOutIcon className="size-5" />}
         </button>
+        ) : null}
         </nav>
       </div>
       {fullscreen || !shell.resizable
@@ -388,7 +388,6 @@ function PluginAppWindow({
 
 function PluginExtrasLayer(props: SlotProps) {
   const slots = props.slots as SlotsService
-  const dock = props.dock as DockService
   const extras = useSlotEntries(slots, 'plugin-store-extras')
   const [listings, setListings] = useState<StoreListing[]>([])
   const [minimized, setMinimized] = useState<Record<string, boolean>>({})
@@ -408,10 +407,10 @@ function PluginExtrasLayer(props: SlotProps) {
         })
     }
     load()
-    const timer = window.setInterval(load, 3000)
+    window.addEventListener('fsdb:change', load)
     return () => {
       cancelled = true
-      window.clearInterval(timer)
+      window.removeEventListener('fsdb:change', load)
     }
   }, [extras.map((item) => item.id).join('|')])
 
@@ -442,7 +441,7 @@ function PluginExtrasLayer(props: SlotProps) {
 
   useEffect(() => {
     const live = new Set(sorted.map((entry) => entry.id))
-    setDismissed((cur) => {
+    const prune = (cur: Record<string, boolean>) => {
       let changed = false
       const next = { ...cur }
       for (const id of Object.keys(next)) {
@@ -451,61 +450,32 @@ function PluginExtrasLayer(props: SlotProps) {
         changed = true
       }
       return changed ? next : cur
-    })
+    }
+    setDismissed(prune)
+    setMinimized(prune)
   }, [sorted.map((entry) => entry.id).join('|')])
 
-  useEffect(() => {
-    const live = new Set<string>()
-    for (const entry of sorted) {
-      if (dismissed[entry.id]) continue
-      const listing = resolveListing(entry.id, listings)
-      const title = listing?.name ?? entry.id
-      const dockId = `plugin:${entry.id}`
-      live.add(dockId)
-      const extraProps = entry.props?.() ?? {}
-      const ExtraIcon = extraProps.Icon as ((props: { className?: string }) => ReactNode) | undefined
-      const Icon = ExtraIcon
-        ? () => <ExtraIcon className="size-5" />
-        : () => <PuzzlePieceIcon className="size-5" aria-hidden />
-      dock.register({
-        id: dockId,
-        title,
-        group: 'tray',
-        kind: 'plugin',
-        pinned: false,
-        order: 300 + entry.order,
-        Icon,
-        onOpen: () => {
-          setMinimized((cur) => {
-            const next = { ...cur }
-            delete next[entry.id]
-            return next
-          })
-        },
-        onClose: () => {
-          const listingNow = resolveListing(entry.id, listings)
-          dismissAndStop(entry.id, listingNow?.id ?? entry.id)
-        },
-      })
-      dock.patch(dockId, {
-        running: true,
-        minimized: Boolean(minimized[entry.id]),
-        title,
-      })
-    }
-    for (const app of dock.list()) {
-      if (app.kind === 'plugin' && !live.has(app.id)) dock.unregister(app.id)
-    }
-  }, [dock, listings, minimized, dismissed, sorted.map((entry) => entry.id).join('|')])
+  const windows = sorted.flatMap((entry) => {
+    if (dismissed[entry.id]) return []
+    const listing = resolveListing(entry.id, listings)
+    const extraProps = entry.props?.() ?? {}
+    if (listingIsHeadless(listing) || extraProps.headless === true) return []
+    const pluginId = listing?.id ?? entry.id
+    const title = listing?.name ?? (typeof extraProps.title === 'string' ? extraProps.title : entry.id)
+    return [{ entry, listing, extraProps, pluginId, title }]
+  })
+
+  const trayItems: PluginTrayItem[] = windows.map(({ entry, extraProps, title }) => ({
+    id: entry.id,
+    title,
+    Icon: typeof extraProps.Icon === 'function' ? (extraProps.Icon as PluginTrayItem['Icon']) : undefined,
+  }))
 
   if (extras.length === 0) return null
   return (
     <div className="pointer-events-none fixed inset-0 z-20" data-testid="plugin-store-extras">
-      {sorted.map((entry) => {
-        if (minimized[entry.id] || dismissed[entry.id]) return null
-        const listing = resolveListing(entry.id, listings)
-        const pluginId = listing?.id ?? entry.id
-        const title = listing?.name ?? entry.id
+      {windows.map(({ entry, pluginId, title, listing }) => {
+        const isMin = Boolean(minimized[entry.id])
         const shell = storeShellFromRecord(listing)
         const Component = entry.Component
         return (
@@ -515,12 +485,12 @@ function PluginExtrasLayer(props: SlotProps) {
             title={title}
             pluginId={pluginId}
             shell={shell}
-            fullscreen={Boolean(shell.resizable) && fullscreenId === entry.id}
+            fullscreen={!isMin && Boolean(shell.resizable) && fullscreenId === entry.id}
+            minimized={isMin}
             onClose={() => dismissAndStop(entry.id, pluginId)}
             onMinimize={() => {
               if (fullscreenId === entry.id) setFullscreenId(null)
               setMinimized((cur) => ({ ...cur, [entry.id]: true }))
-              dock.minimize(`plugin:${entry.id}`)
             }}
             onToggleFullscreen={() => {
               if (!shell.resizable) return
@@ -537,6 +507,21 @@ function PluginExtrasLayer(props: SlotProps) {
           </PluginAppWindow>
         )
       })}
+      <PluginTrayPortal
+        items={trayItems}
+        minimized={minimized}
+        onRestore={(id) => {
+          setMinimized((cur) => {
+            const next = { ...cur }
+            delete next[id]
+            return next
+          })
+        }}
+        onMinimize={(id) => {
+          if (fullscreenId === id) setFullscreenId(null)
+          setMinimized((cur) => ({ ...cur, [id]: true }))
+        }}
+      />
     </div>
   )
 }
@@ -546,10 +531,13 @@ export function apply(ctx: Context) {
   if (!slots) throw new Error('slots service required')
   const ui = ctx.get('databaseUi') as DatabaseUi
   ctx.effect(() => ui.decorate('/plugins', pluginsChrome).dispose)
+  ctx.effect(() => listenEnablePageBlockPlugin())
+  ctx.effect(() => watchInstalledPageBlocks())
+  ctx.effect(() => watchRunningWindowPlugins())
   slots.place('root-overlays', PluginExtrasLayer, {
     key: 'plugin-store-extras-layer',
     order: 20,
-    props: () => ({ slots, dock: ctx.dock }),
+    props: () => ({ slots }),
     children: {
       'plugin-store-extras': { kind: 'list' },
     },

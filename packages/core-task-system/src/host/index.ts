@@ -1,17 +1,16 @@
 import { mkdirSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { createRequire } from 'node:module'
+import { dirname } from 'node:path'
+import { biuSqlitePath, openAndMigrateBiu, readEditorContent, writeEditorContent } from '@biu/host-plugin-loader/data-dir'
 import { Service, type Context } from 'cordis'
 import { currentSessionId } from '@biu/host-sessions/scope'
+import { emptySchemaValue, normalizeSchemaValue, type SchemaFieldValue } from '@biu/type-file-system'
 import { startTaskClock } from './clock.ts'
 import { tasksCollection } from './collection.ts'
 
 type DatabaseSync = import('node:sqlite').DatabaseSync
 type SQLInputValue = import('node:sqlite').SQLInputValue
 
-const require = createRequire(import.meta.url)
-
-export type TaskStatus = 'todo' | 'doing' | 'done'
+export type TaskStatus = 'todo' | 'doing' | 'done' | 'failed'
 export type TaskPriority = 'low' | 'med' | 'high'
 export type TaskDifficulty = 'low' | 'med' | 'high'
 export type TaskActorKind = 'user' | 'agent'
@@ -121,6 +120,8 @@ export type TaskRow = {
   /** report 中 done 的次数（派生） */
   doneCount?: number
   sort: number
+  emoji: string
+  facet: SchemaFieldValue
   createdAt: number
   updatedAt: number
   creator: TaskActor
@@ -138,88 +139,17 @@ export type TaskRow = {
   trigger?: TaskTrigger
   /** 下次触发时间戳（派生）：当前状态 idle/pending 且有命中条件时计算。 */
   nextTriggerAt?: number | null
-  /** 进度汇报提醒间隔（秒）。任务派发后若 assignee 超过该时长未 task_report，creator 会收到进度追问。默认 60。 */
+  /** 进度汇报提醒间隔（秒）。派发后若超过该时长未 report，向执行会话追问进展。默认 60。 */
   reportIntervalSec: number
   /** 上次进度追问时间戳（ms），用于追问冷却（冷却窗口=reportIntervalSec）。 */
   lastReportPromptAt: number | null
-}
-
-
-// ==================== 视图系统（Notion 风格）：task_views 表 + 配置归一化 ====================
-export type TaskViewMode = 'queue' | 'table' | 'cards' | 'board' | 'graph'
-export type TaskViewSortField = 'priority' | 'due' | 'updated' | 'created' | 'status'
-export type TaskViewSortDir = 'asc' | 'desc'
-
-/** 视图筛选（与工具栏筛选对应；time：''=全部 | '1h' | '24h' | '7d' | '30d'） */
-export type TaskViewFilter = {
-  project: string
-  tags: string[]
-  time: string
-}
-
-/** 视图排序：字段 + 升降序。字段为 status 时按「状态 → 优先级 → 截止」复合排序。 */
-export type TaskViewSort = {
-  field: TaskViewSortField
-  dir: TaskViewSortDir
-}
-
-/** 视图 = 一套完整配置：呈现方式 + 筛选 + 排序 */
-export type TaskViewConfig = {
-  mode: TaskViewMode
-  filter: TaskViewFilter
-  sort: TaskViewSort
-}
-
-export type TaskView = {
-  id: string
-  name: string
-  config: TaskViewConfig
-  isBuiltin: boolean
-  createdAt: number
-  updatedAt: number
-}
-
-const VIEW_MODES = new Set<TaskViewMode>(['queue', 'table', 'cards', 'board', 'graph'])
-const VIEW_SORT_FIELDS = new Set<TaskViewSortField>(['priority', 'due', 'updated', 'created', 'status'])
-const VIEW_SORT_DIRS = new Set<TaskViewSortDir>(['asc', 'desc'])
-const VIEW_TIME_FILTERS = new Set<string>(['', '1h', '24h', '7d', '30d'])
-
-export function defaultViewConfig(): TaskViewConfig {
-  return {
-    mode: 'table',
-    filter: { project: '', tags: [], time: '' },
-    // 默认排序：状态 → 优先级 → 截止（status 为复合排序）
-    sort: { field: 'status', dir: 'asc' },
-  }
-}
-
-/** 归一化视图配置：非法字段回退默认，保证写入 task_views.config_json 的数据结构稳定。 */
-export function normalizeViewConfig(value: unknown): TaskViewConfig {
-  const d = defaultViewConfig()
-  if (!value || typeof value !== 'object') return d
-  const raw = value as Record<string, unknown>
-  const mode = VIEW_MODES.has(raw.mode as TaskViewMode) ? (raw.mode as TaskViewMode) : d.mode
-  const filterRaw = (raw.filter && typeof raw.filter === 'object' ? raw.filter : {}) as Record<string, unknown>
-  const tags = Array.isArray(filterRaw.tags) ? [...new Set(filterRaw.tags.map((t) => String(t).trim()).filter(Boolean))] : []
-  const filter: TaskViewFilter = {
-    project: typeof filterRaw.project === 'string' ? filterRaw.project : '',
-    tags,
-    time: VIEW_TIME_FILTERS.has(String(filterRaw.time ?? '')) ? String(filterRaw.time) : '',
-  }
-  const sortRaw = (raw.sort && typeof raw.sort === 'object' ? raw.sort : {}) as Record<string, unknown>
-  const sort: TaskViewSort = {
-    field: VIEW_SORT_FIELDS.has(sortRaw.field as TaskViewSortField) ? (sortRaw.field as TaskViewSortField) : d.sort.field,
-    dir: VIEW_SORT_DIRS.has(sortRaw.dir as TaskViewSortDir) ? (sortRaw.dir as TaskViewSortDir) : d.sort.dir,
-  }
-  return { mode, filter, sort }
-}
-
-export function normalizeViewName(value: unknown): string {
-  const s = typeof value === 'string' ? value.trim() : ''
-  return s ? s.slice(0, 80) : '未命名视图'
+  /** 自上次汇报以来已追问次数。达到 MAX_REPORT_PROMPTS 后停止，避免把执行会话问死。 */
+  reportPromptCount: number
 }
 
 export type TaskCreateInput = {
+  id?: string
+  updatedAt?: number
   title: string
   status?: TaskStatus
   priority?: TaskPriority
@@ -237,9 +167,12 @@ export type TaskCreateInput = {
   trigger?: Partial<TaskTrigger>
   /** 进度汇报提醒间隔（秒），默认 60。 */
   reportIntervalSec?: number
+  emoji?: string
+  facet?: SchemaFieldValue
 }
 
 export type TaskUpdateInput = Partial<{
+  updatedAt: number
   title: string
   status: TaskStatus
   priority: TaskPriority
@@ -261,6 +194,10 @@ export type TaskUpdateInput = Partial<{
   reportIntervalSec: number
   /** 上次进度追问时间戳（ms），仅供内部监测更新。 */
   lastReportPromptAt: number | null
+  /** 自上次汇报以来已追问次数。 */
+  reportPromptCount: number
+  emoji: string
+  facet: SchemaFieldValue
 }>
 
 export type TaskListFilter = {
@@ -329,7 +266,7 @@ type HostCtx = Context & {
   }
 }
 
-const STATUSES = new Set<TaskStatus>(['todo', 'doing', 'done'])
+const STATUSES = new Set<TaskStatus>(['todo', 'doing', 'done', 'failed'])
 const PRIORITIES = new Set<TaskPriority>(['low', 'med', 'high'])
 const DIFFICULTIES = new Set<TaskDifficulty>(['low', 'med', 'high'])
 
@@ -699,7 +636,7 @@ export async function coerceAssigneeArg(host: HostCtx, value: unknown): Promise<
 
 const ASSIGNEE_PARAM = {
   description:
-    '分配人。支持：人名字符串；sessionId 字符串；或 actor 对象 { kind, sessionId?, name?, mascot? }；null 清空。也可用 assigneeSessionId。',
+    '分配人。写执行人字段：sessionId 字符串、或 actor 对象 { kind, sessionId?, name?, mascot? }；空则清空。',
 } as const
 
 const ASSIGNEE_SESSION_PARAM = {
@@ -720,7 +657,7 @@ function actorsEqual(a: TaskActor | null, b: TaskActor | null): boolean {
 export const DELIVER_COLLABORATION_NOTE = [
   '',
   '【协作规范】请优先使用本系统的任务体系进行后续任务派发与协作：',
-  '新需求请用 tasks_create 创建、用 task_deliver 派给负责 session、用 task_report 上报进度。',
+  '新需求请用 db_create 在 /tasks 批量建记录（records 数组）、用 db_action path=/tasks/<id> action=deliver 派工、action=report 上报进度。',
   '这样需求可被跟踪、进度可回传、派发人会收到回执。避免绕过任务系统直接 dispatch 子 session。',
 ].join('\n')
 
@@ -786,7 +723,15 @@ export async function reportBackToCreator(
   }
 }
 
-function mapRow(row: Record<string, unknown>): TaskRow {
+function isBlankJson(raw: unknown) {
+  return raw == null || raw === '' || raw === '[]' || raw === '{}'
+}
+
+const LIST_TASK_COLUMNS = `tasks.id, tasks.title, tasks.status, tasks.priority, tasks.difficulty, tasks.due_at,
+         tasks.sort, tasks.created_at, tasks.updated_at, tasks.creator_json, tasks.assignee_json, tasks.assigned_at,
+         tasks.project, tasks.tags_json, tasks.parent_id, tasks.depends_on, tasks.depth, tasks.emoji, tasks.reports_json`
+
+function mapRow(row: Record<string, unknown>, listed = false): TaskRow {
   let creator: TaskActor = { kind: 'user', name: '用户' }
   if (typeof row.creator_json === 'string' && row.creator_json) {
     try {
@@ -815,7 +760,7 @@ function mapRow(row: Record<string, unknown>): TaskRow {
       : Number(row.assigned_at)
 
   const reports: TaskReport[] = []
-  if (typeof row.reports_json === 'string' && row.reports_json) {
+  if (!isBlankJson(row.reports_json) && typeof row.reports_json === 'string') {
     try {
       const parsed = JSON.parse(row.reports_json)
       if (Array.isArray(parsed)) {
@@ -853,7 +798,7 @@ function mapRow(row: Record<string, unknown>): TaskRow {
   }
 
   const tags: string[] = []
-  if (typeof row.tags_json === 'string' && row.tags_json) {
+  if (!isBlankJson(row.tags_json) && typeof row.tags_json === 'string') {
     try {
       const parsed = JSON.parse(row.tags_json)
       if (Array.isArray(parsed)) {
@@ -870,7 +815,7 @@ function mapRow(row: Record<string, unknown>): TaskRow {
   }
 
   const dependsOn: string[] = []
-  if (typeof row.depends_on === 'string' && row.depends_on) {
+  if (!isBlankJson(row.depends_on) && typeof row.depends_on === 'string') {
     try {
       const parsed = JSON.parse(row.depends_on)
       if (Array.isArray(parsed)) {
@@ -883,6 +828,15 @@ function mapRow(row: Record<string, unknown>): TaskRow {
     }
   }
 
+  let facet = emptySchemaValue()
+  if (!listed && !isBlankJson(row.facet_json) && typeof row.facet_json === 'string') {
+    try {
+      facet = normalizeSchemaValue(JSON.parse(row.facet_json))
+    } catch {
+      facet = emptySchemaValue()
+    }
+  }
+
   return {
     id: String(row.id),
     title: String(row.title ?? ''),
@@ -890,38 +844,41 @@ function mapRow(row: Record<string, unknown>): TaskRow {
     priority: asPriority(row.priority),
     difficulty: asDifficulty(row.difficulty),
     dueAt: row.due_at == null ? null : Number(row.due_at),
-    description: String(row.description ?? ''),
-    notes: String(row.notes ?? ''),
+    description: '',
+    notes: listed ? '' : String(row.notes ?? ''),
     project: typeof row.project === 'string' && row.project.trim() ? row.project.trim() : null,
     tags,
     parentId: typeof row.parent_id === 'string' && row.parent_id ? row.parent_id : null,
     dependsOn,
     depth: typeof row.depth === 'number' ? Number(row.depth) : 0,
     sort: Number(row.sort ?? 0),
+    emoji: String(row.emoji ?? ''),
+    facet,
     createdAt: Number(row.created_at ?? 0),
     updatedAt: Number(row.updated_at ?? 0),
     creator,
     assignee,
     assignedAt: assignee ? assignedAt : null,
     reports,
-    trigger: (() => {
-      if (typeof row.trigger_json === 'string' && row.trigger_json) {
-        try {
-          return normalizeTrigger(JSON.parse(row.trigger_json))
-        } catch {
-          /* ignore */
-        }
-      }
-      return undefined
-    })(),
-    reportIntervalSec:
-      row.report_interval_sec == null || Number.isNaN(Number(row.report_interval_sec)) || Number(row.report_interval_sec) <= 0
-        ? 60
-        : Math.round(Number(row.report_interval_sec)),
-    lastReportPromptAt:
-      row.last_report_prompt_at == null || row.last_report_prompt_at === ''
+    trigger: listed
+      ? undefined
+      : (() => {
+          if (typeof row.trigger_json === 'string' && row.trigger_json) {
+            try {
+              return normalizeTrigger(JSON.parse(row.trigger_json))
+            } catch {
+              /* ignore */
+            }
+          }
+          return undefined
+        })(),
+    reportIntervalSec: listed ? 60 : normalizeReportIntervalSec(row.report_interval_sec),
+    lastReportPromptAt: listed
+      ? null
+      : row.last_report_prompt_at == null || row.last_report_prompt_at === ''
         ? null
         : Number(row.last_report_prompt_at),
+    reportPromptCount: listed ? 0 : Math.max(0, Math.round(Number(row.report_prompt_count) || 0)),
   }
 }
 
@@ -1055,32 +1012,48 @@ export function computeTurnUsage(
 }
 
 /**
- * 进度超时判定（纯函数，导出便于单测与复用）。
- * 对已派发（assignee 有 sessionId 且 assignedAt 非空）、非 done 的任务：
- * 距最近一次 task_report（无 report 时以 assignedAt 为基线）超过 reportIntervalSec 且不在追问冷却
- * （距上次追问 lastReportPromptAt 不足 reportIntervalSec）时，应触发一次进度追问。
- * 返回 { shouldPrompt, overdueSec, intervalMs }。
+ * 进度超时判定。
+ * 距最近一次 report（无 report 时以 assignedAt 为基线）超过 reportIntervalSec、不在冷却窗口内、
+ * 且本轮追问次数未达 MAX_REPORT_PROMPTS 时，应再追一次。次数用尽后停，避免把执行会话问死。
  */
+export const DEFAULT_REPORT_INTERVAL_SEC = 60
+/** 同一段未汇报窗口内最多追问几次。 */
+export const MAX_REPORT_PROMPTS = 3
+
+export function normalizeReportIntervalSec(value: unknown, fallback = DEFAULT_REPORT_INTERVAL_SEC): number {
+  if (value == null || value === '') return fallback
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return fallback
+  return Math.round(n)
+}
+
 export type PromptProgressVerdict = {
   shouldPrompt: boolean
+  shouldFail: boolean
   overdueSec: number
   intervalMs: number
 }
 
 export function shouldPromptProgress(row: TaskRow, nowTs: number): PromptProgressVerdict {
-  const none: PromptProgressVerdict = { shouldPrompt: false, overdueSec: 0, intervalMs: 0 }
-  if (row.status === 'done') return none
+  const none: PromptProgressVerdict = { shouldPrompt: false, shouldFail: false, overdueSec: 0, intervalMs: 0 }
+  if (row.status === 'done' || row.status === 'failed') return none
   if (!row.assignedAt) return none
   if (!row.assignee?.sessionId) return none
   if (row.creator?.kind !== 'agent' || !row.creator.sessionId) return none
+  const intervalSec = normalizeReportIntervalSec(row.reportIntervalSec)
+  const intervalMs = intervalSec * 1000
   const lastReportTs = row.reports?.length ? row.reports[row.reports.length - 1].ts : row.assignedAt
-  const intervalMs = Math.max(1, row.reportIntervalSec) * 1000
-  if (nowTs - lastReportTs <= intervalMs) return { shouldPrompt: false, overdueSec: 0, intervalMs }
-  if (row.lastReportPromptAt != null && nowTs - row.lastReportPromptAt < intervalMs) {
-    return { shouldPrompt: false, overdueSec: 0, intervalMs }
-  }
+  const count = Math.max(0, Math.round(Number(row.reportPromptCount) || 0))
   const overdueSec = Math.max(1, Math.floor((nowTs - lastReportTs) / 1000))
-  return { shouldPrompt: true, overdueSec, intervalMs }
+  if (count >= MAX_REPORT_PROMPTS) {
+    if (row.lastReportPromptAt != null && nowTs - row.lastReportPromptAt < intervalMs) return none
+    return { shouldPrompt: false, shouldFail: true, overdueSec, intervalMs }
+  }
+  if (nowTs - lastReportTs <= intervalMs) return { shouldPrompt: false, shouldFail: false, overdueSec: 0, intervalMs }
+  if (row.lastReportPromptAt != null && nowTs - row.lastReportPromptAt < intervalMs) {
+    return { shouldPrompt: false, shouldFail: false, overdueSec: 0, intervalMs }
+  }
+  return { shouldPrompt: true, shouldFail: false, overdueSec, intervalMs }
 }
 
 export class TasksService extends Service {
@@ -1092,66 +1065,7 @@ export class TasksService extends Service {
 
   open() {
     mkdirSync(dirname(this.dbPath), { recursive: true })
-    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite')
-    this.db = new DatabaseSync(this.dbPath)
-    this.db.exec('PRAGMA journal_mode = WAL')
-    this.db.exec('PRAGMA synchronous = NORMAL')
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS tasks (
-        id TEXT PRIMARY KEY,
-        title TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'todo',
-        priority TEXT NOT NULL DEFAULT 'med',
-        difficulty TEXT NOT NULL DEFAULT 'med',
-        assignee TEXT NOT NULL DEFAULT '',
-        due_at INTEGER,
-        notes TEXT NOT NULL DEFAULT '',
-        sort REAL NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        creator_json TEXT,
-        assignee_json TEXT,
-        assigned_at INTEGER
-      );
-      CREATE INDEX IF NOT EXISTS tasks_status_sort ON tasks(status, sort, updated_at DESC);
-    `)
-    for (const sql of [
-      'ALTER TABLE tasks ADD COLUMN creator_json TEXT',
-      'ALTER TABLE tasks ADD COLUMN assignee_json TEXT',
-      'ALTER TABLE tasks ADD COLUMN assigned_at INTEGER',
-      "ALTER TABLE tasks ADD COLUMN description TEXT NOT NULL DEFAULT ''",
-      "ALTER TABLE tasks ADD COLUMN reports_json TEXT NOT NULL DEFAULT '[]'",
-      'ALTER TABLE tasks ADD COLUMN start_at INTEGER',
-      "ALTER TABLE tasks ADD COLUMN project TEXT NOT NULL DEFAULT ''",
-      "ALTER TABLE tasks ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'",
-      "ALTER TABLE tasks ADD COLUMN parent_id TEXT DEFAULT ''",
-      "ALTER TABLE tasks ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'",
-      'ALTER TABLE tasks ADD COLUMN depth INTEGER NOT NULL DEFAULT 0',
-      "ALTER TABLE tasks ADD COLUMN difficulty TEXT NOT NULL DEFAULT 'med'",
-      "ALTER TABLE tasks ADD COLUMN trigger_json TEXT NOT NULL DEFAULT '{}'",
-      'ALTER TABLE tasks ADD COLUMN report_interval_sec INTEGER NOT NULL DEFAULT 60',
-      'ALTER TABLE tasks ADD COLUMN last_report_prompt_at INTEGER',
-    ]) {
-      try {
-        this.db.exec(sql)
-      } catch {
-        /* already exists */
-      }
-    }
-    // ---- 视图持久化：task_views 表。呈现方式（列表/表格/看板/依赖）不是视图，不 seed 内置行。 ----
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS task_views (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        config_json TEXT NOT NULL,
-        is_builtin INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-    `)
-    this.db.exec(
-      `DELETE FROM task_views WHERE is_builtin = 1 OR id IN ('builtin-queue','builtin-table','builtin-board','builtin-graph')`,
-    )
+    this.db = openAndMigrateBiu(this.dbPath, { foreignKeys: false })
     return this
   }
 
@@ -1164,57 +1078,60 @@ export class TasksService extends Service {
     }
   }
 
-  /** 广播「切换到指定视图」事件（Agent 工具触发，前端 WS 收到后自动切换看板）。 */
-  emitViewSwitch(viewId: string) {
-    try {
-      const host = this.ctx as HostCtx
-      host.http?.broadcast?.('tasks', { ts: now(), type: 'view-switch', viewId })
-    } catch {
-      /* host http 未就绪（单测） */
-    }
-  }
-
   list(filter: TaskListFilter = {}): TaskRow[] {
     const clauses: string[] = []
     const params: SQLInputValue[] = []
     if (filter.status) {
-      clauses.push('status = ?')
+      clauses.push('tasks.status = ?')
       params.push(filter.status)
     }
     if (filter.q?.trim()) {
       clauses.push(
-        '(title LIKE ? OR description LIKE ? OR notes LIKE ? OR assignee LIKE ? OR creator_json LIKE ? OR assignee_json LIKE ?)',
+        '(tasks.title LIKE ? OR IFNULL(c.body, \'\') LIKE ? OR tasks.notes LIKE ? OR tasks.assignee LIKE ? OR tasks.creator_json LIKE ? OR tasks.assignee_json LIKE ?)',
       )
       const like = `%${filter.q.trim()}%`
       params.push(like, like, like, like, like, like)
     }
     if (filter.creatorSessionId?.trim()) {
-      clauses.push('creator_json LIKE ?')
+      clauses.push('tasks.creator_json LIKE ?')
       params.push(`%${filter.creatorSessionId.trim()}%`)
     }
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+    const join = filter.q?.trim()
+      ? `LEFT JOIN editor_content c ON c.collection = '/tasks' AND c.record_id = tasks.id`
+      : ''
     const rows = this.db
       .prepare(
-        `SELECT * FROM tasks ${where} ORDER BY
-          CASE status WHEN 'doing' THEN 0 WHEN 'todo' THEN 1 ELSE 2 END,
-          sort DESC, updated_at DESC`,
+        `SELECT ${LIST_TASK_COLUMNS} FROM tasks
+         ${join}
+         ${where} ORDER BY
+          CASE tasks.status WHEN 'doing' THEN 0 WHEN 'todo' THEN 1 ELSE 2 END,
+          tasks.sort DESC, tasks.updated_at DESC`,
       )
       .all(...params) as Array<Record<string, unknown>>
-    return rows.map(mapRow)
+    const mapped = rows.map((row) => mapRow(row, true))
+    if (!filter.q?.trim()) return mapped
+    return mapped.map((row) => this.withEditorDescription(row))
   }
 
   get(id: string): TaskRow | undefined {
     const row = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as
       | Record<string, unknown>
       | undefined
-    return row ? mapRow(row) : undefined
+    return row ? this.withEditorDescription(mapRow(row)) : undefined
+  }
+
+  private withEditorDescription(row: TaskRow): TaskRow {
+    const body = readEditorContent(this.db, '/tasks', row.id)
+    return { ...row, description: body }
   }
 
   create(input: TaskCreateInput & { creator: TaskActor; assignee?: TaskActor | null; assignedAt?: number | null }): TaskRow {
     const title = String(input.title ?? '').trim()
     if (!title) throw new Error('title required')
-    const id = nextId()
-    const ts = now()
+    const requested = typeof input.id === 'string' ? input.id.trim() : ''
+    const id = /^task_[A-Za-z0-9_-]+$/.test(requested) ? requested : nextId()
+    const ts = typeof input.updatedAt === 'number' && input.updatedAt > 0 ? input.updatedAt : now()
     const status = asStatus(input.status)
     const priority = asPriority(input.priority)
     const difficulty = asDifficulty(input.difficulty)
@@ -1257,11 +1174,11 @@ export class TasksService extends Service {
     this.db
       .prepare(
         `INSERT INTO tasks (
-          id, title, status, priority, difficulty, assignee, due_at, description, notes, sort,
+          id, title, status, priority, difficulty, assignee, due_at, notes, sort,
           created_at, updated_at, creator_json, assignee_json, assigned_at,
           project, tags_json, parent_id, depends_on, depth, trigger_json,
-          report_interval_sec
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          report_interval_sec, facet_json, emoji
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -1271,7 +1188,6 @@ export class TasksService extends Service {
         difficulty,
         assigneeLabel,
         dueAt,
-        description,
         notes,
         sort,
         ts,
@@ -1286,7 +1202,10 @@ export class TasksService extends Service {
         depth,
         JSON.stringify(trigger),
         reportIntervalSec,
+        JSON.stringify(normalizeSchemaValue(input.facet)),
+        typeof input.emoji === 'string' ? input.emoji : '',
       )
+    writeEditorContent(this.db, '/tasks', id, description)
     this.emitChange()
     return this.get(id)!
   }
@@ -1379,15 +1298,21 @@ export class TasksService extends Service {
         : patch.lastReportPromptAt == null
           ? null
           : Number(patch.lastReportPromptAt)
+    const reportPromptCount =
+      patch.reportPromptCount === undefined
+        ? current.reportPromptCount
+        : Math.max(0, Math.round(Number(patch.reportPromptCount) || 0))
+    const emoji = patch.emoji !== undefined ? String(patch.emoji ?? '') : current.emoji
+    const facet = patch.facet !== undefined ? normalizeSchemaValue(patch.facet) : current.facet
 
-    const ts = now()
+    const ts = typeof patch.updatedAt === 'number' && patch.updatedAt > 0 ? patch.updatedAt : now()
     this.db
       .prepare(
         `UPDATE tasks SET
-          title = ?, status = ?, priority = ?, difficulty = ?, assignee = ?, due_at = ?, description = ?, notes = ?, sort = ?,
+          title = ?, status = ?, priority = ?, difficulty = ?, assignee = ?, due_at = ?, notes = ?, sort = ?,
           updated_at = ?, creator_json = ?, assignee_json = ?, assigned_at = ?, project = ?, tags_json = ?,
           parent_id = ?, depends_on = ?, depth = ?, trigger_json = ?,
-          report_interval_sec = ?, last_report_prompt_at = ?
+          report_interval_sec = ?, last_report_prompt_at = ?, report_prompt_count = ?, facet_json = ?, emoji = ?
          WHERE id = ?`,
       )
       .run(
@@ -1397,7 +1322,6 @@ export class TasksService extends Service {
         difficulty,
         assignee?.name ?? '',
         dueAt,
-        description,
         notes,
         sort,
         ts,
@@ -1412,8 +1336,12 @@ export class TasksService extends Service {
         JSON.stringify(trigger),
         reportIntervalSec,
         lastReportPromptAt,
+        reportPromptCount,
+        JSON.stringify(facet),
+        emoji,
         id,
       )
+    writeEditorContent(this.db, '/tasks', id, description)
     this.emitChange()
     return this.get(id)!
   }
@@ -1421,69 +1349,6 @@ export class TasksService extends Service {
   delete(id: string): boolean {
     const result = this.db.prepare('DELETE FROM tasks WHERE id = ?').run(id) as { changes: number }
     if (result.changes > 0) this.emitChange()
-    return result.changes > 0
-  }
-
-  // ---- 视图（task_views）----
-  private rowToView(row: Record<string, unknown>): TaskView {
-    let config = defaultViewConfig()
-    try {
-      config = normalizeViewConfig(JSON.parse(String(row.config_json ?? '{}')))
-    } catch {
-      /* 脏数据回退默认 */
-    }
-    return {
-      id: String(row.id),
-      name: String(row.name),
-      config,
-      isBuiltin: Number(row.is_builtin) === 1,
-      createdAt: Number(row.created_at ?? 0),
-      updatedAt: Number(row.updated_at ?? 0),
-    }
-  }
-
-  listTaskViews(): TaskView[] {
-    const rows = this.db
-      .prepare('SELECT * FROM task_views ORDER BY is_builtin DESC, created_at ASC, id ASC')
-      .all() as Array<Record<string, unknown>>
-    return rows.map((r) => this.rowToView(r))
-  }
-
-  getTaskView(id: string): TaskView | undefined {
-    const row = this.db.prepare('SELECT * FROM task_views WHERE id = ?').get(id) as Record<string, unknown> | undefined
-    return row ? this.rowToView(row) : undefined
-  }
-
-  createTaskView(input: { name: string; config: TaskViewConfig }): TaskView {
-    const name = normalizeViewName(input.name)
-    const config = normalizeViewConfig(input.config)
-    const id = `view_${now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
-    const ts = now()
-    this.db
-      .prepare('INSERT INTO task_views (id, name, config_json, is_builtin, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?)')
-      .run(id, name, JSON.stringify(config), ts, ts)
-    this.emitChange({ type: 'view-changed', viewId: id })
-    return this.getTaskView(id)!
-  }
-
-  updateTaskView(id: string, patch: { name?: string; config?: TaskViewConfig }): TaskView {
-    const current = this.getTaskView(id)
-    if (!current) throw new Error('unknown view')
-    const name = patch.name !== undefined ? normalizeViewName(patch.name) : current.name
-    const config = patch.config !== undefined ? normalizeViewConfig(patch.config) : current.config
-    this.db
-      .prepare('UPDATE task_views SET name = ?, config_json = ?, updated_at = ? WHERE id = ?')
-      .run(name, JSON.stringify(config), now(), id)
-    this.emitChange({ type: 'view-changed', viewId: id })
-    return this.getTaskView(id)!
-  }
-
-  /** 返回是否删除成功。 */
-  deleteTaskView(id: string): boolean {
-    const current = this.getTaskView(id)
-    if (!current) return false
-    const result = this.db.prepare('DELETE FROM task_views WHERE id = ?').run(id) as { changes: number }
-    if (result.changes > 0) this.emitChange({ type: 'view-changed', viewId: id })
     return result.changes > 0
   }
 
@@ -1508,9 +1373,9 @@ export class TasksService extends Service {
     if (!current) throw new Error('unknown task')
     const reports = [...(current.reports ?? []), report]
     const ts = now()
-    // 新 report 到来即「已回应」：重置 lastReportPromptAt（清空后倒计时重新从本次报道算起，避免立即再追问）
+    // 新 report 到来即「已回应」：重置追问时间与次数
     this.db
-      .prepare('UPDATE tasks SET reports_json = ?, updated_at = ?, last_report_prompt_at = NULL WHERE id = ?')
+      .prepare('UPDATE tasks SET reports_json = ?, updated_at = ?, last_report_prompt_at = NULL, report_prompt_count = 0 WHERE id = ?')
       .run(JSON.stringify(reports), ts, id)
     this.emitChange()
     return this.get(id)!
@@ -1524,7 +1389,7 @@ export { tasksCollection } from './collection.ts'
 export function apply(ctx: Context) {
   startTaskClock(ctx)
   const host = ctx as HostCtx
-  const dbPath = join(process.cwd(), '.cordis', 'tasks.sqlite')
+  const dbPath = biuSqlitePath()
   const tasks = new TasksService(ctx, dbPath).open()
 
   async function present(row: TaskRow): Promise<TaskRow> {
@@ -1563,705 +1428,72 @@ export function apply(ctx: Context) {
     kind: 'tasks',
   })
 
-  host.tools.register({
-    name: 'tasks_list',
-    description: '列出任务（含创建人、分配人、执行情况；可按 status / 关键词筛选）',
-    parameters: {
-      type: 'object',
-      properties: {
-        status: { type: 'string', enum: ['todo', 'doing', 'done'], description: '状态筛选' },
-        q: { type: 'string', description: '标题/备注/负责人/创建人关键词' },
-      },
-    },
-    execute: async (args) =>
-      presentMany(
-        tasks.list({
-          ...(args.status ? { status: asStatus(args.status) } : {}),
-          ...(args.q ? { q: String(args.q) } : {}),
-        }),
-      ),
-  })
 
-  host.tools.register({
-    name: 'tasks_get',
-    description: '按 id 获取任务详情（含执行情况）',
-    parameters: {
-      type: 'object',
-      properties: { id: { type: 'string', description: '任务 id' } },
-      required: ['id'],
-    },
-    execute: async (args) => {
-      const row = tasks.get(String(args.id ?? ''))
-      if (!row) throw new Error('unknown task')
-      return present(row)
-    },
-  })
-
-  host.tools.register({
-    name: 'tasks_create',
-    description: '创建任务（自动记录创建 Agent；可用 assigneeSessionId 分配给某 session）',
-    parameters: {
-      type: 'object',
-      properties: {
-        title: { type: 'string' },
-        status: { type: 'string', enum: ['todo', 'doing', 'done'] },
-        priority: { type: 'string', enum: ['low', 'med', 'high'] },
-        difficulty: { type: 'string', enum: ['low', 'med', 'high'], description: '难度（low=低, med=中, high=高）' },
-        assigneeSessionId: ASSIGNEE_SESSION_PARAM,
-        assignee: ASSIGNEE_PARAM,
-        dueAt: { type: 'number', description: '截止时间戳 ms' },
-        description: { type: 'string', description: '任务描述' },
-        notes: { type: 'string', description: '备忘' },
-        project: { type: 'string', description: '归属项目（如 cordis-web）' },
-        tags: { type: 'array', items: { type: 'string' }, description: '标签（类型/性质）' },
-        parentId: { type: 'string', description: '父任务 id（树层级，深度上限 3）' },
-        dependsOn: { type: 'array', items: { type: 'string' }, description: '依赖的任务 id 列表（DAG，自动防环）' },
-        reportIntervalSec: { type: 'number', description: '进度汇报提醒间隔（秒），默认 60' },
-      },
-      required: ['title'],
-    },
-    execute: async (args) => {
-      const creator = await resolveCreator(host)
-      let assignee: TaskActor | null = null
-      if (args.assigneeSessionId !== undefined && args.assigneeSessionId !== null && String(args.assigneeSessionId).trim()) {
-        const resolved = await resolveAssignee(host, { assigneeSessionId: String(args.assigneeSessionId) })
-        assignee = resolved.assignee
-      } else if (args.assignee !== undefined) {
-        assignee = await coerceAssigneeArg(host, args.assignee)
-      }
-      const row = tasks.create({
-        title: String(args.title ?? ''),
-        ...(args.status != null ? { status: asStatus(args.status) } : {}),
-        ...(args.priority != null ? { priority: asPriority(args.priority) } : {}),
-        ...(args.difficulty != null ? { difficulty: asDifficulty(args.difficulty) } : {}),
-        ...(args.dueAt != null ? { dueAt: Number(args.dueAt) } : {}),
-        ...(args.description != null ? { description: String(args.description) } : {}),
-        ...(args.notes != null ? { notes: String(args.notes) } : {}),
-        ...(args.project != null ? { project: String(args.project) } : {}),
-        ...(Array.isArray(args.tags) ? { tags: args.tags.map(String).filter(Boolean) } : {}),
-        ...(args.parentId != null ? { parentId: String(args.parentId) || null } : {}),
-        ...(Array.isArray(args.dependsOn) ? { dependsOn: args.dependsOn.map(String).filter(Boolean) } : {}),
-        ...(args.reportIntervalSec != null ? { reportIntervalSec: Number(args.reportIntervalSec) } : {}),
-        creator,
-        assignee,
-      })
-      return present(row)
-    },
-  })
-
-  host.tools.register({
-    name: 'tasks_update',
-    description:
-      '更新任务字段。分配人请用 assigneeSessionId，或 assignee（人名 / sessionId / actor 对象）；改 status 即换状态。',
-    parameters: {
-      type: 'object',
-      properties: {
-        id: { type: 'string' },
-        title: { type: 'string' },
-        status: { type: 'string', enum: ['todo', 'doing', 'done'] },
-        priority: { type: 'string', enum: ['low', 'med', 'high'] },
-        difficulty: { type: 'string', enum: ['low', 'med', 'high'], description: '难度（low=低, med=中, high=高）' },
-        assigneeSessionId: ASSIGNEE_SESSION_PARAM,
-        assignee: ASSIGNEE_PARAM,
-        dueAt: { type: ['number', 'null'] },
-        description: { type: 'string', description: '任务描述' },
-        notes: { type: 'string', description: '备忘' },
-        sort: { type: 'number' },
-        project: { type: ['string', 'null'], description: '归属项目（如 cordis-web），传 null 清除' },
-        tags: { type: 'array', items: { type: 'string' }, description: '标签（类型/性质），替换整个列表' },
-        parentId: { type: ['string', 'null'], description: '父任务 id（树层级，深度上限 3），传 null 移到根' },
-        dependsOn: { type: 'array', items: { type: 'string' }, description: '依赖的任务 id 列表（DAG，自动防环），替换整个列表' },
-        reportIntervalSec: { type: 'number', description: '进度汇报提醒间隔（秒），默认 60' },
-        trigger: {
-          type: 'object',
-          description: '自动触发配置（partial，与现有合并）：{ enabled, cron, at, on[], state, lastRun }',
-          properties: {
-            enabled: { type: 'boolean', description: '是否开启自动触发' },
-            cron: { type: ['string', 'null'], description: '定时 cron 表达式（5 字段：分 时 日 月 周）' },
-            at: { type: ['number', 'null'], description: '特定时间戳（一次性触发）' },
-            on: { type: 'array', items: { type: 'string' }, description: "自动触发事件：如 dep:done(依赖完成) / turn:end(回合结束)" },
-            state: { type: 'string', enum: ['idle', 'pending', 'delivered', 'done', 'cancelled'], description: '调度状态' },
-            lastRun: { type: ['number', 'null'], description: '上次触发时间戳' },
-          },
-        },
-      },
-      required: ['id'],
-    },
-    execute: async (args) => {
-      const id = String(args.id ?? '')
-      const patch: TaskUpdateInput & { assignee?: TaskActor | null } = {}
-      if (args.title != null) patch.title = String(args.title)
-      if (args.status != null) patch.status = asStatus(args.status)
-      if (args.priority != null) patch.priority = asPriority(args.priority)
-      if (args.difficulty != null) patch.difficulty = asDifficulty(args.difficulty)
-      if (args.dueAt !== undefined) patch.dueAt = args.dueAt == null ? null : Number(args.dueAt)
-      if (args.description != null) patch.description = String(args.description)
-      if (args.notes != null) patch.notes = String(args.notes)
-      if (args.sort != null) patch.sort = Number(args.sort)
-      if (args.project !== undefined) {
-        patch.project = args.project == null ? null : String(args.project).trim() || null
-      }
-      if (Array.isArray(args.tags)) patch.tags = args.tags.map(String).filter(Boolean)
-      if (args.parentId !== undefined) {
-        patch.parentId = args.parentId == null ? null : String(args.parentId) || null
-      }
-      if (Array.isArray(args.dependsOn)) patch.dependsOn = args.dependsOn.map(String).filter(Boolean)
-      if (args.reportIntervalSec !== undefined) patch.reportIntervalSec = Number(args.reportIntervalSec)
-      if (args.trigger !== undefined && args.trigger !== null && typeof args.trigger === 'object') {
-        patch.trigger = args.trigger as Partial<TaskTrigger>
-      }
-      if (args.assigneeSessionId !== undefined) {
-        const resolved = await resolveAssignee(host, {
-          assigneeSessionId: args.assigneeSessionId == null ? null : String(args.assigneeSessionId),
-        })
-        patch.assignee = resolved.assignee
-      } else if (args.assignee !== undefined) {
-        patch.assignee = await coerceAssigneeArg(host, args.assignee)
-      }
-      return present(tasks.update(id, patch))
-    },
-  })
-
-  host.tools.register({
-    name: 'task_report',
-    description:
-      'agent 在执行任务时主动上报进度。每完成一轮(一个 turn)，调用一次并关联到任务：未搞定传 status=doing，彻底搞定传 status=done。任务执行视图会累积这份报告历史（次数、每次的 turn/状态/说明）。任务当前状态 = 最新一次 report 的 status。上报后会通过 session 机制把子 agent(上报方)的进度/info 返回给分配该任务的人(任务的 creator session)。',
-    parameters: {
-      type: 'object',
-      properties: {
-        taskId: { type: 'string', description: '任务 id' },
-        status: { type: 'string', enum: ['doing', 'done'], description: 'doing=还在做；done=本任务已彻底完成' },
-        note: { type: 'string', description: '本轮做了什么/当前进度（可选 payload）' },
-      },
-      required: ['taskId'],
-    },
-    execute: async (args) => {
-      const id = String(args.taskId ?? '')
-      const row = tasks.get(id)
-      if (!row) throw new Error('unknown task')
-      const status = args.status === 'done' ? 'done' : 'doing'
-      const sessionId = currentSessionId()
-      // 取当前 session 最新 turn
-      let turn: number | null = null
-      if (sessionId) {
-        const record = host.sessions?.peek(sessionId) ?? (await host.sessions?.get?.(sessionId))
-        if (record?.events?.length) {
-          for (const ev of record.events) {
-            if (ev.type === 'turn/start' || ev.type === 'turn/end') {
-              if (typeof ev.turn === 'number') turn = ev.turn
-            }
+  async function runTaskReport(id: string, args: Record<string, unknown> = {}) {
+    const row = tasks.get(id)
+    if (!row) throw new Error('unknown task')
+    const status = args.status === 'done' ? 'done' : 'doing'
+    const sessionId = currentSessionId()
+    let turn: number | null = null
+    if (sessionId) {
+      const record = host.sessions?.peek(sessionId) ?? (await host.sessions?.get?.(sessionId))
+      if (record?.events?.length) {
+        for (const ev of record.events) {
+          if (ev.type === 'turn/start' || ev.type === 'turn/end') {
+            if (typeof ev.turn === 'number') turn = ev.turn
           }
         }
       }
-      // 持久化该 report 当回合的消耗：取 (sessionId, turn) 的 turn-stats 固化进 usage，删 session 也不丢。
-      // 若 session 仍存在可从事件流计算出 usage（assistant/message 的 usage 汇总）；否则 use 保持 undefined。
-      let usage: TaskUsage | undefined
-      if (sessionId && turn != null) {
-        const rec: { events?: Array<Record<string, unknown>> } | undefined =
-          (host.sessions?.get ? await host.sessions.get(sessionId) : undefined) ??
-          (host.sessions?.peek(sessionId) as { events?: Array<Record<string, unknown>> } | undefined)
-        usage = computeTurnUsage(rec?.events, turn)
-      }
-      const report: TaskReport = {
-        sessionId: sessionId ?? 'unknown',
-        ...(sessionId ? { sessionName: sessionId.slice(0, 8) } : {}),
-        turn,
-        status,
-        ...(typeof args.note === 'string' && args.note.trim() ? { note: String(args.note).trim() } : {}),
-        ...(usage ? { usage } : {}),
-        ts: now(),
-      }
-      tasks.report(id, report)
-      // report 同时推进完成状态（doing/done），last-write-wins
-      tasks.update(id, { status })
-      // 把子 agent 的信息返回给分配任务的人（creator session）——通过 session inject 机制
-      const delivered = await reportBackToCreator(host, row, report)
-      return { ...(await present(tasks.get(id)!)), delivered }
-    },
-  })
-
-  host.tools.register({
-    name: 'task_deliver',
-    description:
-      '把已经分配了 session 的任务作为 wake 消息发送到被分配 session 的队列里去（派工）。任务需已用 assigneeSessionId 分配好负责 session；无负责人 session 时需先 tasks_update 指派。text 可自定义派工措辞（默认带上任务标题/描述/优先级等）。wait=false 时入队后立即返回 queued，不阻塞当前回合。',
-    parameters: {
-      type: 'object',
-      properties: {
-        taskId: { type: 'string', description: '任务 id' },
-        text: {
-          type: 'string',
-          description:
-            '可选自定义 wake 内容；缺省时自动生成：把任务标题/描述/优先级/难度/截止/父任务等整理成派工消息发给执行的 agent session',
-        },
-        wait: {
-          type: 'boolean',
-          description: '默认 true 等目标 session 回合结束；false 则入队后立即返回 queued',
-        },
-      },
-      required: ['taskId'],
-    },
-    execute: async (args) => {
-      const id = String(args.taskId ?? '')
-      const row = tasks.get(id)
-      if (!row) throw new Error('unknown task')
-      const targetSessionId = row.assignee?.sessionId
-      if (!targetSessionId) {
-        throw new Error(`task ${id} 未分配负责 session（assignee 无 sessionId），请先用 tasks_update 的 assigneeSessionId 指派`)
-      }
-      if (!host.sessions?.sendMessage) {
-        throw new Error('sessions.sendMessage 不可用：sessions 服务未就绪')
-      }
-      const text = String(args.text ?? '').trim() || buildDeliverText(row)
-      const sender = { type: 'session' as const, sessionId: currentSessionId() ?? 'unknown' }
-      const wait = args.wait !== false && args.wait !== 'false'
-      if (!wait) {
-        void host.sessions.sendMessage(targetSessionId, text, { wait: false, sender })
-        return { taskId: id, sessionId: targetSessionId, queued: true, wait: false, text }
-      }
-      const turn = await host.sessions.sendMessage(targetSessionId, text, { wait: true, sender })
-      return {
-        taskId: id,
-        sessionId: targetSessionId,
-        queued: false,
-        wait: true,
-        text: turn.text.slice(0, 1200),
-        steps: turn.steps.length,
-      }
-    },
-  })
-
-  host.tools.register({
-    name: 'tasks_delete',
-    description: '删除任务',
-    parameters: {
-      type: 'object',
-      properties: { id: { type: 'string' } },
-      required: ['id'],
-    },
-    execute: (args) => {
-      const ok = tasks.delete(String(args.id ?? ''))
-      if (!ok) throw new Error('unknown task')
-      return { ok: true }
-    },
-  })
-
-  host.tools.register({
-    name: 'tasks_update_many',
-    description:
-      '批量更新任务（一次更新多个任务）。每个 update 含 id 与要更新的字段（title/status/priority/difficulty/description/notes/project/tags/parentId/dependsOn/dueAt），未传字段保持不变。',
-    parameters: {
-      type: 'object',
-      properties: {
-        updates: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: {
-              id: { type: 'string' },
-              title: { type: 'string' },
-              status: { type: 'string', enum: ['todo', 'doing', 'done'] },
-              priority: { type: 'string', enum: ['low', 'med', 'high'] },
-              difficulty: { type: 'string', enum: ['low', 'med', 'high'], description: '难度（low=低, med=中, high=高）' },
-              dueAt: { type: ['number', 'null'] },
-              description: { type: 'string' },
-              notes: { type: 'string' },
-              project: { type: ['string', 'null'] },
-              tags: { type: 'array', items: { type: 'string' } },
-              parentId: { type: ['string', 'null'] },
-              dependsOn: { type: 'array', items: { type: 'string' } },
-              assigneeSessionId: ASSIGNEE_SESSION_PARAM,
-            },
-            required: ['id'],
-          },
-          description: '更新项列表',
-        },
-      },
-      required: ['updates'],
-    },
-    execute: async (args) => {
-      const updates = (Array.isArray(args.updates) ? args.updates : []) as Array<Record<string, unknown>>
-      const updated: TaskRow[] = []
-      const errors: { id: string; error: string }[] = []
-      for (const u of updates) {
-        const id = String(u.id ?? '')
-        if (!tasks.get(id)) {
-          errors.push({ id, error: 'unknown task' })
-          continue
-        }
-        const patch: TaskUpdateInput & { assignee?: TaskActor | null } = {}
-        if (u.title != null) patch.title = String(u.title)
-        if (u.status != null) patch.status = asStatus(u.status as TaskStatus)
-        if (u.priority != null) patch.priority = asPriority(u.priority as TaskPriority)
-        if (u.difficulty != null) patch.difficulty = asDifficulty(u.difficulty as TaskDifficulty)
-        if (u.dueAt !== undefined) patch.dueAt = u.dueAt == null ? null : Number(u.dueAt)
-        if (u.description != null) patch.description = String(u.description)
-        if (u.notes != null) patch.notes = String(u.notes)
-        if (u.project !== undefined) patch.project = u.project == null ? null : String(u.project).trim() || null
-        if (Array.isArray(u.tags)) patch.tags = u.tags.map(String).filter(Boolean)
-        if (u.parentId !== undefined) patch.parentId = u.parentId == null ? null : String(u.parentId) || null
-        if (Array.isArray(u.dependsOn)) patch.dependsOn = u.dependsOn.map(String).filter(Boolean)
-        if (u.assigneeSessionId !== undefined) {
-          const resolved = await resolveAssignee(host, {
-            assigneeSessionId: u.assigneeSessionId == null ? null : String(u.assigneeSessionId),
-          })
-          patch.assignee = resolved.assignee
-        }
-        try {
-          updated.push(await present(tasks.update(id, patch)))
-        } catch (error) {
-          errors.push({ id, error: String(error) })
-        }
-      }
-      return { ok: true, updated, errors }
-    },
-  })
-
-  host.tools.register({
-    name: 'tasks_delete_many',
-    description: '批量删除任务（一次可删多个）',
-    parameters: {
-      type: 'object',
-      properties: { ids: { type: 'array', items: { type: 'string' }, description: '要删除的任务 id 列表' } },
-      required: ['ids'],
-    },
-    execute: (args) => {
-      const ids = (Array.isArray(args.ids) ? args.ids : []).map(String)
-      let deleted = 0
-      const missing: string[] = []
-      for (const id of ids) {
-        if (tasks.delete(id)) deleted++
-        else missing.push(id)
-      }
-      return { ok: true, deleted, missing }
-    },
-  })
-
-  host.tools.register({
-    name: 'tasks_create_many',
-    description: '批量创建任务（一次建多个，各任务可独立设置 项目/标签/父任务/依赖/分配人/状态/优先级/难度/截止）',
-    parameters: {
-      type: 'object',
-      properties: {
-        tasks: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: {
-              title: { type: 'string' },
-              status: { type: 'string', enum: ['todo', 'doing', 'done'] },
-              priority: { type: 'string', enum: ['low', 'med', 'high'] },
-              difficulty: { type: 'string', enum: ['low', 'med', 'high'], description: '难度（low=低, med=中, high=高）' },
-              assigneeSessionId: ASSIGNEE_SESSION_PARAM,
-              project: { type: 'string' },
-              tags: { type: 'array', items: { type: 'string' } },
-              parentId: { type: 'string' },
-              dependsOn: { type: 'array', items: { type: 'string' } },
-              dueAt: { type: 'number' },
-              description: { type: 'string' },
-              notes: { type: 'string' },
-            },
-            required: ['title'],
-          },
-          description: '任务列表',
-        },
-      },
-      required: ['tasks'],
-    },
-    execute: async (args) => {
-      const items = (Array.isArray(args.tasks) ? args.tasks : []) as Array<Record<string, unknown>>
-      const creator = await resolveCreator(host)
-      const created: TaskRow[] = []
-      for (const item of items) {
-        let assignee: TaskActor | null = null
-        if (item.assigneeSessionId) {
-          const resolved = await resolveAssignee(host, { assigneeSessionId: String(item.assigneeSessionId) })
-          assignee = resolved.assignee
-        } else if (item.assignee !== undefined) {
-          assignee = await coerceAssigneeArg(host, item.assignee as unknown)
-        }
-        const row = tasks.create({
-          title: String(item.title ?? ''),
-          ...(item.status != null ? { status: asStatus(item.status as TaskStatus) } : {}),
-          ...(item.priority != null ? { priority: asPriority(item.priority as TaskPriority) } : {}),
-          ...(item.difficulty != null ? { difficulty: asDifficulty(item.difficulty as TaskDifficulty) } : {}),
-          ...(item.dueAt != null ? { dueAt: Number(item.dueAt) } : {}),
-          ...(item.project != null ? { project: String(item.project) } : {}),
-          ...(Array.isArray(item.tags) ? { tags: item.tags.map(String).filter(Boolean) } : {}),
-          ...(item.parentId != null ? { parentId: String(item.parentId) || null } : {}),
-          ...(Array.isArray(item.dependsOn) ? { dependsOn: item.dependsOn.map(String).filter(Boolean) } : {}),
-          ...(item.description != null ? { description: String(item.description) } : {}),
-          ...(item.notes != null ? { notes: String(item.notes) } : {}),
-          creator,
-          assignee,
-        })
-        created.push(row)
-      }
-      return { created: presentMany(created) }
-    },
-  })
-
-  // ==================== 视图（task_views）Agent 工具：新建视图 / 筛选 / 排序 ====================
-  const VIEW_MODE_PARAM = { type: 'string', enum: ['queue', 'table', 'cards', 'board', 'graph'] as const, description: '呈现方式：列表 / 表格 / 卡片 / 看板 / 依赖图' }
-  const VIEW_FILTER_PARAM = {
-    type: 'object',
-    properties: {
-      project: { type: 'string', description: '按项目筛选（空串=全部）' },
-      tags: { type: 'array', items: { type: 'string' }, description: '按标签筛选（至少命中一个）' },
-      time: { type: 'string', enum: ['', '1h', '24h', '7d', '30d'], description: '按更新时间筛选：空=全部 | 1h | 24h | 7d | 30d' },
-    },
-    description: '筛选条件',
-  }
-  const VIEW_SORT_PARAM = {
-    type: 'object',
-    properties: {
-      field: { type: 'string', enum: ['priority', 'due', 'updated', 'created', 'status'] as const, description: '排序字段（status 为「状态→优先级→截止」复合排序）' },
-      dir: { type: 'string', enum: ['asc', 'desc'] as const, description: '升序 asc / 降序 desc' },
-    },
-    description: '排序规则',
+    }
+    let usage: TaskUsage | undefined
+    if (sessionId && turn != null) {
+      const rec: { events?: Array<Record<string, unknown>> } | undefined =
+        (host.sessions?.get ? await host.sessions.get(sessionId) : undefined) ??
+        (host.sessions?.peek(sessionId) as { events?: Array<Record<string, unknown>> } | undefined)
+      usage = computeTurnUsage(rec?.events, turn)
+    }
+    const report: TaskReport = {
+      sessionId: sessionId ?? 'unknown',
+      ...(sessionId ? { sessionName: sessionId.slice(0, 8) } : {}),
+      turn,
+      status,
+      ...(typeof args.note === 'string' && args.note.trim() ? { note: String(args.note).trim() } : {}),
+      ...(usage ? { usage } : {}),
+      ts: now(),
+    }
+    tasks.report(id, report)
+    tasks.update(id, { status })
+    const delivered = await reportBackToCreator(host, row, report)
+    return { ...(await present(tasks.get(id)!)), delivered }
   }
 
-  host.tools.register({
-    name: 'tasks_view_list',
-    description: '列出任务面板已保存的视图及其筛选、排序、呈现方式',
-    parameters: { type: 'object', properties: {} },
-    execute: () => ({ views: tasks.listTaskViews() }),
-  })
-
-  host.tools.register({
-    name: 'tasks_view_create',
-    description: '新建一个任务面板视图：名称 + 呈现方式 mode + 筛选 filter + 排序 sort',
-    parameters: {
-      type: 'object',
-      properties: {
-        name: { type: 'string', description: '视图名称' },
-        mode: VIEW_MODE_PARAM,
-        filter: VIEW_FILTER_PARAM,
-        sort: VIEW_SORT_PARAM,
-      },
-      required: ['name'],
-    },
-    execute: async (args) => {
-      const view = tasks.createTaskView({
-        name: normalizeViewName(args.name),
-        config: normalizeViewConfig({
-          ...(args.mode !== undefined ? { mode: args.mode } : {}),
-          ...(args.filter !== undefined ? { filter: args.filter } : {}),
-          ...(args.sort !== undefined ? { sort: args.sort } : {}),
-        }),
-      })
-      return { view }
-    },
-  })
-
-  host.tools.register({
-    name: 'tasks_view_update',
-    description: '更新任务面板视图：可重命名，或修改筛选/排序/呈现方式（只传要改的字段，其余保持不变）',
-    parameters: {
-      type: 'object',
-      properties: {
-        id: { type: 'string', description: '视图 id' },
-        name: { type: 'string', description: '新名称' },
-        mode: VIEW_MODE_PARAM,
-        filter: VIEW_FILTER_PARAM,
-        sort: VIEW_SORT_PARAM,
-      },
-      required: ['id'],
-    },
-    execute: async (args) => {
-      const id = String(args.id ?? '')
-      const current = tasks.getTaskView(id)
-      if (!current) throw new Error('unknown view')
-      const config: TaskViewConfig = {
-        mode: args.mode !== undefined ? (args.mode as TaskViewMode) : current.config.mode,
-        filter: args.filter !== undefined ? (args.filter as TaskViewFilter) : current.config.filter,
-        sort: args.sort !== undefined ? (args.sort as TaskViewSort) : current.config.sort,
-      }
-      const view = tasks.updateTaskView(id, {
-        ...(args.name !== undefined ? { name: String(args.name) } : {}),
-        ...(args.mode !== undefined || args.filter !== undefined || args.sort !== undefined ? { config } : {}),
-      })
-      return { view }
-    },
-  })
-
-  host.tools.register({
-    name: 'tasks_view_delete',
-    description: '删除任务面板的已保存视图',
-    parameters: {
-      type: 'object',
-      properties: { id: { type: 'string', description: '视图 id' } },
-      required: ['id'],
-    },
-    execute: async (args) => {
-      const ok = tasks.deleteTaskView(String(args.id ?? ''))
-      if (!ok) throw new Error('unknown view')
-      return { ok: true }
-    },
-  })
-
-  host.tools.register({
-    name: 'tasks_view_switch',
-    description: '切换任务面板前端当前显示的视图（即把看板切到指定视图；通过后端广播事件，前端 WS 收到后立即切换）',
-    parameters: {
-      type: 'object',
-      properties: { id: { type: 'string', description: '视图 id（可用 tasks_view_list 查询）' } },
-      required: ['id'],
-    },
-    execute: async (args) => {
-      const id = String(args.id ?? '')
-      const view = tasks.getTaskView(id)
-      if (!view) throw new Error('unknown view')
-      tasks.emitViewSwitch(id)
-      return { ok: true, viewId: id, view: view.name }
-    },
-  })
-
-  host.http.route('GET', '/api/tasks', async (route) => {
-    const statusRaw = route.query.get('status')
-    const q = route.query.get('q') ?? undefined
-    const status = statusRaw && STATUSES.has(statusRaw as TaskStatus) ? (statusRaw as TaskStatus) : undefined
-    const rows = await presentMany(tasks.list({ ...(status ? { status } : {}), ...(q ? { q } : {}) }))
-    route.send(200, { tasks: rows })
-  })
-
-  host.http.route('POST', '/api/tasks', async (route) => {
-    try {
-      const body = (await route.json()) as TaskCreateInput
-      const creator = await resolveCreator(host, body.creator)
-      const resolved = await resolveAssignee(host, {
-        ...(body.assigneeSessionId !== undefined ? { assigneeSessionId: body.assigneeSessionId } : {}),
-        ...(body.assignee !== undefined ? { assignee: body.assignee } : {}),
-      })
-      const row = tasks.create({
-        ...body,
-        creator,
-        assignee: resolved.touchAssignedAt ? resolved.assignee : body.assignee ?? null,
-      })
-      route.send(201, { task: await present(row) })
-    } catch (error) {
-      route.send(400, { error: String(error) })
+  async function runTaskDeliver(id: string, args: Record<string, unknown> = {}) {
+    const row = tasks.get(id)
+    if (!row) throw new Error('unknown task')
+    const targetSessionId = row.assignee?.sessionId
+    if (!targetSessionId) {
+      throw new Error(`task ${id} 未分配执行代理。请先 db_update /tasks/${id} 写入 assignee（代理 id）`)
     }
-  })
-
-  host.http.route('GET', '/api/tasks/:id', async (route) => {
-    const row = tasks.get(route.params.id)
-    if (!row) return route.send(404, { error: 'unknown task' })
-    route.send(200, { task: await present(row) })
-  })
-
-  host.http.route('PATCH', '/api/tasks/:id', async (route) => {
-    try {
-      const body = (await route.json()) as TaskUpdateInput
-      const patch: TaskUpdateInput & { assignee?: TaskActor | null; creator?: TaskActor } = { ...body }
-      if (body.assigneeSessionId !== undefined || body.assignee !== undefined) {
-        const resolved = await resolveAssignee(host, {
-          ...(body.assigneeSessionId !== undefined ? { assigneeSessionId: body.assigneeSessionId } : {}),
-          ...(body.assignee !== undefined ? { assignee: body.assignee } : {}),
-        })
-        if (resolved.touchAssignedAt) patch.assignee = resolved.assignee
-      }
-      if (body.creatorSessionId !== undefined) {
-        const sid = body.creatorSessionId?.trim()
-        if (!sid) patch.creator = { kind: 'user', name: '用户' }
-        else {
-          const resolved = await resolveAssignee(host, { assigneeSessionId: sid })
-          patch.creator = resolved.assignee ?? { kind: 'agent', sessionId: sid, name: sid.slice(0, 8) }
-        }
-      }
-      const row = tasks.update(route.params.id, patch)
-      route.send(200, { task: await present(row) })
-    } catch (error) {
-      const message = String(error)
-      route.send(message.includes('unknown') ? 404 : 400, { error: message })
+    if (!host.sessions?.sendMessage) {
+      throw new Error('sessions.sendMessage 不可用：sessions 服务未就绪')
     }
-  })
-
-  host.http.route('DELETE', '/api/tasks/:id', (route) => {
-    const ok = tasks.delete(route.params.id)
-    if (!ok) return route.send(404, { error: 'unknown task' })
-    route.send(200, { ok: true })
-  })
-
-  // 批量创建
-  host.http.route('POST', '/api/tasks/batch', async (route) => {
-    try {
-      const body = (await route.json()) as { tasks: TaskCreateInput[] }
-      const items = Array.isArray(body.tasks) ? body.tasks : []
-      const creator = await resolveCreator(host)
-      const created: TaskRow[] = []
-      for (const input of items) {
-        const resolved = await resolveAssignee(host, {
-          ...(input.assigneeSessionId !== undefined ? { assigneeSessionId: input.assigneeSessionId } : {}),
-          ...(input.assignee !== undefined ? { assignee: input.assignee } : {}),
-        })
-        const row = tasks.create({ ...input, creator, assignee: resolved.touchAssignedAt ? resolved.assignee : input.assignee ?? null })
-        created.push(row)
-      }
-      route.send(201, { tasks: await presentMany(created) })
-    } catch (error) {
-      route.send(400, { error: String(error) })
+    const text = String(args.text ?? '').trim() || buildDeliverText(row)
+    const sender = { type: 'session' as const, sessionId: currentSessionId() ?? 'unknown' }
+    const wait = args.wait !== false && args.wait !== 'false'
+    if (!wait) {
+      void host.sessions.sendMessage(targetSessionId, text, { wait: false, sender })
+      return { taskId: id, sessionId: targetSessionId, queued: true, wait: false, text }
     }
-  })
-
-  // 批量删除
-  host.http.route('DELETE', '/api/tasks', async (route) => {
-    try {
-      const body = (await route.json()) as { ids: string[] }
-      const ids = Array.isArray(body.ids) ? body.ids.map(String) : []
-      let deleted = 0
-      const missing: string[] = []
-      for (const id of ids) {
-        if (tasks.delete(id)) deleted++
-        else missing.push(id)
-      }
-      route.send(200, { ok: true, deleted, missing })
-    } catch (error) {
-      route.send(400, { error: String(error) })
+    const turn = await host.sessions.sendMessage(targetSessionId, text, { wait: true, sender })
+    return {
+      taskId: id,
+      sessionId: targetSessionId,
+      queued: false,
+      wait: true,
+      text: turn.text.slice(0, 1200),
+      steps: turn.steps.length,
     }
-  })
-
-  // ==================== 视图（task_views）REST：Notion 风格视图持久化 ====================
-  // GET    /api/task-views      —— 视图列表
-  // POST   /api/task-views      —— 新建/另存为（body: { name, config }）
-  // PATCH  /api/task-views/:id  —— 重命名/更新配置（body: { name?, config? }）
-  // DELETE /api/task-views/:id  —— 删除已保存视图
-  host.http.route('GET', '/api/task-views', async (route) => {
-    route.send(200, { views: tasks.listTaskViews() })
-  })
-
-  host.http.route('POST', '/api/task-views', async (route) => {
-    try {
-      const body = (await route.json()) as { name?: string; config?: TaskViewConfig }
-      const view = tasks.createTaskView({ name: normalizeViewName(body.name), config: normalizeViewConfig(body.config) })
-      route.send(201, { view })
-    } catch (error) {
-      route.send(400, { error: String(error) })
-    }
-  })
-
-  host.http.route('PATCH', '/api/task-views/:id', async (route) => {
-    try {
-      const body = (await route.json()) as { name?: string; config?: TaskViewConfig }
-      const view = tasks.updateTaskView(route.params.id, {
-        ...(body.name !== undefined ? { name: body.name } : {}),
-        ...(body.config !== undefined ? { config: body.config } : {}),
-      })
-      route.send(200, { view })
-    } catch (error) {
-      const message = String(error)
-      route.send(message.includes('unknown') ? 404 : 400, { error: message })
-    }
-  })
-
-  host.http.route('DELETE', '/api/task-views/:id', async (route) => {
-    try {
-      const ok = tasks.deleteTaskView(route.params.id)
-      if (!ok) return route.send(404, { error: 'unknown view' })
-      route.send(200, { ok: true })
-    } catch (error) {
-      route.send(400, { error: String(error) })
-    }
-  })
+  }
 
   // ==================== Trigger 统一调度 driver（自包含，事件驱动） ====================
   // 触发语义：cron(定时) / at(特定时间) / on(自动事件 dep:done·turn:end) 三源统一。
@@ -2277,7 +1509,7 @@ export function apply(ctx: Context) {
     const tr = row.trigger
     if (!tr?.enabled) return false
     if (tr.state !== 'idle') return false
-    if (row.status === 'done') return false
+    if (row.status === 'done' || row.status === 'failed') return false
     const targetSessionId = row.assignee?.sessionId
     if (!targetSessionId) {
       // 未分配负责 session：不派工也不改状态（保持 idle，等分配后再触发）
@@ -2342,29 +1574,33 @@ export function apply(ctx: Context) {
    */
   function promptForProgress(row: TaskRow): void {
     try {
-      if (row.status === 'done') return
-      if (!row.assignedAt) return
-      const assigneeSessionId = row.assignee?.sessionId
-      if (!assigneeSessionId) return
-      const creatorSessionId = row.creator?.kind === 'agent' ? row.creator.sessionId : undefined
-      if (!creatorSessionId) return
-      if (!host.sessions?.sendMessage) return
-      // 基线：最新 report.ts；无 report 用 assignedAt
-      const lastReportTs = row.reports?.length ? row.reports[row.reports.length - 1].ts : row.assignedAt
-      const intervalMs = Math.max(1, row.reportIntervalSec) * 1000
       const nowTs = now()
-      // 距上次汇报未超过间隔 → 仍处于窗口内，不追问
-      if (nowTs - lastReportTs <= intervalMs) return
-      // 冷却：距上次追问未超过间隔 → 不重复追问
-      if (row.lastReportPromptAt != null && nowTs - row.lastReportPromptAt < intervalMs) return
-      const overdueSec = Math.max(1, Math.floor((nowTs - lastReportTs) / 1000))
-      const text = `【任务进度询问】${row.title}\n任务 id：${row.id}\n任务已派发 ${overdueSec} 秒仍未收到汇报，请问当前进展？`
+      const verdict = shouldPromptProgress(row, nowTs)
+      if (verdict.shouldFail) {
+        if (row.status === 'failed') return
+        tasks.update(row.id, { status: 'failed' })
+        const assigneeSessionId = row.assignee?.sessionId
+        const creatorSessionId = row.creator?.kind === 'agent' ? row.creator.sessionId : undefined
+        if (assigneeSessionId && host.sessions?.sendMessage) {
+          const text = `【任务失败】${row.title}\n任务 id：${row.id}\n已询问进度 ${MAX_REPORT_PROMPTS} 次仍未收到汇报，任务已标记为失败。`
+          const sender = creatorSessionId ? { type: 'session' as const, sessionId: creatorSessionId } : undefined
+          host.sessions.sendMessage(assigneeSessionId, text, { wait: false, ...(sender ? { sender } : {}) }).catch(() => {})
+        }
+        return
+      }
+      if (!verdict.shouldPrompt) return
+      const assigneeSessionId = row.assignee?.sessionId
+      const creatorSessionId = row.creator?.kind === 'agent' ? row.creator.sessionId : undefined
+      if (!assigneeSessionId || !creatorSessionId) return
+      if (!host.sessions?.sendMessage) return
+      const used = Math.max(0, Math.round(Number(row.reportPromptCount) || 0))
+      const nextCount = used + 1
+      const text = `【任务进度询问】${row.title}\n任务 id：${row.id}\n任务已派发 ${verdict.overdueSec} 秒仍未收到汇报（第 ${nextCount}/${MAX_REPORT_PROMPTS} 次询问）。请问当前进展？`
       const sender = { type: 'session' as const, sessionId: creatorSessionId }
       host.sessions.sendMessage(assigneeSessionId, text, { wait: false, sender }).catch(() => {
         /* 发送失败：保留 lastReportPromptAt 未更新，下轮可重试 */
       })
-      // 记录追问时间，进入冷却窗口
-      tasks.update(row.id, { lastReportPromptAt: nowTs })
+      tasks.update(row.id, { lastReportPromptAt: nowTs, reportPromptCount: nextCount })
     } catch {
       /* 单测/无完整 host 时容忍 */
     }
@@ -2447,7 +1683,7 @@ export function apply(ctx: Context) {
   // 简化为：监听 task_report（tools/post-execute 中 name==='task_report'），若报告 done 则触发其下游。
   ctx.on('tools/post-execute', (payload) => {
     try {
-      if (payload?.name !== 'task_report') return
+      if (payload?.name !== 'db_action') return
       const rows = tasks.list()
       // 找所有已完成的任务 id 集合（作为 dep:done 的候选依赖源）
       for (const row of rows) {
@@ -2465,11 +1701,26 @@ export function apply(ctx: Context) {
   })
 
   ctx.inject(['database'], (inner) => {
-    inner.database.register(tasksCollection(tasks))
+    inner.database.register(
+      tasksCollection(
+        tasks,
+        {
+          report: (id, _record, args) => runTaskReport(id, args),
+          deliver: (id, _record, args) => runTaskDeliver(id, args),
+        },
+        {
+          resolveCreator: () => resolveCreator(host),
+          resolveAssignee: async (input) => {
+            const resolved = await resolveAssignee(host, input)
+            return resolved.touchAssignedAt ? resolved.assignee : null
+          },
+        },
+      ),
+    )
   })
 }
 
-// 供其它 plugin（如 cap-chat）通过 inject 'tasks' 注入本服务，做 Live 派工统计按 creator 取数。
+// 供其它 plugin（如 core-chat）通过 inject 'tasks' 注入本服务，做 Live 派工统计按 creator 取数。
 declare module 'cordis' {
   interface Context {
     tasks: TasksService

@@ -1,8 +1,10 @@
-import { test } from 'vitest'
+import { afterEach, test } from 'vitest'
 import assert from 'node:assert/strict'
 import { useState } from 'react'
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, cleanup } from '@testing-library/react'
 import { AppDialog, LocalText } from './controls.tsx'
+
+afterEach(() => cleanup())
 
 test('named AppDialog keeps draft local so the parent does not re-render while typing', () => {
   let parentRenders = 0
@@ -37,6 +39,44 @@ test('named AppDialog keeps draft local so the parent does not re-render while t
   assert.equal(confirmed, '列表改名')
 })
 
+test('AppDialog keeps cancel enabled when confirm is disabled', () => {
+  let canceled = false
+  render(
+    <AppDialog
+      title="标签"
+      confirm="贴上"
+      disabled
+      body={<p>还没有标签</p>}
+      onCancel={() => {
+        canceled = true
+      }}
+      onConfirm={() => {}}
+    />,
+  )
+  const cancel = screen.getByRole('button', { name: '取消' }) as HTMLButtonElement
+  const ok = screen.getByRole('button', { name: '贴上' }) as HTMLButtonElement
+  assert.equal(cancel.disabled, false)
+  assert.equal(ok.disabled, true)
+  fireEvent.click(cancel)
+  assert.equal(canceled, true)
+})
+
+test('AppDialog can hide cancel so an alert only has a confirm button', () => {
+  render(
+    <AppDialog
+      title="安装失败"
+      confirm="知道了"
+      hideCancel
+      body={<p>语法错误</p>}
+      onCancel={() => {}}
+      onConfirm={() => {}}
+    />,
+  )
+  assert.equal(screen.queryByRole('button', { name: '取消' }), null)
+  assert.ok(screen.getByRole('button', { name: '知道了' }))
+  assert.ok(screen.getByRole('dialog', { name: '安装失败' }))
+})
+
 test('LocalText keeps keystrokes inside the field and only commits on blur', () => {
   let parentRenders = 0
   let committed = ''
@@ -53,4 +93,22 @@ test('LocalText keeps keystrokes inside the field and only commits on blur', () 
   assert.equal(committed, '')
   fireEvent.blur(box)
   assert.equal(committed, '新正文一二三')
+})
+
+test('LocalText autoSize grows height to scrollHeight instead of a fixed row cap', () => {
+  render(
+    <LocalText
+      as="textarea"
+      autoSize
+      className="fsdb-detail-title-input"
+      value="BIO - LINUX TOOLKIT K8S + NOTION + OFFICE"
+      onCommit={() => {}}
+    />,
+  )
+  const box = document.querySelector('.fsdb-detail-title-input') as HTMLTextAreaElement
+  assert.ok(box)
+  assert.equal(box.rows, 1)
+  Object.defineProperty(box, 'scrollHeight', { configurable: true, get: () => 96 })
+  fireEvent.change(box, { target: { value: `${box.value} extra` } })
+  assert.equal(box.style.height, '96px')
 })

@@ -1,124 +1,131 @@
-import { useEffect, useState } from 'react'
-import { createPortal } from 'react-dom'
-import { BoolBox } from '@biu/public-ui'
+import { BoolBox } from '@biu/biu-ui/bool-box'
+import { TagChip, TagChips } from '@biu/biu-ui/tag-chip'
 import {
   ArchiveBoxArrowDownIcon,
+  ArrowDownTrayIcon,
   ArrowPathIcon,
-  Bars3BottomLeftIcon,
-  CalendarDaysIcon,
+  ArrowUpTrayIcon,
+  BoltIcon,
+  ChatBubbleLeftRightIcon,
+  CheckCircleIcon,
   CheckIcon,
-  CircleStackIcon,
-  ClipboardDocumentListIcon,
-  DocumentTextIcon,
-  HashtagIcon,
+  Bars3BottomLeftIcon,
   LinkIcon,
-  ListBulletIcon,
-  PaperClipIcon,
+  PaperAirplaneIcon,
   PencilSquareIcon,
-  PhotoIcon,
   PlayIcon,
-  RectangleStackIcon,
   StopIcon,
-  TableCellsIcon,
-  ShareIcon,
-  Squares2X2Icon,
-  ViewColumnsIcon,
 } from '@heroicons/react/16/solid'
 import { TrashGlyph } from '@biu/web-session-view/trash-glyph'
 import type { CollectionSchema, DbRecord, FieldSpec, FieldType } from '@biu/type-file-system'
-import { asAttachment, asHttpHref, asImageSrc } from '@biu/type-file-system'
-import type { CollectionViewType } from '@biu/type-file-system/ui'
+import { actionVisibleToUser, asAttachmentList, asHttpHref, asImageSrc, asImageSrcList, asPerson, asPersonList, commitAttachments } from '@biu/type-file-system'
+import type { CollectionRowViewType, CollectionViewType } from '@biu/type-file-system/ui'
 import {
   asStringList,
-  asTime,
+  enumDisplayLabel,
   formatField,
+  isRecordLinkField,
   matchActionWhen,
   resolveFieldType,
   type ViewMode,
 } from './fields.ts'
-import { CellSelect, LocalText, TokenMultiSelect } from './controls.tsx'
+import { AttachmentFile, UrlHref } from './cell-media.tsx'
+import { PersonFace } from './person-cell.tsx'
+import { RecordLinkChips } from './record-link-cell.tsx'
 
-export function actionIcon(id: string) {
-  const cls = 'size-[14px]'
-  if (id === 'start' || id === 'play' || id === 'run' || id === 'open') return <PlayIcon aria-hidden className={cls} />
-  if (id === 'stop' || id === 'close' || id === 'pause') return <StopIcon aria-hidden className={cls} />
+export function actionIcon(id: string, opts?: { fallback?: boolean; className?: string }) {
+  const cls = opts?.className ?? 'size-[14px]'
+  if (id === 'start' || id === 'play' || id === 'run' || id === 'open' || id === 'enable') return <PlayIcon aria-hidden className={cls} />
+  if (id === 'stop' || id === 'close' || id === 'pause' || id === 'disable') return <StopIcon aria-hidden className={cls} />
   if (id === 'pack') return <ArchiveBoxArrowDownIcon aria-hidden className={cls} />
   if (id === 'uninstall' || id === 'delete' || id === 'remove') return <TrashGlyph aria-hidden className={cls} />
   if (id === 'edit' || id === 'rename') return <PencilSquareIcon aria-hidden className={cls} />
   if (id === 'refresh') return <ArrowPathIcon aria-hidden className={cls} />
-  return null
+  if (id === 'sync-from-directory') return <ArrowDownTrayIcon aria-hidden className={cls} />
+  if (id === 'sync-to-directory') return <ArrowUpTrayIcon aria-hidden className={cls} />
+  if (id === 'deliver') return <PaperAirplaneIcon aria-hidden className={cls} />
+  if (id === 'report' || id === 'progress') return <ChatBubbleLeftRightIcon aria-hidden className={cls} />
+  if (opts?.fallback === false) return null
+  return <BoltIcon aria-hidden className={cls} />
 }
 
-export function ModeGlyph({ id, extra }: { id: ViewMode; extra?: CollectionViewType[] }) {
+export function ModeGlyph({
+  id,
+  extra,
+  rows,
+}: {
+  id: ViewMode
+  extra?: CollectionViewType[]
+  rows?: CollectionRowViewType[]
+}) {
   const cls = 'size-[14px]'
-  const Custom = extra?.find((item) => item.id === id)?.Icon
+  const Custom = extra?.find((item) => item.id === id)?.Icon ?? rows?.find((item) => item.id === id)?.Icon
   if (Custom) return <Custom className={cls} />
-  if (id === 'queue') return <ListBulletIcon aria-hidden className={cls} />
-  if (id === 'table') return <TableCellsIcon aria-hidden className={cls} />
-  if (id === 'cards') return <Squares2X2Icon aria-hidden className={cls} />
-  if (id === 'board') return <ViewColumnsIcon aria-hidden className={cls} />
-  return <ShareIcon aria-hidden className={cls} />
+  if (id === 'table') return <span aria-hidden className="fsdb-ui-glyph" data-icon="table" />
+  return <span aria-hidden className="fsdb-ui-glyph" data-icon="share" />
 }
 
 export const VIEW_MODES: Array<{ id: ViewMode; label: string }> = [
-  { id: 'queue', label: '列表' },
   { id: 'table', label: '表格' },
-  { id: 'cards', label: '卡片' },
-  { id: 'board', label: '看板' },
 ]
+
+export function fieldDraftValue(field: FieldSpec, value: unknown): string {
+  const kind = resolveFieldType(field)
+  if (kind === 'multi-select') return asStringList(value).join(', ')
+  if (kind === 'boolean') return value === true || value === 'true' ? 'true' : 'false'
+  if (kind === 'url') return asHttpHref(value)
+  if (kind === 'image') {
+    const list = asImageSrcList(value)
+    if (list.length <= 1) return list[0] ?? ''
+    return JSON.stringify(list)
+  }
+  if (kind === 'attachment') {
+    const list = asAttachmentList(value)
+    if (list.length <= 1) return list[0] ? JSON.stringify(list[0]) : ''
+    return JSON.stringify(list)
+  }
+  if (kind === 'person') {
+    const person = asPerson(value)
+    return person ? JSON.stringify(person) : ''
+  }
+  if (kind === 'multi-ref') return asStringList(value).join(', ')
+  if (kind === 'ref') return String(value ?? '')
+  if (kind === 'file') {
+    if (value == null || value === '') return ''
+    if (typeof value === 'string') return value
+    return JSON.stringify(value, null, 2)
+  }
+  if (value == null) return ''
+  return String(value)
+}
 
 export function draftFromRecord(schema: CollectionSchema, row: DbRecord, bodyKey: string | null | undefined, detailBody: unknown) {
   const next: Record<string, string> = {}
   for (const [key, field] of Object.entries(schema.fields)) {
     const value = key === bodyKey ? detailBody : row[key]
-    const kind = resolveFieldType(field)
-    if (kind === 'multi-select') next[key] = asStringList(value).join(', ')
-    else if (kind === 'boolean') next[key] = value === true || value === 'true' ? 'true' : 'false'
-    else if (kind === 'url') next[key] = asHttpHref(value)
-    else if (kind === 'image') next[key] = asImageSrc(value)
-    else if (kind === 'attachment') next[key] = asAttachment(value)?.href ?? ''
-    else if (kind === 'file') {
-      if (value == null || value === '') next[key] = ''
-      else if (typeof value === 'string') next[key] = value
-      else next[key] = JSON.stringify(value, null, 2)
-    }
-    else if (value == null) next[key] = ''
-    else next[key] = String(value)
+    next[key] = fieldDraftValue(field, value)
   }
   return next
 }
 
-export function toDatetimeLocal(value: unknown) {
-  const n = asTime(value)
-  if (!n) return ''
-  const d = new Date(n)
-  const pad = (x: number) => String(x).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-
-export function fromDatetimeLocal(value: string) {
-  if (!value) return ''
-  const n = new Date(value).getTime()
-  return Number.isFinite(n) ? String(n) : ''
+export function fieldGlyphKind(kind: FieldType) {
+  if (kind === 'person') return 'person'
+  if (kind === 'datetime') return 'date'
+  if (kind === 'number') return 'num'
+  if (kind === 'action') return 'play'
+  if (kind === 'select' || kind === 'multi-select') return 'stack'
+  if (kind === 'facet') return 'tag'
+  if (kind === 'url') return 'link'
+  if (kind === 'ref' || kind === 'multi-ref') return 'ref'
+  if (kind === 'image' || kind === 'attachment' || kind === 'file') return 'file'
+  return 'text'
 }
 
 export function FieldGlyph({ kind }: { kind: FieldType }) {
-  const cls = 'size-[14px] shrink-0 opacity-80'
-  if (kind === 'boolean') return <ClipboardDocumentListIcon aria-hidden className={cls} />
-  if (kind === 'select') return <ListBulletIcon aria-hidden className={cls} />
-  if (kind === 'multi-select') return <RectangleStackIcon aria-hidden className={cls} />
-  if (kind === 'datetime') return <CalendarDaysIcon aria-hidden className={cls} />
-  if (kind === 'bytes') return <CircleStackIcon aria-hidden className={cls} />
-  if (kind === 'number') return <HashtagIcon aria-hidden className={cls} />
-  if (kind === 'url') return <LinkIcon aria-hidden className={cls} />
-  if (kind === 'image') return <PhotoIcon aria-hidden className={cls} />
-  if (kind === 'attachment') return <PaperClipIcon aria-hidden className={cls} />
-  if (kind === 'file') return <DocumentTextIcon aria-hidden className={cls} />
-  return <Bars3BottomLeftIcon aria-hidden className={cls} />
-}
-
-export function boolOn(value: unknown) {
-  return value === true || value === 'true'
+  if (kind === 'boolean') return <CheckCircleIcon aria-hidden className="fsdb-field-hero" />
+  if (kind === 'url') return <LinkIcon aria-hidden className="fsdb-field-hero" />
+  if (fieldGlyphKind(kind) === 'text') return <Bars3BottomLeftIcon aria-hidden className="fsdb-field-hero" />
+  return <span aria-hidden className="fsdb-field-glyph" data-kind={fieldGlyphKind(kind)} />
 }
 
 export function BoolCell({
@@ -147,12 +154,12 @@ export function BoolCell({
       type="button"
       className="fsdb-boolbtn"
       aria-pressed={on}
-      aria-label={on ? '是' : '否'}
-      title={on ? '是，点击改为否' : '否，点击改为是'}
+      aria-label={on ? '是，点击改为否' : '否，点击改为是'}
       onClick={(event) => {
         event.stopPropagation()
         onToggle()
       }}
+      onPointerDown={(event) => event.stopPropagation()}
     >
       {mark}
     </button>
@@ -160,57 +167,52 @@ export function BoolCell({
 }
 
 function ImageThumb({ src }: { src: string }) {
-  const [open, setOpen] = useState(false)
-  useEffect(() => {
-    if (!open) return
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setOpen(false)
-    }
-    document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
-  }, [open])
   return (
-    <>
-      <button
-        type="button"
-        className="fsdb-thumb-btn"
-        title="查看大图"
-        onClick={(event) => {
-          event.stopPropagation()
-          setOpen(true)
-        }}
-      >
-        <img className="fsdb-thumb" src={src} alt="" decoding="async" width={28} height={18} />
-      </button>
-      {open
-        ? createPortal(
-            <div
-              className="fsdb-lightbox"
-              role="dialog"
-              aria-modal="true"
-              aria-label="查看图片"
-              onMouseDown={(event) => {
-                event.stopPropagation()
-                if (event.target === event.currentTarget) setOpen(false)
-              }}
-            >
-              <img src={src} alt="" decoding="async" onClick={(event) => event.stopPropagation()} />
-            </div>,
-            document.body,
-          )
-        : null}
-    </>
+    <span className="fsdb-thumb-btn" onPointerDown={(event) => event.stopPropagation()}>
+      <img src={src} alt="" width={28} height={18} className="fsdb-thumb" />
+    </span>
+  )
+}
+
+function ImageThumbs({ srcs, compact }: { srcs: string[]; compact?: boolean }) {
+  if (!srcs.length) return null
+  const shown = compact ? srcs.slice(0, 4) : srcs
+  if (compact) {
+    return (
+      <span className="fsdb-thumbs">
+        {shown.map((src, index) => (
+          <ImageThumb key={`${src}-${index}`} src={src} />
+        ))}
+        {srcs.length > 4 ? <span className="fsdb-meta">+{srcs.length - 4}</span> : null}
+      </span>
+    )
+  }
+  return (
+    <div className="fsdb-fileview-imgs">
+      {shown.map((src, index) => (
+        <img key={`${src}-${index}`} className="fsdb-fileview-img" src={src} alt="" />
+      ))}
+    </div>
   )
 }
 
 export function parseFieldValue(field: FieldSpec, raw: string): unknown {
   const kind = resolveFieldType(field)
   if (kind === 'boolean') return raw === 'true'
-  if (kind === 'number' || kind === 'datetime' || kind === 'bytes') return raw === '' ? null : Number(raw)
+  if (kind === 'number' || kind === 'datetime') return raw === '' ? null : Number(raw)
   if (kind === 'multi-select') return asStringList(raw)
-  if (kind === 'file') {
+  if (kind === 'facet') {
     const trimmed = raw.trim()
-    if (!trimmed) return null
+    if (!trimmed) return { tags: [], values: {} }
+    try {
+      return JSON.parse(trimmed) as unknown
+    } catch {
+      return { tags: [], values: {} }
+    }
+  }
+  if (kind === 'file' || kind === 'attachment' || kind === 'image' || kind === 'person') {
+    const trimmed = raw.trim()
+    if (!trimmed) return kind === 'file' ? null : ''
     if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
       try {
         return JSON.parse(trimmed) as unknown
@@ -224,10 +226,10 @@ export function parseFieldValue(field: FieldSpec, raw: string): unknown {
 }
 
 function previewImageSrc(kind: FieldType | undefined, value: unknown): string {
-  if (kind === 'attachment' || kind === 'url') return ''
+  if (kind === 'attachment' || kind === 'url' || kind === 'image') return ''
   const src = asImageSrc(value)
   if (!src) return ''
-  if (kind === 'image' || !kind) return src
+  if (!kind) return src
   if (/^data:image\//i.test(src)) return src
   if (/\.(?:png|jpe?g|gif|webp|svg|avif|bmp)(?:[?#]|$)/i.test(src)) return src
   return ''
@@ -237,24 +239,45 @@ export function FilePreview({
   value,
   compact = false,
   kind,
+  onChange,
 }: {
   value: unknown
   compact?: boolean
   kind?: FieldType
+  onChange?: (next: unknown) => void
 }) {
-  if (value == null || value === '') return <span className="fsdb-muted">—</span>
+  if (value == null || value === '') return null
+  if (kind === 'url') {
+    const href = asHttpHref(value)
+    if (!href) return null
+    return <UrlHref href={href} />
+  }
+  if (kind === 'image') {
+    const list = asImageSrcList(value)
+    if (!list.length) return null
+    return <ImageThumbs srcs={list} compact={compact} />
+  }
   const src = previewImageSrc(kind, value)
   if (src) {
     if (compact) return <ImageThumb src={src} />
-    return <img className="fsdb-fileview-img" src={src} alt="" decoding="async" />
+    return <img className="fsdb-fileview-img" src={src} alt="" />
   }
-  const file = asAttachment(value)
-  if (file) {
+  const files = asAttachmentList(value)
+  if (files.length) {
     return (
-      <a className="fsdb-file" href={file.href} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
-        <PaperClipIcon aria-hidden className="size-[14px] shrink-0" />
-        <span className="fsdb-file-name">{file.name}</span>
-      </a>
+      <span className="fsdb-files">
+        {files.map((file, index) => (
+          <AttachmentFile
+            key={`${file.href}-${index}`}
+            file={file}
+            onRemove={
+              onChange
+                ? () => onChange(commitAttachments(files.filter((_, i) => i !== index)))
+                : undefined
+            }
+          />
+        ))}
+      </span>
     )
   }
   const href = asHttpHref(value)
@@ -265,103 +288,131 @@ export function FilePreview({
       </a>
     )
   }
+  if (kind === 'url' || kind === 'attachment' || kind === 'image') return null
   const text = typeof value === 'string' ? value : JSON.stringify(value, null, compact ? 0 : 2)
   if (compact) return <span className="fsdb-meta">{text.length > 80 ? `${text.slice(0, 80)}…` : text}</span>
-  return <pre className="fsdb-fileview-pre">{text || '—'}</pre>
+  return text ? <pre className="fsdb-fileview-pre">{text}</pre> : null
 }
 
-export function DefaultCell({ field, value }: { field: FieldSpec; value: unknown }) {
-  const kind = resolveFieldType(field)
-  if (kind === 'select') {
-    const text = String(value ?? '')
-    if (!text) return <span className="fsdb-muted">—</span>
-    return (
-      <span className="fsdb-tag">
-        {text}
-      </span>
-    )
-  }
-  if (kind === 'multi-select') {
-    const tags = asStringList(value)
-    if (!tags.length) return <span className="fsdb-muted">—</span>
-    return (
-      <span className="fsdb-tags">
-        {tags.map((tag) => (
-          <span key={tag} className="fsdb-tag">
-            {tag}
-          </span>
-        ))}
-      </span>
-    )
-  }
-  if (kind === 'url' || kind === 'image' || kind === 'attachment' || kind === 'file') {
-    return <FilePreview value={value} compact kind={kind} />
-  }
-  const text = formatField(field, value)
-  return <span className={kind === 'datetime' || kind === 'bytes' ? 'fsdb-meta' : undefined}>{text}</span>
-}
-
-export function FieldEditor({
-  fieldKey,
+export function DefaultCell({
   field,
   value,
+  fieldKey,
+  records,
+  collectionPath,
+  labelField,
+  onRun,
   onChange,
-  options,
+  plain,
+  onOpenLink,
 }: {
-  fieldKey: string
   field: FieldSpec
-  value: string
-  onChange: (next: string) => void
-  options?: string[]
+  value: unknown
+  fieldKey?: string
+  records?: DbRecord[]
+  collectionPath?: string
+  labelField?: string
+  onRun?: () => void
+  onChange?: (next: unknown) => void
+  plain?: boolean
+  onOpenLink?: (id: string) => void
 }) {
   const kind = resolveFieldType(field)
-  if (kind === 'select' && field.enum) {
+  if (kind === 'action') {
+    return <ActionCell field={field} fieldKey={fieldKey ?? ''} onRun={onRun} />
+  }
+  if (fieldKey && isRecordLinkField(field, fieldKey)) {
     return (
-      <CellSelect
+      <RecordLinkChips
+        field={field}
+        fieldKey={fieldKey}
         value={value}
-        options={field.enum.map((item) => ({ value: item, label: item }))}
-        onSelect={onChange}
+        collectionPath={collectionPath}
+        records={records}
+        labelField={labelField}
+        deferMissing={plain}
+        onOpen={onOpenLink}
       />
+    )
+  }
+  if (kind === 'select' || kind === 'multi-select') {
+    const tags = kind === 'multi-select' ? asStringList(value) : String(value ?? '') ? [String(value)] : []
+    if (!tags.length) return null
+    if (plain) {
+      return <span className="fsdb-select-text">{tags.map((tag) => enumDisplayLabel(field, tag)).join('、')}</span>
+    }
+    return (
+      <TagChips>
+        {tags.map((tag) => (
+          <TagChip key={tag} id={tag} label={enumDisplayLabel(field, tag)} />
+        ))}
+      </TagChips>
     )
   }
   if (kind === 'boolean') {
-    return <BoolCell on={value === 'true'} writable onToggle={() => onChange(value === 'true' ? 'false' : 'true')} />
+    return <BoolCell on={value === true || value === 'true'} />
+  }
+  if (kind === 'person') {
+    if (plain) {
+      const text = asPersonList(value)
+        .map((item) => item.name)
+        .filter(Boolean)
+        .join('、')
+      if (!text) return null
+      return <span className="fsdb-person-text">{text}</span>
+    }
+    return <PersonFace value={value} />
   }
   if (kind === 'datetime') {
-    return (
-      <LocalText
-        className="fsdb-plain-input"
-        value={toDatetimeLocal(value)}
-        placeholder="YYYY-MM-DDTHH:mm"
-        onCommit={(next) => onChange(fromDatetimeLocal(next))}
-      />
-    )
+    const text = formatField(field, value)
+    if (!text) return null
+    return <span className="fsdb-datetime-text">{text}</span>
   }
-  if (kind === 'multi-select') {
-    return (
-      <TokenMultiSelect
-        values={asStringList(value)}
-        options={[...(field.enum ?? []), ...(options ?? [])].filter((item, index, list) => list.indexOf(item) === index)}
-        onChange={(next) => onChange(next.join(', '))}
-      />
-    )
+  if (kind === 'url' || kind === 'image' || kind === 'attachment' || kind === 'file') {
+    return <FilePreview value={value} compact kind={kind} onChange={kind === 'attachment' ? onChange : undefined} />
   }
-  if (kind === 'url' || kind === 'image' || kind === 'attachment') {
-    return (
-      <LocalText
-        className="fsdb-plain-input"
-        value={value}
-        placeholder={kind === 'image' ? 'https://…、/cover.png 或 data:image' : 'https://'}
-        onCommit={onChange}
-      />
-    )
-  }
-  return <LocalText className="fsdb-plain-input" value={value} title={value} placeholder={fieldKey} onCommit={onChange} />
+  const text = formatField(field, value)
+  if (!text) return null
+  return <span>{text}</span>
+}
+
+export function fieldActionId(fieldKey: string, field: FieldSpec) {
+  return String(field.action ?? fieldKey).trim() || fieldKey
+}
+
+export function ActionCell({
+  field,
+  fieldKey,
+  onRun,
+}: {
+  field: FieldSpec
+  fieldKey: string
+  onRun?: () => void
+}) {
+  const label = field.label || fieldKey
+  return (
+    <button
+      type="button"
+      className="fsdb-action-btn"
+      aria-label={label}
+      onClick={(event) => {
+        event.stopPropagation()
+        onRun?.()
+      }}
+    >
+      {label}
+    </button>
+  )
+}
+
+export function placedActions(schema: CollectionSchema | undefined, place: 'row' | 'detail') {
+  return (schema?.actions ?? []).filter((action) => {
+    if (!actionVisibleToUser(action)) return false
+    const places = action.placement ?? ['row', 'detail']
+    return places.includes(place)
+  })
 }
 
 export function visibleActions(schema: CollectionSchema | undefined, row: DbRecord, place: 'row' | 'detail') {
-  return (schema?.actions ?? []).filter((action) => {
-    const places = action.placement ?? ['row', 'detail']
-    return places.includes(place) && matchActionWhen(row, action.when)
-  })
+  return placedActions(schema, place).filter((action) => matchActionWhen(row, action.when))
 }

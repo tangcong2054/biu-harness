@@ -1,0 +1,21 @@
+{
+  "name": "@biu/host-skills",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Skill 仓库：独立 /skills 表，正文不进 /pages",
+  "exports": {
+    ".": "./src/host/index.ts",
+    "./store": "./src/host/store.ts",
+    "./web": "./src/web/index.tsx"
+  },
+  "peerDependencies": {
+    "cordis": "4.0.0-rc.8",
+    "react": "^19.1.1"
+  },
+  "dependencies": {
+    "@biu/host-plugin-loader": "0.1.0",
+    "@biu/biu-ui": "0.1.0",
+    "@biu/type-file-system": "0.1.0"
+  }
+}

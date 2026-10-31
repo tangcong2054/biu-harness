@@ -1,6 +1,7 @@
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
 import { Context } from 'cordis'
+import { DEFAULT_CHROME_PATH } from '@biu/type-file-system/ui'
 import { DatabaseUiService, normalizeCollectionPath } from './database-ui.ts'
 
 test('normalizeCollectionPath strips trailing slash', () => {
@@ -23,6 +24,39 @@ test('decorate merges cells; later layer wins; dispose restores', () => {
   assert.equal(ui.chrome('/plugins').cells?.tags, undefined)
   second.dispose()
   assert.equal(ui.chrome('/plugins').cells?.name, undefined)
+})
+
+test('decorate merges DetailTools; later layer wins', () => {
+  const ctx = new Context()
+  const ui = new DatabaseUiService(ctx)
+  const First = () => null
+  const Second = () => null
+  ui.decorate('/pages', { DetailTools: First })
+  assert.equal(ui.chrome('/pages').DetailTools, First)
+  ui.decorate('/pages', { DetailTools: Second })
+  assert.equal(ui.chrome('/pages').DetailTools, Second)
+})
+
+test('decorate merges Actions; later layer wins', () => {
+  const ctx = new Context()
+  const ui = new DatabaseUiService(ctx)
+  const First = () => null
+  const Second = () => null
+  ui.decorate('/plugins', { Actions: First })
+  assert.equal(ui.chrome('/plugins').Actions, First)
+  ui.decorate('/plugins', { Actions: Second })
+  assert.equal(ui.chrome('/plugins').Actions, Second)
+})
+
+test('decorate keeps Icon as the record mark, later layer wins', () => {
+  const ctx = new Context()
+  const ui = new DatabaseUiService(ctx)
+  const IconA = () => null
+  const IconB = () => null
+  ui.decorate('/agents', { Icon: IconA })
+  assert.equal(ui.chrome('/agents').Icon, IconA)
+  ui.decorate('/agents', { Icon: IconB })
+  assert.equal(ui.chrome('/agents').Icon, IconB)
 })
 
 test('decorate notifies subscribers', () => {
@@ -52,6 +86,21 @@ test('decorate panes with the same id keep a single pane', () => {
   assert.equal(panes[0]?.Pane, PaneB)
 })
 
+test('default chrome applies to every table and a later table layer wins', () => {
+  const ctx = new Context()
+  const ui = new DatabaseUiService(ctx)
+  const DefaultContent = () => null
+  const OverrideContent = () => null
+  const DefaultTools = () => null
+  ui.decorate(DEFAULT_CHROME_PATH, { Content: DefaultContent, DetailTools: DefaultTools })
+  assert.equal(ui.chrome('/skills').Content, DefaultContent)
+  assert.equal(ui.chrome('/mcp').Content, DefaultContent)
+  assert.equal(ui.chrome('/skills').DetailTools, DefaultTools)
+  ui.decorate('/skills', { Content: OverrideContent })
+  assert.equal(ui.chrome('/skills').Content, OverrideContent)
+  assert.equal(ui.chrome('/mcp').Content, DefaultContent)
+})
+
 test('registerView is scoped to the collection that registered it', () => {
   const ctx = new Context()
   const ui = new DatabaseUiService(ctx)
@@ -67,4 +116,31 @@ test('registerView is scoped to the collection that registered it', () => {
   assert.equal(ui.views('/tasks')[0]?.label, '依赖图')
   first.dispose()
   assert.equal(ui.views('/tasks').length, 0)
+})
+
+test('registerRowView merges star path with the collection', () => {
+  const ctx = new Context()
+  const ui = new DatabaseUiService(ctx)
+  const Card = () => null
+  const Task = () => null
+  ui.registerRowView('*', { id: 'card', label: '卡片', Row: Card })
+  ui.registerRowView('/tasks', { id: 'task-card', label: '任务卡', Row: Task })
+  ui.registerRowView('/plugins', { id: 'plugin-card', label: '插件卡', Row: Card })
+  assert.equal(ui.rowViews('/tasks').map((item) => item.id).join(','), 'card,task-card')
+  assert.equal(ui.rowViews('/plugins').map((item) => item.id).join(','), 'card,plugin-card')
+  const later = ui.registerRowView('/tasks', { id: 'card', label: '任务默认卡', Row: Task })
+  assert.equal(ui.rowViews('/tasks').find((item) => item.id === 'card')?.label, '任务默认卡')
+  later.dispose()
+  assert.equal(ui.rowViews('/tasks').find((item) => item.id === 'card')?.label, '卡片')
+})
+
+test('refresh notifies chrome subscribers', () => {
+  const ctx = new Context()
+  const ui = new DatabaseUiService(ctx)
+  let n = 0
+  ui.subscribe(() => {
+    n += 1
+  })
+  ui.refresh()
+  assert.equal(n, 1)
 })

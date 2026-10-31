@@ -1,14 +1,30 @@
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
 import type { DbRecord } from '@biu/type-file-system'
-import { pluginsCollection } from './collection.ts'
+import { BIU_GITHUB, BIU_OFFICIAL_NAME, pluginsCollection } from './collection.ts'
 import type { PluginStoreService } from './store.ts'
 import { defaultStoreShell } from '../shell.ts'
+
+function stubStore(partial: Partial<PluginStoreService>): PluginStoreService {
+  return {
+    list: () => Promise.resolve([]),
+    listSandboxes: () => Promise.resolve([]),
+    readReadme: async () => '',
+    writeReadme: async () => {},
+    openPlugin: async () => undefined,
+    close: async () => {},
+    pack: async (id: string) => ({ id, sandboxPath: '', pluginPath: '' }),
+    uninstall: async () => {},
+    pluginPath: (id: string) => `/workspace/.plugin/${id}`,
+    sandboxPath: (id: string) => `/workspace/.plugin-dev/${id}`,
+    ...partial,
+  } as PluginStoreService
+}
 
 test('pluginsCollection lists installed plugins and sandboxes in one table', async () => {
   const items: DbRecord[] = [{ id: 'demo', name: 'Demo', enabled: false }]
   const calls: string[] = []
-  const spec = pluginsCollection({
+  const spec = pluginsCollection(stubStore({
     list: () =>
       Promise.resolve([
         {
@@ -26,6 +42,7 @@ test('pluginsCollection lists installed plugins and sandboxes in one table', asy
           lastRunAt: null,
           hasHost: true,
           hasWeb: true,
+          codeVersion: 'abc123def456',
           shell: defaultStoreShell(),
         },
       ]),
@@ -44,54 +61,121 @@ test('pluginsCollection lists installed plugins and sandboxes in one table', asy
           updatedAt: 2,
         },
       ]),
-    openPlugin(id: string) {
+    async openPlugin(id: string) {
       calls.push(`open:${id}`)
       items[0]!.enabled = true
+      return undefined
     },
-    close(id: string) {
+    async close(id: string) {
       calls.push(`close:${id}`)
       items[0]!.enabled = false
     },
-    pack(id: string) {
+    async pack(id: string) {
       calls.push(`pack:${id}`)
+      return { id, sandboxPath: '', pluginPath: '' }
     },
-    uninstall(id: string) {
+    async uninstall(id: string) {
       calls.push(`uninstall:${id}`)
     },
-  } as PluginStoreService)
+  }))
   assert.equal(spec.path, '/plugins')
   assert.equal(spec.view?.moduleId, 'plugins')
   const listed = await spec.list()
   const demo = listed.find((row) => row.id === 'demo')
   const draft = listed.find((row) => row.id === 'draft-hello')
   assert.equal(demo?.installed, true)
+  assert.equal(demo?.pluginPath, '/workspace/.plugin/demo')
   assert.equal(demo?.sandbox, undefined)
   assert.equal(demo?.shellWidth, defaultStoreShell().width)
   assert.equal(demo?.hasWeb, true)
+  assert.equal(demo?.codeVersion, 'abc123def456')
+  assert.equal(demo?.headless, undefined)
   assert.equal(draft?.sandbox, true)
+  assert.equal(draft?.sandboxPath, '/workspace/.plugin-dev/draft-hello')
   assert.equal(draft?.installed, undefined)
   assert.equal(draft?.running, undefined)
   assert.equal(draft?.bytes, undefined)
+  assert.equal(draft?.codeVersion, undefined)
   assert.equal(draft?.shellWidth, undefined)
   assert.deepEqual(
     spec.actions?.map((item) => item.id),
-    ['start', 'stop', 'pack', 'uninstall'],
+    ['sandbox', 'start', 'stop', 'pack', 'uninstall'],
   )
   await spec.actions!.find((item) => item.id === 'start')!.run('demo', demo!)
   await spec.actions!.find((item) => item.id === 'pack')!.run('draft-hello', draft!)
   assert.deepEqual(calls, ['open:demo', 'pack:draft-hello'])
-  assert.equal(spec.update, undefined)
+  assert.equal(typeof spec.update, 'function')
+  assert.equal(spec.schema.contentField, 'readme')
+  assert.match(String(spec.view?.blurb ?? ''), /示例写法/)
+  assert.match(String(spec.view?.blurb ?? ''), /:::pageBlock/)
+  assert.equal(spec.schema.labelField, 'title')
+  assert.ok(spec.schema.fields.title)
+  assert.equal(spec.schema.fields.builtin?.type, 'boolean')
+  assert.equal(spec.schema.fields.name, undefined)
+  assert.equal(spec.schema.columns?.[0], 'title')
   assert.deepEqual(spec.records, { update: false, create: false, delete: true })
   assert.equal(typeof spec.remove, 'function')
   assert.ok(spec.schema.columns?.includes('sandbox'))
+  assert.ok(spec.schema.columns?.includes('sandboxPath'))
+  assert.ok(spec.schema.columns?.includes('pluginPath'))
   assert.ok(spec.schema.columns?.includes('installed'))
+  assert.equal(spec.schema.columns?.includes('tags'), false)
+  assert.ok(spec.schema.columns?.includes('codeVersion'))
+  assert.equal(spec.schema.fields.codeVersion?.label, '代码版本')
+  assert.equal(spec.schema.fields.tags, undefined)
+  assert.equal(spec.schema.fields.emoji?.writable, true)
   assert.deepEqual(spec.actions?.find((item) => item.id === 'start')?.when, { installed: true, running: false })
-  assert.deepEqual(spec.actions?.find((item) => item.id === 'pack')?.when, { sandbox: true })
-  assert.deepEqual(spec.actions?.find((item) => item.id === 'uninstall')?.when, { installed: true })
+  assert.deepEqual(spec.actions?.find((item) => item.id === 'pack')?.when, {
+    sandbox: true,
+    installed: false,
+    canManagePackage: true,
+  })
+  assert.equal(spec.actions?.find((item) => item.id === 'start')?.requiredAction, 'resource:read')
+  assert.equal(spec.actions?.find((item) => item.id === 'stop')?.requiredAction, 'resource:read')
+  assert.equal(spec.actions?.find((item) => item.id === 'pack')?.requiredAction, 'resource:read')
+  assert.equal(spec.actions?.find((item) => item.id === 'sandbox')?.requiredAction, 'resource:read')
+  assert.deepEqual(spec.actions?.find((item) => item.id === 'uninstall')?.when, { installed: true, canManagePackage: true })
+  assert.equal(spec.actions?.find((item) => item.id === 'uninstall')?.requiredAction, 'resource:read')
+  assert.equal(spec.actions?.find((item) => item.id === 'sandbox')?.for, 'agent')
+  assert.equal(spec.actions?.find((item) => item.id === 'start')?.for, undefined)
+})
+
+test('headless plugins omit shell columns', async () => {
+  const spec = pluginsCollection(stubStore({
+    list: () =>
+      Promise.resolve([
+        {
+          id: 'skin',
+          name: 'Skin',
+          blurb: '',
+          tags: [],
+          author: '',
+          authorUrl: '',
+          enabled: true,
+          running: true,
+          bytes: 8,
+          createdAt: 1,
+          updatedAt: 2,
+          lastRunAt: null,
+          hasHost: false,
+          hasWeb: true,
+          headless: true,
+        },
+      ]),
+    listSandboxes: () => Promise.resolve([]),
+    openPlugin: async () => undefined,
+    close: async () => {},
+    pack: async (id: string) => ({ id, sandboxPath: '', pluginPath: '' }),
+    uninstall: async () => {},
+  }))
+  const listed = await spec.list()
+  assert.equal(listed[0]?.headless, true)
+  assert.equal(listed[0]?.shellWidth, undefined)
+  assert.ok(spec.schema.columns?.includes('headless'))
 })
 
 test('same id with sandbox and install merges into one row', async () => {
-  const spec = pluginsCollection({
+  const spec = pluginsCollection(stubStore({
     list: () =>
       Promise.resolve([
         {
@@ -127,11 +211,11 @@ test('same id with sandbox and install merges into one row', async () => {
           updatedAt: 9,
         },
       ]),
-    openPlugin() {},
-    close() {},
-    pack() {},
-    uninstall() {},
-  } as PluginStoreService)
+    openPlugin: async () => undefined,
+    close: async () => {},
+    pack: async (id: string) => ({ id, sandboxPath: '', pluginPath: '' }),
+    uninstall: async () => {},
+  }))
   const listed = await spec.list()
   assert.equal(listed.length, 1)
   assert.equal(listed[0]?.id, 'echo')
@@ -139,4 +223,118 @@ test('same id with sandbox and install merges into one row', async () => {
   assert.equal(listed[0]?.sandbox, true)
   assert.equal(listed[0]?.running, true)
   assert.equal(listed[0]?.updatedAt, 9)
+})
+
+test('plugin intro is README.md via contentField readme', async () => {
+  const files = new Map<string, string>()
+  const spec = pluginsCollection(
+    stubStore({
+      list: () =>
+        Promise.resolve([
+          {
+            id: 'demo',
+            name: 'Demo',
+            blurb: 'hi',
+            tags: [],
+            author: '',
+            authorUrl: '',
+            enabled: false,
+            running: false,
+            bytes: 12,
+            createdAt: 1,
+            updatedAt: 2,
+            lastRunAt: null,
+            hasHost: true,
+            hasWeb: false,
+          },
+        ]),
+      readReadme: async (id) => files.get(id) ?? '',
+      writeReadme: async (id, markdown) => {
+        files.set(id, markdown)
+      },
+    }),
+  )
+  const row = await spec.get!('demo')
+  assert.equal(row?.readme, '')
+  const written = await spec.update!('demo', { readme: '# Demo\n\n介绍\n' })
+  assert.equal(written.readme, '# Demo\n\n介绍\n')
+  assert.equal(files.get('demo'), '# Demo\n\n介绍\n')
+  await assert.rejects(() => spec.update!('demo', { name: '改名' }), /not writable/)
+})
+
+test('builtin listing prefers live sandbox name over a stale packed HTML title', async () => {
+  const spec = pluginsCollection(stubStore({
+    list: () => Promise.resolve([
+      {
+        id: 'page-sandbox',
+        name: 'HTML',
+        blurb: 'old',
+        tags: ['html'],
+        author: 'Biu',
+        authorUrl: '',
+        enabled: true,
+        running: true,
+        bytes: 12,
+        createdAt: 1,
+        updatedAt: 2,
+        lastRunAt: null,
+        hasHost: true,
+        hasWeb: true,
+        builtin: true,
+      },
+    ]),
+    listSandboxes: () => Promise.resolve([
+      {
+        id: 'page-sandbox',
+        name: 'Sandbox',
+        blurb: '斜杠插入 Sandbox',
+        tags: ['sandbox'],
+        author: 'Biu',
+        authorUrl: '',
+        builtin: true,
+        hasHost: true,
+        hasWeb: true,
+        createdAt: 1,
+        updatedAt: 3,
+      },
+    ]),
+  }))
+  const row = (await spec.list()).find((item) => item.id === 'page-sandbox')
+  assert.equal(row?.title, 'Sandbox')
+  assert.equal(row?.name, 'Sandbox')
+  assert.equal(row?.blurb, '斜杠插入 Sandbox')
+  assert.equal(row?.builtin, true)
+  assert.equal(row?.installed, true)
+  assert.equal(row?.running, true)
+})
+
+test('builtin plugins list BIU官方 and the GitHub link', async () => {
+  const spec = pluginsCollection(stubStore({
+    list: () => Promise.resolve([]),
+    listSandboxes: () => Promise.resolve([
+      {
+        id: 'api-playground',
+        name: 'API 调试块',
+        blurb: '调试',
+        tags: [],
+        author: 'Biu',
+        authorUrl: '',
+        builtin: true,
+        hasHost: true,
+        hasWeb: true,
+        createdAt: 1,
+        updatedAt: 2,
+      },
+    ]),
+  }))
+  const row = (await spec.list()).find((item) => item.id === 'api-playground')
+  assert.equal(row?.author, BIU_OFFICIAL_NAME)
+  assert.equal(row?.authorUrl, BIU_GITHUB)
+  assert.deepEqual(row?.createdBy, { kind: 'user', name: BIU_OFFICIAL_NAME, url: BIU_GITHUB })
+  assert.deepEqual(row?.updatedBy, [{ kind: 'user', name: BIU_OFFICIAL_NAME, url: BIU_GITHUB }])
+  assert.equal(spec.schema.columns?.includes('createdBy'), true)
+  assert.equal(spec.schema.columns?.includes('updatedBy'), true)
+  assert.equal(spec.schema.fields.author, undefined)
+  assert.equal(spec.schema.fields.authorUrl, undefined)
+  assert.equal(spec.schema.columns?.includes('author'), false)
 })
