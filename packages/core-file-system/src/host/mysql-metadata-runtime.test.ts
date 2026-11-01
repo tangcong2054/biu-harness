@@ -20,8 +20,16 @@ class MemoryMetadataRepository implements MetadataRepository {
     return this.rows.get('shares')?.find((row) => row.token === token) ?? null
   }
 
-  async deleteShareByToken(token: string) {
-    this.rows.set('shares', (this.rows.get('shares') ?? []).filter((row) => row.token !== token))
+  async saveShare(row: Record<string, unknown>, previous: Record<string, unknown> | null) {
+    const rows = this.rows.get('shares') ?? []
+    const current = rows.find((item) => item.token === row.token)
+    if (previous && (!current || Object.keys(previous).some((key) => current[key] !== previous[key]))) throw new Error('share conflict')
+    if (!previous && current) throw new Error('share conflict')
+    this.rows.set('shares', [...rows.filter((item) => item.token !== row.token), { workspace_id: 'ws-meta', ...row }])
+  }
+
+  async deleteShares(where: Record<string, unknown>) {
+    this.rows.set('shares', (this.rows.get('shares') ?? []).filter((row) => !Object.entries(where).every(([key, value]) => row[key] === value)))
   }
 }
 

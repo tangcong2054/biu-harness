@@ -4527,7 +4527,11 @@ export function apply(ctx: Context) {
       await shares.flush()
       route.send(200, { share: { ...share, url: publicShareUrl(route.req, share.token) } })
     } catch (error) {
-      route.send(400, { error: String(error) })
+      if ((error as { code?: string } | null)?.code === 'SHARE_CONFLICT') {
+        route.send(409, { code: 'SHARE_CONFLICT', error: '分享设置已变更，请刷新后重试' })
+      } else {
+        route.send(400, { error: String(error) })
+      }
     }
   })
   ctx.http.route('GET', '/api/share/:token', async (route) => shares.withTokenWorkspace(route.params.token ?? '', async () => {

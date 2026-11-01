@@ -174,6 +174,100 @@ export class MysqlFileSystemMetadataRepository extends MysqlRuntimeRepository {
     return (rows[0] as T | undefined) ?? null
   }
 
+  async saveShare(row: Record<string, unknown>, previous: Record<string, unknown> | null) {
+    const workspaceId = this.workspaceId()
+    const columns = FILE_SYSTEM_METADATA_COLUMNS.shares
+    const capture = (value: Record<string, unknown>) => {
+      checkedColumns('shares', value)
+      if (columns.some((column) => value[column] === undefined || value[column] === null)) throw new Error('Incomplete share row')
+      const copy = Object.fromEntries(columns.map((column) => [column, value[column]]))
+      for (const column of ['token', 'kind', 'collection', 'view_id', 'record_id', 'password_salt', 'password_hash']) {
+        if (typeof copy[column] !== 'string') throw new Error('Invalid share row')
+      }
+      if (!copy.token || !copy.collection || !['view', 'record'].includes(String(copy.kind))) throw new Error('Invalid share target')
+      for (const column of ['created_at', 'updated_at', 'share_plugins', 'allow_copy']) {
+        if (!Number.isSafeInteger(copy[column]) || Number(copy[column]) < 0) throw new Error('Invalid share value')
+      }
+      return copy
+    }
+    const next = capture(row)
+    const before = previous === null ? null : capture(previous)
+    const conflict = () => Object.assign(new Error('Share changed; reload before saving'), { code: 'SHARE_CONFLICT', status: 409 })
+    if (before && ['token', 'kind', 'collection', 'view_id', 'record_id', 'created_at'].some((column) => before[column] !== next[column])) throw conflict()
+    let baseViewId = String(next.view_id)
+    if (next.kind === 'view' && baseViewId.startsWith('builtin-scope:')) {
+      const match = /^builtin-scope:(personal|workspace|shared):(.+)$/.exec(baseViewId)
+      if (!match) throw conflict()
+      try { baseViewId = decodeURIComponent(match[2]!) } catch { throw conflict() }
+      if (!baseViewId || baseViewId.startsWith('builtin-scope:')
+        || `builtin-scope:${match[1]}:${encodeURIComponent(baseViewId)}` !== next.view_id) throw conflict()
+    }
+    const connection = await this.pool.getConnection()
+    let discard = false
+    try {
+      await connection.beginTransaction()
+      if (next.kind === 'view' && baseViewId && !/^builtin(?:-|:)/.test(baseViewId)) {
+        const [views] = await connection.query<RowDataPacket[]>(
+          `SELECT payload_json FROM ${this.database}.saved_views
+           WHERE workspace_id = ? AND collection = ? AND view_id = ? FOR UPDATE`,
+          [workspaceId, next.collection, baseViewId],
+        )
+        let view: unknown
+        try {
+          const payload = views[0]?.payload_json
+          view = typeof payload === 'string' ? JSON.parse(payload) : payload
+        } catch { throw conflict() }
+        if (!view || typeof view !== 'object' || Array.isArray(view)
+          || (view as Record<string, unknown>).id !== baseViewId
+          || (view as Record<string, unknown>).deletedAt != null) throw conflict()
+      }
+      if (before) {
+        const [rows] = await connection.query<RowDataPacket[]>(
+          `SELECT * FROM ${this.database}.shares WHERE workspace_id = ? AND token = ? FOR UPDATE`,
+          [workspaceId, before.token],
+        )
+        const current = rows[0]
+        if (!current || columns.some((column) => String(current[column]) !== String(before[column]))) throw conflict()
+        const updates = ['password_salt', 'password_hash', 'share_plugins', 'allow_copy', 'updated_at']
+        await connection.query(
+          `UPDATE ${this.database}.shares SET ${updates.map((column) => `${safeColumn(column)} = ?`).join(', ')}
+           WHERE workspace_id = ? AND token = ?`,
+          [...updates.map((column) => next[column]), workspaceId, next.token],
+        )
+      } else {
+        await connection.query(
+          `INSERT INTO ${this.database}.shares (workspace_id, ${columns.map(safeColumn).join(', ')})
+           VALUES (?, ${columns.map(() => '?').join(', ')})`,
+          [workspaceId, ...columns.map((column) => next[column])],
+        )
+      }
+      await connection.commit()
+    } catch (error) {
+      try { await connection.rollback() } catch (rollbackError) {
+        discard = true
+        throw new AggregateError([error, rollbackError], 'Share transaction rollback failed')
+      }
+      const code = (error as { code?: string } | null)?.code
+      if (['ER_DUP_ENTRY', 'ER_LOCK_DEADLOCK', 'ER_LOCK_WAIT_TIMEOUT'].includes(code ?? '')) throw conflict()
+      throw error
+    } finally {
+      if (discard) connection.destroy()
+      else connection.release()
+    }
+  }
+
+  async deleteShares(where: Record<string, unknown>) {
+    const columns = Object.keys(where)
+    if (!columns.length || columns.some((column) => !['token', 'kind', 'collection', 'view_id', 'record_id'].includes(column)
+      || typeof where[column] !== 'string')) throw new Error('Invalid share deletion predicate')
+    const exactViewTarget = where.kind === 'view' && typeof where.view_id === 'string'
+      && typeof where.record_id === 'string'
+    if (!(typeof where.token === 'string' && where.token)
+      && !(where.collection && ['view', 'record'].includes(String(where.kind))
+        && (where.kind === 'record' ? where.record_id : where.view_id || exactViewTarget))) throw new Error('Share target required')
+    return this.delete('shares', where)
+  }
+
   async deleteShareByToken(token: string) {
     const [result] = await this.pool.query<ResultSetHeader>(
       `DELETE FROM ${this.database}.shares WHERE token = ?`,

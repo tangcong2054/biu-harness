@@ -8,6 +8,8 @@ export type MetadataRepository = {
   replaceTable(table: string, rows: Array<Record<string, unknown>>): Promise<void>
   getShareByToken?(token: string): Promise<Record<string, unknown> | null>
   deleteShareByToken?(token: string): Promise<unknown>
+  saveShare?(row: Record<string, unknown>, previous: Record<string, unknown> | null): Promise<void>
+  deleteShares?(where: Record<string, unknown>): Promise<unknown>
 }
 
 type DatabaseSync = import('node:sqlite').DatabaseSync
@@ -48,7 +50,7 @@ export class SqliteMetadataRuntime {
     if (!workspaceId) throw new Error('MySQL metadata runtime requires a workspace')
     if (this.prepared && this.activeWorkspace === workspaceId && Date.now() - this.loadedAt < reloadAfterMs()) {
       await this.flush()
-      return
+      if (this.prepared && this.activeWorkspace === workspaceId) return
     }
     await this.flush()
     const database = this.db()
@@ -100,6 +102,7 @@ export class SqliteMetadataRuntime {
 
   changed(...tables: string[]) {
     if (this.mode === 'sqlite' || !this.repository) return
+    if (tables.includes('shares')) throw new Error('Shares require row-level writes')
     this.revision += 1
     const unique = [...new Set(tables)]
     const workspaceId = currentRequestWorkspaceId().trim()
@@ -122,18 +125,61 @@ export class SqliteMetadataRuntime {
     this.pending = this.pending.then(write)
   }
 
+  requireShareWriter() {
+    if (this.mode === 'sqlite') return
+    if (!this.tables.includes('shares') || !this.repository?.saveShare || !this.repository?.deleteShares
+      || !currentRequestWorkspaceId().trim()) throw new Error('Workspace-scoped share repository required')
+  }
+
+  saveShare(row: Record<string, unknown>, previous: Record<string, unknown> | null) {
+    this.requireShareWriter()
+    const next = { ...row }
+    const before = previous ? { ...previous } : null
+    this.queueShareWrite(() => this.repository!.saveShare!(next, before))
+  }
+
+  deleteShares(where: Record<string, unknown>) {
+    this.requireShareWriter()
+    const captured = { ...where }
+    this.queueShareWrite(() => this.repository!.deleteShares!(captured).then(() => undefined))
+  }
+
   deleteShareToken(token: string) {
-    if (this.mode === 'sqlite' || !this.repository?.deleteShareByToken) return
-    const write = () => this.repository!.deleteShareByToken!(token).then(() => undefined)
+    this.deleteShares({ token })
+  }
+
+  private queueShareWrite(write: () => Promise<void>) {
+    if (this.mode === 'sqlite') return
+    const workspaceId = currentRequestWorkspaceId()
+    this.revision += 1
+    const queued = this.pending.then(async () => {
+      try {
+        await runWithRequestWorkspace(workspaceId, write)
+      } finally {
+        this.revision += 1
+        this.prepared = false
+      }
+    })
     if (this.mode === 'shadow') {
-      this.pending = this.pending.then(write).catch((error) => this.onShadowError(error))
+      this.pending = queued.catch((error) => this.onShadowError(error))
     } else {
-      this.pending = this.pending.then(write)
+      this.pending = queued.catch((error) => {
+        this.prepared = false
+        try { this.db().prepare('DELETE FROM shares').run() } catch { /* The next prepare must reload the overlay. */ }
+        throw error
+      })
+      void this.pending.catch(() => {})
     }
   }
 
   async flush() {
-    await this.pending
+    const pending = this.pending
+    try {
+      await pending
+    } catch (error) {
+      if (this.tables.includes('shares') && this.pending === pending) this.pending = Promise.resolve()
+      throw error
+    }
   }
 
   private async loadSnapshots() {

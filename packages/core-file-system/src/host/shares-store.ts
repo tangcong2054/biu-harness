@@ -161,6 +161,7 @@ export class SharesStore {
     sharePlugins?: boolean
     allowCopy?: boolean
   }): ShareRecord {
+    this.runtime?.requireShareWriter()
     const kind = asKind(input.kind)
     if (!kind) throw new Error('invalid share kind')
     const collection = normalizeCollectionPath(input.collection)
@@ -173,6 +174,9 @@ export class SharesStore {
       ? this.findRecord(collection, recordId)
       : this.find(kind, collection, requestedViewId, recordId)
     const viewId = existing?.kind === 'record' ? existing.viewId : requestedViewId
+    const previous = existing
+      ? this.conn().prepare('SELECT * FROM shares WHERE token = ?').get(existing.token) as ShareRow
+      : null
     let salt = ''
     let hash = ''
     if (input.password === undefined) {
@@ -211,42 +215,42 @@ export class SharesStore {
       existing?.createdAt ?? now,
       now,
     )
-    this.runtime?.changed('shares')
-    return this.get(token)!
+    const saved = this.conn().prepare('SELECT * FROM shares WHERE token = ?').get(token) as ShareRow
+    this.runtime?.saveShare({ ...saved }, previous ? { ...previous } : null)
+    return publicShare(saved)
   }
 
   revoke(token: string) {
+    this.runtime?.requireShareWriter()
     this.conn().prepare('DELETE FROM shares WHERE token = ?').run(token)
     this.runtime?.deleteShareToken(token)
   }
 
   revokeTarget(kind: ShareKind, collection: string, viewId = '', recordId = '') {
+    this.runtime?.requireShareWriter()
+    const path = normalizeCollectionPath(collection)
     this.conn().prepare(
       'DELETE FROM shares WHERE kind = ? AND collection = ? AND view_id = ? AND record_id = ?',
-    ).run(kind, normalizeCollectionPath(collection), viewId, recordId)
-    this.runtime?.changed('shares')
+    ).run(kind, path, viewId, recordId)
+    this.runtime?.deleteShares({ kind, collection: path, view_id: viewId, record_id: recordId })
   }
 
   revokeRecord(collection: string, recordId: string) {
     const id = String(recordId ?? '').trim()
     if (!id) return
-    this.conn().prepare('DELETE FROM shares WHERE kind = ? AND collection = ? AND record_id = ?').run(
-      'record',
-      normalizeCollectionPath(collection),
-      id,
-    )
-    this.runtime?.changed('shares')
+    this.runtime?.requireShareWriter()
+    const path = normalizeCollectionPath(collection)
+    this.conn().prepare('DELETE FROM shares WHERE kind = ? AND collection = ? AND record_id = ?').run('record', path, id)
+    this.runtime?.deleteShares({ kind: 'record', collection: path, record_id: id })
   }
 
   revokeView(collection: string, viewId: string) {
     const id = String(viewId ?? '').trim()
     if (!id) return
-    this.conn().prepare('DELETE FROM shares WHERE kind = ? AND collection = ? AND view_id = ?').run(
-      'view',
-      normalizeCollectionPath(collection),
-      id,
-    )
-    this.runtime?.changed('shares')
+    this.runtime?.requireShareWriter()
+    const path = normalizeCollectionPath(collection)
+    this.conn().prepare('DELETE FROM shares WHERE kind = ? AND collection = ? AND view_id = ?').run('view', path, id)
+    this.runtime?.deleteShares({ kind: 'view', collection: path, view_id: id })
   }
 
   list(): ShareRecord[] {
