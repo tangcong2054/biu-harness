@@ -2302,6 +2302,18 @@ export class DatabaseService extends Service implements Database {
     return this.ownerCache.map.get(id) ?? ''
   }
 
+  /** 插件记录已经属于别的空间时，当前空间安装或重新打包不能把它改挂过来。 */
+  private pluginOwnedByAnotherWorkspace(recordId: string) {
+    const store = this.collabStore() as {
+      recordWorkspace?: (collection: string, recordId: string) => string | null
+      activeWorkspaceId?: () => string | null
+    } | undefined
+    const ownerWorkspace = store?.recordWorkspace?.('/plugins', recordId) || ''
+    if (!ownerWorkspace) return false
+    const current = currentRequestWorkspaceId() || store?.activeWorkspaceId?.() || ''
+    return Boolean(current) && ownerWorkspace !== current
+  }
+
   private withBanner(spec: CollectionSpec, row: DbRecord): DbRecord {
     const banner = this.facets.recordBanner(spec.path, row.id)
     const next = { ...row }
@@ -2890,8 +2902,11 @@ export class DatabaseService extends Service implements Database {
       await this.requirePath(spec.path, 'resource:read')
       if (loaded) {
         const owner = this.recordOwner(spec.path, record.id)
-        if (!owner) await this.attachWorkspaceRecord(spec.path, record.id, { ownership: 'personal', accessMode: 'private' })
-        else await this.assertLiveRecord(spec, record.id, 'resource:read', record)
+        if (!owner) {
+          if (!this.pluginOwnedByAnotherWorkspace(record.id)) {
+            await this.attachWorkspaceRecord(spec.path, record.id, { ownership: 'personal', accessMode: 'private' })
+          }
+        } else await this.assertLiveRecord(spec, record.id, 'resource:read', record)
       }
     } else if (!personalLoad && (loaded || !action.allowMissing)) {
       await this.assertLiveRecord(spec, record.id, (action.requiredAction ?? 'resource:update') as PermissionAction, record)
@@ -2900,10 +2915,10 @@ export class DatabaseService extends Service implements Database {
     }
     if (!matchActionWhen(record, action.when)) throw new Error(`action not available: ${actionId}`)
     const result = await action.run(parts[1]!, record, args)
-    if (spec.path === '/plugins' && actionId === 'sandbox' && !this.recordOwner(spec.path, parts[1]!)) {
+    if (spec.path === '/plugins' && actionId === 'sandbox' && !this.recordOwner(spec.path, parts[1]!) && !this.pluginOwnedByAnotherWorkspace(parts[1]!)) {
       await this.attachWorkspaceRecord(spec.path, parts[1]!, { ownership: 'personal', accessMode: 'private' })
     }
-    if (pluginAuthor) {
+    if (pluginAuthor && !this.pluginOwnedByAnotherWorkspace(parts[1]!)) {
       await this.stampActor(spec.path, parts[1]!)
     }
     const next = (await spec.get(parts[1]!)) ?? record
@@ -4011,8 +4026,57 @@ export function apply(ctx: Context) {
     }
     return safe
   }
+  // 插件装在正在打开页面的这台机器上。云端列表可以拿来展示，已安装/运行必须用本机记录覆盖。
+  const pluginInstallStateStaysLocal = (path: string) => {
+    const name = (path.startsWith('/') ? path.slice(1) : path).split('/')[0]
+    return name === 'plugins' || name === 'plugin-catalog'
+  }
+  const applyLocalPluginInstall = async (body: unknown, shape: 'list' | 'read') => {
+    if (!body || typeof body !== 'object') return body
+    const local = new Map<string, { installed?: boolean; running?: boolean; enabled?: boolean }>()
+    try {
+      const store = ctx.get('pluginStore') as {
+        list?: () => Promise<Array<{ id: string; installed?: boolean; running?: boolean; enabled?: boolean }>>
+      }
+      if (typeof store?.list !== 'function') return body
+      for (const row of await store.list()) local.set(row.id, row)
+    } catch {
+      return body
+    }
+    const paint = (record: unknown) => {
+      if (!record || typeof record !== 'object' || Array.isArray(record)) return record
+      const row = record as Record<string, unknown>
+      const id = String(row.id ?? '')
+      if (!id) return record
+      const hit = local.get(id)
+      const next = { ...row }
+      if (hit?.installed) next.installed = true
+      else delete next.installed
+      if (hit?.running) next.running = true
+      else delete next.running
+      if (hit?.enabled) next.enabled = true
+      else delete next.enabled
+      return next
+    }
+    if (shape === 'list') {
+      const page = body as { items?: unknown[] }
+      if (!Array.isArray(page.items)) return body
+      return { ...page, items: page.items.map(paint) }
+    }
+    const record = body as { value?: unknown }
+    if (!record.value || typeof record.value !== 'object') return body
+    return { ...record, value: paint(record.value) }
+  }
   ctx.http.route('GET', '/api/db/list', async (route) => {
-    if (await forwardCloudRead(route, '/api/db/list')) return
+    const path = route.query.get('path') || '/'
+    if (pluginInstallStateStaysLocal(path)) {
+      const search = route.query.toString()
+      const forwarded = await forwardCloud(ctx, '', '', search ? `/api/db/list?${search}` : '/api/db/list', { method: 'GET' })
+      if (forwarded) {
+        route.send(forwarded.status, await applyLocalPluginInstall(forwarded.body, 'list'))
+        return
+      }
+    } else if (await forwardCloudRead(route, '/api/db/list')) return
     await send(route, () => {
       let filter: Record<string, unknown> | undefined
       const raw = route.query.get('filter')
@@ -4036,8 +4100,16 @@ export function apply(ctx: Context) {
     })
   })
   ctx.http.route('GET', '/api/db/read', async (route) => {
-    if (await forwardCloudRead(route, '/api/db/read')) return
-    await send(route, () => db.read(route.query.get('path') || '/'))
+    const path = route.query.get('path') || '/'
+    if (pluginInstallStateStaysLocal(path)) {
+      const search = route.query.toString()
+      const forwarded = await forwardCloud(ctx, '', '', search ? `/api/db/read?${search}` : '/api/db/read', { method: 'GET' })
+      if (forwarded) {
+        route.send(forwarded.status, await applyLocalPluginInstall(forwarded.body, 'read'))
+        return
+      }
+    } else if (await forwardCloudRead(route, '/api/db/read')) return
+    await send(route, () => db.read(path))
   })
   ctx.http.route('GET', '/api/db/banner-gallery', (route) =>
     send(route, async () => {
