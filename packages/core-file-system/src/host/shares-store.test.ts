@@ -96,7 +96,7 @@ test('deleting a saved view revokes that view share', async () => {
   const db = new DatabaseService(ctx)
   const views = new SavedViewsStore().open(':memory:')
   db.register(viewsCollection(views, () => [{ id: 'pages', path: '/pages', kind: 'collection' as const, label: '页面', view: null }]))
-  const created = views.create({ title: '看板', tablePath: '/pages', mode: 'board' }, [{ id: 'pages', path: '/pages', kind: 'collection', label: '页面', view: null }])
+  const created = await views.create({ title: '看板', tablePath: '/pages', mode: 'board' }, [{ id: 'pages', path: '/pages', kind: 'collection', label: '页面', view: null }])
   const viewId = String(created.viewId)
   const share = db.shares.upsert({ kind: 'view', collection: '/pages', viewId })
   await db.remove('/views', { ids: [String(created.id)] })

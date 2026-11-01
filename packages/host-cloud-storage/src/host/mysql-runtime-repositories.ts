@@ -1,5 +1,12 @@
 import type { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise'
 import { currentRequestWorkspaceId } from '@biu/host-plugin-loader/data-dir'
+import {
+  applySavedViewMutation,
+  captureSavedViewMutations,
+  savedViewMutationError,
+  type SavedViewMutation,
+  type SavedViewMutationResult,
+} from '@biu/host-plugin-loader/metadata-runtime'
 
 const SAFE_DATABASE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
 
@@ -320,6 +327,94 @@ export class MysqlFileSystemMetadataRepository extends MysqlRuntimeRepository {
       await tx.clear(table)
       for (const row of rows) await tx.upsert(table, row)
     })
+  }
+
+  /** The caller must authorize resource:update and supply the authenticated account, never a body field. */
+  async mutateSavedViews(accountId: string, input: readonly SavedViewMutation[]): Promise<SavedViewMutationResult[]> {
+    const workspaceId = this.workspaceId()
+    if (typeof accountId !== 'string' || !accountId || accountId !== accountId.trim()
+      || accountId.length > 64 || /[\u0000-\u001f\u007f]/.test(accountId)) throw savedViewMutationError('SAVED_VIEW_DENIED')
+    const mutations = captureSavedViewMutations(input)
+    if (!mutations.length) return []
+    const ordered = mutations.map((mutation, index) => ({ mutation, index }))
+      .sort((a, b) => {
+        const left = `${a.mutation.collection}\0${a.mutation.id}`
+        const right = `${b.mutation.collection}\0${b.mutation.id}`
+        return left < right ? -1 : left > right ? 1 : 0
+      })
+    const connection = await this.pool.getConnection()
+    let discardConnection = false
+    try {
+      await connection.beginTransaction()
+      const [members] = await connection.query<RowDataPacket[]>(
+        `SELECT account_id FROM ${this.database}.workspace_members
+         WHERE workspace_id = ? AND account_id = ? FOR UPDATE`,
+        [workspaceId, accountId],
+      )
+      if (!members.length) throw savedViewMutationError('SAVED_VIEW_DENIED')
+      const results: SavedViewMutationResult[] = []
+      for (const { mutation, index } of ordered) {
+        const key = [workspaceId, mutation.collection, mutation.id]
+        const [rows] = await connection.query<RowDataPacket[]>(
+          `SELECT payload_json FROM ${this.database}.saved_views
+           WHERE workspace_id = ? AND collection = ? AND view_id = ? FOR UPDATE`,
+          key,
+        )
+        let current: unknown = null
+        if (rows.length) {
+          try {
+            const payload = rows[0]!.payload_json
+            current = (typeof payload === 'string' ? JSON.parse(payload) : payload) ?? undefined
+          } catch {
+            throw savedViewMutationError('SAVED_VIEW_CONFLICT')
+          }
+        }
+        const now = Date.now()
+        const result = applySavedViewMutation(mutation, current, accountId, now)
+        if (mutation.type === 'create') {
+          await connection.query(
+            `INSERT INTO ${this.database}.saved_views (workspace_id, collection, view_id, payload_json, updated_at)
+             VALUES (?, ?, ?, ?, ?)`,
+            [...key, JSON.stringify(result.view), now],
+          )
+        } else {
+          await connection.query(
+            `UPDATE ${this.database}.saved_views SET payload_json = ?, updated_at = ?
+             WHERE workspace_id = ? AND collection = ? AND view_id = ?`,
+            [JSON.stringify(result.view), now, ...key],
+          )
+        }
+        if (mutation.type === 'delete') {
+          const shareViewIds = [mutation.id, ...['personal', 'workspace', 'shared']
+            .map((scope) => `builtin-scope:${scope}:${encodeURIComponent(mutation.id)}`)]
+          for (const viewId of shareViewIds) {
+            await connection.query(
+              `DELETE FROM ${this.database}.shares
+               WHERE workspace_id = ? AND kind = 'view' AND collection = ? AND view_id = ?`,
+              [workspaceId, mutation.collection, viewId],
+            )
+          }
+        }
+        results[index] = result
+      }
+      await connection.commit()
+      return results
+    } catch (error) {
+      try {
+        await connection.rollback()
+      } catch (rollbackError) {
+        discardConnection = true
+        throw new AggregateError([error, rollbackError], 'Saved view transaction rollback failed')
+      }
+      const code = (error as { code?: string } | null)?.code
+      if (code === 'ER_DUP_ENTRY' || code === 'ER_LOCK_DEADLOCK' || code === 'ER_LOCK_WAIT_TIMEOUT') {
+        throw savedViewMutationError('SAVED_VIEW_CONFLICT')
+      }
+      throw error
+    } finally {
+      if (discardConnection) connection.destroy()
+      else connection.release()
+    }
   }
 
   async transaction<T>(run: (repository: MysqlFileSystemMetadataTransaction) => Promise<T>): Promise<T> {

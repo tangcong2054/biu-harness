@@ -138,6 +138,7 @@ import {
   persistViewDisplay,
   pickViewForRoute,
   pushSavedViews,
+  SavedViewSaveError,
   subscribeStarredViews,
   toggleStarredView,
   viewForPath,
@@ -1811,9 +1812,16 @@ export function CollectionBrowser({
     viewsWriteGenRef.current.set(path, gen)
     applyViewsLocally(path, listed)
     setViewsSaveError('')
-    void pushSavedViews(path, stored).catch((error) => {
-      // 只回滚最后一次写入；中间又有新写入时交给新写入决定最终状态。
+    void pushSavedViews(path, stored, previous).catch(async (error) => {
+      // 只处理最后一次写入；中间又有新写入时交给新写入决定最终状态。
       if (viewsWriteGenRef.current.get(path) !== gen) return
+      if (error instanceof SavedViewSaveError && (error.conflict || error.status === 503)) {
+        await pullSavedViews([path], true)
+        if (viewsWriteGenRef.current.get(path) !== gen) return
+        applyViewsLocally(path, listedViews(path, loadViews(path)).map((view) => withViewDisplay(path, view)))
+        setViewsSaveError('视图已在其他窗口或设备上修改，已刷新为最新版本，请重新操作')
+        return
+      }
       applyViewsLocally(path, previous)
       setViewsSaveError(error instanceof Error ? error.message : String(error))
     })

@@ -45,7 +45,7 @@ test('viewsCollection lists saved views with source table', async () => {
   assert.equal(sorted.sortField, 'title')
   assert.equal(sorted.sortDir, 'desc')
   assert.equal(String(sorted.sorts).includes('"field":"title"'), true)
-  assert.throws(() => spec.update!(String(all?.id), { title: '改掉' }), /read-only/)
+  await assert.rejects(async () => spec.update!(String(all?.id), { title: '改掉' }), /read-only/)
   const graphed = await spec.update!(String(user?.id), { mode: 'graph' })
   assert.equal(graphed.mode, 'graph')
 })
@@ -64,8 +64,8 @@ test('viewsCollection creates and deletes user views on a registered table', asy
   assert.equal(row?.filters, '{"status":"doing"}')
   assert.deepEqual(row?.columnWidths, { title: 240 })
   assert.equal(typeof row?.viewId, 'string')
-  assert.throws(() => spec.create!([{ tablePath: '/nope', title: 'x' }]), /unknown collection/)
-  assert.throws(() => spec.create!([{ title: '无表' }]), /tablePath required/)
+  await assert.rejects(async () => spec.create!([{ tablePath: '/nope', title: 'x' }]), /unknown collection/)
+  await assert.rejects(async () => spec.create!([{ title: '无表' }]), /tablePath required/)
   const ids = await spec.remove!({ ids: [String(row?.id)] })
   assert.deepEqual(ids, [String(row?.id)])
   const listed = await spec.list()
@@ -94,19 +94,7 @@ test('saved views persist created fields and updates across reopen', async () =>
   const spec = viewsCollection(first, () => tables)
   const [row] = await spec.create!([{ tablePath: '/tasks', title: '看板', mode: 'graph', sortField: 'dueAt' }])
   await spec.update!(String(row?.id), { query: 'foo', groupBy: 'status' })
-  first.replace('/tasks', [
-    {
-      id: String(row?.viewId),
-      name: '看板',
-      mode: 'graph',
-      sortField: 'dueAt',
-      sortDir: 'asc',
-      query: 'foo',
-      groupBy: 'status',
-      filters: { status: 'doing' },
-      columns: ['title', 'status'],
-    },
-  ])
+  await spec.update!(String(row?.id), { filters: { status: 'doing' }, columns: ['title', 'status'] })
   const second = new SavedViewsStore()
   second.open(file)
   const listed = await viewsCollection(second, () => tables).list()
@@ -182,6 +170,29 @@ test('index collection views stay with the account that saved them', async () =>
   await assert.rejects(() => spec.remove!({ ids: ['facets::ada-view'] }), /unknown view/)
 })
 
+test('user table views are isolated by the account that saved them', async () => {
+  const store = new SavedViewsStore().open(':memory:')
+  const tables = () => [{ path: '/pages', id: 'pages', kind: 'collection' as const, label: '页面', view: { moduleId: 'pages', route: '/pages', title: '页面' } }]
+  let who = 'ada'
+  const spec = viewsCollection(store, tables, () => who)
+  const [adaRow] = await spec.create!([{ tablePath: '/pages', title: '汇报' }])
+  await store.createMany([{ tablePath: '/pages', viewId: 'bob-view', title: 'Bob 的视图' }], tables(), 'bob')
+  await assert.rejects(() => store.write(String(adaRow?.id), { title: '冒名改写' }, 'bob'), /unknown view/)
+  await store.removeMany(['pages::bob-view'], 'bob')
+  await store.createMany([{ tablePath: '/pages', viewId: 'bob-new', title: 'Bob 新视图' }], tables(), 'bob')
+  const custom = (rows: Array<Record<string, unknown>>) =>
+    rows.map((row) => String(row.viewId)).filter((id) => id !== builtinAllViewId('/pages')).sort()
+
+  assert.deepEqual(custom(await spec.list()), [String(adaRow?.viewId)])
+  assert.equal((await spec.list()).find((row) => row.viewId === adaRow?.viewId)?.title, '汇报')
+  who = 'bob'
+  assert.deepEqual(custom(await spec.list()), ['bob-new'])
+  await assert.rejects(async () => spec.update!(String(adaRow?.id), { title: '越权' }), /unknown view/)
+  await assert.rejects(async () => spec.remove!({ ids: [String(adaRow?.id)] }), /unknown view/)
+  assert.deepEqual(store.viewsFor('/pages').map((view) => view.id).sort(), ['bob-new', String(adaRow?.viewId)].sort())
+  assert.deepEqual(store.viewsFor('/pages', 'ada').map((view) => view.createdBy), ['ada'])
+})
+
 test('parseViewColumnsInput accepts arrays and JSON strings but not JSON fragments', () => {
   assert.deepEqual(parseViewColumnsInput(['title', 'facet', 'title']), ['title', 'facet'])
   assert.deepEqual(parseViewColumnsInput('["title","facet::facet::category"]'), ['title', 'facet::facet::category'])
@@ -204,7 +215,7 @@ test('同一毫秒批量新建视图不撞 id；任一行不合法时整批不�
     ])
     const ids = created.map((row) => String(row.viewId))
     assert.equal(new Set(ids).size, 3)
-    assert.deepEqual(ids, ['1700000000000', '1700000000001', '1700000000002'])
+    for (const id of ids) assert.match(id, /^view-[0-9a-f-]{36}$/)
 
     await assert.rejects(
       async () => spec.create!([{ tablePath: '/tasks', title: 'D' }, { tablePath: '/missing', title: 'E' }]),

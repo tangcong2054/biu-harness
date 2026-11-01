@@ -1,4 +1,9 @@
 import { currentRequestWorkspaceId, runWithRequestWorkspace } from './data-dir.ts'
+import { captureSavedViewMutations, type SavedViewMutation, type SavedViewMutationResult } from './saved-view-mutations.ts'
+import { mutateSqliteSavedViews } from './sqlite-saved-view-mutations.ts'
+
+export { applySavedViewMutation, captureSavedViewMutations, savedViewMutationError } from './saved-view-mutations.ts'
+export type { SavedViewMutation, SavedViewMutationResult } from './saved-view-mutations.ts'
 
 export type MetadataRuntimeMode = 'sqlite' | 'mysql' | 'shadow'
 
@@ -10,6 +15,7 @@ export type MetadataRepository = {
   deleteShareByToken?(token: string): Promise<unknown>
   saveShare?(row: Record<string, unknown>, previous: Record<string, unknown> | null): Promise<void>
   deleteShares?(where: Record<string, unknown>): Promise<unknown>
+  mutateSavedViews?(accountId: string, mutations: readonly SavedViewMutation[]): Promise<SavedViewMutationResult[]>
 }
 
 type DatabaseSync = import('node:sqlite').DatabaseSync
@@ -35,6 +41,12 @@ export class SqliteMetadataRuntime {
   private pending: Promise<void> = Promise.resolve()
   /** 本地表被改过的次数。从 MySQL 装回内存时用来丢掉过期快照。 */
   private revision = 0
+  private incrementalViews = false
+  private invalidViewCache = false
+
+  get savedViewCacheValid() {
+    return !this.invalidViewCache
+  }
 
   constructor(
     readonly mode: MetadataRuntimeMode,
@@ -77,6 +89,7 @@ export class SqliteMetadataRuntime {
       }
       database.exec('COMMIT')
       this.activeWorkspace = workspaceId
+      this.invalidViewCache = false
       this.prepared = true
       this.loadedAt = Date.now()
     } catch (error) {
@@ -100,7 +113,60 @@ export class SqliteMetadataRuntime {
     return workspaceId ? runWithRequestWorkspace(workspaceId, run) : run()
   }
 
+  async mutateSavedViews(accountId: string, input: readonly SavedViewMutation[]): Promise<SavedViewMutationResult[]> {
+    const mutations = captureSavedViewMutations(input)
+    if (!mutations.length) return []
+    if (!this.tables.includes('saved_views')) throw new Error('Runtime does not manage saved views')
+    if (this.mode === 'shadow') throw new Error('Incremental saved views are not enabled in shadow mode')
+    const workspaceId = currentRequestWorkspaceId()
+    if (this.mode === 'mysql' && (!workspaceId.trim() || !this.repository?.mutateSavedViews)) {
+      throw new Error('MySQL incremental saved view repository and workspace are required')
+    }
+    this.incrementalViews = true
+    const write = async () => {
+      this.revision += 1
+      this.prepared = false
+      try {
+        if (this.mode === 'sqlite') return mutateSqliteSavedViews(this.db(), workspaceId, accountId, mutations)
+        const results = await runWithRequestWorkspace(workspaceId, () => this.repository!.mutateSavedViews!(accountId, mutations))
+        try {
+          const database = this.db()
+          database.exec('BEGIN IMMEDIATE')
+          try {
+            for (const result of results) {
+              database.prepare('DELETE FROM saved_views WHERE workspace_id = ? AND collection = ? AND view_id = ?')
+                .run(workspaceId, result.collection, result.id)
+              this.insertRows(database, 'saved_views', [{
+                workspace_id: workspaceId, collection: result.collection, view_id: result.id,
+                payload_json: JSON.stringify(result.view), updated_at: Date.now(),
+              }])
+            }
+            database.exec('COMMIT')
+          } catch (error) {
+            database.exec('ROLLBACK')
+            throw error
+          }
+        } catch (cause) {
+          this.invalidViewCache = true
+          throw Object.assign(new Error('Saved views committed; local cache must be reloaded', { cause }), {
+            code: 'SAVED_VIEW_CACHE_FAILED', status: 503, committed: true,
+          })
+        }
+        return results
+      } finally {
+        this.revision += 1
+        this.prepared = false
+      }
+    }
+    const result = this.pending.then(write)
+    this.pending = result.then(() => undefined, () => undefined)
+    return result
+  }
+
   changed(...tables: string[]) {
+    if (this.incrementalViews && tables.includes('saved_views')) {
+      throw new Error('Saved views require incremental mutations')
+    }
     if (this.mode === 'sqlite' || !this.repository) return
     if (tables.includes('shares')) throw new Error('Shares require row-level writes')
     this.revision += 1

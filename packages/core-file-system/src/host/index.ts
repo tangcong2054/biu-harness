@@ -57,13 +57,14 @@ import {
   parseContentJump,
 } from '@biu/type-file-system'
 import { parsePageBanner, type PageBanner } from '../page-banner.ts'
-import { SavedViewsStore, clientViewFromDbRow, viewsCollection, type StoredView } from './saved-views.ts'
+import { SavedViewsStore, clientViewFromDbRow, viewsCollection } from './saved-views.ts'
+import type { SavedViewMutation } from '@biu/host-plugin-loader/metadata-runtime'
 import { accessMemberViewMatches, accessRecordViewMatches } from './access-matchers.ts'
 import { publicShareUrl } from './share-origin.ts'
 import { readSharePluginWebJs, zipSharePluginSource } from './share-plugin-pack.ts'
 import { collectShareResources } from '../share-resources.ts'
 import { FacetStore } from './facets-store.ts'
-import { SharesStore, dropSharesForRemovedViews } from './shares-store.ts'
+import { SharesStore } from './shares-store.ts'
 import { builtinAllView, builtinAllViewId, builtinMemberViews, displayNameForView, isReadOnlyViewId, stubBuiltinAllView, stubBuiltinMemberView } from '../catalog-views.ts'
 import { isIndexCollection, isSystemCollection } from '../web/database-path.ts'
 import { effectiveDataScope, highestViewRole, recordMatchesGrantedView, type DataScopeName, type ViewGrantRole } from '../view-access.ts'
@@ -4325,20 +4326,60 @@ export function apply(ctx: Context) {
   ctx.http.route('GET', '/api/db/trash', (route) => send(route, () => db.listTrash()))
   ctx.http.route('POST', '/api/db/saved-views', async (route) => {
     try {
-      const body = (await route.json()) as { path?: string; views?: StoredView[] }
-      const path = String(body?.path ?? '')
-      const next = Array.isArray(body.views) ? body.views : []
+      const body = (await route.json()) as { path?: unknown; mutations?: unknown; views?: unknown } | null
+      const path = normalizeCollectionPath(String(body?.path ?? ''))
       await db.requirePath(path, 'resource:update')
-      if (isIndexCollection(path)) {
-        savedViews.replaceOwned(path, next, currentAccountId())
-      } else {
-        dropSharesForRemovedViews(shares, path, savedViews.viewsFor(path), next)
-        savedViews.replace(path, next)
+      if (!Array.isArray(body?.mutations)) {
+        route.send(409, { code: 'SAVED_VIEW_PROTOCOL', error: '视图保存方式已升级，请刷新页面后重试' })
+        return
       }
-      await Promise.all([savedViews.flush(), shares.flush()])
+      const mutations = (body.mutations as Array<Record<string, unknown>>).map((item) => {
+        if (!item || typeof item !== 'object' || normalizeCollectionPath(String(item.collection ?? '')) !== path) {
+          throw Object.assign(new Error('Invalid saved view change'), { code: 'SAVED_VIEW_INVALID', status: 400 })
+        }
+        if (item.type === 'delete') return { type: 'delete', collection: path, id: item.id, expectedRevision: item.expectedRevision }
+        const view = item.view && typeof item.view === 'object' && !Array.isArray(item.view)
+          ? (({ createdBy: _c, revision: _r, deletedAt: _d, ...rest }) => rest)(item.view as Record<string, unknown>)
+          : item.view
+        return item.type === 'create'
+          ? { type: 'create', collection: path, id: item.id, view }
+          : { type: item.type, collection: path, id: item.id, expectedRevision: item.expectedRevision, view }
+      }) as unknown as SavedViewMutation[]
+      const results = await savedViews.mutate(currentAccountId() ?? '', mutations)
+      const deleted = mutations.filter((item) => item.type === 'delete').map((item) => item.id)
+      if (deleted.length) {
+        try {
+          for (const id of deleted) {
+            for (const viewId of ['personal', 'workspace', 'shared'].map((scope) => `builtin-scope:${scope}:${encodeURIComponent(id)}`)) {
+              shares.revokeView(path, viewId)
+            }
+          }
+          await shares.flush()
+        } catch {
+          /* 权威库已在同一事务内撤销；本地分享缓存下次 prepare 时重载。 */
+        }
+      }
       ctx.emit('database/change')
-      route.send(200, { ok: true })
+      route.send(200, {
+        ok: true,
+        views: results.map((result) => ({
+          id: result.id,
+          revision: result.view.revision,
+          ...(result.view.deletedAt != null ? { deleted: true } : {}),
+        })),
+      })
     } catch (error) {
+      const failure = error as { code?: unknown; status?: unknown } | null
+      const code = typeof failure?.code === 'string' ? failure.code : ''
+      if (code === 'SAVED_VIEW_CACHE_FAILED') ctx.emit('database/change')
+      if (code.startsWith('SAVED_VIEW_') && typeof failure?.status === 'number') {
+        const message = code === 'SAVED_VIEW_CONFLICT' ? '视图已在其他窗口或设备上修改，请刷新后重试'
+          : code === 'SAVED_VIEW_DENIED' ? '没有权限修改该视图'
+          : code === 'SAVED_VIEW_CACHE_FAILED' ? '视图已保存，但缓存刷新失败，请刷新页面'
+          : '视图保存请求无效'
+        route.send(failure.status, { code, error: message })
+        return
+      }
       route.send(400, { error: String(error) })
     }
   })

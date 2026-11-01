@@ -4,6 +4,10 @@ import { countFilterRules, filterTreeStateKey, normalizeSorts, resolveViewFilter
 export type SavedView = {
   id: string
   name: string
+  revision?: number
+  createdBy?: string
+  createdAt?: number
+  updatedAt?: number
   mode: ViewMode
   sortField: string
   sortDir: 'asc' | 'desc'

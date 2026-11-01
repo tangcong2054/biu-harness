@@ -24,10 +24,11 @@ import {
 test('authoritative empty saved views hide stale local workspace data', () => {
   const path = '/workspace-empty-views'
   const stale = [{ id: 'old', name: '旧工作区视图', mode: 'table' }]
+  const key = viewsKey(path)
   Object.defineProperty(globalThis, 'localStorage', {
     configurable: true,
     value: {
-      getItem: (key: string) => key === viewsKey(path) ? JSON.stringify(stale) : null,
+      getItem: (name: string) => name === key ? JSON.stringify(stale) : null,
       setItem: () => undefined,
       removeItem: () => undefined,
     },
@@ -47,6 +48,35 @@ test('browser view memory is isolated by workspace', () => {
   sessionStorage.setItem('biu.workspaceId', 'ws-a')
   assert.deepEqual(loadViews(path).map((view) => view.id), ['a'])
   sessionStorage.removeItem('biu.workspaceId')
+})
+
+test('browser view cache is isolated by signed-in account', () => {
+  const path = '/account-scoped-views'
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+  const mem: Record<string, string> = {}
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => mem[key] ?? null,
+      setItem: (key: string, value: string) => {
+        mem[key] = value
+      },
+      removeItem: (key: string) => {
+        delete mem[key]
+      },
+    },
+  })
+  try {
+    mem['biu.account.token'] = 'token-ada'
+    const adaKey = viewsKey(path)
+    rememberViews(path, [{ id: 'ada', name: 'Ada', mode: 'table', sortField: 'title', sortDir: 'asc', filters: {}, columns: [] }])
+    mem['biu.account.token'] = 'token-bob'
+    assert.notEqual(viewsKey(path), adaKey)
+    assert.equal(viewsKey(path).includes('token-bob'), false)
+    assert.deepEqual(loadViews(path), [])
+  } finally {
+    if (previous) Object.defineProperty(globalThis, 'localStorage', previous)
+  }
 })
 
 test('builtin all views default to no grouping; index tables never group by share', () => {
@@ -199,9 +229,9 @@ test('rememberRecords scopes crumb rows to the current view', () => {
 
 test('saved views pull shares one in-flight list and a short ttl', () => {
   const src = readFileSync(resolve(import.meta.dirname, './view-storage.ts'), 'utf8')
-  assert.match(src, /let viewsPull: Promise<void> \| null = null/)
+  assert.match(src, /const viewsPulls = new Map<string, Promise<void>>\(\)/)
   assert.match(src, /VIEWS_PULL_TTL_MS = 2500/)
-  assert.match(src, /if \(viewsPull\) return viewsPull/)
+  assert.match(src, /if \(pending\) return pending/)
 })
 
 test('starred records toggle by collection path and id', () => {
