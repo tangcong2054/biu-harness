@@ -409,36 +409,66 @@ export async function pullSavedViews(collectionPaths: readonly string[] = [], fo
   return request
 }
 
+const VIEW_LIST_COLUMNS = ['title', 'tablePath', 'viewId', 'revision', 'mode', 'sortField', 'sortDir',
+  'sorts', 'query', 'groupBy', 'columns', 'filters', 'filterTree', 'tree', 'wrap',
+  'truncate', 'pageSize', 'columnWidths']
+const MAX_PULLED_VIEWS = 100_000
+
+type PulledViews = Map<string, Map<string, SavedView>>
+
+/** 解析视图行；同一视图出现两次说明数据不一致，返回 false 放弃本次结果。 */
+function collectViewRows(rows: readonly Record<string, unknown>[], byPath: PulledViews) {
+  for (const row of rows) {
+    const tablePath = String(row.tablePath ?? '').trim()
+    const view = savedViewFromRecord(row)
+    if (!tablePath || !view) continue
+    const list = byPath.get(tablePath) ?? new Map<string, SavedView>()
+    if (list.has(view.id)) return false
+    list.set(view.id, view)
+    byPath.set(tablePath, list)
+  }
+  return true
+}
+
+/** 一次性快照；旧服务没有这个接口时返回 'unsupported'，其他失败返回 null。 */
+async function snapshotViews(scope: string): Promise<PulledViews | null | 'unsupported'> {
+  const res = await fetch('/api/db/saved-views', { method: 'GET', headers: { accept: 'application/json' } })
+  if (res.status === 404 || res.status === 405) return 'unsupported'
+  if (!res.ok || viewsKey('') !== scope) return null
+  const body = (await res.json().catch(() => null)) as { items?: unknown; total?: unknown; snapshot?: unknown } | null
+  if (viewsKey('') !== scope || body?.snapshot !== true || !Array.isArray(body.items)) return null
+  if (body.items.length > MAX_PULLED_VIEWS || body.total !== body.items.length) return null
+  const byPath: PulledViews = new Map()
+  return collectViewRows(body.items as Record<string, unknown>[], byPath) ? byPath : null
+}
+
+/** 旧服务的分页读取；分页之间数据变了（总数变化、空页、重复行）就放弃本次结果。 */
+async function pagedViews(scope: string): Promise<PulledViews | null> {
+  const byPath: PulledViews = new Map()
+  let offset = 0
+  let total: number | undefined
+  do {
+    if (viewsKey('') !== scope) return null
+    const page = await listCollection({
+      path: '/views', limit: 200, offset, sortField: 'id', requestScope: scope, columns: VIEW_LIST_COLUMNS,
+    })
+    if (viewsKey('') !== scope) return null
+    if (!Number.isSafeInteger(page.total) || page.total < 0 || page.total > MAX_PULLED_VIEWS
+      || (total !== undefined && total !== page.total)) return null
+    total = page.total
+    if (!page.items.length && offset < total) return null
+    if (!collectViewRows(page.items, byPath)) return null
+    offset += page.items.length
+  } while (offset < total)
+  return byPath
+}
+
 async function pullSavedViewsNow(collectionPaths: readonly string[], scope: string) {
   const revisions = new Map(viewCacheRevisions)
   try {
-    const byPath = new Map<string, Map<string, SavedView>>()
-    let offset = 0
-    let total: number | undefined
-    do {
-      if (viewsKey('') !== scope) return false
-      const page = await listCollection({
-        path: '/views', limit: 200, offset, sortField: 'id', requestScope: scope,
-        columns: ['title', 'tablePath', 'viewId', 'revision', 'mode', 'sortField', 'sortDir',
-          'sorts', 'query', 'groupBy', 'columns', 'filters', 'filterTree', 'tree', 'wrap',
-          'truncate', 'pageSize', 'columnWidths'],
-      })
-      if (viewsKey('') !== scope) return false
-      if (!Number.isSafeInteger(page.total) || page.total < 0 || page.total > 100_000
-        || (total !== undefined && total !== page.total)) return false
-      total = page.total
-      if (!page.items.length && offset < total) return false
-      for (const row of page.items) {
-        const tablePath = String(row.tablePath ?? '').trim()
-        const view = savedViewFromRecord(row)
-        if (!tablePath || !view) continue
-        const list = byPath.get(tablePath) ?? new Map<string, SavedView>()
-        if (list.has(view.id)) return false
-        list.set(view.id, view)
-        byPath.set(tablePath, list)
-      }
-      offset += page.items.length
-    } while (offset < total)
+    const snapshot = await snapshotViews(scope)
+    const byPath = snapshot === 'unsupported' ? await pagedViews(scope) : snapshot
+    if (!byPath || viewsKey('') !== scope) return false
     const paths = new Set([...collectionPaths, ...byPath.keys()])
     pruneForeignViewCaches()
     let complete = true

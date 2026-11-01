@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { REQUIRED_RECORD_FIELDS } from '@biu/type-file-system'
+import { runWithAccount } from '@biu/host-plugin-loader/data-dir'
 import { apply as applyFileSystem, type DatabaseService } from './index.ts'
 
 type Handler = (route: Record<string, unknown>) => Promise<void> | void
@@ -43,10 +44,10 @@ async function boot() {
     list: () => [],
     get: () => null,
   })
-  const post = async (body: unknown) => {
+  const call = async (method: string, body?: unknown) => {
     let status = 0
     let payload: Record<string, unknown> = {}
-    await routes.get('POST /api/db/saved-views')!({
+    await routes.get(`${method} /api/db/saved-views`)!({
       json: async () => body,
       send: (code: number, value: Record<string, unknown>) => { status = code; payload = value },
       req: { headers: {} },
@@ -54,7 +55,9 @@ async function boot() {
     })
     return { status, payload }
   }
-  return { post }
+  const post = (body: unknown) => call('POST', body)
+  const get = () => call('GET')
+  return { post, get }
 }
 const view = (id: string, name = id) => ({ id, name, mode: 'table', sortField: 'title', sortDir: 'asc', filters: {}, columns: [] })
 
@@ -98,5 +101,41 @@ describe('POST /api/db/saved-views incremental protocol', () => {
     const api = await boot()
     const created = await api.post({ path: '/notes', mutations: [{ type: 'create', collection: '/notes', id: 'a', view: { ...view('a'), createdBy: 'mallory', revision: 99 } }] })
     expect(created.payload).toMatchObject({ views: [{ id: 'a', revision: 1 }] })
+  })
+})
+
+describe('GET /api/db/saved-views snapshot', () => {
+  const create = (id: string) => ({ type: 'create', collection: '/notes', id, view: view(id) })
+
+  it('returns every custom view at once with revisions, beyond a single list page', async () => {
+    const api = await boot()
+    const ids = Array.from({ length: 230 }, (_, i) => `v${String(i).padStart(3, '0')}`)
+    for (let i = 0; i < ids.length; i += 100) {
+      expect((await api.post({ path: '/notes', mutations: ids.slice(i, i + 100).map(create) })).status).toBe(200)
+    }
+    const { status, payload } = await api.get()
+    expect(status).toBe(200)
+    const items = payload.items as Array<Record<string, unknown>>
+    expect(payload).toMatchObject({ snapshot: true, total: 230 })
+    expect(items.map((row) => row.viewId).sort()).toEqual(ids)
+    expect(items.every((row) => row.revision === 1 && row.tablePath === '/notes')).toBe(true)
+  })
+
+  it('omits builtin read-only views and deleted tombstones', async () => {
+    const api = await boot()
+    await api.post({ path: '/notes', mutations: [create('keep'), create('gone')] })
+    await api.post({ path: '/notes', mutations: [{ type: 'delete', collection: '/notes', id: 'gone', expectedRevision: 1 }] })
+    const items = (await api.get()).payload.items as Array<Record<string, unknown>>
+    expect(items.map((row) => row.viewId)).toEqual(['keep'])
+  })
+
+  it('only returns the current account views', async () => {
+    const api = await boot()
+    await runWithAccount('ada', () => api.post({ path: '/notes', mutations: [create('ada-view')] }))
+    await runWithAccount('bob', () => api.post({ path: '/notes', mutations: [create('bob-view')] }))
+    const ada = (await runWithAccount('ada', () => api.get())).payload.items as Array<Record<string, unknown>>
+    const bob = (await runWithAccount('bob', () => api.get())).payload.items as Array<Record<string, unknown>>
+    expect(ada.map((row) => row.viewId)).toEqual(['ada-view'])
+    expect(bob.map((row) => row.viewId)).toEqual(['bob-view'])
   })
 })

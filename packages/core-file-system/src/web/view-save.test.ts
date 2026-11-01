@@ -75,7 +75,7 @@ describe('incremental saved view push', () => {
       items: [
         { id: 'pages::mine', viewId: 'mine', revision: 1, title: 'mine', tablePath: '/pages' },
         { id: 'pages::other', viewId: 'other', revision: 1, title: 'other', tablePath: '/pages' },
-      ], total: 2,
+      ], total: 2, snapshot: true,
     }))).mockResolvedValueOnce(ok([{ id: 'new', revision: 1 }])))
     await pullSavedViews(['/pages'], true)
     const fetch = globalThis.fetch as ReturnType<typeof vi.fn>

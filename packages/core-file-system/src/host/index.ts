@@ -4324,6 +4324,17 @@ export function apply(ctx: Context) {
     }
   })
   ctx.http.route('GET', '/api/db/trash', (route) => send(route, () => db.listTrash()))
+  ctx.http.route('GET', '/api/db/saved-views', async (route) => {
+    if (await forwardCloudRead(route, '/api/db/saved-views')) return
+    await send(route, async () => {
+      // 一次性返回当前空间、当前账号的全部视图：同一份内存快照，分页之间被别的窗口改动不会拼出不一致的列表。
+      await db.requirePath('/views', 'resource:read')
+      const tables = db.collectionsList().map((item) => db.publishCollection(item))
+      const items = savedViews.rows(tables, currentAccountId() ?? '')
+        .filter((row) => !isReadOnlyViewId(String(row.viewId ?? '')))
+      return { items, total: items.length, snapshot: true }
+    })
+  })
   ctx.http.route('POST', '/api/db/saved-views', async (route) => {
     try {
       const body = (await route.json()) as { path?: unknown; mutations?: unknown; views?: unknown } | null
