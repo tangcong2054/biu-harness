@@ -98,7 +98,7 @@ const FACET_ROW_SQL = 'id, label, fields_json, created_at, updated_at'
 
 /** 分面目录由 File System 用 SQLite 管：目录 + 跨表倒排，查询不扫全表。 */
 export class FacetStore {
-  private db: DatabaseSync | null = null
+  private base: DatabaseSync | null = null
   private runtime: SqliteMetadataRuntime | null = null
   private editorRepository: {
     list(collection: string): Promise<Array<{ record_id: string; body: string; updated_at: number; version: number }>>
@@ -117,12 +117,13 @@ export class FacetStore {
     this.runtime = new SqliteMetadataRuntime(
       mode,
       repository,
-      () => this.ensure(),
+      () => this.baseDb(),
       [
         'facets', 'facet_stamps', 'facet_record_values', 'record_meta',
         'record_banners', 'banner_gallery', 'attachments', 'content_refs', 'block_refs',
       ],
       onShadowError,
+      { workspaceDb: () => FacetStore.migrate(openAndMigrateBiu(':memory:')) },
     )
     this.editorRepository = editorRepository
     this.onShadowError = onShadowError ?? (() => {})
@@ -171,16 +172,19 @@ export class FacetStore {
 
   open(path = ':memory:') {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
-    this.db = openAndMigrateBiu(path)
-    this.ensureCreatedAtColumn()
-    this.ensurePersonMetaColumns()
-    this.ensureDeletedAtColumn()
-    this.ensureBannerTable()
+    this.base = FacetStore.migrate(openAndMigrateBiu(path))
     return this
   }
 
-  private ensureCreatedAtColumn() {
-    const db = this.db!
+  private static migrate(db: DatabaseSync) {
+    FacetStore.ensureCreatedAtColumn(db)
+    FacetStore.ensurePersonMetaColumns(db)
+    FacetStore.ensureDeletedAtColumn(db)
+    FacetStore.ensureBannerTable(db)
+    return db
+  }
+
+  private static ensureCreatedAtColumn(db: DatabaseSync) {
     const cols = db.prepare('PRAGMA table_info(facets)').all() as Array<{ name: string }>
     if (!cols.some((col) => col.name === 'created_at')) {
       db.exec(`ALTER TABLE facets ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`)
@@ -188,8 +192,7 @@ export class FacetStore {
     db.exec(`UPDATE facets SET created_at = updated_at WHERE created_at = 0 AND updated_at > 0`)
   }
 
-  private ensurePersonMetaColumns() {
-    const db = this.db!
+  private static ensurePersonMetaColumns(db: DatabaseSync) {
     const cols = db.prepare('PRAGMA table_info(record_meta)').all() as Array<{ name: string }>
     const names = new Set(cols.map((col) => col.name))
     if (!names.has('created_by_json')) db.exec(`ALTER TABLE record_meta ADD COLUMN created_by_json TEXT`)
@@ -197,8 +200,7 @@ export class FacetStore {
     if (!names.has('deleted_at')) db.exec(`ALTER TABLE record_meta ADD COLUMN deleted_at INTEGER`)
   }
 
-  private ensureDeletedAtColumn() {
-    const db = this.db!
+  private static ensureDeletedAtColumn(db: DatabaseSync) {
     const cols = db.prepare('PRAGMA table_info(record_meta)').all() as Array<{ name: string }>
     if (!cols.some((col) => col.name === 'deleted_at')) {
       db.exec(`ALTER TABLE record_meta ADD COLUMN deleted_at INTEGER`)
@@ -206,8 +208,7 @@ export class FacetStore {
     db.exec('CREATE INDEX IF NOT EXISTS record_meta_deleted ON record_meta(collection, deleted_at)')
   }
 
-  private ensureBannerTable() {
-    const db = this.db!
+  private static ensureBannerTable(db: DatabaseSync) {
     const cols = db.prepare('PRAGMA table_info(record_meta)').all() as Array<{ name: string }>
     if (!cols.some((col) => col.name === 'banner_json')) return
     const rows = db
@@ -253,9 +254,14 @@ export class FacetStore {
     this.changedFacetNotes(pack.id, notes)
   }
 
+  private baseDb() {
+    if (!this.base) this.open(':memory:')
+    return this.base!
+  }
+
+  /** MySQL 模式下返回当前请求工作区自己的覆盖层，不会读到别的空间刚装进来的表。 */
   ensure() {
-    if (!this.db) this.open(':memory:')
-    return this.db!
+    return this.runtime ? this.runtime.database() : this.baseDb()
   }
 
   list(query = ''): CollectionSchemaPack[] {

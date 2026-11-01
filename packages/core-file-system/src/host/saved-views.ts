@@ -61,9 +61,15 @@ type ViewRow = { workspace_id: string; collection: string; payload_json: string 
 
 export class SavedViewsStore {
   private byPath = new Map<string, StoredView[]>()
-  private db: DatabaseSync | null = null
+  private base: DatabaseSync | null = null
   private runtime: SqliteMetadataRuntime | null = null
   private incrementalViews = false
+
+  /** MySQL 模式下是当前请求工作区自己的覆盖层；未打开时为 null。 */
+  private get db(): DatabaseSync | null {
+    if (!this.base) return null
+    return this.runtime ? this.runtime.database() : this.base
+  }
 
   configureRuntime(
     mode: MetadataRuntimeMode,
@@ -74,11 +80,12 @@ export class SavedViewsStore {
       mode,
       repository,
       () => {
-        if (!this.db) this.open(':memory:')
-        return this.db!
+        if (!this.base) this.open(':memory:')
+        return this.base!
       },
       ['saved_views'],
       onShadowError,
+      { workspaceDb: () => openAndMigrateBiu(':memory:', { foreignKeys: false }) },
     )
   }
 
@@ -99,9 +106,19 @@ export class SavedViewsStore {
       this.hydrate()
       return results
     } catch (error) {
-      if ((error as { committed?: boolean } | null)?.committed) this.byPath.clear()
+      if ((error as { committed?: boolean } | null)?.committed) this.dropCachedViews()
       throw error
     }
+  }
+
+  /** 丢掉缓存的视图；按工作区隔离时只丢本空间的。 */
+  private dropCachedViews() {
+    if (!this.runtime?.isolated) {
+      this.byPath.clear()
+      return
+    }
+    const prefix = `${this.workspaceId()}\0`
+    for (const key of [...this.byPath.keys()]) if (key.startsWith(prefix)) this.byPath.delete(key)
   }
 
   private requireLegacyViews() {
@@ -115,7 +132,7 @@ export class SavedViewsStore {
 
   open(path = ':memory:') {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
-    this.db = openAndMigrateBiu(path, { foreignKeys: false })
+    this.base = openAndMigrateBiu(path, { foreignKeys: false })
     this.hydrate()
     return this
   }
@@ -136,10 +153,11 @@ export class SavedViewsStore {
   }
 
   private hydrate() {
-    if (!this.db) return
-    this.byPath.clear()
+    const db = this.db
+    if (!db) return
+    this.dropCachedViews()
     if (this.runtime && !this.runtime.savedViewCacheValid) return
-    const rows = this.db.prepare('SELECT workspace_id, collection, payload_json FROM saved_views').all() as ViewRow[]
+    const rows = db.prepare('SELECT workspace_id, collection, payload_json FROM saved_views').all() as ViewRow[]
     for (const row of rows) {
       const collection = normalizeCollectionPath(row.collection)
       if (!collection || collection === '/' || collection === '/views') continue
@@ -166,18 +184,19 @@ export class SavedViewsStore {
 
   /** 多张表一起落盘：包在同一个事务里，失败时整批回滚，避免内存改完而磁盘只写了一半。 */
   private persistPaths(collectionPaths: readonly string[]) {
-    if (!this.db) return
+    const db = this.db
+    if (!db) return
     const paths = [...new Set(collectionPaths.map((item) => normalizeCollectionPath(item)))]
     if (!paths.length) return
     const workspaceId = this.workspaceId()
-    const upsert = this.db.prepare(
+    const upsert = db.prepare(
       `INSERT INTO saved_views (workspace_id, collection, view_id, payload_json, updated_at)
        VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(workspace_id, collection, view_id)
        DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`,
     )
-    const wipe = this.db.prepare('DELETE FROM saved_views WHERE workspace_id = ? AND collection = ?')
-    this.db.exec('BEGIN IMMEDIATE')
+    const wipe = db.prepare('DELETE FROM saved_views WHERE workspace_id = ? AND collection = ?')
+    db.exec('BEGIN IMMEDIATE')
     try {
       for (const path of paths) {
         wipe.run(workspaceId, path)
@@ -186,10 +205,10 @@ export class SavedViewsStore {
           upsert.run(workspaceId, path, String(view.id), JSON.stringify(view), Date.now())
         }
       }
-      this.db.exec('COMMIT')
+      db.exec('COMMIT')
       this.runtime?.changed('saved_views')
     } catch (error) {
-      this.db.exec('ROLLBACK')
+      db.exec('ROLLBACK')
       throw error
     }
   }

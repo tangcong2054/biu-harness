@@ -56,7 +56,7 @@ function publicShare(row: ShareRow): ShareRecord {
 }
 
 export class SharesStore {
-  private db: DatabaseSync | null = null
+  private base: DatabaseSync | null = null
   private runtime: SqliteMetadataRuntime | null = null
 
   configureRuntime(
@@ -67,9 +67,10 @@ export class SharesStore {
     this.runtime = new SqliteMetadataRuntime(
       mode,
       repository,
-      () => this.conn(),
+      () => this.baseConn(),
       ['shares'],
       onShadowError,
+      { workspaceDb: () => SharesStore.ensureFlagColumns(openAndMigrateBiu(':memory:', { foreignKeys: false })) },
     )
   }
 
@@ -91,23 +92,26 @@ export class SharesStore {
 
   open(path = ':memory:') {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
-    this.db = openAndMigrateBiu(path, { foreignKeys: false })
-    this.ensureFlagColumns()
+    this.base = SharesStore.ensureFlagColumns(openAndMigrateBiu(path, { foreignKeys: false }))
     return this
   }
 
-  private ensureFlagColumns() {
-    const db = this.db
-    if (!db) return
+  private static ensureFlagColumns(db: DatabaseSync) {
     const cols = db.prepare('PRAGMA table_info(shares)').all() as Array<{ name: string }>
     const names = new Set(cols.map((col) => col.name))
     if (!names.has('share_plugins')) db.exec('ALTER TABLE shares ADD COLUMN share_plugins INTEGER NOT NULL DEFAULT 0')
     if (!names.has('allow_copy')) db.exec('ALTER TABLE shares ADD COLUMN allow_copy INTEGER NOT NULL DEFAULT 1')
+    return db
   }
 
+  private baseConn() {
+    if (!this.base) this.open(':memory:')
+    return this.base!
+  }
+
+  /** MySQL 模式下返回当前请求工作区自己的覆盖层。 */
   private conn() {
-    if (!this.db) this.open(':memory:')
-    return this.db!
+    return this.runtime ? this.runtime.database() : this.baseConn()
   }
 
   get(token: string): ShareRecord | null {

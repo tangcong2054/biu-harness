@@ -1292,13 +1292,18 @@ function databaseOf(ctx: Context) {
     | {
         facets: { isDeleted: (collection: string, id: string) => boolean; deletedIds: (collection: string) => Set<string> }
         remove: (path: string, query: { ids: string[] }) => Promise<unknown>
+        prepareAssetAccess?: () => Promise<void>
       }
     | undefined
 }
 
-function liveSessionItems<T extends { id: string }>(ctx: Context, items: T[]) {
-  const hidden = databaseOf(ctx)?.facets.deletedIds('/sessions')
-  if (!hidden?.size) return items
+/** 删除标记在当前工作区的元数据覆盖层里；先装载本空间，冷启动或过期时才不会读到空表。 */
+async function liveSessionItems<T extends { id: string }>(ctx: Context, items: T[]) {
+  const database = databaseOf(ctx)
+  if (!database) return items
+  await database.prepareAssetAccess?.()
+  const hidden = database.facets.deletedIds('/sessions')
+  if (!hidden.size) return items
   return items.filter((item) => !hidden.has(item.id))
 }
 
@@ -1391,7 +1396,7 @@ export async function openSessionHttpPayload(ctx: Context, id: string, limitTurn
   }
   let summaries: Awaited<ReturnType<typeof ctx.sessions.listSummaries>> = []
   try {
-    summaries = liveSessionItems(ctx, await ctx.sessions.listSummaries())
+    summaries = await liveSessionItems(ctx, await ctx.sessions.listSummaries())
   } catch {
     summaries = []
   }
@@ -1745,10 +1750,13 @@ export function apply(ctx: Context) {
   })
   ctx.http.route('GET', '/api/sessions', async (route) => {
     await ctx.sessions.ensureDefaultSession()
-    let items = liveSessionItems(ctx, await ctx.sessions.listSummaries())
+    const summaries = await ctx.sessions.listSummaries()
+    let items = await liveSessionItems(ctx, summaries)
+    // DEBUG(sessions-ghost): 验证修复后删除
+    ctx.logger('sessions-ghost').info(`GET /api/sessions summaries=${summaries.length} live=${items.length}`)
     if (!items.length) {
       await ctx.sessions.create()
-      items = liveSessionItems(ctx, await ctx.sessions.listSummaries())
+      items = await liveSessionItems(ctx, await ctx.sessions.listSummaries())
     }
     route.send(200, {
       sessions: items.map((item) => ({
