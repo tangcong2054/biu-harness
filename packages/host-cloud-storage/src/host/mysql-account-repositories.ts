@@ -1,9 +1,16 @@
 import type { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise'
 import { randomUUID } from 'node:crypto'
 import { resolveRuntimeRepositoryMode, type RuntimeRepositoryMode } from './mysql-runtime-repositories.ts'
-import { MysqlAccessReader, type AccessMatchers } from './mysql-access-reader.ts'
+import { accessDenied, MysqlAccessReader, type AccessMatchers } from './mysql-access-reader.ts'
 
 const SAFE_DATABASE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
+
+function viewShareDenied() {
+  return Object.assign(new Error('没有权限分享这个视图'), { status: 403, code: 'VIEW_SHARE_DENIED' })
+}
+
+type ViewOwnership = { kind: 'builtin' } | { kind: 'missing' } | { kind: 'custom'; owner: string }
+type ViewSharePurpose = 'read' | 'grant' | 'revoke'
 
 /** 与 SQLite CollabStore 相同的 409 语义；HTTP 层读 `status` 决定状态码。 */
 function leaseError(message: string) {
@@ -595,7 +602,7 @@ export class MysqlAccountRepository {
     collection: string; recordId: string; viewId: string; role: 'viewer' | 'editor';
     expiresAt: number; now: number
   }) {
-    if (input.viewId) await this.requireManager(input.actorId, input.workspaceId)
+    if (input.viewId) await this.requireViewSharer(input.actorId, input.workspaceId, input.collection, input.viewId, 'grant')
     else await this.requireGrantManager(input.actorId, input.workspaceId, input.collection, input.recordId)
     await this.pool.query(
       `INSERT INTO ${this.db}.workspace_invites
@@ -1403,10 +1410,12 @@ export class MysqlAccountRepository {
     actorId: string; workspaceId: string; collection: string; viewId: string;
     subjectType: 'account' | 'member_view'; subjectId: string; role: GrantRole; now: number
   }) {
-    await this.requireManager(input.actorId, input.workspaceId)
+    await this.requireViewSharer(input.actorId, input.workspaceId, input.collection, input.viewId, 'grant')
     const connection = await this.pool.getConnection()
     try {
       await connection.beginTransaction()
+      await this.requireOwnViewGrantSlot(connection, input.actorId, input.workspaceId, input.collection,
+        input.viewId, input.subjectType, input.subjectId)
       await connection.query(
         `INSERT INTO ${this.db}.view_grants
          (workspace_id, collection, view_id, subject_type, subject_id, role, granted_by, created_at)
@@ -1428,7 +1437,7 @@ export class MysqlAccountRepository {
     actorId: string; workspaceId: string; collection: string; viewId: string;
     email: string; role: GrantRole; collaboratorKind: 'internal' | 'external'; now: number
   }) {
-    await this.requireManager(input.actorId, input.workspaceId)
+    await this.requireViewSharer(input.actorId, input.workspaceId, input.collection, input.viewId, 'grant')
     const target = await this.accountByEmail(input.email)
     if (!target) return null
     const connection = await this.pool.getConnection()
@@ -1455,6 +1464,8 @@ export class MysqlAccountRepository {
           )
         }
       }
+      await this.requireOwnViewGrantSlot(connection, input.actorId, input.workspaceId, input.collection,
+        input.viewId, 'account', target.id)
       await connection.query(
         `INSERT INTO ${this.db}.view_grants
          (workspace_id, collection, view_id, subject_type, subject_id, role, granted_by, created_at)
@@ -1474,7 +1485,9 @@ export class MysqlAccountRepository {
   }
 
   async viewAccess(actorId: string, workspaceId: string, collection: string, viewId: string) {
-    await this.requireMember(actorId, workspaceId)
+    await this.requireViewSharer(actorId, workspaceId, collection, viewId, 'read')
+    // “全部”视图按人隔离：同一视图 ID 下，每个人只看到自己授出的那部分。
+    const ownGrantsOnly = viewId.startsWith('builtin-all:')
     const [rows] = await this.pool.query<RowDataPacket[]>(
       `SELECT g.subject_type, g.subject_id, g.role, g.granted_by, g.created_at,
               COALESCE(NULLIF(m.display_name, ''), NULLIF(a.name, ''), '未设置') AS name,
@@ -1485,8 +1498,9 @@ export class MysqlAccountRepository {
        LEFT JOIN ${this.db}.workspace_members m
          ON m.workspace_id = g.workspace_id AND m.account_id = a.id
        WHERE g.workspace_id = ? AND g.collection = ? AND g.view_id = ?
+         ${ownGrantsOnly ? 'AND g.granted_by = ?' : ''}
        ORDER BY g.created_at`,
-      [workspaceId, collection, viewId],
+      ownGrantsOnly ? [workspaceId, collection, viewId, actorId] : [workspaceId, collection, viewId],
     )
     const people = rows
       .filter((row) => row.subject_type === 'account')
@@ -1517,14 +1531,17 @@ export class MysqlAccountRepository {
     actorId: string; workspaceId: string; collection: string; viewId: string;
     subjectType: 'account' | 'member_view'; subjectId: string
   }) {
-    await this.requireManager(input.actorId, input.workspaceId)
+    await this.requireViewSharer(input.actorId, input.workspaceId, input.collection, input.viewId, 'revoke')
+    const ownGrantsOnly = input.viewId.startsWith('builtin-all:')
     const connection = await this.pool.getConnection()
     try {
       await connection.beginTransaction()
       const [result] = await connection.query<ResultSetHeader>(
         `DELETE FROM ${this.db}.view_grants
-         WHERE workspace_id = ? AND collection = ? AND view_id = ? AND subject_type = ? AND subject_id = ?`,
-        [input.workspaceId, input.collection, input.viewId, input.subjectType, input.subjectId],
+         WHERE workspace_id = ? AND collection = ? AND view_id = ? AND subject_type = ? AND subject_id = ?
+           ${ownGrantsOnly ? 'AND granted_by = ?' : ''}`,
+        [input.workspaceId, input.collection, input.viewId, input.subjectType, input.subjectId,
+          ...(ownGrantsOnly ? [input.actorId] : [])],
       )
       if (!result.affectedRows) throw new Error('view grant not found')
       if (input.subjectType === 'account') {
@@ -2103,6 +2120,77 @@ export class MysqlAccountRepository {
     const role = await this.requireMember(accountId, workspaceId)
     if (role !== 'owner' && role !== 'admin') throw new Error('workspace manager required')
     return role
+  }
+
+  /** 自定义视图按创建账号隔离；范围包装 builtin-scope:* 看它包着的基视图；其他 builtin 视图没有归属。 */
+  private async viewOwnership(workspaceId: string, collection: string, viewId: string): Promise<ViewOwnership | null> {
+    let id = viewId
+    if (id.startsWith('builtin-scope:')) {
+      const match = /^builtin-scope:(personal|workspace|shared):(.+)$/.exec(id)
+      if (!match) return null
+      try { id = decodeURIComponent(match[2]!) } catch { return null }
+      if (!id || id.startsWith('builtin-scope:')) return null
+    }
+    if (/^builtin(?:-|:)/.test(id)) return { kind: 'builtin' }
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT payload_json FROM ${this.db}.saved_views WHERE workspace_id = ? AND collection = ? AND view_id = ?`,
+      [workspaceId, collection, id],
+    )
+    if (!rows[0]) return { kind: 'missing' }
+    let payload: unknown
+    try {
+      const raw = rows[0].payload_json
+      payload = typeof raw === 'string' ? JSON.parse(raw) : raw
+    } catch {
+      return { kind: 'missing' }
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return { kind: 'missing' }
+    const view = payload as { deletedAt?: unknown; createdBy?: unknown }
+    if (view.deletedAt != null) return { kind: 'missing' }
+    return { kind: 'custom', owner: typeof view.createdBy === 'string' ? view.createdBy : '' }
+  }
+
+  /**
+   * 视图分享：只有空间管理员能分享（与原来的写入规则相同），而且自定义视图只能由创建者分享。
+   * 读取详情和撤销允许已删除的视图，方便清理残留授权；新增授权不允许。
+   */
+  private async requireViewSharer(
+    actorId: string, workspaceId: string, collection: string, viewId: string, purpose: ViewSharePurpose,
+  ) {
+    const denied = purpose === 'read' ? accessDenied : viewShareDenied
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT role, member_kind FROM ${this.db}.workspace_members WHERE workspace_id = ? AND account_id = ?`,
+      [workspaceId, actorId],
+    )
+    const role = String(rows[0]?.role ?? '')
+    if (rows[0]?.member_kind !== 'member' || (role !== 'owner' && role !== 'admin')) throw denied()
+    const view = await this.viewOwnership(workspaceId, collection, viewId)
+    if (!view) throw denied()
+    if (view.kind === 'custom') {
+      // 迁移前没有归属的历史视图已交给空间所有者；仍为空时只有所有者能管。
+      const owner = view.owner || (role === 'owner' ? actorId : '')
+      if (owner !== actorId) throw denied()
+    }
+    if (view.kind === 'missing' && purpose === 'grant') throw denied()
+  }
+
+  /**
+   * view_grants 主键不含授权人，“全部”视图上同一对象只能有一条授权。
+   * 别人已经授过时不覆盖：覆盖会把对方看到的范围从别人的记录换成自己的。
+   */
+  private async requireOwnViewGrantSlot(
+    connection: PoolConnection, actorId: string, workspaceId: string, collection: string,
+    viewId: string, subjectType: string, subjectId: string,
+  ) {
+    if (!viewId.startsWith('builtin-all:')) return
+    const [rows] = await connection.query<RowDataPacket[]>(
+      `SELECT granted_by FROM ${this.db}.view_grants
+       WHERE workspace_id = ? AND collection = ? AND view_id = ? AND subject_type = ? AND subject_id = ? FOR UPDATE`,
+      [workspaceId, collection, viewId, subjectType, subjectId],
+    )
+    if (rows[0] && String(rows[0].granted_by) !== actorId) {
+      throw Object.assign(new Error('对方已通过其他成员的“全部”视图获得授权'), { status: 409, code: 'VIEW_GRANT_TAKEN' })
+    }
   }
 
   private async requireOwner(accountId: string, workspaceId: string) {

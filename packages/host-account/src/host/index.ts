@@ -652,8 +652,13 @@ function purgeSessionEvents(sessionIds: string[]) {
 }
 
 function fail(route: RouteContext, error: unknown) {
-  if (error instanceof Error && (error as { code?: string }).code === 'ACCESS_DETAILS_DENIED') {
-    route.send(403, { error: error.message })
+  const code = error instanceof Error ? (error as { code?: string }).code : undefined
+  if (code === 'ACCESS_DETAILS_DENIED' || code === 'VIEW_SHARE_DENIED') {
+    route.send(403, { code, error: (error as Error).message })
+    return
+  }
+  if (code === 'VIEW_GRANT_TAKEN') {
+    route.send(409, { code, error: (error as Error).message })
     return
   }
   if (error instanceof CollabError) {

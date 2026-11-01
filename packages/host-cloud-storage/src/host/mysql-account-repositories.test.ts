@@ -65,6 +65,14 @@ integration('MySQL account/workspace/authz integration', () => {
       record_id VARCHAR(128) NOT NULL,
       view_id VARCHAR(128) NOT NULL DEFAULT ''
     )`)
+    await pool.query(`CREATE TABLE \`${database}\`.saved_views (
+      workspace_id VARCHAR(64) NOT NULL,
+      collection VARCHAR(128) NOT NULL,
+      view_id VARCHAR(128) NOT NULL,
+      payload_json LONGTEXT NOT NULL,
+      updated_at BIGINT NOT NULL,
+      PRIMARY KEY (workspace_id, collection, view_id)
+    )`)
     accounts = new MysqlAccountRepository(pool, database)
     authz = new MysqlAuthorizationRepository(pool, database)
   })
@@ -209,6 +217,11 @@ integration('MySQL account/workspace/authz integration', () => {
     await accounts.addGroupMember('acc_owner', 'ws_a', 'grp_1', 'acc_member', now)
     expect(await accounts.groupMembers('acc_owner', 'ws_a', 'grp_1')).toHaveLength(1)
 
+    await pool.query(
+      `INSERT INTO \`${database}\`.saved_views (workspace_id, collection, view_id, payload_json, updated_at)
+       VALUES ('ws_a', '/pages', 'view_1', ?, ?)`,
+      [JSON.stringify({ id: 'view_1', name: 'View 1', createdBy: 'acc_owner', revision: 1 }), now],
+    )
     await accounts.grantView({
       actorId: 'acc_owner',
       workspaceId: 'ws_a',

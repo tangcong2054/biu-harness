@@ -52,7 +52,7 @@ test('access detail GET uses the request workspace and returns 403 without colla
     await runWithRequestWorkspace('requested-workspace', () => http.routes.get('GET /api/account/access')!(route))
     expect(recordAccess).toHaveBeenCalledWith('bob', 'requested-workspace', '/pages', 'p1')
     expect(route.status).toBe(403)
-    expect(route.payload).toEqual({ error: 'denied' })
+    expect(route.payload).toEqual({ code: 'ACCESS_DETAILS_DENIED', error: 'denied' })
     recordAccess.mockResolvedValue({ scope: 'personal', people: [] })
     await runWithRequestWorkspace('requested-workspace', () => http.routes.get('GET /api/account/access')!(route))
     expect(route.status).toBe(200)
