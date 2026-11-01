@@ -93,3 +93,27 @@ test('MySQL visibility cache never leaks one account result to another', async (
   const adaFacet = await as('ada', () => db.collectFacet('tag'))
   assert.deepEqual(adaFacet.items.map((item) => item.id).sort(), ['p_ada', 'p_team'])
 })
+
+test('MySQL share groups and the share column always agree, including public links', async () => {
+  const { db, as } = boot()
+  const groups = async () => {
+    const out: Record<string, Array<[string, unknown]>> = {}
+    for (const scope of ['personal', 'workspace', 'shared'] as const) {
+      const page = await as('ada', () => db.list('/pages', { $scope: scope }))
+      out[scope] = page.items.map((row) => [row.id, (row as Record<string, unknown>).shareScope])
+    }
+    return out
+  }
+  assert.deepEqual(await groups(), {
+    personal: [['p_ada', '私人']],
+    workspace: [['p_team', '空间']],
+    shared: [],
+  })
+  // 开了公开链接的空间页面：分享列显示共享，分组也要从“空间”挪到“共享”。
+  db.shares.upsert({ kind: 'record', collection: '/pages', recordId: 'p_team' })
+  assert.deepEqual(await groups(), {
+    personal: [['p_ada', '私人']],
+    workspace: [],
+    shared: [['p_team', '共享']],
+  })
+})

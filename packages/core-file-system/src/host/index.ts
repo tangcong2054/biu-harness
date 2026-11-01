@@ -691,6 +691,8 @@ type VisibleSortedPack = {
   personal: DbRecord[]
   workspace: DbRecord[]
   shared: DbRecord[]
+  /** MySQL 模式下分组时用到的归属，按行 id。分享列直接复用，避免缓存失效后两边算得不一样。 */
+  scopes?: Map<string, DataScope>
 }
 
 type WorkspaceMembership = {
@@ -773,6 +775,8 @@ export class DatabaseService extends Service implements Database {
   private mysqlScopes = new Map<string, DataScope | null>()
   /** 同一条键上，MySQL 策略是否允许当前账号看见。没有键表示这条记录还没在 MySQL 落归属。 */
   private mysqlVisible = new Map<string, boolean>()
+  /** 当前这一页装饰时，分组阶段已经算好的归属。 */
+  private scopeHints: Map<string, DataScope> | null = null
   private boundAuth?: AuthorizationService
   private unbindAuth?: () => void
   recycleAssets?: () => void
@@ -939,11 +943,12 @@ export class DatabaseService extends Service implements Database {
   }
 
   /** 只装饰当前页，避免为整张表逐行读取 owner、view grant 和人物信息。 */
-  private decorateSlice(spec: CollectionSpec, rows: DbRecord[]) {
+  private decorateSlice(spec: CollectionSpec, rows: DbRecord[], scopes?: Map<string, DataScope>) {
     this.ownershipCache = null
     this.ownerCache = null
     this.viewAudienceCache = null
     this.viewShareCache = null
+    this.scopeHints = scopes ?? null
     try {
       return rows.map((row) => this.decorateRecord(spec, row))
     } finally {
@@ -951,6 +956,7 @@ export class DatabaseService extends Service implements Database {
       this.ownerCache = null
       this.viewAudienceCache = null
       this.viewShareCache = null
+      this.scopeHints = null
     }
   }
 
@@ -1429,6 +1435,10 @@ export class DatabaseService extends Service implements Database {
     if (!mysqlRecordVisible(target.collection, target.id, sources, accountId)) {
       throw new Error(`unknown record: ${collection}/${id}`)
     }
+    this.mysqlScopes.set(
+      this.mysqlScopeKey(workspaceId, target.collection, target.id),
+      resolveRecordScope(target.collection, target.id, sources),
+    )
     return true
   }
 
@@ -1749,7 +1759,7 @@ export class DatabaseService extends Service implements Database {
     if (!this.mysqlAccount()?.usesMysqlAccounts?.()) return undefined
     const workspaceId = currentRequestWorkspaceId()
     if (!workspaceId) return null
-    return this.mysqlScopes.get(this.mysqlScopeKey(workspaceId, collection, id))
+    return this.mysqlScopes.get(this.mysqlScopeKey(workspaceId, collection, id)) ?? null
   }
 
   private partitionVisibleRows(collection: string, rows: DbRecord[], mysql: boolean): VisibleSortedPack {
@@ -1760,18 +1770,23 @@ export class DatabaseService extends Service implements Database {
       const personal: DbRecord[] = []
       const workspace: DbRecord[] = []
       const shared: DbRecord[] = []
+      const scopes = new Map<string, DataScope>()
       for (const row of rows) {
-        if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
+        const id = String(row.id ?? '')
+        if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) {
           shared.push(row)
+          scopes.set(id, 'shared')
           continue
         }
-        const target = this.scopeTarget(collection, String(row.id ?? ''), row)
-        const scope = this.mysqlScopeOf(target.collection, target.id)
-        if (scope === 'personal') personal.push(row)
-        else if (scope === 'workspace') workspace.push(row)
+        const target = this.scopeTarget(collection, id, row)
+        // 云端还没落归属的记录，分享列按“私人”显示，分组也归到私人，两边保持一致。
+        const scope = this.mysqlScopeOf(target.collection, target.id) ?? 'personal'
+        scopes.set(id, scope)
+        if (scope === 'workspace') workspace.push(row)
         else if (scope === 'shared') shared.push(row)
+        else personal.push(row)
       }
-      return { rows, personal, workspace, shared }
+      return { rows, personal, workspace, shared, scopes }
     }
     const personal: DbRecord[] = []
     const workspace: DbRecord[] = []
@@ -1798,6 +1813,27 @@ export class DatabaseService extends Service implements Database {
       else if (scope === 'shared') shared.push(row)
     }
     return { rows, personal, workspace, shared }
+  }
+
+  /**
+   * 分组和分享列共用同一条规则：开了公开链接的记录一律算“共享”，
+   * 从私人 / 空间分组里拿掉。只改分组归类，不改可见范围。
+   */
+  private visibleRowsForScope(collection: string, pack: VisibleSortedPack, scope: DataScope) {
+    let publicIds: Set<string>
+    try {
+      publicIds = this.shares.recordIds(collection)
+    } catch {
+      return pack[scope]
+    }
+    if (!publicIds.size) return pack[scope]
+    const scopedIds = new Set(pack[scope].map((row) => String(row.id ?? '')))
+    if (scope === 'shared') {
+      for (const id of publicIds) scopedIds.add(id)
+    } else {
+      for (const id of publicIds) scopedIds.delete(id)
+    }
+    return pack.rows.filter((row) => scopedIds.has(String(row.id ?? '')))
   }
 
   private async scanCollectionRowsNow(spec: CollectionSpec, query: CollectionListQuery, overlay: boolean) {
@@ -2145,13 +2181,13 @@ export class DatabaseService extends Service implements Database {
     try {
       const overlay = listNeedsMatchOverlay(liveFilter, q, sortField, page?.sorts)
       const pack = await this.visibleSortedCollectionRows(spec, query, sortField, sortDir, page?.sorts, overlay)
-      const visible = scopeFilter ? pack[scopeFilter] : pack.rows
+      const visible = scopeFilter ? this.visibleRowsForScope(spec.path, pack, scopeFilter) : pack.rows
       const tagFilter = spec.path === '/facets' ? String(filter?.facetId ?? '').trim() : ''
       if (tagFilter) schema = schemaWithTagPack(schema, this.facets.get(tagFilter))
       const packs = this.facets.list()
       const sorted = visible.filter((row) => matchListFilter(row, liveFilter, schema, packs) && matchQuery(row, q, packs))
       const total = sorted.length
-      const slice = this.decorateSlice(spec, sorted.slice(offset, offset + limit))
+      const slice = this.decorateSlice(spec, sorted.slice(offset, offset + limit), pack.scopes)
       return {
         kind: 'collection' as const,
         path: spec.path,
@@ -2222,8 +2258,8 @@ export class DatabaseService extends Service implements Database {
 
   private shareScopeLabel(collection: string, id: string, record: DbRecord, stored: 'personal' | 'workspace' | 'shared') {
     const target = this.scopeTarget(collection, id, record)
-    const mysqlScope = this.mysqlScopeOf(target.collection, target.id)
-    if (mysqlScope === 'personal' || mysqlScope === 'workspace' || mysqlScope === 'shared') {
+    const mysqlScope = this.scopeHints?.get(id) ?? this.mysqlScopeOf(target.collection, target.id)
+    if (mysqlScope !== undefined) {
       if (this.hasPublicShare(collection, id) || mysqlScope === 'shared') return '共享'
       if (mysqlScope === 'workspace') return '空间'
       return '私人'

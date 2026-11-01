@@ -132,6 +132,14 @@ export class SharesStore {
     return row ? publicShare(row) : null
   }
 
+  /** 这张表里开了公开链接的记录 id，一次读出，列表分组不逐行查库。 */
+  recordIds(collection: string): Set<string> {
+    const rows = this.conn().prepare(
+      'SELECT DISTINCT record_id FROM shares WHERE kind = ? AND collection = ? AND record_id <> ?',
+    ).all('record', normalizeCollectionPath(collection), '') as Array<{ record_id: string }>
+    return new Set(rows.map((row) => row.record_id))
+  }
+
   verifyPassword(token: string, password: string) {
     const row = this.conn().prepare('SELECT password_salt, password_hash FROM shares WHERE token = ?').get(token) as
       | { password_salt: string; password_hash: string }

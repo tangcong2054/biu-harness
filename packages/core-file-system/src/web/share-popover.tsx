@@ -646,6 +646,8 @@ export function ShareScopeDetail({
   const [direct, setDirect] = useState<Array<{ id: string; name: string; role: string; note: string }>>([])
   const [chain, setChain] = useState<Array<{ id: string; title: string; detail: string; result: string }>>([])
   const [error, setError] = useState('')
+  // 列表接口给出的分享值是权威结果（含公开链接），分组也按它算；标签直接用它，不在前端重算。
+  const shownScope = label === '共享' ? 'shared' : label === '空间' ? 'workspace' : label === '私人' ? 'personal' : scope
 
   useEffect(() => {
     if (localOnly) {
@@ -661,6 +663,8 @@ export function ShareScopeDetail({
       setError('')
       return
     }
+    // 每个单元格挂载时都去读权限会把整页请求放大好几倍，只在点开详情时读取。
+    if (!open) return
     let cancelled = false
     void (async () => {
       const [access, recordPage, viewPage, memberViewPage] = await Promise.all([
@@ -746,6 +750,9 @@ export function ShareScopeDetail({
           detail: `${row.name} ${roleLabel(row.role)}`,
           result: row.external ? '共享' : '空间',
         })),
+        ...(label === '共享' && stored !== 'shared' && !matched.some((row) => row.external)
+          ? [{ id: 'public-link', title: '公开分享链接', detail: '已开启链接，拿到链接的人可以查看', result: '共享' }]
+          : []),
       ])
       setError('')
     })().catch((err) => {
@@ -760,8 +767,8 @@ export function ShareScopeDetail({
     <div className="fsdb-scope-detail" ref={wrapRef}>
       <button
         type="button"
-        className={`fsdb-scope-tag is-${scope}`}
-        aria-label={`${label || scopeText(scope)}的权限详情`}
+        className={`fsdb-scope-tag is-${shownScope}`}
+        aria-label={`${label || scopeText(shownScope)}的权限详情`}
         aria-expanded={open}
         onPointerDown={(event) => event.stopPropagation()}
         onClick={(event) => {
@@ -771,7 +778,7 @@ export function ShareScopeDetail({
           setOpen((prev) => !prev)
         }}
       >
-        <ScopeMark scope={scope} />
+        <ScopeMark scope={shownScope} />
       </button>
       {open && box ? createPortal(
         <HeadlessDismiss
@@ -784,7 +791,7 @@ export function ShareScopeDetail({
                 <strong>数据归属</strong>
                 <em>直接协作者和匹配到的视图，取最宽的一档</em>
               </div>
-              <b className={`fsdb-scope-pill is-${scope}`}><ScopeMark scope={scope} /></b>
+              <b className={`fsdb-scope-pill is-${shownScope}`}><ScopeMark scope={shownScope} /></b>
             </header>
             <ol className="fsdb-scope-chain">
               {chain.length ? chain.map((step) => (
