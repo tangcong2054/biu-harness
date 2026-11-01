@@ -578,6 +578,56 @@ export const PRODUCT_MIGRATIONS: readonly MysqlMigration[] = [
        WHERE id IN (OLD.session_id, NEW.session_id)`,
     ],
   },
+  {
+    version: 15,
+    name: 'saved_views_account_owner',
+    statements: [
+      // 视图按创建账号隔离。迁移前没有归属的历史视图统一交给空间所有者。
+      `UPDATE saved_views v JOIN workspaces w ON w.id = v.workspace_id
+       SET v.payload_json = JSON_SET(v.payload_json, '$.createdBy', w.owner_id)
+       WHERE JSON_VALID(v.payload_json) AND w.owner_id <> ''
+         AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(v.payload_json, '$.createdBy')), '') IN ('', 'null')`,
+    ],
+  },
+  {
+    version: 16,
+    name: 'record_scope_from_collaborators',
+    statements: [
+      // 之前 MySQL 加协作者不会重算归属，留下“有协作者却仍是私人”的记录；按 SQLite 同一规则补齐。
+      `UPDATE resource_policies p
+       SET p.ownership = CASE WHEN EXISTS (
+             SELECT 1 FROM record_grants g
+             JOIN workspace_members m ON m.workspace_id = g.workspace_id AND m.account_id = g.subject_id
+             WHERE g.workspace_id = p.workspace_id AND g.collection = p.collection AND g.record_id = p.record_id
+               AND g.subject_type = 'account' AND g.subject_id <> p.owner_account_id
+               AND m.member_kind IN ('external', 'guest')
+           ) THEN 'shared' ELSE 'workspace' END,
+           p.access_mode = IF(p.access_mode = 'private', 'restricted', p.access_mode)
+       WHERE p.ownership = 'personal'
+         AND EXISTS (
+           SELECT 1 FROM record_grants g
+           WHERE g.workspace_id = p.workspace_id AND g.collection = p.collection AND g.record_id = p.record_id
+             AND NOT (g.subject_type = 'account' AND g.subject_id = p.owner_account_id)
+         )`,
+    ],
+  },
+  {
+    version: 17,
+    name: 'shares_drop_untenanted_target_index',
+    statements: [
+      // 从 SQLite 导入时带来的 shares_target(kind, collection, view_id, record_id) 不含 workspace_id：
+      // 两个空间分享同一目标会撞唯一约束，按冲突更新写入时还会改写别的空间的分享。
+      // 第 11 版已加了按空间的 shares_tenant_target，这里只删旧索引；不存在时什么也不做。
+      `SET @biu_drop_shares_target = (
+         SELECT IF(COUNT(*) > 0, 'ALTER TABLE shares DROP INDEX shares_target', 'DO 0')
+         FROM information_schema.statistics
+         WHERE table_schema = DATABASE() AND table_name = 'shares' AND index_name = 'shares_target'
+       )`,
+      'PREPARE biu_drop_shares_target FROM @biu_drop_shares_target',
+      'EXECUTE biu_drop_shares_target',
+      'DEALLOCATE PREPARE biu_drop_shares_target',
+    ],
+  },
 ]
 
 export const OPERATIONS_MIGRATIONS: readonly MysqlMigration[] = [
