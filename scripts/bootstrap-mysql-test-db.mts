@@ -9,8 +9,8 @@
  *   set -a && . ~/.config/biu/test-mysql.env && set +a
  *   npx tsx scripts/bootstrap-mysql-test-db.mts biu_test1 biu_test2
  *
- * 第 14 版迁移会建触发器；开启 binlog 时需要 SUPER 权限或 log_bin_trust_function_creators=1。
- * 没有该权限时可加 --skip=14 跳过这一版（视图、分享测试不受影响，会话时间统计测试需要它）。
+ * 第 14 版迁移会建触发器（线上会话列表依赖它们）；开启 binlog 时需要 SUPER 权限或
+ * log_bin_trust_function_creators=1。两者都没有时可加 --skip=14 临时跳过，但结构就与线上不一致了。
  */
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'

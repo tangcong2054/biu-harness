@@ -9,6 +9,8 @@ import { PRODUCT_MIGRATIONS } from '../../../host-cloud-storage/src/host/migrati
 import { runMysqlMigrations } from '../../../host-cloud-storage/src/host/runner.ts'
 
 const testUrl = process.env.BIU_MYSQL_PROJECTION_TEST_URL
+/** 设为 1 时直接使用连接串里已授权的空库（不建库删库），结束时只删除本次建的表。 */
+const useExistingDatabase = process.env.BIU_MYSQL_PROJECTION_TEST_EXISTING === '1'
 
 test('projection query binds candidates and never treats an empty candidate set as unrestricted', async () => {
   const calls: Array<{ sql: string; values: unknown[] }> = []
@@ -36,10 +38,19 @@ describe.skipIf(!testUrl)('MySQL event-time projection in an isolated database',
   beforeAll(async () => {
     const url = new URL(testUrl!)
     database = url.pathname.slice(1)
-    if (!/^biu_summary_test_[a-z0-9_]+$/.test(database)) throw new Error('Disposable test database required')
-    url.pathname = '/'
-    pool = createPool({ uri: url.toString(), connectionLimit: 5 })
-    await pool.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`)
+    if (useExistingDatabase) {
+      if (!/^[A-Za-z0-9_]{1,64}$/.test(database)) throw new Error('Plain test database name required')
+      pool = createPool({ uri: url.toString(), connectionLimit: 5 })
+      const [tables] = await pool.query(
+        'SELECT table_name AS name FROM information_schema.tables WHERE table_schema = ?', [database],
+      )
+      if ((tables as unknown[]).length) throw new Error(`${database} must be empty for the projection test`)
+    } else {
+      if (!/^biu_summary_test_[a-z0-9_]+$/.test(database)) throw new Error('Disposable test database required')
+      url.pathname = '/'
+      pool = createPool({ uri: url.toString(), connectionLimit: 5 })
+      await pool.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`)
+    }
     created = true
     await pool.query(`CREATE TABLE \`${database}\`.sessions (
       id VARCHAR(128) PRIMARY KEY, version BIGINT NOT NULL, project_json LONGTEXT NULL,
@@ -55,8 +66,17 @@ describe.skipIf(!testUrl)('MySQL event-time projection in an isolated database',
   })
 
   afterAll(async () => {
-    if (created) await pool.query(`DROP DATABASE \`${database}\``)
-    await pool?.end()
+    try {
+      if (created && useExistingDatabase) {
+        for (const table of ['events', 'sessions', 'schema_migrations']) {
+          await pool.query(`DROP TABLE IF EXISTS \`${database}\`.\`${table}\``)
+        }
+      } else if (created) {
+        await pool.query(`DROP DATABASE \`${database}\``)
+      }
+    } finally {
+      await pool?.end()
+    }
   })
 
   const record = (times: number[], createdAt?: number): SessionRecord => ({
