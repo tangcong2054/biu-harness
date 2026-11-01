@@ -1488,7 +1488,7 @@ export function CollectionBrowser({
   }, [collapsedGroups, flattenRows, groupPages, grouped, grouping, pageSize, visible])
   const tableColSpan = Math.max(columns.length, 1)
   const tableRef = useRef<HTMLTableElement>(null)
-  const tableWrapRef = useRef<HTMLDivElement>(null)
+  const [tableWrap, setTableWrap] = useState<HTMLDivElement | null>(null)
   const checkStackRef = useRef<HTMLDivElement>(null)
   const checkHoverRef = useRef<string | 'head' | null>(null)
   const [tableScroll, setTableScroll] = useState({ top: 0, height: 0 })
@@ -1613,8 +1613,8 @@ export function CollectionBrowser({
   }, [checkSlots, paintCheckHover])
 
   useLayoutEffect(() => {
-    const wrap = tableWrapRef.current
-    if (!wrap) return
+    if (!tableWrap) return
+    const wrap = tableWrap
     let raf = 0
     const sync = () => {
       const top = wrap.scrollTop
@@ -1637,14 +1637,13 @@ export function CollectionBrowser({
       wrap.removeEventListener('scroll', onScroll)
       ro.disconnect()
     }
-  }, [customView, rowView])
+  }, [tableWrap])
 
   useLayoutEffect(() => {
-    const wrap = tableWrapRef.current
-    if (!wrap) return
-    wrap.scrollTop = 0
-    setTableScroll((prev) => ({ top: 0, height: wrap.clientHeight || prev.height }))
-  }, [activeViewId, collectionPath, groupBy, page, pageSize, query])
+    if (!tableWrap) return
+    tableWrap.scrollTop = 0
+    setTableScroll((prev) => ({ top: 0, height: tableWrap.clientHeight || prev.height }))
+  }, [activeViewId, collectionPath, groupBy, page, pageSize, query, tableWrap])
 
   const listedSelected = detailId ? items.find((item) => item.id === detailId) : undefined
   const selected = useMemo(() => {
@@ -4022,7 +4021,7 @@ export function CollectionBrowser({
               </PluginSurface>
             ) : null}
             {!customView && !rowView ? (
-              <div className="tasks-table-wrap" ref={tableWrapRef}>
+              <div className="tasks-table-wrap" ref={setTableWrap}>
                 {pickedIds.length ? (
                   <div className="fsdb-bulk" data-testid="fsdb-bulk-bar">
                     <span

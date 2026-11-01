@@ -398,6 +398,16 @@ function WorkspaceAccess({
     .filter((row) => !normalizedMemberQuery || `${row.name} ${row.email}`.toLowerCase().includes(normalizedMemberQuery))
     .slice(0, 8)
   const selectedMember = workspaceMembers.find((row) => row.id === selectedMemberId)
+  // 只输入了名字或邮箱、没点下拉项时：唯一匹配或邮箱完全一致也能直接添加，不让按钮一直灰着没反应。
+  const pickedMember = selectedMember
+    ?? (normalizedMemberQuery
+      ? matchingMembers.find((row) => row.email.toLowerCase() === normalizedMemberQuery)
+        ?? (matchingMembers.length === 1 ? matchingMembers[0] : undefined)
+      : undefined)
+  const addMember = () => {
+    if (pickedMember) void grant({ email: pickedMember.email }, 'internal')
+    else if (normalizedMemberQuery) setError(matchingMembers.length ? '匹配到多个成员，请从下拉列表里选一个' : '没有可添加的空间成员')
+  }
 
   const roleSelect = (
     <select value={role} aria-label="权限" onChange={(event) => setRole(event.target.value as typeof role)}>
@@ -473,6 +483,12 @@ function WorkspaceAccess({
                 setMemberQuery(event.target.value)
                 setSelectedMemberId('')
                 setMemberPickerOpen(true)
+                setError('')
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== 'Enter' || event.nativeEvent.isComposing) return
+                event.preventDefault()
+                addMember()
               }}
             />
             {memberPickerOpen ? (
@@ -499,9 +515,7 @@ function WorkspaceAccess({
             ) : null}
           </div>
           {roleSelect}
-          <button type="button" className="fsdb-share-publish" disabled={!selectedMember} data-testid="fsdb-share-member-add" onClick={() => {
-            if (selectedMember) void grant({ email: selectedMember.email }, 'internal')
-          }}>添加</button>
+          <button type="button" className="fsdb-share-publish" disabled={!pickedMember && !normalizedMemberQuery} data-testid="fsdb-share-member-add" onClick={addMember}>添加</button>
         </div>
         {availableMemberViews.length ? (
           <details className="fsdb-share-advanced" data-testid="fsdb-share-member-view">
