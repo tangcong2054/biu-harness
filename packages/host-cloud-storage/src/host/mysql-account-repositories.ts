@@ -1,6 +1,7 @@
 import type { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise'
 import { randomUUID } from 'node:crypto'
 import { resolveRuntimeRepositoryMode, type RuntimeRepositoryMode } from './mysql-runtime-repositories.ts'
+import { MysqlAccessReader, type AccessMatchers } from './mysql-access-reader.ts'
 
 const SAFE_DATABASE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
 
@@ -70,6 +71,14 @@ function mysqlJsonValue(value: unknown) {
   }
 }
 
+function memberKindOf(value: unknown): 'member' | 'external' | 'guest' {
+  return value === 'external' || value === 'guest' ? value : 'member'
+}
+
+function scopeOf(value: unknown): 'personal' | 'workspace' | 'shared' {
+  return value === 'workspace' || value === 'shared' ? value : 'personal'
+}
+
 function accountRow(row: Record<string, unknown>): AccountRow {
   return {
     id: String(row.id),
@@ -86,6 +95,11 @@ function accountRow(row: Record<string, unknown>): AccountRow {
 export class MysqlAccountRepository {
   private readonly db: string
   private readonly operationsDb: string | null
+  private accessMatchers?: AccessMatchers
+
+  setAccessMatchers(matchers: AccessMatchers) {
+    this.accessMatchers = matchers
+  }
 
   constructor(readonly pool: Pool, database: string, operationsDatabase?: string) {
     this.db = databaseName(database)
@@ -1132,6 +1146,7 @@ export class MysqlAccountRepository {
          ON DUPLICATE KEY UPDATE role = VALUES(role), granted_by = VALUES(granted_by), created_at = VALUES(created_at)`,
         [input.workspaceId, input.collection, input.recordId, input.subjectType, input.subjectId, input.role, input.actorId, input.now],
       )
+      await this.reconcileRecordScope(connection, input.workspaceId, input.collection, input.recordId)
       await this.bumpRevision(connection, input.workspaceId, input.collection)
       await connection.commit()
     } catch (error) {
@@ -1159,6 +1174,7 @@ export class MysqlAccountRepository {
       if (input.subjectType === 'account') {
         await this.cleanupExternalMembership(connection, input.workspaceId, input.subjectId)
       }
+      await this.reconcileRecordScope(connection, input.workspaceId, input.collection, input.recordId)
       await this.bumpRevision(connection, input.workspaceId, input.collection)
       await connection.commit()
     } catch (error) {
@@ -1185,7 +1201,10 @@ export class MysqlAccountRepository {
   }
 
   async recordAccess(actorId: string, workspaceId: string, collection: string, recordId: string) {
-    await this.requireMember(actorId, workspaceId)
+    const applicable = await new MysqlAccessReader(
+      this.pool, this.db.slice(1, -1), workspaceId, actorId, this.accessMatchers,
+    ).record(collection, recordId)
+    const grantKeys = new Set(applicable.map((row) => JSON.stringify([row.view_id, row.subject_type, row.subject_id, row.granted_by])))
     const [policies] = await this.pool.query<RowDataPacket[]>(
       `SELECT ownership, owner_account_id, access_mode, member_default_role,
               parent_collection, parent_record_id
@@ -1195,7 +1214,8 @@ export class MysqlAccountRepository {
     )
     const [grants] = await this.pool.query<RowDataPacket[]>(
       `SELECT g.subject_type, g.subject_id, g.role, g.granted_by, g.created_at,
-              COALESCE(a.name, '') AS name, COALESCE(a.email, '') AS email,
+              COALESCE(NULLIF(m.display_name, ''), NULLIF(a.name, ''), '未设置') AS name,
+              COALESCE(a.email, '') AS email,
               COALESCE(m.member_kind, '') AS member_kind, COALESCE(wg.name, '') AS group_name
        FROM ${this.db}.record_grants g
        LEFT JOIN ${this.db}.accounts a ON g.subject_type = 'account' AND a.id = g.subject_id
@@ -1207,13 +1227,123 @@ export class MysqlAccountRepository {
        ORDER BY g.created_at`,
       [workspaceId, collection, recordId],
     )
-    const [views] = await this.pool.query<RowDataPacket[]>(
-      `SELECT view_id, subject_type, subject_id, role, granted_by, created_at
-       FROM ${this.db}.view_grants WHERE workspace_id = ? AND collection = ?
-       ORDER BY created_at`,
+    const [owners] = policies[0]?.owner_account_id
+      ? [[] as RowDataPacket[]]
+      : await this.pool.query<RowDataPacket[]>(
+        `SELECT owner_id FROM ${this.db}.record_owners
+         WHERE workspace_id = ? AND collection = ? AND record_id = ?`,
+        [workspaceId, collection, recordId],
+      )
+    const policy = policies[0] ?? null
+    const ownerId = String(policy?.owner_account_id || owners[0]?.owner_id || '')
+    const people = grants
+      .filter((row) => row.subject_type === 'account')
+      .map((row) => ({
+        id: String(row.subject_id),
+        name: String(row.name),
+        email: String(row.email),
+        role: String(row.role),
+        memberKind: memberKindOf(row.member_kind),
+      }))
+    const groups = grants
+      .filter((row) => row.subject_type === 'group')
+      .map((row) => ({ id: String(row.subject_id), name: String(row.group_name || row.subject_id), role: String(row.role) }))
+    const memberViews = grants
+      .filter((row) => row.subject_type === 'member_view')
+      .map((row) => ({ id: String(row.subject_id), role: String(row.role) }))
+    const collaborators = people.filter((row) => row.id !== ownerId).length + groups.length + memberViews.length
+    return {
+      // 与 SQLite 版 recordAccess 同形：前端分享面板只认这些字段。
+      private: collaborators === 0,
+      scope: scopeOf(policy?.ownership),
+      ownerId,
+      people,
+      groups,
+      memberViews,
+      viewGrants: (await this.viewGrantShares(workspaceId, collection)).filter((grant) =>
+        grantKeys.has(JSON.stringify([grant.viewId, grant.subjectType, grant.subjectId, grant.grantedBy])),
+      ),
+      policy,
+      grants,
+    }
+  }
+
+  /** 这张表上所有视图授权，形状同 SQLite 版 viewGrantShares。 */
+  private async viewGrantShares(workspaceId: string, collection: string) {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT g.view_id, g.subject_type, g.subject_id, g.role, g.granted_by,
+              COALESCE(NULLIF(m.display_name, ''), NULLIF(a.name, ''), '未设置') AS name,
+              COALESCE(a.email, '') AS email, COALESCE(m.member_kind, '') AS member_kind
+       FROM ${this.db}.view_grants g
+       LEFT JOIN ${this.db}.accounts a ON g.subject_type = 'account' AND a.id = g.subject_id
+       LEFT JOIN ${this.db}.workspace_members m
+         ON m.workspace_id = g.workspace_id AND m.account_id = g.subject_id
+       WHERE g.workspace_id = ? AND g.collection = ?
+         AND (g.subject_type = 'member_view' OR (g.subject_type = 'account' AND a.id IS NOT NULL))
+       ORDER BY g.created_at`,
       [workspaceId, collection],
     )
-    return { policy: policies[0] ?? null, grants, viewGrants: views }
+    return rows.map((row) => ({
+      viewId: String(row.view_id),
+      subjectType: row.subject_type === 'member_view' ? 'member_view' as const : 'account' as const,
+      subjectId: String(row.subject_id),
+      role: String(row.role),
+      name: row.subject_type === 'member_view' ? String(row.subject_id) : String(row.name),
+      email: row.subject_type === 'member_view' ? '' : String(row.email),
+      grantedBy: String(row.granted_by ?? ''),
+      memberKind: row.subject_type === 'member_view' ? 'member' as const : memberKindOf(row.member_kind),
+    }))
+  }
+
+  /**
+   * 协作者变化后按剩余授权和公开链接重算归属，不以旧 ownership 保留共享。
+   * 外部协作者或公开记录链接算共享；内部协作者或全员访问算空间，否则私人。
+   * 继承父级和全员默认可见的访问方式保持不变。
+   */
+  private async reconcileRecordScope(
+    connection: PoolConnection,
+    workspaceId: string,
+    collection: string,
+    recordId: string,
+  ) {
+    const [policies] = await connection.query<RowDataPacket[]>(
+      `SELECT ownership, owner_account_id, access_mode FROM ${this.db}.resource_policies
+       WHERE workspace_id = ? AND collection = ? AND record_id = ? FOR UPDATE`,
+      [workspaceId, collection, recordId],
+    )
+    const policy = policies[0]
+    if (!policy) return
+    const [rows] = await connection.query<RowDataPacket[]>(
+      `SELECT g.subject_type, g.subject_id, COALESCE(m.member_kind, '') AS member_kind
+       FROM ${this.db}.record_grants g
+       LEFT JOIN ${this.db}.workspace_members m
+         ON g.subject_type = 'account' AND m.workspace_id = g.workspace_id AND m.account_id = g.subject_id
+       WHERE g.workspace_id = ? AND g.collection = ? AND g.record_id = ?`,
+      [workspaceId, collection, recordId],
+    )
+    const collaborators = rows.filter(
+      (row) => row.subject_type !== 'account' || row.subject_id !== policy.owner_account_id,
+    )
+    const hasExternal = collaborators.some(
+      (row) => row.subject_type === 'account' && (row.member_kind === 'external' || row.member_kind === 'guest'),
+    )
+    const mode = String(policy.access_mode)
+    const [shares] = hasExternal ? [[] as RowDataPacket[]] : await connection.query<RowDataPacket[]>(
+      `SELECT 1 AS shared FROM ${this.db}.shares
+       WHERE workspace_id = ? AND kind = 'record' AND collection = ? AND record_id = ? LIMIT 1`,
+      [workspaceId, collection, recordId],
+    )
+    const ownership = hasExternal || shares.length > 0 ? 'shared'
+      : collaborators.length > 0 || mode === 'members' ? 'workspace' : 'personal'
+    const accessMode = mode === 'private' || mode === 'restricted'
+      ? (collaborators.length ? 'restricted' : 'private')
+      : mode
+    if (ownership === policy.ownership && accessMode === mode) return
+    await connection.query(
+      `UPDATE ${this.db}.resource_policies SET ownership = ?, access_mode = ?
+       WHERE workspace_id = ? AND collection = ? AND record_id = ?`,
+      [ownership, accessMode, workspaceId, collection, recordId],
+    )
   }
 
   async shareRecordWithEmail(input: {
@@ -1257,6 +1387,7 @@ export class MysqlAccountRepository {
           input.role, input.actorId, input.now,
         ],
       )
+      await this.reconcileRecordScope(connection, input.workspaceId, input.collection, input.recordId)
       await this.bumpRevision(connection, input.workspaceId, input.collection)
       await connection.commit()
       return target
@@ -1346,7 +1477,8 @@ export class MysqlAccountRepository {
     await this.requireMember(actorId, workspaceId)
     const [rows] = await this.pool.query<RowDataPacket[]>(
       `SELECT g.subject_type, g.subject_id, g.role, g.granted_by, g.created_at,
-              COALESCE(a.name, '') AS name, COALESCE(a.email, '') AS email,
+              COALESCE(NULLIF(m.display_name, ''), NULLIF(a.name, ''), '未设置') AS name,
+              COALESCE(a.email, '') AS email,
               COALESCE(m.member_kind, '') AS member_kind
        FROM ${this.db}.view_grants g
        LEFT JOIN ${this.db}.accounts a ON g.subject_type = 'account' AND a.id = g.subject_id
@@ -1356,7 +1488,29 @@ export class MysqlAccountRepository {
        ORDER BY g.created_at`,
       [workspaceId, collection, viewId],
     )
-    return { viewId, grants: rows }
+    const people = rows
+      .filter((row) => row.subject_type === 'account')
+      .map((row) => ({
+        id: String(row.subject_id),
+        name: String(row.name),
+        email: String(row.email),
+        role: String(row.role),
+        memberKind: memberKindOf(row.member_kind),
+      }))
+    const memberViews = rows
+      .filter((row) => row.subject_type === 'member_view')
+      .map((row) => ({ id: String(row.subject_id), role: String(row.role) }))
+    return {
+      // 与 SQLite 版 viewAccess 同形。
+      private: people.length + memberViews.length === 0,
+      scope: 'personal' as const,
+      ownerId: '',
+      people,
+      groups: [] as Array<{ id: string; name: string; role: string }>,
+      memberViews,
+      viewId,
+      grants: rows,
+    }
   }
 
   async revokeView(input: {

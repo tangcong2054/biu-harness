@@ -652,6 +652,10 @@ function purgeSessionEvents(sessionIds: string[]) {
 }
 
 function fail(route: RouteContext, error: unknown) {
+  if (error instanceof Error && (error as { code?: string }).code === 'ACCESS_DETAILS_DENIED') {
+    route.send(403, { error: error.message })
+    return
+  }
   if (error instanceof CollabError) {
     route.send(error.status, { error: error.message })
     return
@@ -1988,11 +1992,22 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
     }
   })
 
+  async function recordAccessAfterChange(actorId: string, workspaceId: string, collection: string, recordId: string) {
+    try {
+      return await account.mysql!.recordAccess(actorId, workspaceId, collection, recordId)
+    } catch (error) {
+      if (error instanceof Error && (error as { code?: string }).code === 'ACCESS_DETAILS_DENIED') {
+        return { ok: true, access: null }
+      }
+      throw error
+    }
+  }
+
   ctx.http.route('GET', '/api/account/access', async (route) => {
     try {
       if (account.usesMysqlAccounts()) {
         const me = await mysqlActor(route)
-        const workspaceId = me.activeWorkspaceId
+        const workspaceId = currentRequestWorkspaceId() || me.activeWorkspaceId
         if (!workspaceId) throw new CollabError('没有工作区', 400)
         const collection = String(route.query.get('collection') ?? '')
         const viewId = String(route.query.get('viewId') ?? '')
@@ -2043,7 +2058,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
           groupId?: string; memberViewId?: string; role?: ResourceRole;
           collaboratorKind?: 'internal' | 'external'
         }
-        const workspaceId = me.activeWorkspaceId
+        const workspaceId = currentRequestWorkspaceId() || me.activeWorkspaceId
         if (!workspaceId) throw new CollabError('没有工作区', 400)
         const collection = String(body.collection ?? '')
         const role: ResourceRole =
@@ -2097,7 +2112,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
             now: Date.now(),
           })
           if (!target) throw new CollabError('没有这个邮箱，对方需要先注册', 404)
-          route.send(200, await account.mysql!.recordAccess(
+          route.send(200, await recordAccessAfterChange(
             me.id,
             workspaceId,
             collection,
@@ -2115,7 +2130,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
           role,
           now: Date.now(),
         })
-        route.send(200, await account.mysql!.recordAccess(
+        route.send(200, await recordAccessAfterChange(
           me.id,
           workspaceId,
           collection,
@@ -2168,7 +2183,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
           collection?: string; recordId?: string; viewId?: string;
           subjectType?: 'account' | 'group' | 'member_view'; subjectId?: string
         }
-        const workspaceId = me.activeWorkspaceId
+        const workspaceId = currentRequestWorkspaceId() || me.activeWorkspaceId
         if (!workspaceId) throw new CollabError('没有工作区', 400)
         const collection = String(body.collection ?? '')
         const subjectType =
@@ -2198,7 +2213,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
           subjectType,
           subjectId: String(body.subjectId ?? ''),
         })
-        route.send(200, await account.mysql!.recordAccess(
+        route.send(200, await recordAccessAfterChange(
           me.id,
           workspaceId,
           collection,

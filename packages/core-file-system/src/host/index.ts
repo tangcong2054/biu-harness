@@ -58,6 +58,7 @@ import {
 } from '@biu/type-file-system'
 import { parsePageBanner, type PageBanner } from '../page-banner.ts'
 import { SavedViewsStore, clientViewFromDbRow, viewsCollection, type StoredView } from './saved-views.ts'
+import { accessMemberViewMatches, accessRecordViewMatches } from './access-matchers.ts'
 import { publicShareUrl } from './share-origin.ts'
 import { readSharePluginWebJs, zipSharePluginSource } from './share-plugin-pack.ts'
 import { collectShareResources } from '../share-resources.ts'
@@ -2195,6 +2196,16 @@ export class DatabaseService extends Service implements Database {
     }
   }
 
+  async readAccessMatchRecord(workspaceId: string, collection: string, recordId: string) {
+    if (!workspaceId || workspaceId !== currentRequestWorkspaceId()) return null
+    const spec = this.collection(collection)
+    if (!spec) return null
+    await this.facets.prepare()
+    const row = await spec.get(recordId)
+    if (!row || this.facets.isDeleted(collection, recordId)) return null
+    return this.applyMetaOverlay(spec, this.applyPersonOverlay(spec, this.applyFacetOverlay(spec, row)))
+  }
+
   private decorateRecord(spec: CollectionSpec, row: DbRecord): DbRecord {
     const withFacet = this.applyFacetOverlay(spec, row)
     const withPeople = this.applyPersonOverlay(spec, withFacet)
@@ -3546,6 +3557,11 @@ export function apply(ctx: Context) {
     authorization?: AuthorizationService
     usesMysqlAccounts?: () => boolean
     mysql?: {
+      setAccessMatchers?: (matchers: {
+        readRecord: (workspaceId: string, collection: string, recordId: string) => Promise<DbRecord | null>
+        memberView: typeof accessMemberViewMatches
+        recordView: typeof accessRecordViewMatches
+      }) => void
       externallySharedRecords?: (
         accountId: string,
         workspaceId: string,
@@ -3583,6 +3599,11 @@ export function apply(ctx: Context) {
     return workspaceId && account?.workspaceLocation?.(workspaceId) === 'cloud' ? 'cloud' : 'device'
   }
   db.viewCatalog = savedViews
+  account?.mysql?.setAccessMatchers?.({
+    readRecord: (workspaceId, collection, recordId) => db.readAccessMatchRecord(workspaceId, collection, recordId),
+    memberView: accessMemberViewMatches,
+    recordView: accessRecordViewMatches,
+  })
   ctx.inject(['sessions'], (inner) => {
     inner.sessions.viewAccess = Object.assign(
       (id: string, record?: { id?: unknown }) => db.allowsViaView('/sessions', { ...record, id }),
