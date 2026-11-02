@@ -111,38 +111,38 @@ describe('saved view store incremental SQLite persistence', () => {
     })
   })
 
-  it('refuses ambiguous legacy share cleanup for a nonempty workspace', async () => {
+  it('scopes local view links by workspace and also clears legacy unscoped links', async () => {
     const f = fixture()
-    await runWithRequestWorkspace('ws-a', async () => {
-      await f.first.mutate('owner', [create('a')])
-      const share = f.shares.upsert({ kind: 'view', collection: '/pages', viewId: 'a' })
-      await expect(f.first.mutate('owner', [remove('a', 1)])).rejects.toMatchObject({ code: 'SAVED_VIEW_DENIED' })
-      expect(f.shares.get(share.token)).not.toBeNull()
-      expect(f.first.viewsFor('/pages')[0]).toMatchObject({ id: 'a', revision: 1 })
-    })
+    await runWithRequestWorkspace('ws-a', () => f.first.mutate('owner', [create('a')]))
+    const own = await runWithRequestWorkspace('ws-a', () => f.shares.upsert({ kind: 'view', collection: '/pages', viewId: 'a' }))
+    const other = await runWithRequestWorkspace('ws-b', () => f.shares.upsert({ kind: 'view', collection: '/pages', viewId: 'a' }))
+    const scoped = await runWithRequestWorkspace('ws-a', () => f.shares.upsert({ kind: 'view', collection: '/pages', viewId: 'builtin-scope:shared:a' }))
+    f.db.prepare("INSERT INTO shares (token, workspace_id, kind, collection, view_id, created_at, updated_at) VALUES ('legacy', '', 'view', '/pages', 'a', 1, 1)").run()
+    expect(own.token).not.toBe(other.token)
+    await runWithRequestWorkspace('ws-a', () => f.first.mutate('owner', [remove('a', 1)]))
+    expect(f.shares.get(own.token)).toBeNull()
+    expect(f.shares.get(scoped.token)).toBeNull()
+    expect(f.shares.get('legacy')).toBeNull()
+    expect(f.shares.get(other.token)).not.toBeNull()
   })
 
-  it('also refuses ambiguous cleanup from the empty workspace in a mixed database', async () => {
+  it('keeps share lookups, lists and revocation inside the request workspace', async () => {
     const f = fixture()
-    await f.first.mutate('', [create('a')])
-    await runWithRequestWorkspace('other', () => f.second.mutate('owner', [create('b')]))
-    const share = f.shares.upsert({ kind: 'view', collection: '/pages', viewId: 'a' })
-    await expect(f.first.mutate('', [remove('a', 1)])).rejects.toMatchObject({ code: 'SAVED_VIEW_DENIED' })
-    expect(f.shares.get(share.token)).not.toBeNull()
-  })
-
-  it('supports scoped share tables without touching another workspace link', async () => {
-    const f = fixture()
-    f.db.exec("ALTER TABLE shares ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''; DROP INDEX shares_target")
-    const insert = f.db.prepare('INSERT INTO shares (token, workspace_id, kind, collection, view_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, 1)')
-    insert.run('own-link', 'ws-a', 'view', '/pages', 'a')
-    insert.run('other-link', 'ws-b', 'view', '/pages', 'a')
+    const a = await runWithRequestWorkspace('ws-a', () => f.shares.upsert({ kind: 'record', collection: '/pages', recordId: 'p1' }))
+    const b = await runWithRequestWorkspace('ws-b', () => f.shares.upsert({ kind: 'record', collection: '/pages', recordId: 'p1' }))
+    expect(a.token).not.toBe(b.token)
     await runWithRequestWorkspace('ws-a', async () => {
-      await f.first.mutate('owner', [create('a')])
-      await f.first.mutate('owner', [remove('a', 1)])
+      expect(f.shares.findRecord('/pages', 'p1')?.token).toBe(a.token)
+      expect(f.shares.list().map((row) => row.token)).toEqual([a.token])
+      f.shares.revokeRecord('/pages', 'p1')
+      f.shares.revoke(b.token)
     })
-    expect(f.shares.get('own-link')).toBeNull()
-    expect(f.shares.get('other-link')).not.toBeNull()
+    expect(f.shares.get(a.token)).toBeNull()
+    // 公开访问按 token 读取，不受空间限制；但别的空间撤销不了它。
+    expect(f.shares.get(b.token)).not.toBeNull()
+    await runWithRequestWorkspace('ws-b', async () => {
+      expect(f.shares.recordIds('/pages')).toEqual(new Set(['p1']))
+    })
   })
 
   it('blocks legacy full writes before changing memory, including after reopening', async () => {

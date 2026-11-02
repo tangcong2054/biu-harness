@@ -40,8 +40,12 @@ export function mutateSqliteSavedViews(
         const columns = db.prepare('PRAGMA table_info(shares)').all() as Array<{ name: string }>
         const scoped = columns.some((column) => column.name === 'workspace_id')
         if (scoped) {
-          db.prepare("DELETE FROM shares WHERE workspace_id = ? AND kind = 'view' AND collection = ? AND view_id = ?")
-            .run(workspaceId, mutation.collection, mutation.id)
+          // 旧分享的 workspace_id 为空串，与分享存储同一兼容规则：一并清理。
+          for (const viewId of [mutation.id, ...['personal', 'workspace', 'shared']
+            .map((scope) => `builtin-scope:${scope}:${encodeURIComponent(mutation.id)}`)]) {
+            db.prepare("DELETE FROM shares WHERE workspace_id IN (?, '') AND kind = 'view' AND collection = ? AND view_id = ?")
+              .run(workspaceId, mutation.collection, viewId)
+          }
         } else {
           const target = db.prepare("SELECT 1 FROM shares WHERE kind = 'view' AND collection = ? AND view_id = ? LIMIT 1")
             .get(mutation.collection, mutation.id)
