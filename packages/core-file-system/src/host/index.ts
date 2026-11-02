@@ -65,7 +65,7 @@ import { readSharePluginWebJs, zipSharePluginSource } from './share-plugin-pack.
 import { collectShareResources } from '../share-resources.ts'
 import { FacetStore } from './facets-store.ts'
 import { SharesStore } from './shares-store.ts'
-import { builtinAllView, builtinAllViewId, builtinMemberViews, displayNameForView, isReadOnlyViewId, stubBuiltinAllView, stubBuiltinMemberView } from '../catalog-views.ts'
+import { builtinAllView, builtinAllViewId, builtinMemberViews, displayNameForView, isBuiltinScopeViewId, isReadOnlyViewId, parseBuiltinScopeViewId, stubBuiltinAllView, stubBuiltinMemberView } from '../catalog-views.ts'
 import { isIndexCollection, isSystemCollection } from '../web/database-path.ts'
 import { effectiveDataScope, highestViewRole, recordMatchesGrantedView, type DataScopeName, type ViewGrantRole } from '../view-access.ts'
 import { buildShareSnapshot } from './share-payload.ts'
@@ -1460,16 +1460,21 @@ export class DatabaseService extends Service implements Database {
     if (direct?.accessMode === 'inherit' && direct.parentCollection) await load(direct.parentCollection)
     const known = Boolean(direct) || Boolean(sources.get(target.collection)?.owners.has(target.id))
     if (!known) return false
-    if (!mysqlRecordVisible(target.collection, target.id, sources, accountId)) {
+    const visibleKey = this.mysqlVisibleKey(workspaceId, accountId, target.collection, target.id)
+    const ownVisible = mysqlRecordVisible(target.collection, target.id, sources, accountId)
+    this.mysqlVisible.set(visibleKey, ownVisible)
+    if (ownVisible) this.mysqlGrantRoles.delete(visibleKey)
+    if (!ownVisible) {
       let role: ResourceRole | null = null
       if (mysql.collectionGrantSources) {
         const grants = new Map<string, MysqlCollectionGrants>()
-        for (const name of new Set([collection, ...sources.keys()])) {
-          grants.set(name, await mysql.collectionGrantSources(accountId, workspaceId, name))
-        }
+        const names = [...new Set([collection, ...sources.keys()])]
+        const loaded = await Promise.all(names.map((name) => mysql.collectionGrantSources!(accountId, workspaceId, name)))
+        names.forEach((name, index) => grants.set(name, loaded[index]!))
         role = this.computeMysqlGrantRole(collection, record ?? { id }, target, sources, grants)
       }
       if (!role || !roleCoversAction(role, action)) throw new Error(`unknown record: ${collection}/${id}`)
+      this.mysqlGrantRoles.set(visibleKey, role)
     }
     this.mysqlScopes.set(
       this.mysqlScopeKey(workspaceId, target.collection, target.id),
@@ -1498,7 +1503,10 @@ export class DatabaseService extends Service implements Database {
     const workspaceId = currentRequestWorkspaceId()
     if (!workspaceId) return null
     const target = this.scopeTarget(collection, String(row.id ?? ''), row)
-    return this.mysqlGrantRoles.get(this.mysqlVisibleKey(workspaceId, currentAccountId(), target.collection, target.id)) ?? null
+    const key = this.mysqlVisibleKey(workspaceId, currentAccountId(), target.collection, target.id)
+    // 只有归属判为不可见的记录才看授权；归属本身可见时（自己的、对成员开放的）授权角色不参与。
+    if (this.mysqlVisible.get(key) !== false) return null
+    return this.mysqlGrantRoles.get(key) ?? null
   }
 
   /**
@@ -1843,10 +1851,12 @@ export class DatabaseService extends Service implements Database {
       const visible = mysqlRecordVisible(target.collection, target.id, sources, accountId)
       this.mysqlVisible.set(visibleKey, visible)
       if (!visible) hidden.push({ row, target, key: visibleKey })
+      else this.mysqlGrantRoles.delete(visibleKey)
     }
     if (hidden.length && mysql.collectionGrantSources && workspaceId && accountId) {
       const grants = new Map<string, MysqlCollectionGrants>()
-      for (const name of names) grants.set(name, await mysql.collectionGrantSources(accountId, workspaceId, name))
+      const loaded = await Promise.all([...names].map((name) => mysql.collectionGrantSources!(accountId, workspaceId, name)))
+      ;[...names].forEach((name, index) => grants.set(name, loaded[index]!))
       for (const item of hidden) {
         const role = this.computeMysqlGrantRole(collection, item.row, item.target, sources, grants)
         if (role) this.mysqlGrantRoles.set(item.key, role)
@@ -1890,7 +1900,8 @@ export class DatabaseService extends Service implements Database {
         }
         const target = this.scopeTarget(collection, id, row)
         // 云端还没落归属的记录，分享列按“私人”显示，分组也归到私人，两边保持一致。
-        const scope = this.mysqlScopeOf(target.collection, target.id) ?? 'personal'
+        // 通过授权才看得到的记录，对当前账号来说是“别人共享给我的”，分组和分享列都按共享算。
+        const scope = this.mysqlGrantedRole(collection, row) ? 'shared' : this.mysqlScopeOf(target.collection, target.id) ?? 'personal'
         scopes.set(id, scope)
         if (scope === 'workspace') workspace.push(row)
         else if (scope === 'shared') shared.push(row)
@@ -2369,7 +2380,8 @@ export class DatabaseService extends Service implements Database {
 
   private shareScopeLabel(collection: string, id: string, record: DbRecord, stored: 'personal' | 'workspace' | 'shared') {
     const target = this.scopeTarget(collection, id, record)
-    const mysqlScope = this.scopeHints?.get(id) ?? this.mysqlScopeOf(target.collection, target.id)
+    const mysqlScope = this.scopeHints?.get(id)
+      ?? (this.mysqlGrantedRole(collection, { ...record, id }) ? 'shared' as const : this.mysqlScopeOf(target.collection, target.id))
     if (mysqlScope !== undefined) {
       if (this.hasPublicShare(collection, id) || mysqlScope === 'shared') return '共享'
       if (mysqlScope === 'workspace') return '空间'
@@ -4724,6 +4736,27 @@ export function apply(ctx: Context) {
       resources,
     })
   })
+  /**
+   * 公开链接与“邀请协作”同一规则：自定义视图（含 builtin-scope:* 包着的自定义视图）只有创建者能开关。
+   * 整表与内置视图仍只看 resource:share。已删除的视图只允许关闭，方便清理残留链接。
+   */
+  function publicViewShareAllowed(collection: string, viewId: string, disabling: boolean) {
+    const accountId = currentAccountId()
+    if (!accountId) return true
+    let base = viewId
+    if (viewId.startsWith('builtin-scope:')) {
+      // 范围包装只认 personal / workspace / shared；格式不对的不能冒充内置视图。
+      if (!isBuiltinScopeViewId(viewId)) return false
+      const parsed = parseBuiltinScopeViewId(viewId)
+      if (!parsed || isBuiltinScopeViewId(parsed.viewId)) return false
+      base = parsed.viewId
+    }
+    if (!base || /^builtin(?:-|:)/.test(base)) return true
+    const view = savedViews.viewsFor(normalizeCollectionPath(collection)).find((item) => item.id === base)
+    if (!view) return disabling
+    const owner = typeof view.createdBy === 'string' ? view.createdBy.trim() : ''
+    return !owner || owner === accountId
+  }
   ctx.http.route('POST', '/api/db/shares', async (route) => {
     try {
       const body = (await route.json()) as {
@@ -4749,6 +4782,10 @@ export function apply(ctx: Context) {
         return
       }
       await db.requirePath(kind === 'record' ? `${collection}/${recordId}` : collection, 'resource:share')
+      if (kind === 'view' && !publicViewShareAllowed(collection, String(body.viewId ?? ''), body.enabled === false)) {
+        route.send(403, { code: 'VIEW_SHARE_DENIED', error: '只有视图的创建者可以开启或关闭它的公开链接' })
+        return
+      }
       if (body.enabled === false) {
         if (kind === 'record') shares.revokeRecord(collection, recordId)
         else shares.revokeTarget(kind, collection, body.viewId ?? '', body.recordId ?? '')

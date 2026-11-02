@@ -2,11 +2,13 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { ArrowPathIcon, CheckIcon, EyeIcon, LinkIcon, PencilSquareIcon, ShareIcon, ShieldCheckIcon, UserIcon, UsersIcon, XMarkIcon } from '@heroicons/react/16/solid'
 import { HeadlessDismiss } from '@biu/public-ui'
-import { listCollection, readJson } from './db-client.ts'
+import { HttpError, listCollection, readJson } from './db-client.ts'
+import { loadFacets } from './facet-catalog.ts'
 import { mintSharePin, shareClipboardText, type ShareResourceStats } from '../share-resources.ts'
 import { builtinAllView, builtinMemberViews, isBuiltinAllViewId, parseBuiltinScopeViewId, scopedCollectionName } from '../catalog-views.ts'
-import { effectiveDataScope, grantAudienceKind, recordMatchesGrantedView } from '../view-access.ts'
-import type { DbRecord } from '@biu/type-file-system'
+import { effectiveDataScope, grantAudienceKind, recordMatchesGrantedView, viewRowFilters } from '../view-access.ts'
+import type { CollectionSchema, DbRecord } from '@biu/type-file-system'
+
 
 export type ShareKind = 'view' | 'record'
 
@@ -170,11 +172,14 @@ function WorkspaceAccess({
     grantedBy?: string
   }>>([])
   const [record, setRecord] = useState<DbRecord | null>(null)
+  const [recordSchema, setRecordSchema] = useState<CollectionSchema | undefined>(undefined)
   const [dataViews, setDataViews] = useState<Array<{ id: string; name: string; filters?: Record<string, unknown> }>>([])
   const [tableLabel, setTableLabel] = useState('')
   const [guestUrl, setGuestUrl] = useState('')
   const [guestCopied, setGuestCopied] = useState(false)
   const [error, setError] = useState('')
+  /** 读取协作详情被拒（403）：只有创建者/有管理权的人能看和管协作者。 */
+  const [denied, setDenied] = useState(false)
 
   async function load() {
     const data = await readJson<{
@@ -203,6 +208,7 @@ function WorkspaceAccess({
         ? `/api/account/access?collection=${encodeURIComponent(collection)}&viewId=${encodeURIComponent(viewId)}`
         : `/api/account/access?collection=${encodeURIComponent(collection)}&recordId=${encodeURIComponent(recordId)}`,
     )
+    setDenied(false)
     setScope(data.scope ?? 'personal')
     setOwnerId(data.ownerId ?? '')
     setPeople(data.people ?? [])
@@ -215,7 +221,11 @@ function WorkspaceAccess({
   }
 
   useEffect(() => {
-    void load().catch(() => setPeople([]))
+    setDenied(false)
+    void load().catch((err) => {
+      setPeople([])
+      if (err instanceof HttpError && err.status === 403) setDenied(true)
+    })
     void listCollection({
       path: '/views',
       limit: 200,
@@ -268,13 +278,19 @@ function WorkspaceAccess({
       return
     }
     void listCollection({ path: collection, limit: 1, filters: { id: recordId } })
-      .then((page) => setRecord(page.items[0] ?? null))
-      .catch(() => setRecord(null))
+      .then((page) => {
+        setRecord(page.items[0] ?? null)
+        setRecordSchema(page.schema)
+      })
+      .catch(() => {
+        setRecord(null)
+        setRecordSchema(undefined)
+      })
     void listCollection({
       path: '/views',
       limit: 200,
       filters: { tablePath: collection },
-      columns: ['title', 'table', 'viewId', 'filters'],
+      columns: ['title', 'table', 'viewId', 'filters', 'filterTree'],
     })
       .then((page) => {
         const label = String(page.items[0]?.table ?? '').trim()
@@ -282,14 +298,7 @@ function WorkspaceAccess({
         setDataViews(page.items.flatMap((row) => {
           const id = String(row.viewId ?? '').trim()
           if (!id) return []
-          let filters: Record<string, unknown> | undefined
-          try {
-            const parsed = JSON.parse(String(row.filters ?? '{}'))
-            filters = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined
-          } catch {
-            filters = undefined
-          }
-          return [{ id, name: String(row.title ?? id), filters }]
+          return [{ id, name: String(row.title ?? id), filters: viewRowFilters(row.filters, row.filterTree) }]
         }))
       })
       .catch(() => setDataViews([]))
@@ -365,7 +374,7 @@ function WorkspaceAccess({
   ]
   const inherited = !viewId && record
     ? viewGrants.flatMap((grant) => {
-        if (!recordMatchesGrantedView(record, grant.viewId, dataViews, scope, { grantedBy: grant.grantedBy, recordOwnerId: ownerId })) return []
+        if (!recordMatchesGrantedView(record, grant.viewId, dataViews, scope, { grantedBy: grant.grantedBy, recordOwnerId: ownerId }, recordSchema, loadFacets())) return []
         const audience = grant.subjectType === 'member_view'
           ? grantAudienceKind({ subjectType: 'member_view', subjectId: grant.subjectId }, memberViewFilters)
           : grant.memberKind === 'external' || grant.memberKind === 'guest' ? 'external' : 'internal'
@@ -389,7 +398,7 @@ function WorkspaceAccess({
         subjectType: grant.subjectType,
         subjectId: grant.subjectId,
         memberKind: grant.memberKind,
-      })), dataViews, memberViewFilters)
+      })), dataViews, memberViewFilters, '', recordSchema, loadFacets())
     : scope
   const grantedAccountIds = new Set(people.map((row) => row.id))
   const normalizedMemberQuery = memberQuery.trim().toLowerCase()
@@ -416,6 +425,18 @@ function WorkspaceAccess({
       <option value="manager">可管理</option>
     </select>
   )
+
+  if (denied) {
+    return (
+      <div className="fsdb-share-link-section" data-testid="fsdb-share-members">
+        <p className="fsdb-share-error is-inline" data-testid="fsdb-share-members-denied">
+          {viewId
+            ? '只有视图的创建者（空间所有者或管理者）可以查看和管理这个视图的协作者。'
+            : '你没有管理这条内容协作者的权限，请联系它的拥有者。'}
+        </p>
+      </div>
+    )
+  }
 
   return (
     <div className="fsdb-share-link-section" data-testid="fsdb-share-members">
@@ -588,14 +609,7 @@ function viewRows(items: DbRecord[]) {
   return items.flatMap((row) => {
     const id = String(row.viewId ?? '').trim()
     if (!id) return []
-    let filters: Record<string, unknown> | undefined
-    try {
-      const parsed = JSON.parse(String(row.filters ?? '{}'))
-      filters = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined
-    } catch {
-      filters = undefined
-    }
-    return [{ id, name: String(row.title ?? id), filters }]
+    return [{ id, name: String(row.title ?? id), filters: viewRowFilters(row.filters, row.filterTree) }]
   })
 }
 
@@ -699,8 +713,8 @@ export function ShareScopeDetail({
           }>
         }>(`/api/account/access?collection=${encodeURIComponent(collection)}&recordId=${encodeURIComponent(recordId)}`),
         listCollection({ path: collection, limit: 1, filters: { id: recordId } }),
-        listCollection({ path: '/views', limit: 200, filters: { tablePath: collection }, columns: ['title', 'tablePath', 'viewId', 'filters'] }),
-        listCollection({ path: '/views', limit: 200, filters: { tablePath: '/workspace-members' }, columns: ['title', 'tablePath', 'viewId', 'filters'] }),
+        listCollection({ path: '/views', limit: 200, filters: { tablePath: collection }, columns: ['title', 'tablePath', 'viewId', 'filters', 'filterTree'] }),
+        listCollection({ path: '/views', limit: 200, filters: { tablePath: '/workspace-members' }, columns: ['title', 'tablePath', 'viewId', 'filters', 'filterTree'] }),
       ])
       if (cancelled) return
       const record = recordPage.items[0] ?? null
@@ -725,6 +739,8 @@ export function ShareScopeDetail({
         dataViews,
         memberViews,
         ownerId,
+        recordPage.schema,
+        loadFacets(),
       ))
       setDirect([
         ...(access.people ?? []).map((row) => ({ id: `account:${row.id}`, name: row.name, role: row.role, note: row.memberKind === 'member' ? '空间成员' : '外部' })),
@@ -737,7 +753,7 @@ export function ShareScopeDetail({
         })),
       ])
       const matched = record ? (access.viewGrants ?? []).flatMap((grant) => {
-        if (!recordMatchesGrantedView(record, grant.viewId, dataViews, stored, { grantedBy: grant.grantedBy, recordOwnerId: ownerId })) return []
+        if (!recordMatchesGrantedView(record, grant.viewId, dataViews, stored, { grantedBy: grant.grantedBy, recordOwnerId: ownerId }, recordPage.schema, loadFacets())) return []
         const parsed = parseBuiltinScopeViewId(grant.viewId)
         const source = dataViews.find((view) => view.id === grant.viewId)?.name
           || (parsed ? scopedCollectionName({ path: collection, label: tableLabel || collection.replace(/^\//, '') }, parsed.scope) : '')
@@ -882,8 +898,8 @@ export function ShareRoleDetail({
           }>
         }>(`/api/account/access?collection=${encodeURIComponent(collection)}&recordId=${encodeURIComponent(recordId)}`),
         listCollection({ path: collection, limit: 1, filters: { id: recordId } }),
-        listCollection({ path: '/views', limit: 200, filters: { tablePath: collection }, columns: ['title', 'tablePath', 'viewId', 'filters'] }),
-        listCollection({ path: '/views', limit: 200, filters: { tablePath: '/workspace-members' }, columns: ['title', 'tablePath', 'viewId', 'filters'] }),
+        listCollection({ path: '/views', limit: 200, filters: { tablePath: collection }, columns: ['title', 'tablePath', 'viewId', 'filters', 'filterTree'] }),
+        listCollection({ path: '/views', limit: 200, filters: { tablePath: '/workspace-members' }, columns: ['title', 'tablePath', 'viewId', 'filters', 'filterTree'] }),
       ])
       if (cancelled) return
       const record = recordPage.items[0] ?? null
@@ -896,7 +912,7 @@ export function ShareRoleDetail({
       const stored = access.scope ?? 'personal'
       const ownerId = access.ownerId ?? ''
       const matched = record ? (access.viewGrants ?? []).flatMap((grant) => {
-        if (!recordMatchesGrantedView(record, grant.viewId, dataViews, stored, { grantedBy: grant.grantedBy, recordOwnerId: ownerId })) return []
+        if (!recordMatchesGrantedView(record, grant.viewId, dataViews, stored, { grantedBy: grant.grantedBy, recordOwnerId: ownerId }, recordPage.schema, loadFacets())) return []
         const parsed = parseBuiltinScopeViewId(grant.viewId)
         const source = dataViews.find((view) => view.id === grant.viewId)?.name
           || (parsed ? scopedCollectionName({ path: collection, label: tableLabel || collection.replace(/^\//, '') }, parsed.scope) : '')

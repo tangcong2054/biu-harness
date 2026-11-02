@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { test } from 'vitest'
+import { expect, test } from 'vitest'
 import { Context, Service } from 'cordis'
 import { runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import { REQUIRED_RECORD_FIELDS, type DbRecord } from '@biu/type-file-system'
@@ -220,4 +220,21 @@ test('a view cannot re-share private records its granter cannot see', async () =
   // 空间成员都能看到的记录不受影响；授权人缺失时什么都不给。
   grantsByAccount.bob = { records: {}, views: [{ viewId: 'v_x', grantedBy: '', role: 'viewer' }], savedViews: [projectX] }
   assert.deepEqual(await ids('bob'), ['p_team'])
+})
+
+test('records seen through a grant show and group as shared for the collaborator only', async () => {
+  const { as, db, grantsByAccount, projectX } = boot()
+  grantsByAccount.bob = { records: {}, views: [{ viewId: 'v_x', grantedBy: 'ada', role: 'viewer' }], savedViews: [projectX] }
+  const labels = async (accountId: string, filter?: Record<string, unknown>) => Object.fromEntries(
+    (await as(accountId, () => db.list('/pages', filter))).items.map((row) => [row.id, (row as Record<string, unknown>).shareScope]),
+  )
+  const bob = await labels('bob')
+  expect(bob.p_x1).toBe('共享')
+  expect(bob.p_team).toBe('空间')
+  expect(Object.keys(await labels('bob', { $scope: 'shared' })).sort()).toEqual(['p_x1', 'p_x2'])
+  expect(Object.keys(await labels('bob', { $scope: 'personal' }))).toEqual([])
+  // 拥有者看到的仍是自己的私人页，不受协作者视角影响。
+  const ada = await labels('ada')
+  expect(ada.p_x1).toBe('私人')
+  expect(await labels('bob')).toEqual(bob)
 })

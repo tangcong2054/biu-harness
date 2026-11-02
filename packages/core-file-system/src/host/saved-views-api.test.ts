@@ -57,7 +57,18 @@ async function boot() {
   }
   const post = (body: unknown) => call('POST', body)
   const get = () => call('GET')
-  return { post, get }
+  const route = async (key: string, body?: unknown) => {
+    let status = 0
+    let payload: Record<string, unknown> = {}
+    await routes.get(key)!({
+      json: async () => body,
+      send: (code: number, value: Record<string, unknown>) => { status = code; payload = value },
+      req: { headers: {} },
+      query: new URLSearchParams(),
+    })
+    return { status, payload }
+  }
+  return { post, get, route }
 }
 const view = (id: string, name = id) => ({ id, name, mode: 'table', sortField: 'title', sortDir: 'asc', filters: {}, columns: [] })
 
@@ -137,5 +148,36 @@ describe('GET /api/db/saved-views snapshot', () => {
     const bob = (await runWithAccount('bob', () => api.get())).payload.items as Array<Record<string, unknown>>
     expect(ada.map((row) => row.viewId)).toEqual(['ada-view'])
     expect(bob.map((row) => row.viewId)).toEqual(['bob-view'])
+  })
+})
+
+describe('POST /api/db/shares for views', () => {
+  const create = (id: string) => ({ type: 'create', collection: '/notes', id, view: view(id) })
+  const share = (viewId: string, enabled = true) => ({ kind: 'view', collection: '/notes', viewId, enabled })
+
+  it('only lets the creator of a custom view open or close its public link', async () => {
+    const api = await boot()
+    await runWithAccount('ada', () => api.post({ path: '/notes', mutations: [create('mine')] }))
+    const denied = await runWithAccount('bob', () => api.route('POST /api/db/shares', share('mine')))
+    expect(denied).toMatchObject({ status: 403, payload: { code: 'VIEW_SHARE_DENIED' } })
+    const wrapped = await runWithAccount('bob', () => api.route('POST /api/db/shares', share('builtin-scope:shared:mine')))
+    expect(wrapped.status).toBe(403)
+    const opened = await runWithAccount('ada', () => api.route('POST /api/db/shares', share('mine')))
+    expect(opened.status).toBe(200)
+    expect((await runWithAccount('bob', () => api.route('POST /api/db/shares', share('mine', false)))).status).toBe(403)
+    expect((await runWithAccount('ada', () => api.route('POST /api/db/shares', share('mine', false)))).status).toBe(200)
+  })
+
+  it('keeps whole-collection and builtin view links governed by the share permission only', async () => {
+    const api = await boot()
+    expect((await runWithAccount('bob', () => api.route('POST /api/db/shares', share('')))).status).toBe(200)
+    expect((await runWithAccount('bob', () => api.route('POST /api/db/shares', share('builtin-all:/notes')))).status).toBe(200)
+  })
+
+  it('refuses to open a link for a missing view but lets anyone with share permission close leftovers', async () => {
+    const api = await boot()
+    expect((await runWithAccount('bob', () => api.route('POST /api/db/shares', share('ghost')))).status).toBe(403)
+    expect((await runWithAccount('bob', () => api.route('POST /api/db/shares', share('ghost', false)))).status).toBe(200)
+    expect((await runWithAccount('bob', () => api.route('POST /api/db/shares', share('builtin-scope:bad:x')))).status).toBe(403)
   })
 })

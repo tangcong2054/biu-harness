@@ -67,11 +67,13 @@ export function effectiveDataScope(
   dataViews: Array<{ id: string; filters?: Record<string, unknown> }>,
   memberViews: Array<{ id: string; filters?: Record<string, unknown> }> = [],
   recordOwnerId = '',
+  schema?: CollectionSchema,
+  packs: CollectionSchemaPack[] = [],
 ): DataScopeName {
   let internal = false
   let external = false
   for (const grant of grants) {
-    if (!recordMatchesGrantedView(record, grant.viewId, dataViews, stored, { grantedBy: grant.grantedBy, recordOwnerId })) continue
+    if (!recordMatchesGrantedView(record, grant.viewId, dataViews, stored, { grantedBy: grant.grantedBy, recordOwnerId }, schema, packs)) continue
     if (grantAudienceKind(grant, memberViews) === 'external') external = true
     else internal = true
   }
@@ -85,4 +87,23 @@ function stripScope(filters: Record<string, unknown> | undefined) {
   const rest = { ...filters }
   delete rest.$scope
   return rest
+}
+
+/** 视图行的 filters 与 filterTree 都是 JSON 字符串；树条件合并为 $tree，与服务端匹配规则一致。 */
+export function viewRowFilters(rawFilters: unknown, rawTree: unknown): Record<string, unknown> | undefined {
+  const parse = (value: unknown) => {
+    if (value && typeof value === 'object') return value
+    try {
+      return JSON.parse(String(value ?? '') || 'null')
+    } catch {
+      return undefined
+    }
+  }
+  const filters = parse(rawFilters)
+  const tree = parse(rawTree)
+  const base = filters && typeof filters === 'object' && !Array.isArray(filters) ? filters as Record<string, unknown> : {}
+  if (tree && typeof tree === 'object' && !Array.isArray(tree) && (tree as { kind?: unknown }).kind === 'group') {
+    return { ...base, $tree: tree }
+  }
+  return filters === undefined && rawFilters ? undefined : base
 }
