@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld('biuPresentation', {
   available: true,
   open: (request) => ipcRenderer.invoke('biu:presentation:open', request),
   focus: (request) => ipcRenderer.invoke('biu:presentation:focus', request),
+  focusOwner: () => ipcRenderer.invoke('biu:presentation:focus-owner'),
   close: (request) => ipcRenderer.invoke('biu:presentation:close', request),
   onClosed: (fn) => {
     const h = (_event, payload) => fn(payload)

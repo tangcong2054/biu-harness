@@ -207,6 +207,34 @@ test('popout mirrors pick mode and sends picked refs back to the main window', (
   }
 })
 
+test('a popout pick handoff in localStorage reaches the main window', () => {
+  history.replaceState({}, '', '/database')
+  const main = new PickService(new Context())
+  let attached = 0
+  const onAttached = () => {
+    attached += 1
+  }
+  window.addEventListener('biu:pick-attached', onAttached)
+  try {
+    const message = {
+      type: 'picked',
+      source: 'page-terminal:test',
+      refs: [{ kind: 'terminal', id: 'terminal:s1:ab', label: '终端第 2 行', route: '/', selection: 'ls' }],
+      attach: true,
+    }
+    localStorage.setItem('biu:pick:handoff', JSON.stringify({ at: Date.now(), message }))
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'biu:pick:handoff',
+      newValue: localStorage.getItem('biu:pick:handoff'),
+    }))
+    assert.equal(main.refs[0]?.selection, 'ls')
+    assert.ok(attached >= 1)
+  } finally {
+    window.removeEventListener('biu:pick-attached', onAttached)
+    localStorage.removeItem('biu:pick:handoff')
+  }
+})
+
 test('claimSession keeps refs within one session and drops them on switch', () => {
   const ctx = new Context()
   const pick = new PickService(ctx)

@@ -180,7 +180,8 @@ export const pageBlock = Node.create({
         return true
       },
       stopEvent: ({ event }) => {
-        const target = event.target as HTMLElement | null
+        const raw = event.target
+        const target = raw instanceof Element ? raw : raw instanceof Node ? raw.parentElement : null
         return Boolean(target?.closest('.page-block, [data-page-block-capture], textarea, input, select, button, canvas, .excalidraw, .cm-editor'))
       },
     })

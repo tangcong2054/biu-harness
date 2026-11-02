@@ -14,7 +14,7 @@ dist/
 .plugin-registry/
 .workspace/
 # 临时外部接口调试脚本，含硬编码凭据，不入库
-scripts/test-roles-api.mjs
+scripts/test-*.mjs
 *.log
 .DS_Store
 .vscode/

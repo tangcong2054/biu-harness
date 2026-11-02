@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 import { Context } from 'cordis'
 import { createElement } from 'react'
-import { fireEvent, render } from '@testing-library/react'
+import { act, fireEvent, render } from '@testing-library/react'
 import { PagePresentationMinimized, PagePresentationService } from './presentation.tsx'
 
 function registered(service: PagePresentationService, id: string) {
@@ -87,6 +87,37 @@ test('multiple plugins can open independent windows without changing inline mode
   second.dispose()
   first.inlineTarget.remove()
   second.inlineTarget.remove()
+  Reflect.deleteProperty(window, 'biuPresentation')
+})
+
+test('maximize opens a detached window and keeps the inline host', async () => {
+  const opened: string[] = []
+  Object.defineProperty(window, 'biuPresentation', {
+    configurable: true,
+    value: {
+      available: true,
+      open: async ({ recordId }: { recordId: string }) => opened.push(recordId),
+    },
+  })
+  const ctx = new Context()
+  const service = new PagePresentationService(ctx)
+  const item = registered(service, 'one')
+  let handed = ''
+  const onHandoff = (event: Event) => {
+    handed = String((event as CustomEvent<{ recordId?: string }>).detail?.recordId ?? '')
+  }
+  window.addEventListener('biu:page-block-handoff', onHandoff)
+  await act(async () => {
+    service.controls('one').maximize()
+  })
+  window.removeEventListener('biu:page-block-handoff', onHandoff)
+  assert.equal(handed, '/pages::page::one')
+  assert.deepEqual(opened, ['/pages::page::one'])
+  assert.equal(service.snapshot('one')?.mode, 'inline')
+  assert.equal(service.snapshot('one')?.detached, true)
+  assert.equal(item.host.parentElement, item.inlineTarget)
+  item.dispose()
+  item.inlineTarget.remove()
   Reflect.deleteProperty(window, 'biuPresentation')
 })
 

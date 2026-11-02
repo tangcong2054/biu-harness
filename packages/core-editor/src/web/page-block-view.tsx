@@ -151,15 +151,24 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
   const pickLabel = spec?.label || kind
   const presentationTitle = String(data.title ?? '').trim() || pickLabel
   const [recordKey, setRecordKey] = useState('')
+  const liveRef = useRef(data)
+  const renderedRef = useRef(data)
+  if (renderedRef.current !== data) {
+    renderedRef.current = data
+    liveRef.current = data
+  }
   const applyRemoteData = useCallback((next: Record<string, unknown>) => {
+    liveRef.current = next
     updateAttributes({ data: next })
   }, [updateAttributes])
-  const publishData = usePageBlockSync(recordKey, data, applyRemoteData)
+  const publishData = usePageBlockSync(recordKey, data, applyRemoteData, { answerHandoff: true })
   const update = (patch: Record<string, unknown>, opts?: { replace?: boolean }) => {
-    const next = opts?.replace ? { ...patch } : { ...data, ...patch }
-    if (!Object.prototype.hasOwnProperty.call(patch, 'title') && typeof data.title === 'string') {
-      next.title = data.title
+    const current = liveRef.current
+    const next = opts?.replace ? { ...patch } : { ...current, ...patch }
+    if (!Object.prototype.hasOwnProperty.call(patch, 'title') && typeof current.title === 'string') {
+      next.title = current.title
     }
+    liveRef.current = next
     updateAttributes({ data: next })
     publishData(next)
   }
@@ -205,8 +214,10 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
     })
   }, [View, presentationId, plugin, contentHost, showView])
   useEffect(() => {
+    if (recordKey) contentHost.setAttribute('data-page-block-record', recordKey)
+    else contentHost.removeAttribute('data-page-block-record')
     getPagePresentation()?.updateMeta(presentationId, { plugin, title: presentationTitle, recordId: recordKey })
-  }, [presentationId, plugin, presentationTitle, recordKey])
+  }, [presentationId, plugin, presentationTitle, recordKey, contentHost])
 
   useEffect(() => {
     if (!cloneFrom || !file) return
@@ -222,7 +233,12 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
 
   const onMouseDown = (event: MouseEvent) => {
     if (!editor.isEditable || editor.isDestroyed) return
-    if (event.target instanceof Element && event.target.closest('textarea, input, select, button, a')) return
+    const target = event.target instanceof Element
+      ? event.target
+      : event.target instanceof Node
+        ? event.target.parentElement
+        : null
+    if (target?.closest('textarea, input, select, button, a, [data-biu-select]')) return
     // Pick overlay resolves the inner html node. A node selection here becomes
     // a markdown fence pick on pointerup and hides that node.
     if (document.documentElement.classList.contains('pick-mode')) return

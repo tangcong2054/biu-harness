@@ -16,9 +16,45 @@ function isSendHotkey(event: KeyboardEvent) {
   return event.key === 'l' || event.key === 'L'
 }
 
+function inPageBlockPopout() {
+  return new URLSearchParams(window.location.search).get('popout') === 'page-block'
+}
+
+/** 独立窗口没有对话栏。选区交给主窗口的 pick 服务，再把主窗口调到前面。 */
+function deliverPopoutPick(ref: Record<string, unknown>) {
+  const message = {
+    type: 'picked' as const,
+    source: `page-terminal:${Date.now()}:${Math.random()}`,
+    refs: [ref],
+    attach: true,
+  }
+  try {
+    const channel = new BroadcastChannel('biu:pick:v1')
+    channel.postMessage(message)
+    channel.close()
+  } catch {
+    /* 没有 BroadcastChannel 时走下面的 storage */
+  }
+  try {
+    localStorage.setItem('biu:pick:handoff', JSON.stringify({ at: Date.now(), message }))
+  } catch {
+    /* 存不下就只能靠上面的通道 */
+  }
+  const bridge = (window as unknown as { biuPresentation?: { focusOwner?: () => Promise<unknown> } }).biuPresentation
+  if (typeof bridge?.focusOwner === 'function') {
+    void bridge.focusOwner()
+    return
+  }
+  try {
+    const opener = window.opener as Window | null
+    opener?.focus()
+  } catch {
+    /* 跨源时读 opener 会抛 */
+  }
+}
+
 /** 把一段终端文字（带终端行号）加入会话草稿。成功返回 true。 */
 function attachTerminalText(opts: { sessionKey: string; text: string; startLine: number; endLine: number; snapshot?: boolean }) {
-  if (typeof PICK?.attach !== 'function') return false
   const text = opts.text.trim()
   if (!text) return false
   const clipped = text.length > PICK_SELECTION_CHARS ? `${text.slice(0, PICK_SELECTION_CHARS)}\n…（终端内容已截断）` : text
@@ -27,21 +63,26 @@ function attachTerminalText(opts: { sessionKey: string; text: string; startLine:
   const key = `${opts.sessionKey}:${startLine}:${endLine}:${clipped}`
   for (let i = 0; i < key.length; i += 1) hash = (hash * 33 + key.charCodeAt(i)) >>> 0
   const where = opts.snapshot ? '终端快照' : '终端'
+  const ref = {
+    kind: 'terminal',
+    id: `terminal:${opts.sessionKey}:${hash.toString(16)}`,
+    label: startLine === endLine ? `${where}第 ${startLine} 行` : `${where}第 ${startLine}-${endLine} 行`,
+    title: where,
+    route: location.pathname,
+    plugin: name,
+    // 终端缓冲区 / 快照内的行号（1 起），不是页面 markdown 行号；不带 path，避免被当成页面行。
+    start_line: startLine,
+    end_line: endLine,
+    selection: clipped,
+  }
   try {
-    PICK.attach([
-      {
-        kind: 'terminal',
-        id: `terminal:${opts.sessionKey}:${hash.toString(16)}`,
-        label: startLine === endLine ? `${where}第 ${startLine} 行` : `${where}第 ${startLine}-${endLine} 行`,
-        title: where,
-        route: location.pathname,
-        plugin: name,
-        // 终端缓冲区 / 快照内的行号（1 起），不是页面 markdown 行号；不带 path，避免被当成页面行。
-        start_line: startLine,
-        end_line: endLine,
-        selection: clipped,
-      },
-    ])
+    if (inPageBlockPopout()) {
+      // 独立窗口里的 pick 服务看不见主窗口的对话框，直接把选区交回去。
+      deliverPopoutPick(ref)
+      return true
+    }
+    if (typeof PICK?.attach !== 'function') return false
+    PICK.attach([ref])
     return true
   } catch {
     return false
@@ -605,6 +646,30 @@ function TerminalSurface({
   onPersistRef.current = onPersist
   const onGoneRef = useRef(onGone)
   onGoneRef.current = onGone
+  const readLiveRef = useRef<() => TerminalPersistPatch>(() => ({}))
+  // 另一扇窗口写下的历史会从 props 回来。本地还没落盘的命令不能被盖掉。
+  const historyLive = useRef<HistoryEntry[]>(history.map((item) => ({ ...item })))
+  const historyDirtyRef = useRef(false)
+  const historyProp = useRef(history)
+  historyProp.current = history
+  const historyKey = history.map((item) => `${item.at}\0${item.cmd}\0${item.out ?? ''}`).join('\n')
+  useEffect(() => {
+    if (historyDirtyRef.current) return
+    historyLive.current = historyProp.current.map((item) => ({ ...item }))
+  }, [historyKey])
+
+  useEffect(() => {
+    const onCapture = (event: Event) => {
+      const detail = (event as CustomEvent<{ recordId?: string; patch?: Record<string, unknown> }>).detail
+      const recordId = detail?.recordId?.trim() ?? ''
+      if (!recordId || !detail.patch) return
+      const own = pane.current?.closest('[data-page-block-record]')?.getAttribute('data-page-block-record') ?? ''
+      if (own !== recordId) return
+      Object.assign(detail.patch, readLiveRef.current())
+    }
+    window.addEventListener('biu:page-block-capture', onCapture)
+    return () => window.removeEventListener('biu:page-block-capture', onCapture)
+  }, [])
 
   useLayoutEffect(() => {
     const paneEl = pane.current
@@ -635,6 +700,10 @@ function TerminalSurface({
     /** 有新的命令/输出还没写进块数据。 */
     let historyDirty = false
     let screenDirty = false
+    const markHistoryDirty = (value: boolean) => {
+      historyDirty = value
+      historyDirtyRef.current = value
+    }
 
     /** 读 xterm 缓冲区（含 scrollback）的纯文本尾部。 */
     const readScreen = () => {
@@ -650,7 +719,13 @@ function TerminalSurface({
       return text.length > SNAPSHOT_CHARS ? text.slice(-SNAPSHOT_CHARS) : text
     }
 
-    const historyRef = [...history]
+    readLiveRef.current = () => {
+      const patch: TerminalPersistPatch = {}
+      const text = readScreen()
+      if (text) patch.snapshot = text
+      if (historyLive.current.length) patch.history = historyLive.current.map((item) => ({ ...item }))
+      return patch
+    }
 
     /**
      * 唯一的块数据写入口：历史和快照合并成一次 update。
@@ -663,8 +738,8 @@ function TerminalSurface({
       }
       const patch: TerminalPersistPatch = {}
       if (historyDirty) {
-        patch.history = [...historyRef]
-        historyDirty = false
+        patch.history = historyLive.current.map((item) => ({ ...item }))
+        markHistoryDirty(false)
       }
       if (screenDirty && live && term) {
         const text = readScreen()
@@ -722,10 +797,10 @@ function TerminalSurface({
           .filter((line) => !isPromptLike(line))
           .filter((line, index, all) => !(index === all.length - 1 && line === ''))
         outBuffer = ''
-        const last = historyRef[historyRef.length - 1]
+        const last = historyLive.current[historyLive.current.length - 1]
         if (clean.length && last && last.out === undefined) {
           last.out = clean.slice(0, HISTORY_OUT_LINES).join('\n').slice(0, HISTORY_OUT_CHARS) || undefined
-          historyDirty = true
+          markHistoryDirty(true)
         }
       }
       if (historyDirty) persist()
@@ -746,10 +821,10 @@ function TerminalSurface({
           const cmd = pendingLine.trim()
           pendingLine = ''
           if (!cmd) continue
-          historyRef.push({ cmd, at: Date.now() })
-          if (historyRef.length > HISTORY_MAX) historyRef.splice(0, historyRef.length - HISTORY_MAX)
+          historyLive.current.push({ cmd, at: Date.now() })
+          if (historyLive.current.length > HISTORY_MAX) historyLive.current.splice(0, historyLive.current.length - HISTORY_MAX)
           // 回车时不单独写：等输出安静后和输出、快照一起写一次。没有输出的命令也会按时落盘。
-          historyDirty = true
+          markHistoryDirty(true)
           capturing = true
           outBuffer = ''
           if (outTimer) window.clearTimeout(outTimer)
@@ -890,11 +965,15 @@ function TerminalSurface({
           if (!term?.hasSelection()) return false
           const target = event.target instanceof Node ? event.target : null
           const active = document.activeElement
-          if (!(target && paneEl.contains(target)) && !(active && paneEl.contains(active))) return false
+          const inside = Boolean((target && paneEl.contains(target)) || (active && paneEl.contains(active)))
+          // 独立窗口里焦点经常在窗口本身，不在 xterm 的隐藏输入框上；有选区就送。
+          if (!inside && !inPageBlockPopout()) return false
           const range = term.getSelectionPosition()
-          if (!range) return false
-          const startLine = range.start.y + 1
-          const endLine = Math.max(startLine, range.end.y + (range.end.x === 0 ? 0 : 1))
+          const selected = term.getSelection()
+          const startLine = range ? range.start.y + 1 : 1
+          const endLine = range
+            ? Math.max(startLine, range.end.y + (range.end.x === 0 ? 0 : 1))
+            : startLine + Math.max(0, selected.replace(/\n+$/, '').split('\n').length - 1)
           if (!attachTerminalText({ sessionKey, text: term.getSelection(), startLine, endLine })) return false
           term.clearSelection()
           return true
@@ -999,6 +1078,7 @@ function TerminalSurface({
         // 编辑器可能已销毁。
       }
       disposed = true
+      readLiveRef.current = () => ({})
       if (outTimer) window.clearTimeout(outTimer)
       if (snapshotTimer) window.clearTimeout(snapshotTimer)
       cancelAnimationFrame(frame)
@@ -1562,7 +1642,7 @@ function PageTerminal({
   const popout = new URLSearchParams(window.location.search).get('popout') === 'page-block'
   const zoomed = presentation ? presentation.mode === 'maximized' : legacyZoom.zoomed
   const expanded = presentation
-    ? presentation.detached || presentation.mode === 'sidebar'
+    ? presentation.mode === 'sidebar' || presentation.mode === 'maximized'
     : legacyZoom.zoomed || popout
   const sessionKey = typeof data.sid === 'string' && data.sid ? data.sid : ''
   /** 块加载时就带着的 sid：用它连接时只接旧会话（attach），不存在就转只读。
@@ -1603,7 +1683,9 @@ function PageTerminal({
   /** 拖动中的预览高度；松手写回 data.height 后清空。 */
   const [dragHeight, setDragHeight] = React.useState<number | null>(null)
   const height = dragHeight ?? savedHeight
-  const fillMode = presentation ? presentation.mode === 'sidebar' : legacyZoom.zoomed || popout
+  const fillMode = presentation
+    ? presentation.mode === 'sidebar' || presentation.mode === 'maximized'
+    : legacyZoom.zoomed || popout
 
   // 历史存在块数据里，agent 读页面 markdown 即可看到用户跑过什么。
   const history: HistoryEntry[] = parseHistory(data.history)
@@ -1645,7 +1727,7 @@ function PageTerminal({
           {settingsOpen ? <SettingsPanel onClose={() => setSettingsOpen(false)} /> : null}
         </div>
         <IconButton
-          label={presentation ? (presentation.detached ? '聚焦独立窗口' : '独立窗口') : zoomed ? '放回页面' : '全屏放大'}
+          label={presentation?.detached ? '聚焦独立窗口' : '独立窗口'}
           active={expanded}
           dataZoomExit
           onClick={() => {

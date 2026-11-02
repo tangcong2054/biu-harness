@@ -37,6 +37,8 @@ test('Ctrl/Cmd+L is handled in document capture before the page editor grabs it'
 
 test('live terminal and read-only snapshot both send selected text', () => {
   assert.match(source, /detachSendKey = listenSendHotkey\(/)
+  assert.match(source, /inPageBlockPopout\(\)/)
+  assert.match(source, /deliverPopoutPick\(ref\)/)
   assert.match(source, /attachTerminalText\(\{ sessionKey, text: term\.getSelection\(\), startLine, endLine \}\)/)
   assert.match(source, /attachTerminalText\(\{ sessionKey, text: picked, startLine, endLine, snapshot: true \}\)/)
   assert.match(source, /detachSendKey\(\)/)

@@ -6,6 +6,7 @@ export type PickHover = { top: number; left: number; width: number; height: numb
 export type PickDraft = { text: string; send?: boolean }
 
 const PICK_CHANNEL = 'biu:pick:v1'
+const PICK_HANDOFF_KEY = 'biu:pick:handoff'
 
 type PickSyncMessage =
   | { type: 'hello'; source: string }
@@ -53,8 +54,20 @@ export class PickService extends Service {
         this.channel.onmessage = (event) => this.receive(event.data)
         this.publish({ type: 'hello', source: this.source })
       }
+      // BroadcastChannel 在个别独立窗口里送不到主窗口；localStorage 的 storage 事件只在其他窗口触发。
+      const onStorage = (event: StorageEvent) => {
+        if (event.key !== PICK_HANDOFF_KEY || !event.newValue) return
+        try {
+          const parsed = JSON.parse(event.newValue) as { message?: unknown }
+          this.receive(parsed.message)
+        } catch {
+          /* 坏数据忽略 */
+        }
+      }
+      window.addEventListener('storage', onStorage)
       return () => {
         window.removeEventListener('biu:overlay-closed', onClosed)
+        window.removeEventListener('storage', onStorage)
         this.channel?.close()
         this.channel = null
         if (boundPick === this) boundPick = undefined
@@ -181,6 +194,12 @@ export class PickService extends Service {
 
   private publish(message: PickSyncMessage) {
     this.channel?.postMessage(message)
+    if (message.type !== 'picked' || typeof localStorage === 'undefined') return
+    try {
+      localStorage.setItem(PICK_HANDOFF_KEY, JSON.stringify({ at: Date.now(), message }))
+    } catch {
+      /* 存不下时仍依赖 BroadcastChannel */
+    }
   }
 
   private receive(value: unknown) {

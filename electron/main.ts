@@ -89,6 +89,14 @@ async function openPresentationWindow(event: Electron.IpcMainInvokeEvent, raw: P
 }
 
 ipcMain.handle('biu:presentation:open', openPresentationWindow)
+ipcMain.handle('biu:presentation:focus-owner', (event) => {
+  const sender = presentationSender(event)
+  if (!win || win.isDestroyed() || sender === win) return false
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+  return true
+})
 ipcMain.handle('biu:presentation:focus', (_event, raw: PresentationWindowRequest) => {
   const recordId = typeof raw?.recordId === 'string' ? raw.recordId.trim() : ''
   const child = presentationWindows.get(recordId)
