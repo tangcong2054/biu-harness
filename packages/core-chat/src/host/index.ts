@@ -1831,8 +1831,6 @@ export function apply(ctx: Context) {
     await ctx.sessions.ensureDefaultSession()
     const summaries = await ctx.sessions.listSummaries()
     let items = await liveSessionItems(ctx, summaries)
-    // DEBUG(sessions-ghost): 验证修复后删除
-    ctx.logger('sessions-ghost').info(`GET /api/sessions summaries=${summaries.length} live=${items.length}`)
     if (!items.length) {
       await ctx.sessions.create()
       items = await liveSessionItems(ctx, await ctx.sessions.listSummaries())
