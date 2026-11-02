@@ -17,8 +17,8 @@ import {
   isOnlineRuntime,
 } from '@biu/host-plugin-loader/data-dir'
 import { asPublicProfile, readWorkspaceProfile, writeWorkspaceProfile } from '@biu/host-workspace'
-import { authorizeCollection, roleCoversAction, type Action as PermissionAction, type AuthorizationService } from '@biu/host-account/authorization'
-import { mysqlRecordVisible, resolveRecordScope, type DataScope, type ScopeSource } from './record-scope.ts'
+import { authorizeCollection, roleCoversAction, type Action as PermissionAction, type AuthorizationService, type ResourceRole } from '@biu/host-account/authorization'
+import { effectiveScopePolicy, mysqlRecordVisible, resolveRecordScope, type DataScope, type ScopeSource } from './record-scope.ts'
 import { isRegisteredBuiltinPlugin } from '@biu/host-account/store'
 import { forwardCloud, forwardCloudBytes } from '@biu/host-account/mirror'
 import { Service, type Context } from 'cordis'
@@ -687,6 +687,14 @@ export const DEFAULT_PAGE_SIZE = 20
 export const MAX_PAGE_SIZE = 200
 const HARD_DELETE_PATHS = new Set(['/events', '/trash', '/workspace-members'])
 
+type MysqlCollectionGrants = {
+  records: Record<string, string>
+  views: Array<{ viewId: string; grantedBy: string; role: string }>
+  savedViews: Array<{ id: string; filters?: Record<string, unknown>; filterTree?: unknown }>
+}
+
+const GRANT_ROLE_RANK: Record<ResourceRole, number> = { viewer: 1, editor: 2, manager: 3, owner: 4 }
+
 type VisibleSortedPack = {
   rows: DbRecord[]
   personal: DbRecord[]
@@ -776,6 +784,8 @@ export class DatabaseService extends Service implements Database {
   private mysqlScopes = new Map<string, DataScope | null>()
   /** 同一条键上，MySQL 策略是否允许当前账号看见。没有键表示这条记录还没在 MySQL 落归属。 */
   private mysqlVisible = new Map<string, boolean>()
+  /** 归属判为不可见、但当前账号通过记录授权或视图授权获得的最高角色。键同 mysqlVisible。 */
+  private mysqlGrantRoles = new Map<string, ResourceRole>()
   /** 当前这一页装饰时，分组阶段已经算好的归属。 */
   private scopeHints: Map<string, DataScope> | null = null
   private boundAuth?: AuthorizationService
@@ -1077,6 +1087,10 @@ export class DatabaseService extends Service implements Database {
         (action === 'resource:read' || action === 'resource:list') &&
         this.installedPluginVisible(String(row.id ?? ''), actor.accountId, actor.workspaceId)) return true
       const mysql = this.mysqlVisibility(collection, row)
+      if (mysql === false) {
+        const role = this.mysqlGrantedRole(collection, row)
+        return Boolean(role && roleCoversAction(role, action))
+      }
       if (mysql != null) return mysql
       return sqliteAllows()
     }
@@ -1107,7 +1121,13 @@ export class DatabaseService extends Service implements Database {
       }))
     }
     const membership = this.workspaceMembership()
-    if (!membership) return rows.filter((row) => this.mysqlVisibility(collection, row) !== false)
+    if (!membership) {
+      return rows.filter((row) => {
+        if (this.mysqlVisibility(collection, row) !== false) return true
+        const role = this.mysqlGrantedRole(collection, row)
+        return Boolean(role && roleCoversAction(role, action))
+      })
+    }
     const store = this.collabStore()
     const workspaceId = store?.activeWorkspaceId() ?? ''
     const grants = new Map<string, Map<string, Set<string>>>()
@@ -1383,7 +1403,7 @@ export class DatabaseService extends Service implements Database {
     action: PermissionAction,
     record?: { id?: unknown },
   ) {
-    if (await this.mysqlAllowsRecord(spec.path, id, record)) return
+    if (await this.mysqlAllowsRecord(spec.path, id, record, action)) return
     const authorization = this.authorization()
     const actor = authorization?.currentActor()
     if (authorization && actor) {
@@ -1413,7 +1433,12 @@ export class DatabaseService extends Service implements Database {
   }
 
   /** @returns true 表示 MySQL 已允许，调用方不要再用 SQLite 否决。没有云端归属时返回 false。 */
-  private async mysqlAllowsRecord(collection: string, id: string, record?: { id?: unknown }) {
+  private async mysqlAllowsRecord(
+    collection: string,
+    id: string,
+    record?: { id?: unknown },
+    action: PermissionAction = 'resource:read',
+  ) {
     const account = this.mysqlAccount()
     const mysql = account?.usesMysqlAccounts?.() ? account.mysql : undefined
     const workspaceId = currentRequestWorkspaceId()
@@ -1434,7 +1459,15 @@ export class DatabaseService extends Service implements Database {
     const known = Boolean(direct) || Boolean(sources.get(target.collection)?.owners.has(target.id))
     if (!known) return false
     if (!mysqlRecordVisible(target.collection, target.id, sources, accountId)) {
-      throw new Error(`unknown record: ${collection}/${id}`)
+      let role: ResourceRole | null = null
+      if (mysql.collectionGrantSources) {
+        const grants = new Map<string, MysqlCollectionGrants>()
+        for (const name of new Set([collection, ...sources.keys()])) {
+          grants.set(name, await mysql.collectionGrantSources(accountId, workspaceId, name))
+        }
+        role = this.computeMysqlGrantRole(collection, record ?? { id }, target, sources, grants)
+      }
+      if (!role || !roleCoversAction(role, action)) throw new Error(`unknown record: ${collection}/${id}`)
     }
     this.mysqlScopes.set(
       this.mysqlScopeKey(workspaceId, target.collection, target.id),
@@ -1454,6 +1487,61 @@ export class DatabaseService extends Service implements Database {
     const key = this.mysqlVisibleKey(workspaceId, currentAccountId(), target.collection, target.id)
     if (!this.mysqlVisible.has(key)) return null
     return this.mysqlVisible.get(key) === true
+  }
+
+  private mysqlGrantedRole(
+    collection: string,
+    row: { id?: unknown; pageId?: unknown; collection?: unknown; sessionId?: unknown; sourceId?: unknown; tablePath?: unknown },
+  ) {
+    const workspaceId = currentRequestWorkspaceId()
+    if (!workspaceId) return null
+    const target = this.scopeTarget(collection, String(row.id ?? ''), row)
+    return this.mysqlGrantRoles.get(this.mysqlVisibleKey(workspaceId, currentAccountId(), target.collection, target.id)) ?? null
+  }
+
+  /**
+   * MySQL 授权：记录授权（含继承链上的父记录）和视图授权（记录符合视图条件），取最高角色。
+   * 与详情页 MysqlAccessReader 是同一套规则；视图条件按装饰后的记录匹配，与列表筛选一致。
+   */
+  private computeMysqlGrantRole(
+    listed: string,
+    row: { id?: unknown },
+    target: { collection: string; id: string },
+    sources: ReadonlyMap<string, ScopeSource>,
+    grants: ReadonlyMap<string, MysqlCollectionGrants>,
+  ): ResourceRole | null {
+    const roles: string[] = []
+    const seen = new Set<string>()
+    let collection = target.collection
+    let id = target.id
+    while (id && seen.size < 64 && !seen.has(`${collection}\t${id}`)) {
+      seen.add(`${collection}\t${id}`)
+      const role = grants.get(collection)?.records[id]
+      if (role) roles.push(role)
+      const policy = sources.get(collection)?.policies[id]
+      if (policy?.accessMode !== 'inherit' || !policy.parentRecordId) break
+      collection = policy.parentCollection || collection
+      id = policy.parentRecordId
+    }
+    const viewGrants = grants.get(listed)
+    if (viewGrants?.views.length) {
+      const spec = this.collection(listed)
+      const record = (spec
+        ? this.applyMetaOverlay(spec, this.applyPersonOverlay(spec, this.applyFacetOverlay(spec, row as DbRecord)))
+        : row) as DbRecord
+      const scope = resolveRecordScope(target.collection, target.id, sources)
+      const ownerId = effectiveScopePolicy(target.collection, target.id, sources)?.ownerAccountId ?? ''
+      const views = [{ id: `builtin-all:${listed}` }, ...viewGrants.savedViews]
+      for (const grant of viewGrants.views) {
+        if (accessRecordViewMatches(grant.viewId, record, views, scope, ownerId, grant.grantedBy)) roles.push(grant.role)
+      }
+    }
+    let best: ResourceRole | null = null
+    for (const role of roles) {
+      if (!(role in GRANT_ROLE_RANK)) continue
+      if (!best || GRANT_ROLE_RANK[role as ResourceRole] > GRANT_ROLE_RANK[best]) best = role as ResourceRole
+    }
+    return best
   }
 
   private mysqlAccount() {
@@ -1476,6 +1564,11 @@ export class DatabaseService extends Service implements Database {
             workspaceId: string,
             collection: string,
           ) => Promise<{ policies: ScopeSource['policies']; owners: string[] }>
+          collectionGrantSources?: (
+            accountId: string,
+            workspaceId: string,
+            collection: string,
+          ) => Promise<MysqlCollectionGrants>
           attachPolicy?: (input: {
             actorId: string
             workspaceId: string
@@ -1732,6 +1825,7 @@ export class DatabaseService extends Service implements Database {
         sources.set(name, { policies: loaded.policies, owners: new Set(loaded.owners) })
       }
     }
+    const hidden: Array<{ row: DbRecord; target: { collection: string; id: string }; key: string }> = []
     for (const row of rows) {
       const target = this.scopeTarget(collection, String(row.id ?? ''), row)
       const source = sources.get(target.collection)
@@ -1739,10 +1833,19 @@ export class DatabaseService extends Service implements Database {
       if (!known || !workspaceId || !member || !accountId) continue
       const key = this.mysqlScopeKey(workspaceId, target.collection, target.id)
       this.mysqlScopes.set(key, resolveRecordScope(target.collection, target.id, sources))
-      this.mysqlVisible.set(
-        this.mysqlVisibleKey(workspaceId, accountId, target.collection, target.id),
-        mysqlRecordVisible(target.collection, target.id, sources, accountId),
-      )
+      const visibleKey = this.mysqlVisibleKey(workspaceId, accountId, target.collection, target.id)
+      const visible = mysqlRecordVisible(target.collection, target.id, sources, accountId)
+      this.mysqlVisible.set(visibleKey, visible)
+      if (!visible) hidden.push({ row, target, key: visibleKey })
+    }
+    if (hidden.length && mysql.collectionGrantSources && workspaceId && accountId) {
+      const grants = new Map<string, MysqlCollectionGrants>()
+      for (const name of names) grants.set(name, await mysql.collectionGrantSources(accountId, workspaceId, name))
+      for (const item of hidden) {
+        const role = this.computeMysqlGrantRole(collection, item.row, item.target, sources, grants)
+        if (role) this.mysqlGrantRoles.set(item.key, role)
+        else this.mysqlGrantRoles.delete(item.key)
+      }
     }
     return true
   }
@@ -1901,6 +2004,7 @@ export class DatabaseService extends Service implements Database {
     this.visibleCache.clear()
     this.mysqlScopes.clear()
     this.mysqlVisible.clear()
+    this.mysqlGrantRoles.clear()
   }
 
   private notifyChange() {

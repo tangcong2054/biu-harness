@@ -8,6 +8,7 @@ test('registry-filtered catalog reads are not denied by legacy private metadata'
     authorization: () => null,
     workspaceMembership: () => null,
     mysqlVisibility: () => false,
+    mysqlGrantedRole: () => null,
   }
   const visible = (DatabaseService.prototype as any).visibleRecords
   const published = [{ id: 'approved' }]

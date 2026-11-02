@@ -1207,6 +1207,13 @@ export class MysqlAccountRepository {
     return rows as Array<Record<string, unknown>>
   }
 
+  /** 列表可见性用：当前账号在该集合上匹配到的记录授权与视图授权。 */
+  async collectionGrantSources(accountId: string, workspaceId: string, collection: string) {
+    return new MysqlAccessReader(
+      this.pool, this.db.slice(1, -1), workspaceId, accountId, this.accessMatchers,
+    ).collectionGrants(collection)
+  }
+
   async recordAccess(actorId: string, workspaceId: string, collection: string, recordId: string) {
     const applicable = await new MysqlAccessReader(
       this.pool, this.db.slice(1, -1), workspaceId, actorId, this.accessMatchers,

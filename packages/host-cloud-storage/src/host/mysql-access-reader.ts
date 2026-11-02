@@ -13,12 +13,22 @@ export function accessDenied() {
   return Object.assign(new Error('没有权限查看此资源的协作信息'), { status: 403, code: 'ACCESS_DETAILS_DENIED' })
 }
 
+/** 当前账号在一个集合上获得的授权：记录授权取最高角色，视图授权需再按视图条件逐条匹配。 */
+export type CollectionGrants = {
+  records: Record<string, string>
+  views: Array<{ viewId: string; grantedBy: string; role: string }>
+  savedViews: AccessView[]
+}
+
+const ROLE_RANK: Record<string, number> = { viewer: 1, editor: 2, manager: 3, owner: 4 }
+
 const readableRoles = new Set(['viewer', 'editor', 'manager', 'owner'])
 
 /** 请求级读取决策，不复用跨请求授权缓存，也不以空间管理角色替代私人记录授权。 */
 export class MysqlAccessReader {
   private member: AccessRecord | null = null
   private views = new Map<string, AccessView[]>()
+  private groups = new Map<string, boolean>()
 
   constructor(
     private pool: Pool,
@@ -77,12 +87,16 @@ export class MysqlAccessReader {
     if (grant.subject_type === 'account') return grant.subject_id === this.accountId
     if (grant.subject_type === 'workspace_role') return grant.subject_id === this.member?.role
     if (grant.subject_type === 'group') {
+      const groupId = String(grant.subject_id)
+      const cached = this.groups.get(groupId)
+      if (cached !== undefined) return cached
       const rows = await this.rows(
         `SELECT 1 AS ok FROM \`${this.database}\`.workspace_group_members gm
          JOIN \`${this.database}\`.workspace_groups g ON g.id = gm.group_id
          WHERE g.workspace_id = ? AND gm.group_id = ? AND gm.account_id = ?`,
-        [this.workspaceId, grant.subject_id, this.accountId],
+        [this.workspaceId, groupId, this.accountId],
       )
+      this.groups.set(groupId, rows.length > 0)
       return rows.length > 0
     }
     if (grant.subject_type === 'member_view') {
@@ -102,6 +116,40 @@ export class MysqlAccessReader {
     const result = await this.walk(collection, recordId, new Set())
     if (!result.allowed) throw accessDenied()
     return result.viewGrants
+  }
+
+  /** 列表用：一次读出整个集合上与当前账号匹配的授权。不是成员时返回空，不授予任何访问。 */
+  async collectionGrants(collection: string): Promise<CollectionGrants> {
+    const empty: CollectionGrants = { records: {}, views: [], savedViews: [] }
+    if (!/^\/[^/\s]+$/.test(collection)) return empty
+    try {
+      await this.init()
+    } catch {
+      return empty
+    }
+    const records: Record<string, string> = {}
+    const recordGrants = await this.rows(
+      `SELECT record_id, subject_type, subject_id, role FROM \`${this.database}\`.record_grants
+       WHERE workspace_id = ? AND collection = ?`,
+      [this.workspaceId, collection],
+    )
+    for (const grant of recordGrants) {
+      if (!(await this.subjectMatches(grant))) continue
+      const id = String(grant.record_id)
+      const role = String(grant.role)
+      if ((ROLE_RANK[role] ?? 0) > (ROLE_RANK[records[id] ?? ''] ?? 0)) records[id] = role
+    }
+    const views: CollectionGrants['views'] = []
+    const viewGrants = await this.rows(
+      `SELECT view_id, subject_type, subject_id, role, granted_by FROM \`${this.database}\`.view_grants
+       WHERE workspace_id = ? AND collection = ?`,
+      [this.workspaceId, collection],
+    )
+    for (const grant of viewGrants) {
+      if (!(await this.subjectMatches(grant))) continue
+      views.push({ viewId: String(grant.view_id), grantedBy: String(grant.granted_by ?? ''), role: String(grant.role) })
+    }
+    return { records, views, savedViews: views.length ? await this.savedViews(collection) : [] }
   }
 
   private async walk(collection: string, recordId: string, visited: Set<string>): Promise<{

@@ -98,7 +98,7 @@ integration('MySQL view access details and view sharing permissions', () => {
   afterAll(async () => {
     if (!pool) return
     try {
-      for (const table of ['view_grants', 'saved_views', 'workspace_members', 'authz_revisions', 'workspace_invites']) {
+      for (const table of ['view_grants', 'record_grants', 'saved_views', 'workspace_members', 'authz_revisions', 'workspace_invites']) {
         await pool.query(`DELETE FROM \`${database}\`.\`${table}\` WHERE workspace_id LIKE ?`, [`${prefix}%`])
       }
       await pool.query(`DELETE FROM \`${database}\`.accounts WHERE id LIKE ?`, [`${prefix}%`])
@@ -197,6 +197,24 @@ integration('MySQL view access details and view sharing permissions', () => {
       `SELECT created_by FROM \`${database}\`.workspace_invites WHERE workspace_id = ? AND view_id = 'guest-view'`, [ws],
     )
     expect(rows.map((row) => row.created_by)).toEqual([admin])
+  })
+
+  it('reads collection grants for list visibility: direct, by role, view grants and highest role', async () => {
+    await pool.query(
+      `INSERT INTO \`${database}\`.record_grants (workspace_id, collection, record_id, subject_type, subject_id, role, granted_by, created_at)
+       VALUES (?, '/pages', 'p1', 'account', ?, 'viewer', ?, 1), (?, '/pages', 'p1', 'workspace_role', 'member', 'editor', ?, 1),
+              (?, '/pages', 'p2', 'account', ?, 'viewer', ?, 1), (?, '/pages', 'p3', 'account', ?, 'superuser', ?, 1)`,
+      [ws, friend, owner, ws, owner, ws, plain, owner, ws, friend, owner],
+    )
+    await savedView('vx', { createdBy: owner, filters: { project: 'X' } })
+    await grant('vx', friend, owner)
+    const sources = await repo.collectionGrantSources(friend, ws, '/pages')
+    expect(sources.records).toEqual({ p1: 'editor' })
+    expect(sources.views).toEqual([{ viewId: 'vx', grantedBy: owner, role: 'viewer' }])
+    expect(sources.savedViews.map((view) => view.id)).toEqual(['vx'])
+    const none = await repo.collectionGrantSources(outsider, ws, '/pages')
+    expect(none).toEqual({ records: {}, views: [], savedViews: [] })
+    await pool.query(`DELETE FROM \`${database}\`.record_grants WHERE workspace_id = ?`, [ws])
   })
 
   it('binds view ids as parameters', async () => {
