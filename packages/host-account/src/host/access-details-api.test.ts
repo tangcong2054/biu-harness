@@ -53,9 +53,16 @@ test('access detail GET uses the request workspace and returns 403 without colla
     expect(recordAccess).toHaveBeenCalledWith('bob', 'requested-workspace', '/pages', 'p1')
     expect(route.status).toBe(403)
     expect(route.payload).toEqual({ code: 'ACCESS_DETAILS_DENIED', error: 'denied' })
-    recordAccess.mockResolvedValue({ scope: 'personal', people: [] })
+    recordAccess.mockResolvedValue({
+      scope: 'personal', ownerId: 'ada', people: [], policy: { owner_account_id: 'ada' },
+      grants: [{ subject_id: 'carol', email: 'carol@example.test', granted_by: 'ada' }],
+    })
     await runWithRequestWorkspace('requested-workspace', () => http.routes.get('GET /api/account/access')!(route))
     expect(route.status).toBe(200)
+    // 只出契约字段：原始授权行（含其他协作者邮箱）和策略行不能出现在响应里。
+    expect(route.payload).toEqual({
+      private: true, scope: 'personal', ownerId: 'ada', people: [], groups: [], memberViews: [], viewGrants: [], roleChain: [],
+    })
     recordAccess.mockRejectedValue(denial)
     for (const [method, extra] of [
       ['DELETE', { subjectType: 'account', subjectId: 'bob' }],

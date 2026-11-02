@@ -1242,9 +1242,8 @@ export class MysqlAccountRepository {
   }
 
   async recordAccess(actorId: string, workspaceId: string, collection: string, recordId: string) {
-    const applicable = await new MysqlAccessReader(
-      this.pool, this.db.slice(1, -1), workspaceId, actorId, this.accessMatchers,
-    ).record(collection, recordId)
+    const reader = new MysqlAccessReader(this.pool, this.db.slice(1, -1), workspaceId, actorId, this.accessMatchers)
+    const applicable = await reader.record(collection, recordId)
     const grantKeys = new Set(applicable.map((row) => JSON.stringify([row.view_id, row.subject_type, row.subject_id, row.granted_by])))
     const [policies] = await this.pool.query<RowDataPacket[]>(
       `SELECT ownership, owner_account_id, access_mode, member_default_role,
@@ -1304,8 +1303,7 @@ export class MysqlAccountRepository {
       viewGrants: (await this.viewGrantShares(workspaceId, collection)).filter((grant) =>
         grantKeys.has(JSON.stringify([grant.viewId, grant.subjectType, grant.subjectId, grant.grantedBy])),
       ),
-      policy,
-      grants,
+      roleChain: await reader.roleChain(collection, recordId),
     }
   }
 
@@ -1557,7 +1555,6 @@ export class MysqlAccountRepository {
       groups: [] as Array<{ id: string; name: string; role: string }>,
       memberViews,
       viewId,
-      grants: rows,
     }
   }
 
@@ -2283,9 +2280,18 @@ export class MysqlAccountRepository {
     return Boolean(rows[0])
   }
 
+  private readonly workspaceAuthzListeners = new Set<(workspaceId: string) => void>()
+
+  /** 全空间授权版本（'*'）递增时通知：成员集合或成员组变了，依赖成员身份的进程内缓存要作废。 */
+  onWorkspaceAuthzChange(listener: (workspaceId: string) => void) {
+    this.workspaceAuthzListeners.add(listener)
+    return () => { this.workspaceAuthzListeners.delete(listener) }
+  }
+
   private bumpRevision(connection: PoolConnection, workspaceId: string, collection: string) {
     // 本请求里刚改过授权或成员关系，之后的读取不能再用请求开头缓存的成员身份。
     clearRequestMemo(MEMBERSHIP_MEMO)
+    if (collection === '*') for (const listener of this.workspaceAuthzListeners) listener(workspaceId)
     return connection.query(
       `INSERT INTO ${this.db}.authz_revisions (workspace_id, collection_name, revision, updated_at)
        VALUES (?, ?, 1, ?) ON DUPLICATE KEY UPDATE revision = revision + 1, updated_at = VALUES(updated_at)`,

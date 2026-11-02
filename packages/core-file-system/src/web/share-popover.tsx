@@ -8,6 +8,7 @@ import { mintSharePin, shareClipboardText, type ShareResourceStats } from '../sh
 import { builtinAllView, builtinMemberViews, isBuiltinAllViewId, parseBuiltinScopeViewId, scopedCollectionName } from '../catalog-views.ts'
 import { effectiveDataScope, grantAudienceKind, recordMatchesGrantedView, viewRowFilters } from '../view-access.ts'
 import type { CollectionSchema, DbRecord } from '@biu/type-file-system'
+import type { AccessPerson, RecordAccessDetails, ViewAccessDetails, ViewGrantShare } from '@biu/type-file-system/access'
 
 
 export type ShareKind = 'view' | 'record'
@@ -140,13 +141,7 @@ function WorkspaceAccess({
   const [email, setEmail] = useState('')
   const [scope, setScope] = useState<'personal' | 'workspace' | 'shared'>('personal')
   const [ownerId, setOwnerId] = useState('')
-  const [people, setPeople] = useState<Array<{
-    id: string
-    name: string
-    email: string
-    role: string
-    memberKind: 'member' | 'external' | 'guest'
-  }>>([])
+  const [people, setPeople] = useState<AccessPerson[]>([])
   const [groups, setGroups] = useState<Array<{ id: string; name: string; role: string }>>([])
   const [memberViews, setMemberViews] = useState<Array<{ id: string; name: string; role?: string }>>([])
   const [availableMemberViews, setAvailableMemberViews] = useState<Array<{ id: string; name: string; filters?: Record<string, unknown> }>>([])
@@ -161,16 +156,7 @@ function WorkspaceAccess({
   const [selectedMemberId, setSelectedMemberId] = useState('')
   const [memberPickerOpen, setMemberPickerOpen] = useState(false)
   const [role, setRole] = useState<'viewer' | 'editor' | 'manager'>('editor')
-  const [viewGrants, setViewGrants] = useState<Array<{
-    viewId: string
-    subjectType: 'account' | 'member_view'
-    subjectId: string
-    role: string
-    name: string
-    email: string
-    memberKind: 'member' | 'external' | 'guest'
-    grantedBy?: string
-  }>>([])
+  const [viewGrants, setViewGrants] = useState<ViewGrantShare[]>([])
   const [record, setRecord] = useState<DbRecord | null>(null)
   const [recordSchema, setRecordSchema] = useState<CollectionSchema | undefined>(undefined)
   const [dataViews, setDataViews] = useState<Array<{ id: string; name: string; filters?: Record<string, unknown> }>>([])
@@ -182,28 +168,7 @@ function WorkspaceAccess({
   const [denied, setDenied] = useState(false)
 
   async function load() {
-    const data = await readJson<{
-      scope?: 'personal' | 'workspace' | 'shared'
-      ownerId?: string
-      people?: Array<{
-        id: string
-        name: string
-        email: string
-        role: string
-        memberKind: 'member' | 'external' | 'guest'
-      }>
-      groups?: Array<{ id: string; name: string; role: string }>
-      memberViews?: Array<{ id: string; role: string }>
-      viewGrants?: Array<{
-        viewId: string
-        subjectType: 'account' | 'member_view'
-        subjectId: string
-        role: string
-        name: string
-        email: string
-        memberKind: 'member' | 'external' | 'guest'
-      }>
-    }>(
+    const data = await readJson<Partial<RecordAccessDetails> | Partial<ViewAccessDetails>>(
       viewId
         ? `/api/account/access?collection=${encodeURIComponent(collection)}&viewId=${encodeURIComponent(viewId)}`
         : `/api/account/access?collection=${encodeURIComponent(collection)}&recordId=${encodeURIComponent(recordId)}`,
@@ -217,7 +182,7 @@ function WorkspaceAccess({
       ...item,
       name: availableMemberViews.find((view) => view.id === item.id)?.name ?? item.id,
     })))
-    setViewGrants(data.viewGrants ?? [])
+    setViewGrants('viewGrants' in data ? data.viewGrants ?? [] : [])
   }
 
   useEffect(() => {
@@ -696,22 +661,7 @@ export function ShareScopeDetail({
     let cancelled = false
     void (async () => {
       const [access, recordPage, viewPage, memberViewPage] = await Promise.all([
-        readJson<{
-          scope?: 'personal' | 'workspace' | 'shared'
-          ownerId?: string
-          people?: Array<{ id: string; name: string; role: string; memberKind: string }>
-          groups?: Array<{ id: string; name: string; role: string }>
-          memberViews?: Array<{ id: string; role: string }>
-          viewGrants?: Array<{
-            viewId: string
-            subjectType: 'account' | 'member_view'
-            subjectId: string
-            role: string
-            name: string
-            memberKind: string
-            grantedBy?: string
-          }>
-        }>(`/api/account/access?collection=${encodeURIComponent(collection)}&recordId=${encodeURIComponent(recordId)}`),
+        readJson<Partial<RecordAccessDetails>>(`/api/account/access?collection=${encodeURIComponent(collection)}&recordId=${encodeURIComponent(recordId)}`),
         listCollection({ path: collection, limit: 1, filters: { id: recordId } }),
         listCollection({ path: '/views', limit: 200, filters: { tablePath: collection }, columns: ['title', 'tablePath', 'viewId', 'filters', 'filterTree'] }),
         listCollection({ path: '/views', limit: 200, filters: { tablePath: '/workspace-members' }, columns: ['title', 'tablePath', 'viewId', 'filters', 'filterTree'] }),
@@ -883,20 +833,7 @@ export function ShareRoleDetail({
     let cancelled = false
     void (async () => {
       const [access, recordPage, viewPage, memberViewPage] = await Promise.all([
-        readJson<{
-          scope?: 'personal' | 'workspace' | 'shared'
-          ownerId?: string
-          roleChain?: Array<{ id: string; title: string; detail: string; role: string }>
-          viewGrants?: Array<{
-            viewId: string
-            subjectType: 'account' | 'member_view'
-            subjectId: string
-            role: string
-            name: string
-            memberKind: string
-            grantedBy?: string
-          }>
-        }>(`/api/account/access?collection=${encodeURIComponent(collection)}&recordId=${encodeURIComponent(recordId)}`),
+        readJson<Partial<RecordAccessDetails>>(`/api/account/access?collection=${encodeURIComponent(collection)}&recordId=${encodeURIComponent(recordId)}`),
         listCollection({ path: collection, limit: 1, filters: { id: recordId } }),
         listCollection({ path: '/views', limit: 200, filters: { tablePath: collection }, columns: ['title', 'tablePath', 'viewId', 'filters', 'filterTree'] }),
         listCollection({ path: '/views', limit: 200, filters: { tablePath: '/workspace-members' }, columns: ['title', 'tablePath', 'viewId', 'filters', 'filterTree'] }),

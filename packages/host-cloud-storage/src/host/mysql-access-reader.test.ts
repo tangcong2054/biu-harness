@@ -149,3 +149,44 @@ describe('MySQL access detail record authorization', () => {
     expect(f.query.mock.calls.some(([sql]) => sql.includes('group_name'))).toBe(false)
   })
 })
+
+describe('MySQL role chain matches the SQLite AuthorizationService rules', () => {
+  const chain = (f: ReturnType<typeof fixture>, actor = 'bob') =>
+    new MysqlAccessReader(f.pool, 'test', 'ws', actor, f.matchers).roleChain('/pages', 'p1')
+
+  it('reports owner, direct, group, member-view and workspace-role grants with the highest role', async () => {
+    const f = fixture()
+    expect(await chain(f, 'ada')).toEqual([{ id: 'ws\t/pages\tp1', title: '这条内容', detail: '你是创建者', role: 'owner' }])
+    f.grants['/pages/p1'] = [grant('account', 'bob', { role: 'viewer' }), grant('workspace_role', 'member', { role: 'editor' })]
+    expect(await chain(f)).toEqual([{ id: 'ws\t/pages\tp1', title: '这条内容', detail: '按空间角色授权', role: 'editor' }])
+    f.grants['/pages/p1'] = [grant('account', 'bob', { role: 'editor' })]
+    expect((await chain(f))[0]).toMatchObject({ detail: '直接授权给你', role: 'editor' })
+    f.setGroup(true)
+    f.grants['/pages/p1'] = [grant('group', 'team', { role: 'manager' })]
+    expect((await chain(f))[0]).toMatchObject({ detail: '通过成员组授权', role: 'manager' })
+    f.grants['/pages/p1'] = [grant('member_view', 'builtin-member:member')]
+    expect((await chain(f))[0]).toMatchObject({ detail: '通过成员视图授权', role: 'viewer' })
+    f.grants['/pages/p1'] = [grant('account', 'bob', { role: 'superuser' })]
+    expect(await chain(f)).toEqual([])
+  })
+
+  it('applies member defaults only for internal members and follows inheritance', async () => {
+    const f = fixture()
+    f.policies['/pages/p1'] = f.policy({ ownership: 'workspace', access_mode: 'members' })
+    expect((await chain(f))[0]).toMatchObject({ detail: '空间成员默认可编辑', role: 'editor' })
+    f.member.role = 'admin'
+    expect((await chain(f))[0]).toMatchObject({ detail: '空间管理者默认可管理', role: 'manager' })
+    f.member.role = 'member'
+    f.member.member_kind = 'external'
+    expect(await chain(f)).toEqual([])
+    f.member.member_kind = 'member'
+    f.policies['/pages/p1'] = f.policy({ access_mode: 'inherit', parent_collection: '/tasks', parent_record_id: 't1' })
+    f.policies['/tasks/t1'] = f.policy({ owner_account_id: 'bob' })
+    expect(await chain(f)).toEqual([
+      { id: 'ws\t/pages\tp1', title: '这条内容', detail: '权限继承自上一级', role: 'owner' },
+      { id: 'ws\t/tasks\tt1', title: '上一级内容', detail: '你是创建者', role: 'owner' },
+    ])
+    f.policies['/tasks/t1'] = f.policy({ access_mode: 'inherit', parent_collection: '/pages', parent_record_id: 'p1' })
+    expect(await chain(f)).toEqual([])
+  })
+})

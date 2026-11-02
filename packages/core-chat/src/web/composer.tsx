@@ -158,8 +158,24 @@ function readSlashAtCursor(value: string, cursor: number): SlashState | null {
   return { open: true, query: token, start, end: cursor }
 }
 
-function matchModelOption(catalog: ModelOption[], provider: string, model: string): ModelOption {
+function chatConfigUrl(sessionId?: string | null) {
+  return sessionId ? `/api/chat/config?sessionId=${encodeURIComponent(sessionId)}` : '/api/chat/config'
+}
+
+type SessionModelView = {
+  endpointId?: string
+  provider?: string
+  model?: string
+  thinking?: ThinkingMode
+  reasoningEffort?: ReasoningEffort
+  contextWindow?: ContextWindow
+  speed?: SpeedMode
+  capabilities?: ModelCapabilities
+}
+
+function matchModelOption(catalog: ModelOption[], provider: string, model: string, endpointId?: string): ModelOption {
   return (
+    (endpointId ? catalog.find((item) => item.endpointId === endpointId && item.model === model) : undefined) ??
     catalog.find((item) => item.provider === provider && item.model === model) ??
     catalog.find((item) => item.model === model) ?? {
       id: `${provider}:${model}`,
@@ -274,9 +290,9 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
         }))
         setAllModels(catalog)
         if (data.provider && data.model)
-          setModelOption(matchModelOption(catalog, data.provider, data.model))
+          setModelOption(matchModelOption(catalog, data.provider, data.model, data.endpointId))
       } else if (data.provider && data.model) {
-        setModelOption(matchModelOption([], data.provider, data.model))
+        setModelOption(matchModelOption([], data.provider, data.model, data.endpointId))
       }
       if (data.thinking === 'enabled' || data.thinking === 'disabled') setThinking(data.thinking)
       if (data.reasoningEffort === 'high' || data.reasoningEffort === 'max') setReasoningEffort(data.reasoningEffort)
@@ -303,7 +319,7 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
     }
 
     function reload() {
-      void fetch('/api/chat/config')
+      void fetch(chatConfigUrl(sessionId))
         .then((res) => res.json())
         .then(applyConfig)
         .catch(() => {
@@ -318,16 +334,17 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
       cancelled = true
       window.removeEventListener('biu:chat-config-changed', onConfigChanged)
     }
-  }, [])
+  }, [sessionId])
 
   useEffect(() => {
     if (!modelOpen) return
     // 打开下拉时强制刷新，保证 Settings 里新加的模型立刻可见
-    void fetch('/api/chat/config')
+    void fetch(chatConfigUrl(sessionId))
       .then((res) => res.json())
       .then(
         (data: {
           provider?: string
+          endpointId?: string
           model?: string
           providers?: Record<string, { configured?: boolean }>
           endpoints?: Array<{ id: string; label?: string; configured?: boolean }>
@@ -351,7 +368,7 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
             }))
             setAllModels(catalog)
             if (data.provider && data.model)
-              setModelOption(matchModelOption(catalog, data.provider, data.model))
+              setModelOption(matchModelOption(catalog, data.provider, data.model, data.endpointId))
           }
           const cfg: Record<string, boolean> = {}
           const labels: Record<string, string> = { ...endpointLabels }
@@ -373,7 +390,7 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
       })
     // endpointLabels 仅作合并基础，不纳入依赖避免循环刷新
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [modelOpen])
+  }, [modelOpen, sessionId])
 
   const filtered = useMemo(() => {
     if (!slash?.open) return []
@@ -701,36 +718,43 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
   )
   pickToolRef.current = pickTool
 
+  function applyModelView(data: SessionModelView, fallback?: ModelOption) {
+    if (data.provider && data.model) {
+      setModelOption(matchModelOption(allModels, data.provider, data.model, data.endpointId))
+    } else if (fallback) setModelOption(fallback)
+    if (data.thinking === 'enabled' || data.thinking === 'disabled') setThinking(data.thinking)
+    if (data.reasoningEffort === 'high' || data.reasoningEffort === 'max') setReasoningEffort(data.reasoningEffort)
+    if (data.contextWindow === '200k' || data.contextWindow === '1m') setContextWindow(data.contextWindow)
+    if (data.speed === 'fast' || data.speed === 'slow') setSpeed(data.speed)
+    if (data.capabilities) setModelCaps(data.capabilities)
+  }
+
+  /** 模型 / 档位只写进当前会话配置，不改全局 chat-config（否则会影响所有会话、所有人）。 */
+  async function patchSessionModel(body: Record<string, unknown>, fallback?: ModelOption) {
+    const id = sessionId || (await sessionView.ensureSession())
+    if (!id) return
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/config`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) return
+    const data = (await res.json()) as { modelView?: SessionModelView }
+    // 请求期间已切到别的会话：不把这条会话的结果写到当前界面
+    if (sessionView.get().sessionId !== id) return
+    applyModelView(data.modelView ?? {}, fallback)
+  }
+
   async function selectModel(option: ModelOption) {
     if (modelBusy || option.id === modelOption.id) return
     setModelBusy(true)
     try {
-      const res = await fetch('/api/chat/config', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          endpointId: option.endpointId,
-          provider: option.provider,
-          model: option.model,
-        }),
-      })
-      if (!res.ok) return
-      const data = (await res.json()) as {
-        provider?: string
-        model?: string
-        thinking?: ThinkingMode
-        reasoningEffort?: ReasoningEffort
-        contextWindow?: ContextWindow
-        speed?: SpeedMode
-        capabilities?: ModelCapabilities
-      }
-      if (data.provider && data.model) setModelOption(matchModelOption(allModels, data.provider, data.model))
-      else setModelOption(option)
-      if (data.thinking === 'enabled' || data.thinking === 'disabled') setThinking(data.thinking)
-      if (data.reasoningEffort === 'high' || data.reasoningEffort === 'max') setReasoningEffort(data.reasoningEffort)
-      if (data.contextWindow === '200k' || data.contextWindow === '1m') setContextWindow(data.contextWindow)
-      if (data.speed === 'fast' || data.speed === 'slow') setSpeed(data.speed)
-      if (data.capabilities) setModelCaps(data.capabilities)
+      await patchSessionModel(
+        { endpointId: option.endpointId, provider: option.provider, model: option.model },
+        option,
+      )
+    } catch {
+      /* ignore */
     } finally {
       setModelBusy(false)
     }
@@ -739,29 +763,14 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
   async function patchModelMode(next: Partial<ModelModeValues>) {
     setModelBusy(true)
     try {
-      const res = await fetch('/api/chat/config', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          thinking: next.thinking,
-          speed: next.speed,
-          reasoningEffort: next.effort,
-          contextWindow: next.context,
-        }),
+      await patchSessionModel({
+        thinking: next.thinking,
+        speed: next.speed,
+        reasoningEffort: next.effort,
+        contextWindow: next.context,
       })
-      if (!res.ok) return
-      const data = (await res.json()) as {
-        thinking?: ThinkingMode
-        reasoningEffort?: ReasoningEffort
-        contextWindow?: ContextWindow
-        speed?: SpeedMode
-        capabilities?: ModelCapabilities
-      }
-      if (data.thinking === 'enabled' || data.thinking === 'disabled') setThinking(data.thinking)
-      if (data.reasoningEffort === 'high' || data.reasoningEffort === 'max') setReasoningEffort(data.reasoningEffort)
-      if (data.contextWindow === '200k' || data.contextWindow === '1m') setContextWindow(data.contextWindow)
-      if (data.speed === 'fast' || data.speed === 'slow') setSpeed(data.speed)
-      if (data.capabilities) setModelCaps(data.capabilities)
+    } catch {
+      /* ignore */
     } finally {
       setModelBusy(false)
     }

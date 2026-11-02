@@ -24,6 +24,17 @@ const ROLE_RANK: Record<string, number> = { viewer: 1, editor: 2, manager: 3, ow
 
 const readableRoles = new Set(['viewer', 'editor', 'manager', 'owner'])
 
+type ChainRole = 'viewer' | 'editor' | 'manager' | 'owner'
+export type RoleChainStep = { id: string; title: string; detail: string; role: ChainRole }
+
+/** 与 host-account authorization.ts 的 memberAccessRole 同一规则（本包不能依赖 host-account）。 */
+function memberAccessRole(policy: Record<string, unknown>, membership: unknown): ChainRole {
+  if (membership === 'owner' || membership === 'admin') return 'manager'
+  if (membership === 'viewer') return 'viewer'
+  if (policy.ownership === 'workspace' || policy.member_default_role === 'editor') return 'editor'
+  return 'viewer'
+}
+
 /** 请求级读取决策，不复用跨请求授权缓存，也不以空间管理角色替代私人记录授权。 */
 export class MysqlAccessReader {
   private member: AccessRecord | null = null
@@ -46,6 +57,7 @@ export class MysqlAccessReader {
   }
 
   private async init() {
+    if (this.member) return
     if (!this.workspaceId || !this.accountId) throw accessDenied()
     const rows = await this.rows(
       `SELECT m.role, m.member_kind, m.created_at, m.display_name, a.name, a.email
@@ -116,6 +128,65 @@ export class MysqlAccessReader {
     const result = await this.walk(collection, recordId, new Set())
     if (!result.allowed) throw accessDenied()
     return result.viewGrants
+  }
+
+  /**
+   * 当前账号对这条记录的权限来源，与 SQLite 版 AuthorizationService.roleChain 同一规则：
+   * 创建者 → 直接/成员组/成员视图/空间角色授权（取最高）→ 对成员开放 → 继承上一级。
+   */
+  async roleChain(collection: string, recordId: string): Promise<RoleChainStep[]> {
+    if (!/^\/[^/\s]+$/.test(collection) || !recordId.trim()) return []
+    await this.init()
+    return this.chain(collection, recordId, new Set(), true)
+  }
+
+  private async chain(collection: string, recordId: string, visited: Set<string>, top: boolean): Promise<RoleChainStep[]> {
+    const key = `${this.workspaceId}\t${collection}\t${recordId}`
+    if (visited.has(key) || visited.size > 64) return []
+    visited.add(key)
+    const title = top ? '这条内容' : '上一级内容'
+    const policies = await this.rows(
+      `SELECT ownership, owner_account_id, access_mode, member_default_role, parent_collection, parent_record_id
+       FROM \`${this.database}\`.resource_policies WHERE workspace_id = ? AND collection = ? AND record_id = ?`,
+      [this.workspaceId, collection, recordId],
+    )
+    const policy = policies[0]
+    if (!policy) {
+      const owners = await this.rows(
+        `SELECT owner_id FROM \`${this.database}\`.record_owners WHERE workspace_id = ? AND collection = ? AND record_id = ?`,
+        [this.workspaceId, collection, recordId],
+      )
+      const ownerId = String(owners[0]?.owner_id ?? '')
+      if (!ownerId) return []
+      if (ownerId === this.accountId) return [{ id: key, title, detail: '你是创建者', role: 'owner' }]
+      return [{ id: key, title, detail: '沿用空间里的旧记录', role: this.member?.role === 'viewer' ? 'viewer' : 'editor' }]
+    }
+    if (String(policy.owner_account_id ?? '') === this.accountId) return [{ id: key, title, detail: '你是创建者', role: 'owner' }]
+    const grants = await this.rows(
+      `SELECT subject_type, subject_id, role FROM \`${this.database}\`.record_grants
+       WHERE workspace_id = ? AND collection = ? AND record_id = ?`,
+      [this.workspaceId, collection, recordId],
+    )
+    const matched: RowDataPacket[] = []
+    for (const grant of grants) if (await this.subjectMatches(grant)) matched.push(grant)
+    let best = ''
+    for (const grant of matched) if ((ROLE_RANK[String(grant.role)] ?? 0) > (ROLE_RANK[best] ?? 0)) best = String(grant.role)
+    if (best) {
+      const at = (type: string) => matched.some((grant) => grant.subject_type === type && grant.role === best)
+      const detail = at('account') ? '直接授权给你' : at('group') ? '通过成员组授权' : at('member_view') ? '通过成员视图授权' : '按空间角色授权'
+      return [{ id: key, title, detail, role: best as ChainRole }]
+    }
+    if (policy.access_mode === 'members' && this.member?.membershipKind === 'member') {
+      const role = memberAccessRole(policy, this.member.role)
+      const detail = role === 'manager' ? '空间管理者默认可管理' : role === 'viewer' ? '查看者只能阅读' : '空间成员默认可编辑'
+      return [{ id: key, title, detail, role }]
+    }
+    if (policy.access_mode === 'inherit' && policy.parent_record_id) {
+      const parent = await this.chain(String(policy.parent_collection || collection), String(policy.parent_record_id), visited, false)
+      if (!parent.length) return []
+      return [{ id: key, title, detail: '权限继承自上一级', role: parent[parent.length - 1]!.role }, ...parent]
+    }
+    return []
   }
 
   /** 列表用：一次读出整个集合上与当前账号匹配的授权。不是成员时返回空，不授予任何访问。 */

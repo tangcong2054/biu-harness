@@ -624,12 +624,7 @@ export class SessionsService extends Service {
   /** 合并写入会话配置；传 null/空字符串可清除 title / systemPrompt。 */
   async patchConfig(
     id: string,
-    patch: SessionConfig & {
-      title?: string | null
-      systemPrompt?: string | null
-      inspector?: SessionConfig['inspector'] | null
-      goal?: SessionConfig['goal'] | null
-    },
+    patch: Parameters<typeof mergeSessionConfig>[1],
   ) {
     const record = await this.require(id)
     const next = mergeSessionConfig(record.config, patch)

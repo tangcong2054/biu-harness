@@ -168,6 +168,9 @@ integration('MySQL account/workspace/authz integration', () => {
     const shared = await accounts.recordAccess('acc_owner', 'ws_a', '/pages', 'page_1')
     expect(shared.scope).toBe('workspace')
     expect(shared.ownerId).toBe('acc_owner')
+    expect(shared).not.toHaveProperty('policy')
+    expect(shared).not.toHaveProperty('grants')
+    expect(shared.roleChain).toEqual([{ id: 'ws_a\t/pages\tpage_1', title: '这条内容', detail: '你是创建者', role: 'owner' }])
     expect(shared.private).toBe(false)
     expect(shared.people.find((row) => row.id === 'acc_member')).toMatchObject({
       email: 'member@example.test',
@@ -233,7 +236,8 @@ integration('MySQL account/workspace/authz integration', () => {
       now,
     })
     const viewShared = await accounts.viewAccess('acc_owner', 'ws_a', '/pages', 'view_1')
-    expect(viewShared.grants).toHaveLength(1)
+    // 只返回契约字段，不再带原始授权行（里面有其他协作者的邮箱与授权人）。
+    expect(viewShared).not.toHaveProperty('grants')
     expect(viewShared.people.map((row) => row.id)).toEqual(['acc_member'])
     expect(await authz.viewGrants({
       workspaceId: 'ws_a',
@@ -249,7 +253,7 @@ integration('MySQL account/workspace/authz integration', () => {
       subjectType: 'account',
       subjectId: 'acc_member',
     })
-    expect((await accounts.viewAccess('acc_owner', 'ws_a', '/pages', 'view_1')).grants).toHaveLength(0)
+    expect((await accounts.viewAccess('acc_owner', 'ws_a', '/pages', 'view_1')).people).toHaveLength(0)
   })
 
   it('covers sync, locks, presence, tenant lookup and plugin metadata', async () => {

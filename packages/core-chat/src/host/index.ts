@@ -748,14 +748,18 @@ export class ChatService extends Service {
     }
     if (!sessionId) return { defaults: defaultsView, config: undefined as SessionConfig | undefined, effective: defaultsView }
     const config = this.ctx.sessions.peek(sessionId)?.config
-    // 会话仍可覆盖 provider/model；endpoint 跟随模型所属入口或全局
-    const provider = (config?.provider as ChatProvider | undefined) ?? defaultsView.provider
+    // 会话可覆盖 endpoint/provider/model；未指定 endpoint 时跟随模型所属入口或全局
+    const sessionEndpoint = config?.endpointId ? resolveEndpoint(this.config, config.endpointId) : undefined
+    const provider = sessionEndpoint?.provider ?? (config?.provider as ChatProvider | undefined) ?? defaultsView.provider
     const model = config?.model ?? defaultsView.model
     let endpointId = defaultsView.endpointId
-    const matched = allModels(this.config).find((m) => m.model === model && m.provider === provider)
-    if (matched) endpointId = matched.endpointId
-    else if (config?.provider && CHAT_PROVIDERS.includes(config.provider as ChatProvider)) {
-      endpointId = config.provider as string
+    if (sessionEndpoint) endpointId = sessionEndpoint.id
+    else {
+      const matched = allModels(this.config).find((m) => m.model === model && m.provider === provider)
+      if (matched) endpointId = matched.endpointId
+      else if (config?.provider && CHAT_PROVIDERS.includes(config.provider as ChatProvider)) {
+        endpointId = config.provider as string
+      }
     }
     const effective = {
       endpointId,
@@ -772,13 +776,59 @@ export class ChatService extends Service {
 
   /** 这条会话当前模型实际用的上下文窗口。 */
   contextWindowFor(sessionId?: string | null): ContextWindow {
-    const { effective } = this.resolveEffective(sessionId)
+    const { effective, config } = this.resolveEffective(sessionId)
     const provider = effective.provider as ChatProvider
     const caps = inferModelCapabilities(effective.model, provider)
     const endpointId = (effective as { endpointId?: string }).endpointId ?? this.config.endpointId
-    const prefs = this.config.modelPrefs[prefKey(endpointId, effective.model)]
-    if (hasKnob(caps, 'context')) return prefs?.contextWindow ?? this.config.contextWindow
+    if (hasKnob(caps, 'context')) return this.modeFor(endpointId, effective.model, config).context
     return '200k'
+  }
+
+  /** 会话档位 > 该模型的全局偏好 > 全局档位。 */
+  private modeFor(endpointId: string, model: string, config?: SessionConfig): ModelModeValues {
+    const prefs = this.config.modelPrefs[prefKey(endpointId, model)]
+    return {
+      thinking: config?.thinking ?? prefs?.thinking ?? this.config.thinking,
+      speed: config?.speed ?? prefs?.speed ?? this.config.speed,
+      effort: config?.reasoningEffort ?? prefs?.reasoningEffort ?? this.config.reasoningEffort,
+      context: config?.contextWindow ?? prefs?.contextWindow ?? this.config.contextWindow,
+    }
+  }
+
+  /** 校验会话要切换到的入口 + 模型；入口未知返回 null。不改全局配置。 */
+  pickSessionModel(input: { endpointId?: unknown; provider?: unknown; model?: unknown }) {
+    const rawEndpoint = typeof input.endpointId === 'string' ? input.endpointId.trim() : ''
+    const rawModel = typeof input.model === 'string' ? input.model.trim().slice(0, 200) : ''
+    const provider = parseProvider(input.provider)
+    const endpoint = rawEndpoint
+      ? resolveEndpoint(this.config, rawEndpoint)
+      : provider
+        ? resolveEndpoint(this.config, provider)
+        : undefined
+    if (!endpoint) return null
+    const model =
+      rawModel ||
+      allModels(this.config).find((m) => m.endpointId === endpoint.id)?.model ||
+      defaultModelFor(endpoint.provider)
+    return { endpointId: endpoint.id, provider: endpoint.provider, model }
+  }
+
+  /** 这条会话的模型选择视图（模型下拉 / 档位用）；无会话时即全局默认。 */
+  sessionModelView(sessionId?: string | null) {
+    const { effective, config } = this.resolveEffective(sessionId)
+    const endpointId = (effective as { endpointId?: string }).endpointId ?? this.config.endpointId
+    const provider = effective.provider as ChatProvider
+    const mode = this.modeFor(endpointId, effective.model, config)
+    return {
+      endpointId,
+      provider,
+      model: effective.model,
+      thinking: mode.thinking,
+      reasoningEffort: mode.effort,
+      contextWindow: mode.context,
+      speed: mode.speed,
+      capabilities: inferModelCapabilities(effective.model, provider),
+    }
   }
 
   resolverKey(provider: ChatProvider): string {
@@ -787,7 +837,7 @@ export class ChatService extends Service {
 
   /** 根据有效入口取对应 apiKey + baseUrl。 */
   resolveLlm(sessionId?: string | null): LlmConfig {
-    const { effective } = this.resolveEffective(sessionId)
+    const { effective, config } = this.resolveEffective(sessionId)
     const endpointId = (effective as { endpointId?: string }).endpointId ?? this.config.endpointId
     const endpoint = resolveEndpoint(this.config, endpointId) ?? resolveEndpoint(this.config, effective.provider)
     const provider: ChatProvider = endpoint?.provider ?? effective.provider
@@ -798,13 +848,7 @@ export class ChatService extends Service {
     // 本地入口允许空 Key：上游常不校验，填占位避免部分网关拒空 Authorization
     const key = apiKey.trim() || (endpoint && isLocalEndpoint(endpoint) ? 'local' : '')
     const caps = inferModelCapabilities(effective.model, provider)
-    const prefs = this.config.modelPrefs[prefKey(endpointId, effective.model)]
-    const mode: ModelModeValues = {
-      thinking: prefs?.thinking ?? this.config.thinking,
-      speed: prefs?.speed ?? this.config.speed,
-      effort: prefs?.reasoningEffort ?? this.config.reasoningEffort,
-      context: prefs?.contextWindow ?? this.config.contextWindow,
-    }
+    const mode = this.modeFor(endpointId, effective.model, config)
     return {
       provider,
       endpointId,
@@ -1579,9 +1623,15 @@ export function apply(ctx: Context) {
     kind: 'chat',
   })
 
-  ctx.http.route('GET', '/api/chat/config', (route) => {
+  ctx.http.route('GET', '/api/chat/config', async (route) => {
     chat.activateAccount()
-    route.send(200, chat.publicView())
+    const view = chat.publicView()
+    const sessionId = String(route.query.get('sessionId') ?? '').trim()
+    if (!sessionId) return route.send(200, view)
+    // 带 sessionId：模型/档位换成这条会话的有效值，其余仍是全局目录
+    const record = await ctx.sessions.get(sessionId).catch(() => null)
+    if (!record) return route.send(200, view)
+    route.send(200, { ...view, ...chat.sessionModelView(record.id) })
   })
   ctx.http.route('POST', '/api/chat/config', async (route) => {
     chat.activateAccount()
@@ -1700,11 +1750,17 @@ export function apply(ctx: Context) {
   })
   ctx.http.route('PATCH', '/api/sessions/:id/config', async (route) => {
     try {
+      chat.activateAccount()
       const payload = ((await route.json().catch(() => null)) ?? {}) as Record<string, unknown>
       const patch: {
         title?: string | null
         model?: string
         provider?: SessionConfig['provider']
+        endpointId?: string | null
+        thinking?: SessionConfig['thinking'] | null
+        reasoningEffort?: SessionConfig['reasoningEffort'] | null
+        contextWindow?: SessionConfig['contextWindow'] | null
+        speed?: SessionConfig['speed'] | null
         systemPrompt?: string | null
         agentMode?: AgentToolMode
         extraTools?: string[]
@@ -1714,10 +1770,32 @@ export function apply(ctx: Context) {
         inspector?: SessionConfig['inspector'] | null
       } = {}
       if (typeof payload.title === 'string' || payload.title === null) patch.title = payload.title as string | null
-      if (typeof payload.model === 'string') patch.model = payload.model
-      if (payload.provider === 'deepseek' || payload.provider === 'openai' || payload.provider === 'anthropic') {
-        patch.provider = payload.provider
+      if (typeof payload.endpointId === 'string' && payload.endpointId.trim()) {
+        // 只改这条会话：校验入口后写入会话配置，不碰全局 chat-config
+        const picked = chat.pickSessionModel(payload)
+        if (!picked) return route.send(400, { error: `未知入口：${payload.endpointId.trim().slice(0, 200)}` })
+        patch.endpointId = picked.endpointId
+        patch.provider = picked.provider
+        patch.model = picked.model
+      } else {
+        if (typeof payload.model === 'string') patch.model = payload.model
+        if (payload.provider === 'deepseek' || payload.provider === 'openai' || payload.provider === 'anthropic') {
+          patch.provider = payload.provider
+        }
+        // 旧调用只给 model/provider：去掉入口锁定，按模型所属入口推导
+        if ('model' in patch || 'provider' in patch) patch.endpointId = null
       }
+      if ('model' in patch || 'provider' in patch) {
+        // 换模型时档位回到该模型自己的偏好，除非本次同时指定
+        patch.thinking = null
+        patch.reasoningEffort = null
+        patch.contextWindow = null
+        patch.speed = null
+      }
+      if (payload.thinking === 'enabled' || payload.thinking === 'disabled') patch.thinking = payload.thinking
+      if (payload.reasoningEffort === 'high' || payload.reasoningEffort === 'max') patch.reasoningEffort = payload.reasoningEffort
+      if (payload.contextWindow === '200k' || payload.contextWindow === '1m') patch.contextWindow = payload.contextWindow
+      if (payload.speed === 'fast' || payload.speed === 'slow') patch.speed = payload.speed
       if (typeof payload.systemPrompt === 'string' || payload.systemPrompt === null) {
         patch.systemPrompt = payload.systemPrompt as string | null
       }
@@ -1735,7 +1813,7 @@ export function apply(ctx: Context) {
       }
       const record = await ctx.sessions.patchConfig(
         route.params.id,
-        patch as SessionConfig & { title?: string | null; systemPrompt?: string | null; inspector?: SessionConfig['inspector'] | null },
+        patch as Parameters<typeof ctx.sessions.patchConfig>[1],
       )
       const resolved = chat.resolveEffective(record.id)
       route.send(200, {
@@ -1743,6 +1821,7 @@ export function apply(ctx: Context) {
         config: record.config ?? null,
         defaults: resolved.defaults,
         effective: resolved.effective,
+        modelView: chat.sessionModelView(record.id),
       })
     } catch (error) {
       route.send(400, { error: String(error) })

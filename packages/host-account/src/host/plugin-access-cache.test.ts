@@ -97,3 +97,35 @@ test('cached grants expire so revocations on another instance converge', async (
   vi.setSystemTime(new Date('2026-10-25T00:00:31Z'))
   assert.equal(account.canAccessPluginCached('ada', 'ws_a', 'demo'), false)
 })
+
+test('workspace-wide authorization changes from the repository forget that workspace grants', async () => {
+  const listeners = new Set<(workspaceId: string) => void>()
+  const ctx = new Context()
+  const repository = {
+    async canAccessPlugin() { return true },
+    async membership(accountId: string, workspaceId: string) {
+      return accountId === 'ada' && workspaceId === 'ws_a' ? { role: 'member', memberKind: 'member' } : null
+    },
+    async listWorkspaces() { throw new Error('isMemberAsync must not list every workspace') },
+    onWorkspaceAuthzChange(listener: (workspaceId: string) => void) {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+  }
+  class CloudStorage extends Service {
+    accountMode = 'mysql' as const
+    accountRepository = repository
+    constructor(inner: Context) {
+      super(inner, 'cloudStorage')
+    }
+  }
+  new CloudStorage(ctx)
+  const account = new AccountService(ctx, { sqlitePath: join(dir, 'biu.sqlite') })
+  assert.equal(await account.isMemberAsync('ada', 'ws_a'), true)
+  assert.equal(await account.isMemberAsync('bob', 'ws_a'), false)
+  await account.warmPluginAccess('ada', 'ws_a', ['demo'])
+  await account.warmPluginAccess('ada', 'ws_b', ['demo'])
+  for (const listener of listeners) listener('ws_a')
+  assert.equal(account.canAccessPluginCached('ada', 'ws_a', 'demo'), false)
+  assert.equal(account.canAccessPluginCached('ada', 'ws_b', 'demo'), true)
+})
