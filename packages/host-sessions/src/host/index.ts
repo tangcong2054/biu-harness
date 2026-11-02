@@ -825,7 +825,8 @@ export class SessionsService extends Service {
     const accountId = currentAccountId()
     const workspaceId = currentRequestWorkspaceId()
     if (!mysql || !accountId || !workspaceId || ids?.length === 0) return out
-    if (!(await mysql.membership(accountId, workspaceId))) return out
+    const member = await mysql.membership(accountId, workspaceId)
+    if (!member) return out
     const sources = new Map<string, ScopeSource>()
     const load = async (collection: string) => {
       if (sources.has(collection)) return
@@ -846,7 +847,7 @@ export class SessionsService extends Service {
         current = sources.get(parent)?.policies[current.parentRecordId]
         guard += 1
       }
-      if (mysqlRecordVisible('/sessions', id, sources, accountId)) out.add(id)
+      if (mysqlRecordVisible('/sessions', id, sources, accountId, member.memberKind ?? 'member')) out.add(id)
     }
     return out
   }
@@ -855,7 +856,7 @@ export class SessionsService extends Service {
     let account: {
       usesMysqlAccounts?: () => boolean
       mysql?: {
-        membership?: (accountId: string, workspaceId: string) => Promise<unknown>
+        membership?: (accountId: string, workspaceId: string) => Promise<{ memberKind?: string } | null>
         collectionScopeSources?: (
           workspaceId: string,
           collection: string,
@@ -870,7 +871,7 @@ export class SessionsService extends Service {
     const mysql = account?.usesMysqlAccounts?.() ? account.mysql : null
     if (!mysql?.membership || !mysql.collectionScopeSources) return null
     return mysql as {
-      membership: (accountId: string, workspaceId: string) => Promise<unknown>
+      membership: (accountId: string, workspaceId: string) => Promise<{ memberKind?: string } | null>
       collectionScopeSources: (
         workspaceId: string,
         collection: string,

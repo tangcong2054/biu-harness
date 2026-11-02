@@ -902,12 +902,12 @@ export class MysqlAccountRepository {
 
   async collectionScopeSources(workspaceId: string, collection: string) {
     const [policies] = await this.pool.query<RowDataPacket[]>(
-      `SELECT record_id, ownership, access_mode, parent_collection, parent_record_id, owner_account_id
+      `SELECT record_id, ownership, access_mode, parent_collection, parent_record_id, owner_account_id, member_default_role
        FROM ${this.db}.resource_policies WHERE workspace_id = ? AND collection = ?`,
       [workspaceId, collection],
     )
     const [owners] = await this.pool.query<RowDataPacket[]>(
-      `SELECT record_id FROM ${this.db}.record_owners WHERE workspace_id = ? AND collection = ?`,
+      `SELECT record_id, owner_id FROM ${this.db}.record_owners WHERE workspace_id = ? AND collection = ?`,
       [workspaceId, collection],
     )
     const policyRows: Record<string, {
@@ -916,6 +916,7 @@ export class MysqlAccountRepository {
       parentCollection: string
       parentRecordId: string
       ownerAccountId: string
+      memberDefaultRole: string
     }> = {}
     for (const row of policies) {
       policyRows[String(row.record_id)] = {
@@ -924,11 +925,15 @@ export class MysqlAccountRepository {
         parentCollection: String(row.parent_collection ?? ''),
         parentRecordId: String(row.parent_record_id ?? ''),
         ownerAccountId: String(row.owner_account_id ?? ''),
+        memberDefaultRole: String(row.member_default_role ?? ''),
       }
     }
+    const legacyOwners: Record<string, string> = {}
+    for (const row of owners) legacyOwners[String(row.record_id)] = String(row.owner_id ?? '')
     return {
       policies: policyRows,
       owners: owners.map((row) => String(row.record_id)),
+      legacyOwners,
     }
   }
 

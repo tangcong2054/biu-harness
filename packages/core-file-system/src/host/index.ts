@@ -20,7 +20,7 @@ import {
 } from '@biu/host-plugin-loader/data-dir'
 import { asPublicProfile, readWorkspaceProfile, writeWorkspaceProfile } from '@biu/host-workspace'
 import { authorizeCollection, roleCoversAction, type Action as PermissionAction, type AuthorizationService, type ResourceRole } from '@biu/host-account/authorization'
-import { effectiveScopePolicy, mysqlRecordVisible, resolveRecordScope, type DataScope, type ScopeSource } from './record-scope.ts'
+import { effectiveScopePolicy, mysqlOwnershipRole, mysqlRecordVisible, resolveRecordScope, type DataScope, type ScopeSource } from './record-scope.ts'
 import { isRegisteredBuiltinPlugin } from '@biu/host-account/store'
 import { forwardCloud, forwardCloudBytes } from '@biu/host-account/mirror'
 import { Service, type Context } from 'cordis'
@@ -802,6 +802,11 @@ export class DatabaseService extends Service implements Database {
   private mysqlGrantRoles = new Map<string, ResourceRole>()
   /** 同一条键上，当前账号的成员类型：协作者看到“私人”记录时，按它是内部成员还是外部来显示“空间”或“共享”。 */
   private mysqlGrantAudience = new Map<string, 'workspace' | 'shared'>()
+  /**
+   * “权限”列在 MySQL 模式下的取值：归属（创建者 / 成员默认）与授权（记录、视图）取最高。
+   * 以前这一列用本地 SQLite 账号库计算，而线上那份是过期副本：成员不全、角色不对、没有视图授权。
+   */
+  private mysqlRoles = new Map<string, ResourceRole | null>()
   /** 当前这一页装饰时，分组阶段已经算好的归属。 */
   private scopeHints: Map<string, DataScope> | null = null
   private boundAuth?: AuthorizationService
@@ -1474,15 +1479,25 @@ export class DatabaseService extends Service implements Database {
     const load = async (name: string) => {
       if (sources.has(name)) return
       const loaded = await mysql.collectionScopeSources!(workspaceId, name)
-      sources.set(name, { policies: loaded.policies, owners: new Set(loaded.owners) })
+      sources.set(name, { policies: loaded.policies, owners: new Set(loaded.owners), legacyOwners: loaded.legacyOwners })
     }
     await load(target.collection)
     const direct = sources.get(target.collection)?.policies[target.id]
     if (direct?.accessMode === 'inherit' && direct.parentCollection) await load(direct.parentCollection)
     const known = Boolean(direct) || Boolean(sources.get(target.collection)?.owners.has(target.id))
-    if (!known) return false
     const visibleKey = this.mysqlVisibleKey(workspaceId, accountId, target.collection, target.id)
-    const ownVisible = mysqlRecordVisible(target.collection, target.id, sources, accountId)
+    const base = mysqlOwnershipRole(target.collection, target.id, sources, accountId, member)
+    let labelRole: ResourceRole | null = base
+    if (base !== 'owner' && mysql.collectionGrantSources) {
+      const grants = new Map<string, MysqlCollectionGrants>()
+      const names = [...new Set([collection, ...sources.keys()])]
+      const loaded = await Promise.all(names.map((name) => mysql.collectionGrantSources!(accountId, workspaceId, name)))
+      names.forEach((name, index) => grants.set(name, loaded[index]!))
+      labelRole = higherAccess(base, this.computeMysqlGrantRole(collection, record ?? { id }, target, sources, grants)) as ResourceRole | null
+    }
+    this.mysqlRoles.set(visibleKey, labelRole)
+    if (!known) return false
+    const ownVisible = mysqlRecordVisible(target.collection, target.id, sources, accountId, member.memberKind)
     this.mysqlVisible.set(visibleKey, ownVisible)
     if (ownVisible) this.mysqlGrantRoles.delete(visibleKey)
     if (!ownVisible) {
@@ -1615,7 +1630,7 @@ export class DatabaseService extends Service implements Database {
           collectionScopeSources?: (
             workspaceId: string,
             collection: string,
-          ) => Promise<{ policies: ScopeSource['policies']; owners: string[] }>
+          ) => Promise<{ policies: ScopeSource['policies']; owners: string[]; legacyOwners?: Record<string, string> }>
           collectionGrantSources?: (
             accountId: string,
             workspaceId: string,
@@ -1874,27 +1889,38 @@ export class DatabaseService extends Service implements Database {
     if (workspaceId && member) {
       for (const name of names) {
         const loaded = await mysql.collectionScopeSources(workspaceId, name)
-        sources.set(name, { policies: loaded.policies, owners: new Set(loaded.owners) })
+        sources.set(name, { policies: loaded.policies, owners: new Set(loaded.owners), legacyOwners: loaded.legacyOwners })
       }
     }
     const hidden: Array<{ row: DbRecord; target: { collection: string; id: string }; key: string }> = []
+    const needGrants: Array<{ row: DbRecord; target: { collection: string; id: string }; key: string; base: ResourceRole | null }> = []
     for (const row of rows) {
       const target = this.scopeTarget(collection, String(row.id ?? ''), row)
       const source = sources.get(target.collection)
       const known = Boolean(source?.policies[target.id] || source?.owners.has(target.id))
+      if (workspaceId && member && accountId) {
+        const roleKey = this.mysqlVisibleKey(workspaceId, accountId, target.collection, target.id)
+        const base = mysqlOwnershipRole(target.collection, target.id, sources, accountId, member)
+        this.mysqlRoles.set(roleKey, base)
+        if (base !== 'owner') needGrants.push({ row, target, key: roleKey, base })
+      }
       if (!known || !workspaceId || !member || !accountId) continue
       const key = this.mysqlScopeKey(workspaceId, target.collection, target.id)
       this.mysqlScopes.set(key, resolveRecordScope(target.collection, target.id, sources))
       const visibleKey = this.mysqlVisibleKey(workspaceId, accountId, target.collection, target.id)
-      const visible = mysqlRecordVisible(target.collection, target.id, sources, accountId)
+      const visible = mysqlRecordVisible(target.collection, target.id, sources, accountId, member.memberKind)
       this.mysqlVisible.set(visibleKey, visible)
       if (!visible) hidden.push({ row, target, key: visibleKey })
       else this.mysqlGrantRoles.delete(visibleKey)
     }
-    if (hidden.length && mysql.collectionGrantSources && workspaceId && accountId) {
+    if ((hidden.length || needGrants.length) && mysql.collectionGrantSources && workspaceId && accountId) {
       const grants = new Map<string, MysqlCollectionGrants>()
       const loaded = await Promise.all([...names].map((name) => mysql.collectionGrantSources!(accountId, workspaceId, name)))
       ;[...names].forEach((name, index) => grants.set(name, loaded[index]!))
+      for (const item of needGrants) {
+        const granted = this.computeMysqlGrantRole(collection, item.row, item.target, sources, grants)
+        this.mysqlRoles.set(item.key, higherAccess(item.base, granted) as ResourceRole | null)
+      }
       for (const item of hidden) {
         const role = this.computeMysqlGrantRole(collection, item.row, item.target, sources, grants)
         if (role) {
@@ -2063,6 +2089,7 @@ export class DatabaseService extends Service implements Database {
     this.mysqlVisible.clear()
     this.mysqlGrantRoles.clear()
     this.mysqlGrantAudience.clear()
+    this.mysqlRoles.clear()
     clearRequestMemo(ACTOR_MEMO)
   }
 
@@ -2449,6 +2476,14 @@ export class DatabaseService extends Service implements Database {
 
   /** 当前用户对这一条的权限。记录上的角色和视图授权取较高的一级。 */
   private shareRoleLabel(spec: CollectionSpec, record: DbRecord) {
+    if (this.mysqlAccount()?.usesMysqlAccounts?.()) {
+      const workspaceId = currentRequestWorkspaceId()
+      const target = this.scopeTarget(spec.path, String(record.id ?? ''), record as { pageId?: unknown })
+      const key = this.mysqlVisibleKey(workspaceId, currentAccountId(), target.collection, target.id)
+      // MySQL 模式只认 MySQL 算出的权限；没装载到时显示最保守的“阅读”，不再回退到本地副本。
+      if (this.mysqlRoles.has(key)) return accessLabel(this.mysqlRoles.get(key))
+      return '阅读'
+    }
     const authorization = this.authorization()
     // 当前操作者在一次请求里不变，按请求只解析一次；授权变化时 invalidateCaches 会作废。
     const actor = authorization

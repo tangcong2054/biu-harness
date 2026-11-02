@@ -29,6 +29,7 @@ function boot() {
   }
   const grantsByAccount: Record<string, Grants> = {}
   const memberKinds: Record<string, string> = {}
+  const memberRoles: Record<string, string> = {}
   class AccountBridge extends Service {
     usesMysqlAccounts() {
       return true
@@ -36,7 +37,7 @@ function boot() {
     mysql = {
       async membership(accountId: string, workspaceId: string) {
         return workspaceId === 'ws_a' && ['ada', 'bob', 'carol', 'eve'].includes(accountId)
-          ? { role: 'member', memberKind: memberKinds[accountId] ?? 'member' }
+          ? { role: memberRoles[accountId] ?? 'member', memberKind: memberKinds[accountId] ?? 'member' }
           : null
       },
       async collectionScopeSources(workspaceId: string, collection: string) {
@@ -93,7 +94,7 @@ function boot() {
     return as(accountId, () => assertLive(spec, id, action, record)).then(() => true, () => false)
   }
   const projectX = { id: 'v_x', filters: { project: 'X' } }
-  return { db, as, ids, canRead, allows, grantsByAccount, memberKinds, state, policies, projectX }
+  return { db, as, ids, canRead, allows, grantsByAccount, memberKinds, memberRoles, state, policies, projectX }
 }
 
 test('a collaborator invited to a custom view sees and opens the records matching its filter', async () => {
@@ -158,8 +159,11 @@ test('unknown roles are ignored and grants are not queried when everything is al
   assert.deepEqual(await ids('bob'), ['p_team'])
   for (const key of Object.keys(policies)) policies[key] = { ...policies[key]!, ownership: 'workspace', accessMode: 'members' }
   state.revision += 1
-  const before = state.grantCalls
   assert.deepEqual(await ids('carol'), ['p_child', 'p_team', 'p_x1', 'p_x2', 'p_y'])
+  // 拥有全部记录的人，权限列不需要授权数据，不查授权表。
+  state.revision += 1
+  const before = state.grantCalls
+  assert.deepEqual(await ids('ada'), ['p_child', 'p_team', 'p_x1', 'p_x2', 'p_y'])
   assert.equal(state.grantCalls, before)
 })
 
@@ -241,4 +245,54 @@ test('records seen through a grant show as workspace for members and shared for 
   // 拥有者看到的仍是自己的私人页，不受协作者视角影响；协作者结果互不串用。
   expect((await labels('ada')).p_x1).toBe('私人')
   expect(await labels('bob')).toEqual(bob)
+})
+
+test('the permission column is computed from MySQL ownership and grants, not the local replica', async () => {
+  const { as, db, grantsByAccount, memberRoles, memberKinds, projectX, state } = boot()
+  const roles = async (accountId: string) => Object.fromEntries(
+    (await as(accountId, () => db.list('/pages'))).items.map((row) => [row.id, (row as Record<string, unknown>).shareRole]),
+  )
+  // 创建者对自己的记录是“管理”。
+  assert.deepEqual(await roles('ada'), { p_child: '管理', p_team: '管理', p_x1: '管理', p_x2: '管理', p_y: '管理' })
+  // 普通成员：对成员开放的空间记录按默认权限；视图授权只给“阅读”。
+  grantsByAccount.bob = { records: {}, views: [{ viewId: 'v_x', grantedBy: 'ada', role: 'viewer' }], savedViews: [projectX] }
+  assert.deepEqual(await roles('bob'), { p_team: '编辑', p_x1: '阅读', p_x2: '阅读' })
+  // 记录授权取最高，并沿继承给子页面。
+  grantsByAccount.carol = { records: { p_y: 'editor', p_team: 'manager' }, views: [], savedViews: [] }
+  assert.deepEqual(await roles('carol'), { p_child: '编辑', p_team: '管理', p_y: '编辑' })
+  // 空间管理者对开放记录是“管理”；外部成员看不到对成员开放的记录。
+  memberRoles.bob = 'admin'
+  grantsByAccount.bob = { records: {}, views: [], savedViews: [] }
+  state.revision += 1
+  assert.deepEqual(await roles('bob'), { p_team: '管理' })
+  memberKinds.eve = 'external'
+  grantsByAccount.eve = { records: { p_x1: 'viewer' }, views: [], savedViews: [] }
+  assert.deepEqual(await roles('eve'), { p_x1: '阅读' })
+})
+
+test('the permission column on a single read uses the same MySQL rule', async () => {
+  const { as, db, grantsByAccount } = boot()
+  const read = async (accountId: string, id: string) =>
+    ((await as(accountId, () => db.read(`/pages/${id}`))) as { value?: Record<string, unknown> }).value?.shareRole
+  assert.equal(await read('ada', 'p_x1'), '管理')
+  assert.equal(await read('bob', 'p_team'), '编辑')
+  grantsByAccount.carol = { records: { p_y: 'viewer' }, views: [], savedViews: [] }
+  assert.equal(await read('carol', 'p_y'), '阅读')
+})
+
+test('external collaborators and guests do not see members-mode records unless granted', async () => {
+  const { ids, canRead, grantsByAccount, memberKinds } = boot()
+  memberKinds.eve = 'external'
+  assert.deepEqual(await ids('eve'), [])
+  assert.equal(await canRead('eve', 'p_team'), false)
+  // 内部成员不受影响。
+  assert.deepEqual(await ids('bob'), ['p_team'])
+})
+
+test('a direct grant still lets an external collaborator see a members-mode record', async () => {
+  const { ids, canRead, grantsByAccount, memberKinds } = boot()
+  memberKinds.eve = 'external'
+  grantsByAccount.eve = { records: { p_team: 'viewer' }, views: [], savedViews: [] }
+  assert.deepEqual(await ids('eve'), ['p_team'])
+  assert.equal(await canRead('eve', 'p_team'), true)
 })
