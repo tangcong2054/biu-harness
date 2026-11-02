@@ -1,6 +1,6 @@
 import { isBuiltinAllViewId, parseBuiltinScopeViewId } from './catalog-views.ts'
 import { matchListFilterRecord } from './query-logic.ts'
-import type { DbRecord } from '@biu/type-file-system'
+import type { CollectionSchema, CollectionSchemaPack, DbRecord } from '@biu/type-file-system'
 
 export type DataScopeName = 'personal' | 'workspace' | 'shared'
 export type ViewGrantRole = 'viewer' | 'editor' | 'manager' | 'owner'
@@ -37,12 +37,15 @@ export function recordMatchesGrantedView(
   saved: Array<{ id: string; filters?: Record<string, unknown> }>,
   scope: DataScopeName | null,
   owner?: { grantedBy?: string; recordOwnerId?: string },
+  schema?: CollectionSchema,
+  packs: CollectionSchemaPack[] = [],
 ) {
   const resolved = viewFiltersForGrant(viewId, saved)
   if (!resolved) return false
   if (isBuiltinAllViewId(viewId) && (!owner?.grantedBy || owner.recordOwnerId !== owner.grantedBy)) return false
   if (resolved.scope && scope !== resolved.scope) return false
-  return matchListFilterRecord(record, resolved.filters)
+  // 必须与列表筛选同一份表结构：合集、布尔、时间字段要靠字段类型才能正确比较。
+  return matchListFilterRecord(record, resolved.filters, schema, packs)
 }
 
 export function grantAudienceKind(

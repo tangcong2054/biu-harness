@@ -1228,7 +1228,9 @@ export class DatabaseService extends Service implements Database {
         recordId: target.id,
       })
       const ownerId = this.recordOwner(target.collection, target.id)
-      if (recordMatchesGrantedView(record as never, grant.view_id, saved, scope, { grantedBy: grant.granted_by, recordOwnerId: ownerId })) roles.push(grant.role)
+      const spec = this.collection(collection)
+      if (recordMatchesGrantedView(record as never, grant.view_id, saved, scope, { grantedBy: grant.granted_by, recordOwnerId: ownerId },
+        spec ? schemaFor(spec) : undefined, this.facets.list())) roles.push(grant.role)
     }
     return highestViewRole(roles)
   }
@@ -1532,8 +1534,12 @@ export class DatabaseService extends Service implements Database {
       const scope = resolveRecordScope(target.collection, target.id, sources)
       const ownerId = effectiveScopePolicy(target.collection, target.id, sources)?.ownerAccountId ?? ''
       const views = [{ id: `builtin-all:${listed}` }, ...viewGrants.savedViews]
+      const schema = spec ? schemaFor(spec) : undefined
+      const packs = this.facets.list()
       for (const grant of viewGrants.views) {
-        if (accessRecordViewMatches(grant.viewId, record, views, scope, ownerId, grant.grantedBy)) roles.push(grant.role)
+        // 视图只能转授授权人自己看得到的记录：自己的，或对空间成员开放的。不能借视图转授别人的私人记录。
+        if (!grant.grantedBy || !mysqlRecordVisible(target.collection, target.id, sources, grant.grantedBy)) continue
+        if (accessRecordViewMatches(grant.viewId, record, views, scope, ownerId, grant.grantedBy, schema, packs)) roles.push(grant.role)
       }
     }
     let best: ResourceRole | null = null
@@ -3701,7 +3707,10 @@ export function apply(ctx: Context) {
       setAccessMatchers?: (matchers: {
         readRecord: (workspaceId: string, collection: string, recordId: string) => Promise<DbRecord | null>
         memberView: typeof accessMemberViewMatches
-        recordView: typeof accessRecordViewMatches
+        recordView: (
+          viewId: string, record: DbRecord, views: Array<{ id: string; filters?: Record<string, unknown>; filterTree?: unknown }>,
+          scope: 'personal' | 'workspace' | 'shared' | null, ownerId: string, grantedBy: string, collection: string,
+        ) => boolean
       }) => void
       externallySharedRecords?: (
         accountId: string,
@@ -3743,7 +3752,11 @@ export function apply(ctx: Context) {
   account?.mysql?.setAccessMatchers?.({
     readRecord: (workspaceId, collection, recordId) => db.readAccessMatchRecord(workspaceId, collection, recordId),
     memberView: accessMemberViewMatches,
-    recordView: accessRecordViewMatches,
+    recordView: (viewId, record, views, scope, ownerId, grantedBy, collection) => {
+      const spec = db.collection(collection)
+      return accessRecordViewMatches(viewId, record, views, scope, ownerId, grantedBy,
+        spec ? schemaFor(spec) : undefined, db.facets.list())
+    },
   })
   ctx.inject(['sessions'], (inner) => {
     inner.sessions.viewAccess = Object.assign(

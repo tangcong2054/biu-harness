@@ -6,7 +6,7 @@ type Scope = 'personal' | 'workspace' | 'shared'
 export type AccessMatchers = {
   readRecord(workspaceId: string, collection: string, recordId: string): Promise<AccessRecord | null>
   memberView(viewId: string, member: AccessRecord, views: AccessView[]): boolean
-  recordView(viewId: string, record: AccessRecord, views: AccessView[], scope: Scope | null, ownerId: string, grantedBy: string): boolean
+  recordView(viewId: string, record: AccessRecord, views: AccessView[], scope: Scope | null, ownerId: string, grantedBy: string, collection: string): boolean
 }
 
 export function accessDenied() {
@@ -154,8 +154,10 @@ export class MysqlAccessReader {
 
   private async walk(collection: string, recordId: string, visited: Set<string>): Promise<{
     allowed: boolean; scope: Scope | null; viewGrants: RowDataPacket[]
+    /** 生效策略（继承链顶端）是否对空间成员开放，以及它的拥有者；与 mysqlRecordVisible 同一规则。 */
+    found: boolean; open: boolean; effectiveOwner: string
   }> {
-    const denied = { allowed: false, scope: null, viewGrants: [] }
+    const denied = { allowed: false, scope: null, viewGrants: [], found: false, open: false, effectiveOwner: '' }
     const key = `${collection}\0${recordId}`
     if (visited.has(key) || visited.size >= 64) return denied
     visited.add(key)
@@ -181,11 +183,19 @@ export class MysqlAccessReader {
     )
     for (const grant of grants) if (await this.subjectMatches(grant)) allowed = true
     if (policy?.access_mode === 'members' && this.member?.membershipKind === 'member') allowed = true
+    let open = !policy || (policy.access_mode !== 'private' && policy.access_mode !== 'restricted')
+    let effectiveOwner = policy ? String(policy.owner_account_id || '') : ''
     if (policy?.access_mode === 'inherit' && policy.parent_record_id) {
       const parent = await this.walk(String(policy.parent_collection || collection), String(policy.parent_record_id), visited)
       allowed ||= parent.allowed
       scope = parent.scope
+      if (parent.found) {
+        open = parent.open
+        effectiveOwner = parent.effectiveOwner
+      }
     }
+    // 视图只能转授授权人自己看得到的记录：自己的，或对空间成员开放的。
+    const granterCanSee = (granter: string) => Boolean(granter) && (open || !effectiveOwner || effectiveOwner === granter)
     const viewGrants = await this.rows(
       `SELECT view_id, subject_type, subject_id, role, granted_by FROM \`${this.database}\`.view_grants
        WHERE workspace_id = ? AND collection = ?`,
@@ -197,14 +207,14 @@ export class MysqlAccessReader {
       if (!readableRoles.has(String(grant.role))) continue
       const id = String(grant.view_id)
       let matches = id === `builtin-all:${collection}` && Boolean(grant.granted_by) && grant.granted_by === ownerId
-      if (!id.startsWith('builtin-all:') && this.matchers) {
+      if (!id.startsWith('builtin-all:') && this.matchers && granterCanSee(String(grant.granted_by ?? ''))) {
         if (record === undefined) record = await this.matchers.readRecord(this.workspaceId, collection, recordId)
-        matches = Boolean(record && this.matchers.recordView(id, record, [{ id: `builtin-all:${collection}` }, ...await this.savedViews(collection)], scope, ownerId, String(grant.granted_by ?? '')))
+        matches = Boolean(record && this.matchers.recordView(id, record, [{ id: `builtin-all:${collection}` }, ...await this.savedViews(collection)], scope, ownerId, String(grant.granted_by ?? ''), collection))
       }
       if (!matches) continue
       applicable.push(grant)
       if (await this.subjectMatches(grant)) allowed = true
     }
-    return { allowed, scope, viewGrants: applicable }
+    return { allowed, scope, viewGrants: applicable, found: true, open, effectiveOwner }
   }
 }

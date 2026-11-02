@@ -42,6 +42,18 @@ const grant = (subject_type: string, subject_id: string, extra: Row = {}): Row =
 const denied = { code: 'ACCESS_DETAILS_DENIED', status: 403 }
 
 describe('MySQL access detail record authorization', () => {
+  it('ignores a data view grant from someone who cannot see the private record', async () => {
+    const f = fixture()
+    f.viewGrants['/pages'] = [grant('account', 'bob', { view_id: 'done', granted_by: 'carol' })]
+    f.views['/pages'] = [{ view_id: 'done', payload_json: { filters: { status: 'done' } } }]
+    await expect(f.read()).rejects.toMatchObject(denied)
+    f.viewGrants['/pages'] = [grant('account', 'bob', { view_id: 'done', granted_by: 'ada' })]
+    await expect(f.read()).resolves.toHaveLength(1)
+    f.policies['/pages/p1'] = f.policy({ ownership: 'workspace', access_mode: 'members' })
+    f.member.member_kind = 'external'
+    f.viewGrants['/pages'] = [grant('account', 'bob', { view_id: 'done', granted_by: 'carol' })]
+    await expect(f.read()).resolves.toHaveLength(1)
+  })
   it('rejects ordinary members, admins and workspace owners without record permission', async () => {
     const f = fixture()
     for (const role of ['member', 'admin', 'owner']) {

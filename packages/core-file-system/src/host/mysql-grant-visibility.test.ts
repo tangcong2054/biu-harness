@@ -170,3 +170,54 @@ test('revoking a grant hides the records again once the authz revision moves', a
   state.revision += 1
   assert.deepEqual(await ids('bob'), ['p_team'])
 })
+
+test('a view filtered by collection membership (facet) grants the records in that collection', async () => {
+  const { db, ids, canRead, grantsByAccount } = boot()
+  db.facets.upsert({ id: 'cdb', label: 'CDB 实例巡检', fields: [] })
+  db.facets.writeRecordFacet('/pages', 'p_x1', { tags: ['cdb'], values: {} }, 'X 一')
+  db.facets.writeRecordFacet('/pages', 'p_y', { tags: ['cdb'], values: {} }, 'Y 页')
+  // 与线上“汇报”视图相同的结构：filters 为空，条件写在 filterTree 里。
+  const report = {
+    id: '1791443424667',
+    filters: {},
+    filterTree: {
+      kind: 'group', id: 'g', combinator: 'and',
+      children: [{ kind: 'rule', id: 'r', field: 'facet', op: 'eq', value: 'cdb' }],
+    },
+  }
+  grantsByAccount.bob = { records: {}, views: [{ viewId: report.id, grantedBy: 'ada', role: 'viewer' }], savedViews: [report] }
+  assert.deepEqual(await ids('bob'), ['p_team', 'p_x1', 'p_y'])
+  assert.equal(await canRead('bob', 'p_y'), true)
+  assert.equal(await canRead('bob', 'p_x2'), false)
+  // 按合集名称筛选同样生效。
+  grantsByAccount.carol = {
+    records: {},
+    views: [{ viewId: 'by-label', grantedBy: 'ada', role: 'viewer' }],
+    savedViews: [{
+      id: 'by-label',
+      filters: { $tree: { kind: 'group', combinator: 'and', children: [{ kind: 'rule', field: 'facet', op: 'eq', value: 'CDB 实例巡检' }] } },
+    }],
+  }
+  assert.deepEqual(await ids('carol'), ['p_team', 'p_x1', 'p_y'])
+})
+
+test('a filter tree whose root is a single rule grants nothing instead of everything', async () => {
+  const { ids, grantsByAccount } = boot()
+  grantsByAccount.bob = {
+    records: {},
+    views: [{ viewId: 'bare', grantedBy: 'ada', role: 'viewer' }],
+    savedViews: [{ id: 'bare', filterTree: { kind: 'rule', field: 'project', op: 'eq', value: 'X' } }],
+  }
+  assert.deepEqual(await ids('bob'), ['p_team'])
+})
+
+test('a view cannot re-share private records its granter cannot see', async () => {
+  const { ids, canRead, grantsByAccount, projectX } = boot()
+  // Carol 不是这些私人页面的拥有者，她建的视图授权不能把 Ada 的私人页面带给 Bob。
+  grantsByAccount.bob = { records: {}, views: [{ viewId: 'v_x', grantedBy: 'carol', role: 'viewer' }], savedViews: [projectX] }
+  assert.deepEqual(await ids('bob'), ['p_team'])
+  assert.equal(await canRead('bob', 'p_x1'), false)
+  // 空间成员都能看到的记录不受影响；授权人缺失时什么都不给。
+  grantsByAccount.bob = { records: {}, views: [{ viewId: 'v_x', grantedBy: '', role: 'viewer' }], savedViews: [projectX] }
+  assert.deepEqual(await ids('bob'), ['p_team'])
+})
