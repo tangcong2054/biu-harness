@@ -786,6 +786,8 @@ export class DatabaseService extends Service implements Database {
   private mysqlVisible = new Map<string, boolean>()
   /** 归属判为不可见、但当前账号通过记录授权或视图授权获得的最高角色。键同 mysqlVisible。 */
   private mysqlGrantRoles = new Map<string, ResourceRole>()
+  /** 同一条键上，当前账号的成员类型：协作者看到“私人”记录时，按它是内部成员还是外部来显示“空间”或“共享”。 */
+  private mysqlGrantAudience = new Map<string, 'workspace' | 'shared'>()
   /** 当前这一页装饰时，分组阶段已经算好的归属。 */
   private scopeHints: Map<string, DataScope> | null = null
   private boundAuth?: AuthorizationService
@@ -1475,6 +1477,7 @@ export class DatabaseService extends Service implements Database {
       }
       if (!role || !roleCoversAction(role, action)) throw new Error(`unknown record: ${collection}/${id}`)
       this.mysqlGrantRoles.set(visibleKey, role)
+      this.mysqlGrantAudience.set(visibleKey, member.memberKind === 'member' ? 'workspace' : 'shared')
     }
     this.mysqlScopes.set(
       this.mysqlScopeKey(workspaceId, target.collection, target.id),
@@ -1507,6 +1510,22 @@ export class DatabaseService extends Service implements Database {
     // 只有归属判为不可见的记录才看授权；归属本身可见时（自己的、对成员开放的）授权角色不参与。
     if (this.mysqlVisible.get(key) !== false) return null
     return this.mysqlGrantRoles.get(key) ?? null
+  }
+
+  /**
+   * 协作者视角的归属：只有归属本身是“私人”、靠授权才看得到时才改写，
+   * 内部成员显示“空间”、外部成员显示“共享”，与分享面板和撤销后重算的规则一致。
+   */
+  private mysqlViewerScope(
+    collection: string,
+    row: { id?: unknown; pageId?: unknown; collection?: unknown; sessionId?: unknown; sourceId?: unknown; tablePath?: unknown },
+    stored: DataScope | null | undefined,
+  ): DataScope | null | undefined {
+    if (stored && stored !== 'personal') return stored
+    if (!this.mysqlGrantedRole(collection, row)) return stored
+    const workspaceId = currentRequestWorkspaceId()
+    const target = this.scopeTarget(collection, String(row.id ?? ''), row)
+    return this.mysqlGrantAudience.get(this.mysqlVisibleKey(workspaceId, currentAccountId(), target.collection, target.id)) ?? 'workspace'
   }
 
   /**
@@ -1859,8 +1878,10 @@ export class DatabaseService extends Service implements Database {
       ;[...names].forEach((name, index) => grants.set(name, loaded[index]!))
       for (const item of hidden) {
         const role = this.computeMysqlGrantRole(collection, item.row, item.target, sources, grants)
-        if (role) this.mysqlGrantRoles.set(item.key, role)
-        else this.mysqlGrantRoles.delete(item.key)
+        if (role) {
+          this.mysqlGrantRoles.set(item.key, role)
+          this.mysqlGrantAudience.set(item.key, member?.memberKind === 'member' ? 'workspace' : 'shared')
+        } else this.mysqlGrantRoles.delete(item.key)
       }
     }
     return true
@@ -1901,7 +1922,7 @@ export class DatabaseService extends Service implements Database {
         const target = this.scopeTarget(collection, id, row)
         // 云端还没落归属的记录，分享列按“私人”显示，分组也归到私人，两边保持一致。
         // 通过授权才看得到的记录，对当前账号来说是“别人共享给我的”，分组和分享列都按共享算。
-        const scope = this.mysqlGrantedRole(collection, row) ? 'shared' : this.mysqlScopeOf(target.collection, target.id) ?? 'personal'
+        const scope = this.mysqlViewerScope(collection, row, this.mysqlScopeOf(target.collection, target.id)) ?? 'personal'
         scopes.set(id, scope)
         if (scope === 'workspace') workspace.push(row)
         else if (scope === 'shared') shared.push(row)
@@ -2022,6 +2043,7 @@ export class DatabaseService extends Service implements Database {
     this.mysqlScopes.clear()
     this.mysqlVisible.clear()
     this.mysqlGrantRoles.clear()
+    this.mysqlGrantAudience.clear()
   }
 
   private notifyChange() {
@@ -2381,7 +2403,7 @@ export class DatabaseService extends Service implements Database {
   private shareScopeLabel(collection: string, id: string, record: DbRecord, stored: 'personal' | 'workspace' | 'shared') {
     const target = this.scopeTarget(collection, id, record)
     const mysqlScope = this.scopeHints?.get(id)
-      ?? (this.mysqlGrantedRole(collection, { ...record, id }) ? 'shared' as const : this.mysqlScopeOf(target.collection, target.id))
+      ?? this.mysqlViewerScope(collection, { ...record, id }, this.mysqlScopeOf(target.collection, target.id))
     if (mysqlScope !== undefined) {
       if (this.hasPublicShare(collection, id) || mysqlScope === 'shared') return '共享'
       if (mysqlScope === 'workspace') return '空间'

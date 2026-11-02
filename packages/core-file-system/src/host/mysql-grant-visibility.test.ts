@@ -28,14 +28,15 @@ function boot() {
     p_team: { ownership: 'workspace', accessMode: 'members', parentCollection: '', parentRecordId: '', ownerAccountId: 'ada' },
   }
   const grantsByAccount: Record<string, Grants> = {}
+  const memberKinds: Record<string, string> = {}
   class AccountBridge extends Service {
     usesMysqlAccounts() {
       return true
     }
     mysql = {
       async membership(accountId: string, workspaceId: string) {
-        return workspaceId === 'ws_a' && ['ada', 'bob', 'carol'].includes(accountId)
-          ? { role: 'member', memberKind: 'member' }
+        return workspaceId === 'ws_a' && ['ada', 'bob', 'carol', 'eve'].includes(accountId)
+          ? { role: 'member', memberKind: memberKinds[accountId] ?? 'member' }
           : null
       },
       async collectionScopeSources(workspaceId: string, collection: string) {
@@ -92,7 +93,7 @@ function boot() {
     return as(accountId, () => assertLive(spec, id, action, record)).then(() => true, () => false)
   }
   const projectX = { id: 'v_x', filters: { project: 'X' } }
-  return { db, as, ids, canRead, allows, grantsByAccount, state, policies, projectX }
+  return { db, as, ids, canRead, allows, grantsByAccount, memberKinds, state, policies, projectX }
 }
 
 test('a collaborator invited to a custom view sees and opens the records matching its filter', async () => {
@@ -222,19 +223,22 @@ test('a view cannot re-share private records its granter cannot see', async () =
   assert.deepEqual(await ids('bob'), ['p_team'])
 })
 
-test('records seen through a grant show and group as shared for the collaborator only', async () => {
-  const { as, db, grantsByAccount, projectX } = boot()
-  grantsByAccount.bob = { records: {}, views: [{ viewId: 'v_x', grantedBy: 'ada', role: 'viewer' }], savedViews: [projectX] }
+test('records seen through a grant show as workspace for members and shared for external collaborators', async () => {
+  const { as, db, grantsByAccount, projectX, memberKinds } = boot()
+  const view = { records: {}, views: [{ viewId: 'v_x', grantedBy: 'ada', role: 'viewer' }], savedViews: [projectX] }
+  grantsByAccount.bob = view
+  grantsByAccount.eve = view
+  memberKinds.eve = 'external'
   const labels = async (accountId: string, filter?: Record<string, unknown>) => Object.fromEntries(
     (await as(accountId, () => db.list('/pages', filter))).items.map((row) => [row.id, (row as Record<string, unknown>).shareScope]),
   )
   const bob = await labels('bob')
-  expect(bob.p_x1).toBe('共享')
-  expect(bob.p_team).toBe('空间')
-  expect(Object.keys(await labels('bob', { $scope: 'shared' })).sort()).toEqual(['p_x1', 'p_x2'])
+  expect(bob).toEqual({ p_x1: '空间', p_x2: '空间', p_team: '空间' })
+  expect(Object.keys(await labels('bob', { $scope: 'workspace' })).sort()).toEqual(['p_team', 'p_x1', 'p_x2'])
   expect(Object.keys(await labels('bob', { $scope: 'personal' }))).toEqual([])
-  // 拥有者看到的仍是自己的私人页，不受协作者视角影响。
-  const ada = await labels('ada')
-  expect(ada.p_x1).toBe('私人')
+  const eve = await labels('eve')
+  expect(eve.p_x1).toBe('共享')
+  // 拥有者看到的仍是自己的私人页，不受协作者视角影响；协作者结果互不串用。
+  expect((await labels('ada')).p_x1).toBe('私人')
   expect(await labels('bob')).toEqual(bob)
 })
