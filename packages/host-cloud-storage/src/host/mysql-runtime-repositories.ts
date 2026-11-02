@@ -1,5 +1,12 @@
 import type { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise'
 import { currentRequestWorkspaceId } from '@biu/host-plugin-loader/data-dir'
+import {
+  applySavedViewMutation,
+  captureSavedViewMutations,
+  savedViewMutationError,
+  type SavedViewMutation,
+  type SavedViewMutationResult,
+} from '@biu/host-plugin-loader/metadata-runtime'
 
 const SAFE_DATABASE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
 
@@ -174,6 +181,100 @@ export class MysqlFileSystemMetadataRepository extends MysqlRuntimeRepository {
     return (rows[0] as T | undefined) ?? null
   }
 
+  async saveShare(row: Record<string, unknown>, previous: Record<string, unknown> | null) {
+    const workspaceId = this.workspaceId()
+    const columns = FILE_SYSTEM_METADATA_COLUMNS.shares
+    const capture = (value: Record<string, unknown>) => {
+      checkedColumns('shares', value)
+      if (columns.some((column) => value[column] === undefined || value[column] === null)) throw new Error('Incomplete share row')
+      const copy = Object.fromEntries(columns.map((column) => [column, value[column]]))
+      for (const column of ['token', 'kind', 'collection', 'view_id', 'record_id', 'password_salt', 'password_hash']) {
+        if (typeof copy[column] !== 'string') throw new Error('Invalid share row')
+      }
+      if (!copy.token || !copy.collection || !['view', 'record'].includes(String(copy.kind))) throw new Error('Invalid share target')
+      for (const column of ['created_at', 'updated_at', 'share_plugins', 'allow_copy']) {
+        if (!Number.isSafeInteger(copy[column]) || Number(copy[column]) < 0) throw new Error('Invalid share value')
+      }
+      return copy
+    }
+    const next = capture(row)
+    const before = previous === null ? null : capture(previous)
+    const conflict = () => Object.assign(new Error('Share changed; reload before saving'), { code: 'SHARE_CONFLICT', status: 409 })
+    if (before && ['token', 'kind', 'collection', 'view_id', 'record_id', 'created_at'].some((column) => before[column] !== next[column])) throw conflict()
+    let baseViewId = String(next.view_id)
+    if (next.kind === 'view' && baseViewId.startsWith('builtin-scope:')) {
+      const match = /^builtin-scope:(personal|workspace|shared):(.+)$/.exec(baseViewId)
+      if (!match) throw conflict()
+      try { baseViewId = decodeURIComponent(match[2]!) } catch { throw conflict() }
+      if (!baseViewId || baseViewId.startsWith('builtin-scope:')
+        || `builtin-scope:${match[1]}:${encodeURIComponent(baseViewId)}` !== next.view_id) throw conflict()
+    }
+    const connection = await this.pool.getConnection()
+    let discard = false
+    try {
+      await connection.beginTransaction()
+      if (next.kind === 'view' && baseViewId && !/^builtin(?:-|:)/.test(baseViewId)) {
+        const [views] = await connection.query<RowDataPacket[]>(
+          `SELECT payload_json FROM ${this.database}.saved_views
+           WHERE workspace_id = ? AND collection = ? AND view_id = ? FOR UPDATE`,
+          [workspaceId, next.collection, baseViewId],
+        )
+        let view: unknown
+        try {
+          const payload = views[0]?.payload_json
+          view = typeof payload === 'string' ? JSON.parse(payload) : payload
+        } catch { throw conflict() }
+        if (!view || typeof view !== 'object' || Array.isArray(view)
+          || (view as Record<string, unknown>).id !== baseViewId
+          || (view as Record<string, unknown>).deletedAt != null) throw conflict()
+      }
+      if (before) {
+        const [rows] = await connection.query<RowDataPacket[]>(
+          `SELECT * FROM ${this.database}.shares WHERE workspace_id = ? AND token = ? FOR UPDATE`,
+          [workspaceId, before.token],
+        )
+        const current = rows[0]
+        if (!current || columns.some((column) => String(current[column]) !== String(before[column]))) throw conflict()
+        const updates = ['password_salt', 'password_hash', 'share_plugins', 'allow_copy', 'updated_at']
+        await connection.query(
+          `UPDATE ${this.database}.shares SET ${updates.map((column) => `${safeColumn(column)} = ?`).join(', ')}
+           WHERE workspace_id = ? AND token = ?`,
+          [...updates.map((column) => next[column]), workspaceId, next.token],
+        )
+      } else {
+        await connection.query(
+          `INSERT INTO ${this.database}.shares (workspace_id, ${columns.map(safeColumn).join(', ')})
+           VALUES (?, ${columns.map(() => '?').join(', ')})`,
+          [workspaceId, ...columns.map((column) => next[column])],
+        )
+      }
+      await connection.commit()
+    } catch (error) {
+      try { await connection.rollback() } catch (rollbackError) {
+        discard = true
+        throw new AggregateError([error, rollbackError], 'Share transaction rollback failed')
+      }
+      const code = (error as { code?: string } | null)?.code
+      if (['ER_DUP_ENTRY', 'ER_LOCK_DEADLOCK', 'ER_LOCK_WAIT_TIMEOUT'].includes(code ?? '')) throw conflict()
+      throw error
+    } finally {
+      if (discard) connection.destroy()
+      else connection.release()
+    }
+  }
+
+  async deleteShares(where: Record<string, unknown>) {
+    const columns = Object.keys(where)
+    if (!columns.length || columns.some((column) => !['token', 'kind', 'collection', 'view_id', 'record_id'].includes(column)
+      || typeof where[column] !== 'string')) throw new Error('Invalid share deletion predicate')
+    const exactViewTarget = where.kind === 'view' && typeof where.view_id === 'string'
+      && typeof where.record_id === 'string'
+    if (!(typeof where.token === 'string' && where.token)
+      && !(where.collection && ['view', 'record'].includes(String(where.kind))
+        && (where.kind === 'record' ? where.record_id : where.view_id || exactViewTarget))) throw new Error('Share target required')
+    return this.delete('shares', where)
+  }
+
   async deleteShareByToken(token: string) {
     const [result] = await this.pool.query<ResultSetHeader>(
       `DELETE FROM ${this.database}.shares WHERE token = ?`,
@@ -226,6 +327,135 @@ export class MysqlFileSystemMetadataRepository extends MysqlRuntimeRepository {
       await tx.clear(table)
       for (const row of rows) await tx.upsert(table, row)
     })
+  }
+
+  /** The caller must authorize resource:update and supply the authenticated account, never a body field. */
+  async mutateSavedViews(accountId: string, input: readonly SavedViewMutation[]): Promise<SavedViewMutationResult[]> {
+    const workspaceId = this.workspaceId()
+    if (typeof accountId !== 'string' || !accountId || accountId !== accountId.trim()
+      || accountId.length > 64 || /[\u0000-\u001f\u007f]/.test(accountId)) throw savedViewMutationError('SAVED_VIEW_DENIED')
+    const mutations = captureSavedViewMutations(input)
+    if (!mutations.length) return []
+    const ordered = mutations.map((mutation, index) => ({ mutation, index }))
+      .sort((a, b) => {
+        const left = `${a.mutation.collection}\0${a.mutation.id}`
+        const right = `${b.mutation.collection}\0${b.mutation.id}`
+        return left < right ? -1 : left > right ? 1 : 0
+      })
+    const connection = await this.pool.getConnection()
+    let discardConnection = false
+    try {
+      await connection.beginTransaction()
+      const [members] = await connection.query<RowDataPacket[]>(
+        `SELECT account_id FROM ${this.database}.workspace_members
+         WHERE workspace_id = ? AND account_id = ? FOR UPDATE`,
+        [workspaceId, accountId],
+      )
+      if (!members.length) throw savedViewMutationError('SAVED_VIEW_DENIED')
+      const results: SavedViewMutationResult[] = []
+      for (const { mutation, index } of ordered) {
+        const key = [workspaceId, mutation.collection, mutation.id]
+        const [rows] = await connection.query<RowDataPacket[]>(
+          `SELECT payload_json FROM ${this.database}.saved_views
+           WHERE workspace_id = ? AND collection = ? AND view_id = ? FOR UPDATE`,
+          key,
+        )
+        let current: unknown = null
+        if (rows.length) {
+          try {
+            const payload = rows[0]!.payload_json
+            current = (typeof payload === 'string' ? JSON.parse(payload) : payload) ?? undefined
+          } catch {
+            throw savedViewMutationError('SAVED_VIEW_CONFLICT')
+          }
+        }
+        const now = Date.now()
+        const result = applySavedViewMutation(mutation, current, accountId, now)
+        if (mutation.type === 'create') {
+          await connection.query(
+            `INSERT INTO ${this.database}.saved_views (workspace_id, collection, view_id, payload_json, updated_at)
+             VALUES (?, ?, ?, ?, ?)`,
+            [...key, JSON.stringify(result.view), now],
+          )
+        } else {
+          await connection.query(
+            `UPDATE ${this.database}.saved_views SET payload_json = ?, updated_at = ?
+             WHERE workspace_id = ? AND collection = ? AND view_id = ?`,
+            [JSON.stringify(result.view), now, ...key],
+          )
+        }
+        if (mutation.type === 'delete') {
+          const shareViewIds = [mutation.id, ...['personal', 'workspace', 'shared']
+            .map((scope) => `builtin-scope:${scope}:${encodeURIComponent(mutation.id)}`)]
+          for (const viewId of shareViewIds) {
+            await connection.query(
+              `DELETE FROM ${this.database}.shares
+               WHERE workspace_id = ? AND kind = 'view' AND collection = ? AND view_id = ?`,
+              [workspaceId, mutation.collection, viewId],
+            )
+          }
+        }
+        results[index] = result
+      }
+      await this.bumpGrantedViewRevisions(connection, workspaceId, mutations)
+      await connection.commit()
+      return results
+    } catch (error) {
+      try {
+        await connection.rollback()
+      } catch (rollbackError) {
+        discardConnection = true
+        throw new AggregateError([error, rollbackError], 'Saved view transaction rollback failed')
+      }
+      const code = (error as { code?: string } | null)?.code
+      if (code === 'ER_DUP_ENTRY' || code === 'ER_LOCK_DEADLOCK' || code === 'ER_LOCK_WAIT_TIMEOUT') {
+        throw savedViewMutationError('SAVED_VIEW_CONFLICT')
+      }
+      throw error
+    } finally {
+      if (discardConnection) connection.destroy()
+      else connection.release()
+    }
+  }
+
+  /**
+   * 视图条件决定授权范围：改了或删了一个承载授权的视图（数据视图授权，或被当作成员视图授权对象），
+   * 别的实例按授权版本缓存的可见性就过期了。这里递增版本号；没有授权引用时不写。
+   */
+  private async bumpGrantedViewRevisions(
+    connection: PoolConnection, workspaceId: string, mutations: readonly SavedViewMutation[],
+  ) {
+    const changed = mutations.filter((item) => item.type !== 'create')
+    if (!changed.length) return
+    const bumps = new Set<string>()
+    for (const mutation of changed) {
+      const ids = [mutation.id, ...['personal', 'workspace', 'shared']
+        .map((scope) => `builtin-scope:${scope}:${encodeURIComponent(mutation.id)}`)]
+      const [dataGrants] = await connection.query<RowDataPacket[]>(
+        `SELECT 1 AS hit FROM ${this.database}.view_grants
+         WHERE workspace_id = ? AND collection = ? AND view_id IN (?, ?, ?, ?) LIMIT 1`,
+        [workspaceId, mutation.collection, ...ids],
+      )
+      if (dataGrants.length) bumps.add(mutation.collection)
+      if (mutation.collection === '/workspace-members') {
+        const [memberGrants] = await connection.query<RowDataPacket[]>(
+          `SELECT 1 AS hit FROM ${this.database}.view_grants
+           WHERE workspace_id = ? AND subject_type = 'member_view' AND subject_id = ?
+           UNION ALL
+           SELECT 1 AS hit FROM ${this.database}.record_grants
+           WHERE workspace_id = ? AND subject_type = 'member_view' AND subject_id = ? LIMIT 1`,
+          [workspaceId, mutation.id, workspaceId, mutation.id],
+        )
+        if (memberGrants.length) bumps.add('*')
+      }
+    }
+    for (const name of bumps) {
+      await connection.query(
+        `INSERT INTO ${this.database}.authz_revisions (workspace_id, collection_name, revision, updated_at)
+         VALUES (?, ?, 1, ?) ON DUPLICATE KEY UPDATE revision = revision + 1, updated_at = VALUES(updated_at)`,
+        [workspaceId, name, Date.now()],
+      )
+    }
   }
 
   async transaction<T>(run: (repository: MysqlFileSystemMetadataTransaction) => Promise<T>): Promise<T> {

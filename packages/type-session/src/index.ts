@@ -139,6 +139,13 @@ export interface SessionConfig {
   title?: string
   provider?: 'deepseek' | 'openai' | 'anthropic'
   model?: string
+  /** 会话选中的模型入口（区分自定义入口里的同名模型）；未设回落全局。 */
+  endpointId?: string
+  /** 会话级模型档位；未设回落该模型的全局偏好。 */
+  thinking?: 'enabled' | 'disabled'
+  reasoningEffort?: 'high' | 'max'
+  contextWindow?: '200k' | '1m'
+  speed?: 'fast' | 'slow'
   systemPrompt?: string
   agentMode?: 'standard' | 'minimal' | 'file'
   /** /goal 挂上的会话目标；与极简/标准/数据无关。未完成前自动续跑。 */
@@ -232,6 +239,11 @@ export function normalizeSessionConfig(value: unknown): SessionConfig | undefine
   if (typeof raw.title === 'string' && raw.title.trim()) next.title = raw.title.trim().slice(0, 80)
   if (raw.provider === 'deepseek' || raw.provider === 'openai' || raw.provider === 'anthropic') next.provider = raw.provider
   if (typeof raw.model === 'string' && raw.model.trim()) next.model = raw.model.trim()
+  if (typeof raw.endpointId === 'string' && raw.endpointId.trim()) next.endpointId = raw.endpointId.trim().slice(0, 200)
+  if (raw.thinking === 'enabled' || raw.thinking === 'disabled') next.thinking = raw.thinking
+  if (raw.reasoningEffort === 'high' || raw.reasoningEffort === 'max') next.reasoningEffort = raw.reasoningEffort
+  if (raw.contextWindow === '200k' || raw.contextWindow === '1m') next.contextWindow = raw.contextWindow
+  if (raw.speed === 'fast' || raw.speed === 'slow') next.speed = raw.speed
   if (typeof raw.systemPrompt === 'string') next.systemPrompt = raw.systemPrompt
   if (raw.agentMode === 'minimal' || raw.agentMode === 'file') next.agentMode = raw.agentMode
   if (raw.agentMode === 'standard' || raw.agentMode === 'create') next.agentMode = 'standard'
@@ -266,11 +278,16 @@ export function normalizeSessionConfig(value: unknown): SessionConfig | undefine
 
 export function mergeSessionConfig(
   base: SessionConfig | undefined,
-  patch: SessionConfig & {
+  patch: Omit<SessionConfig, 'thinking' | 'reasoningEffort' | 'contextWindow' | 'speed'> & {
     title?: string | null
     systemPrompt?: string | null
     inspector?: SessionInspectorBind | null
     goal?: SessionGoal | null
+    endpointId?: string | null
+    thinking?: SessionConfig['thinking'] | null
+    reasoningEffort?: SessionConfig['reasoningEffort'] | null
+    contextWindow?: SessionConfig['contextWindow'] | null
+    speed?: SessionConfig['speed'] | null
   },
 ): SessionConfig | undefined {
   const next: SessionConfig = { ...(base ?? {}) }
@@ -282,6 +299,26 @@ export function mergeSessionConfig(
   if (typeof patch.model === 'string') {
     if (!patch.model.trim()) delete next.model
     else next.model = patch.model.trim()
+  }
+  if ('endpointId' in patch) {
+    if (patch.endpointId == null || !String(patch.endpointId).trim()) delete next.endpointId
+    else next.endpointId = String(patch.endpointId).trim().slice(0, 200)
+  }
+  if ('thinking' in patch) {
+    if (patch.thinking === 'enabled' || patch.thinking === 'disabled') next.thinking = patch.thinking
+    else if (patch.thinking == null) delete next.thinking
+  }
+  if ('reasoningEffort' in patch) {
+    if (patch.reasoningEffort === 'high' || patch.reasoningEffort === 'max') next.reasoningEffort = patch.reasoningEffort
+    else if (patch.reasoningEffort == null) delete next.reasoningEffort
+  }
+  if ('contextWindow' in patch) {
+    if (patch.contextWindow === '200k' || patch.contextWindow === '1m') next.contextWindow = patch.contextWindow
+    else if (patch.contextWindow == null) delete next.contextWindow
+  }
+  if ('speed' in patch) {
+    if (patch.speed === 'fast' || patch.speed === 'slow') next.speed = patch.speed
+    else if (patch.speed == null) delete next.speed
   }
   if ('systemPrompt' in patch) {
     if (patch.systemPrompt == null) delete next.systemPrompt
@@ -395,6 +432,6 @@ export interface SessionStore {
   load(id: string): Promise<SessionRecord | undefined>
   save(record: SessionRecord): Promise<void>
   list(): Promise<string[]>
-  listSummaries(): Promise<SessionSummary[]>
+  listSummaries(options?: { sessionIds?: readonly string[] }): Promise<SessionSummary[]>
   delete(id: string): Promise<boolean>
 }

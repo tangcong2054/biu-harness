@@ -138,6 +138,7 @@ import {
   persistViewDisplay,
   pickViewForRoute,
   pushSavedViews,
+  SavedViewSaveError,
   subscribeStarredViews,
   toggleStarredView,
   viewForPath,
@@ -1488,7 +1489,7 @@ export function CollectionBrowser({
   }, [collapsedGroups, flattenRows, groupPages, grouped, grouping, pageSize, visible])
   const tableColSpan = Math.max(columns.length, 1)
   const tableRef = useRef<HTMLTableElement>(null)
-  const tableWrapRef = useRef<HTMLDivElement>(null)
+  const [tableWrap, setTableWrap] = useState<HTMLDivElement | null>(null)
   const checkStackRef = useRef<HTMLDivElement>(null)
   const checkHoverRef = useRef<string | 'head' | null>(null)
   const [tableScroll, setTableScroll] = useState({ top: 0, height: 0 })
@@ -1613,8 +1614,8 @@ export function CollectionBrowser({
   }, [checkSlots, paintCheckHover])
 
   useLayoutEffect(() => {
-    const wrap = tableWrapRef.current
-    if (!wrap) return
+    if (!tableWrap) return
+    const wrap = tableWrap
     let raf = 0
     const sync = () => {
       const top = wrap.scrollTop
@@ -1637,14 +1638,13 @@ export function CollectionBrowser({
       wrap.removeEventListener('scroll', onScroll)
       ro.disconnect()
     }
-  }, [customView, rowView])
+  }, [tableWrap])
 
   useLayoutEffect(() => {
-    const wrap = tableWrapRef.current
-    if (!wrap) return
-    wrap.scrollTop = 0
-    setTableScroll((prev) => ({ top: 0, height: wrap.clientHeight || prev.height }))
-  }, [activeViewId, collectionPath, groupBy, page, pageSize, query])
+    if (!tableWrap) return
+    tableWrap.scrollTop = 0
+    setTableScroll((prev) => ({ top: 0, height: tableWrap.clientHeight || prev.height }))
+  }, [activeViewId, collectionPath, groupBy, page, pageSize, query, tableWrap])
 
   const listedSelected = detailId ? items.find((item) => item.id === detailId) : undefined
   const selected = useMemo(() => {
@@ -1812,9 +1812,16 @@ export function CollectionBrowser({
     viewsWriteGenRef.current.set(path, gen)
     applyViewsLocally(path, listed)
     setViewsSaveError('')
-    void pushSavedViews(path, stored).catch((error) => {
-      // 只回滚最后一次写入；中间又有新写入时交给新写入决定最终状态。
+    void pushSavedViews(path, stored, previous).catch(async (error) => {
+      // 只处理最后一次写入；中间又有新写入时交给新写入决定最终状态。
       if (viewsWriteGenRef.current.get(path) !== gen) return
+      if (error instanceof SavedViewSaveError && (error.conflict || error.status === 503)) {
+        await pullSavedViews([path], true)
+        if (viewsWriteGenRef.current.get(path) !== gen) return
+        applyViewsLocally(path, listedViews(path, loadViews(path)).map((view) => withViewDisplay(path, view)))
+        setViewsSaveError('视图已在其他窗口或设备上修改，已刷新为最新版本，请重新操作')
+        return
+      }
       applyViewsLocally(path, previous)
       setViewsSaveError(error instanceof Error ? error.message : String(error))
     })
@@ -4022,7 +4029,7 @@ export function CollectionBrowser({
               </PluginSurface>
             ) : null}
             {!customView && !rowView ? (
-              <div className="tasks-table-wrap" ref={tableWrapRef}>
+              <div className="tasks-table-wrap" ref={setTableWrap}>
                 {pickedIds.length ? (
                   <div className="fsdb-bulk" data-testid="fsdb-bulk-bar">
                     <span

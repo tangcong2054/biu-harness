@@ -36,6 +36,7 @@ export async function listCollection(opts: {
   sorts?: Array<{ field: string; dir: 'asc' | 'desc' }>
   filters?: Record<string, unknown>
   columns?: string[]
+  requestScope?: string
 }): Promise<ListPage> {
   const params = new URLSearchParams({
     path: opts.path,
@@ -50,7 +51,7 @@ export async function listCollection(opts: {
     params.set('sorts', JSON.stringify(opts.sorts.map((item) => ({ field: item.field, dir: item.dir }))))
   }
   if (opts.columns?.length) params.set('columns', opts.columns.join(','))
-  const key = params.toString()
+  const key = JSON.stringify([opts.requestScope ?? '', params.toString()])
   const pending = listInflight.get(key)
   if (pending) return pending
   const request = readJson<ListPage & { items?: DbRecord[]; total?: number; schema?: CollectionSchema }>(

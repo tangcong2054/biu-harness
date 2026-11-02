@@ -2,7 +2,7 @@ import { builtinAllViewId, stubBuiltinAllView, stubBuiltinBlockKindView, stubBui
 import { isIndexCollection } from './database-path.ts'
 import { listCollection } from './db-client.ts'
 import { looksLikeFilterTree, normalizeFilterGroup, parseSortsInput } from '../query-logic.ts'
-import { normalizePageSize, normalizeSavedView, type SavedView } from './saved-view.ts'
+import { normalizePageSize, normalizeSavedView, normalizeColumnWidths, type SavedView } from './saved-view.ts'
 
 export function workspaceViewScope() {
   try {
@@ -12,8 +12,43 @@ export function workspaceViewScope() {
   }
 }
 
+/** 视图按账号隔离；浏览器里只有登录令牌，用它的短指纹区分缓存，不把令牌本身写进键名。 */
+function accountViewScope() {
+  let token = ''
+  try {
+    token = localStorage.getItem('biu.account.token') ?? ''
+  } catch {
+    /* ignore */
+  }
+  if (!token) return 'anon'
+  let hash = 0x811c9dc5
+  for (let i = 0; i < token.length; i += 1) {
+    hash ^= token.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(36)
+}
+
+const VIEWS_KEY_PREFIX = 'fsdb.views:'
+
 export function viewsKey(collectionPath: string) {
-  return `fsdb.views:${workspaceViewScope()}:${collectionPath}`
+  return `${VIEWS_KEY_PREFIX}${workspaceViewScope()}:${accountViewScope()}:${collectionPath}`
+}
+
+/** 换账号登录后清掉同一空间里其他登录留下的视图缓存。 */
+function pruneForeignViewCaches() {
+  try {
+    const workspace = `${VIEWS_KEY_PREFIX}${workspaceViewScope()}:`
+    const own = `${workspace}${accountViewScope()}:`
+    const stale: string[] = []
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i)
+      if (key?.startsWith(workspace) && !key.startsWith(own)) stale.push(key)
+    }
+    for (const key of stale) localStorage.removeItem(key)
+  } catch {
+    /* ignore */
+  }
 }
 
 export function activeViewStorageKey(collectionPath: string) {
@@ -21,9 +56,12 @@ export function activeViewStorageKey(collectionPath: string) {
 }
 
 const memoryViews = new Map<string, SavedView[]>()
+const viewCacheRevisions = new Map<string, number>()
 
 export function rememberViews(collectionPath: string, views: SavedView[]) {
-  memoryViews.set(viewsKey(collectionPath), views.map((view) => normalizeSavedView(view)))
+  const key = viewsKey(collectionPath)
+  memoryViews.set(key, views.map((view) => normalizeSavedView(view)))
+  viewCacheRevisions.set(key, (viewCacheRevisions.get(key) ?? 0) + 1)
 }
 
 export function loadViews(collectionPath: string): SavedView[] {
@@ -173,17 +211,124 @@ export function persistStarredViews(items: StarredView[]) {
   for (const fn of starredListeners) fn()
 }
 
-/** 失败（网络错误或非 2xx，如无 resource:update 权限）要抛出，调用方据此回滚，不能静默吞掉。 */
-export async function pushSavedViews(collectionPath: string, views: SavedView[]) {
-  const res = await fetch('/api/db/saved-views', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ path: collectionPath, views }),
-  })
-  if (!res.ok) {
-    const data = (await res.json().catch(() => null)) as { error?: unknown } | null
-    throw new Error(typeof data?.error === 'string' && data.error ? data.error : `HTTP ${res.status}`)
+type ViewMutation =
+  | { type: 'create'; collection: string; id: string; view: SavedView }
+  | { type: 'update'; collection: string; id: string; expectedRevision: number; view: SavedView }
+  | { type: 'delete'; collection: string; id: string; expectedRevision: number }
+
+/** 服务端已确认的视图（含版本），作为增量差异基线；不受本地乐观更新影响。 */
+const confirmedViews = new Map<string, Map<string, SavedView>>()
+const saveQueues = new Map<string, Promise<void>>()
+
+function confirmViews(key: string, views: readonly SavedView[]) {
+  confirmedViews.set(key, new Map(views.filter((view) => !view.builtin).map((view) => [view.id, normalizeSavedView(view)])))
+}
+
+function viewContent(view: SavedView) {
+  const { revision: _r, createdBy: _c, createdAt: _a, updatedAt: _u, ...rest } = normalizeSavedView(view)
+  return JSON.stringify(rest)
+}
+
+export function savedViewMutations(collectionPath: string, base: ReadonlyMap<string, SavedView>, desired: readonly SavedView[]) {
+  const mutations: ViewMutation[] = []
+  const wanted = new Map<string, SavedView>()
+  for (const view of desired) if (!view.builtin && !isReadOnlyViewId(view.id)) wanted.set(view.id, view)
+  for (const [id, view] of wanted) {
+    const { revision: _r, createdBy: _c, createdAt: _a, updatedAt: _u, ...payload } = normalizeSavedView(view)
+    const prev = base.get(id)
+    if (!prev) mutations.push({ type: 'create', collection: collectionPath, id, view: payload as SavedView })
+    else if (viewContent(prev) !== viewContent(view)) {
+      mutations.push({ type: 'update', collection: collectionPath, id, expectedRevision: prev.revision ?? 0, view: payload as SavedView })
+    }
   }
+  for (const [id, prev] of base) {
+    if (!wanted.has(id)) mutations.push({ type: 'delete', collection: collectionPath, id, expectedRevision: prev.revision ?? 0 })
+  }
+  return mutations
+}
+
+function patchCachedRevisions(key: string, revisions: ReadonlyMap<string, number>, deleted: ReadonlySet<string>) {
+  const cached = memoryViews.get(key)
+  if (!cached) return
+  const next = cached.filter((view) => !deleted.has(view.id))
+    .map((view) => revisions.has(view.id) ? { ...view, revision: revisions.get(view.id) } : view)
+  memoryViews.set(key, next)
+  try {
+    if (next.length) localStorage.setItem(key, JSON.stringify(next))
+    else localStorage.removeItem(key)
+  } catch {
+    /* ignore */
+  }
+}
+
+export class SavedViewSaveError extends Error {
+  constructor(message: string, readonly status: number, readonly code: string) {
+    super(message)
+  }
+  get conflict() {
+    return this.status === 409
+  }
+}
+
+/**
+ * 只提交相对服务端已确认版本的变化（新增/修改/显式删除）。
+ * 同一集合串行提交；失败（网络错误、非 2xx、版本冲突）抛出，调用方据此回滚或重新拉取。
+ * previous 为本次乐观更新之前的列表，仅在尚无确认基线时使用。
+ */
+export function pushSavedViews(collectionPath: string, views: SavedView[], previous: readonly SavedView[] = []) {
+  const key = viewsKey(collectionPath)
+  const desired = views.filter((view) => !view.builtin).map((view) => normalizeSavedView(view))
+  const fallback = previous.filter((view) => !view.builtin).map((view) => normalizeSavedView(view))
+  const run = async () => {
+    if (viewsKey(collectionPath) !== key) throw new SavedViewSaveError('账号或空间已切换，未保存', 409, 'SAVED_VIEW_SCOPE')
+    if (!confirmedViews.has(key)) confirmViews(key, fallback)
+    const base = confirmedViews.get(key)!
+    const mutations = savedViewMutations(collectionPath, base, desired)
+    if (!mutations.length) return
+    const res = await fetch('/api/db/saved-views', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: collectionPath, mutations }),
+    })
+    const data = (await res.json().catch(() => null)) as
+      | { error?: unknown; code?: unknown; views?: Array<{ id?: unknown; revision?: unknown; deleted?: unknown }> }
+      | null
+    if (!res.ok) {
+      if (res.status === 409 || res.status === 503) confirmedViews.delete(key)
+      throw new SavedViewSaveError(
+        typeof data?.error === 'string' && data.error ? data.error : `HTTP ${res.status}`,
+        res.status,
+        typeof data?.code === 'string' ? data.code : '',
+      )
+    }
+    const revisions = new Map<string, number>()
+    const deleted = new Set<string>()
+    for (const item of data?.views ?? []) {
+      const id = String(item?.id ?? '')
+      if (!id) continue
+      if (item.deleted) deleted.add(id)
+      else if (typeof item.revision === 'number' && Number.isSafeInteger(item.revision)) revisions.set(id, item.revision)
+    }
+    const desiredById = new Map(desired.map((view) => [view.id, view]))
+    for (const mutation of mutations) {
+      if (mutation.type === 'delete') {
+        base.delete(mutation.id)
+        continue
+      }
+      const revision = revisions.get(mutation.id)
+      if (revision === undefined) {
+        confirmedViews.delete(key)
+        return
+      }
+      base.set(mutation.id, { ...desiredById.get(mutation.id)!, revision })
+    }
+    if (viewsKey(collectionPath) === key) patchCachedRevisions(key, revisions, deleted)
+  }
+  const queued = (saveQueues.get(key) ?? Promise.resolve()).then(run)
+  const tail = queued.catch(() => {})
+  saveQueues.set(key, tail)
+  void tail.then(() => { if (saveQueues.get(key) === tail) saveQueues.delete(key) })
+  return queued
 }
 
 function parseMaybeJson(value: unknown): unknown {
@@ -217,7 +362,7 @@ function parseViewFilters(value: unknown): Record<string, string> {
   return {}
 }
 
-export function savedViewFromRecord(row: { viewId?: unknown; title?: unknown; mode?: unknown; sortField?: unknown; sortDir?: unknown; sorts?: unknown; query?: unknown; groupBy?: unknown; columns?: unknown; filters?: unknown; filterTree?: unknown; tree?: unknown; wrap?: unknown; truncate?: unknown; pageSize?: unknown; columnWidths?: unknown }): SavedView | null {
+export function savedViewFromRecord(row: { [key: string]: unknown; revision?: unknown; viewId?: unknown; title?: unknown; mode?: unknown; sortField?: unknown; sortDir?: unknown; sorts?: unknown; query?: unknown; groupBy?: unknown; columns?: unknown; filters?: unknown; filterTree?: unknown; tree?: unknown; wrap?: unknown; truncate?: unknown; pageSize?: unknown; columnWidths?: unknown }): SavedView | null {
   const id = String(row.viewId ?? '').trim()
   if (!id || isReadOnlyViewId(id)) return null
   const sortDir = row.sortDir === 'desc' ? 'desc' : 'asc'
@@ -227,6 +372,7 @@ export function savedViewFromRecord(row: { viewId?: unknown; title?: unknown; mo
   return normalizeSavedView({
     id,
     name: String(row.title ?? id),
+    revision: typeof row.revision === 'number' && Number.isSafeInteger(row.revision) && row.revision >= 0 ? row.revision : undefined,
     mode: String(row.mode ?? 'table') as SavedView['mode'],
     sortField,
     sortDir,
@@ -240,73 +386,111 @@ export function savedViewFromRecord(row: { viewId?: unknown; title?: unknown; mo
     wrap: Boolean(row.wrap),
     truncate: row.truncate !== false,
     pageSize: normalizePageSize(row.pageSize),
-    columnWidths: row.columnWidths,
+    columnWidths: normalizeColumnWidths(row.columnWidths),
     builtin: false,
   })
 }
 
-let viewsPull: Promise<void> | null = null
-let viewsPulledAt = 0
+const viewsPulls = new Map<string, Promise<void>>()
+const viewsPulledAt = new Map<string, number>()
 const VIEWS_PULL_TTL_MS = 2500
 
-export async function pullSavedViews(collectionPaths: readonly string[] = []) {
-  if (viewsPull) return viewsPull
-  if (viewsPulledAt && Date.now() - viewsPulledAt < VIEWS_PULL_TTL_MS) return
-  viewsPull = pullSavedViewsNow(collectionPaths).finally(() => {
-    viewsPull = null
-    viewsPulledAt = Date.now()
-  })
-  return viewsPull
+export async function pullSavedViews(collectionPaths: readonly string[] = [], force = false) {
+  const scope = viewsKey('')
+  const paths = [...new Set(collectionPaths)].sort()
+  const key = JSON.stringify([scope, paths])
+  const pending = viewsPulls.get(key)
+  if (pending) return pending
+  if (!force && Date.now() - (viewsPulledAt.get(key) ?? 0) < VIEWS_PULL_TTL_MS) return
+  const request = pullSavedViewsNow(paths, scope).then((complete) => {
+    if (complete) viewsPulledAt.set(key, Date.now())
+  }).finally(() => { viewsPulls.delete(key) })
+  viewsPulls.set(key, request)
+  return request
 }
 
-async function pullSavedViewsNow(collectionPaths: readonly string[] = []) {
-  try {
+const VIEW_LIST_COLUMNS = ['title', 'tablePath', 'viewId', 'revision', 'mode', 'sortField', 'sortDir',
+  'sorts', 'query', 'groupBy', 'columns', 'filters', 'filterTree', 'tree', 'wrap',
+  'truncate', 'pageSize', 'columnWidths']
+const MAX_PULLED_VIEWS = 100_000
+
+type PulledViews = Map<string, Map<string, SavedView>>
+
+/** 解析视图行；同一视图出现两次说明数据不一致，返回 false 放弃本次结果。 */
+function collectViewRows(rows: readonly Record<string, unknown>[], byPath: PulledViews) {
+  for (const row of rows) {
+    const tablePath = String(row.tablePath ?? '').trim()
+    const view = savedViewFromRecord(row)
+    if (!tablePath || !view) continue
+    const list = byPath.get(tablePath) ?? new Map<string, SavedView>()
+    if (list.has(view.id)) return false
+    list.set(view.id, view)
+    byPath.set(tablePath, list)
+  }
+  return true
+}
+
+/** 一次性快照；旧服务没有这个接口时返回 'unsupported'，其他失败返回 null。 */
+async function snapshotViews(scope: string): Promise<PulledViews | null | 'unsupported'> {
+  const res = await fetch('/api/db/saved-views', { method: 'GET', headers: { accept: 'application/json' } })
+  if (res.status === 404 || res.status === 405) return 'unsupported'
+  if (!res.ok || viewsKey('') !== scope) return null
+  const body = (await res.json().catch(() => null)) as { items?: unknown; total?: unknown; snapshot?: unknown } | null
+  if (viewsKey('') !== scope || body?.snapshot !== true || !Array.isArray(body.items)) return null
+  if (body.items.length > MAX_PULLED_VIEWS || body.total !== body.items.length) return null
+  const byPath: PulledViews = new Map()
+  return collectViewRows(body.items as Record<string, unknown>[], byPath) ? byPath : null
+}
+
+/** 旧服务的分页读取；分页之间数据变了（总数变化、空页、重复行）就放弃本次结果。 */
+async function pagedViews(scope: string): Promise<PulledViews | null> {
+  const byPath: PulledViews = new Map()
+  let offset = 0
+  let total: number | undefined
+  do {
+    if (viewsKey('') !== scope) return null
     const page = await listCollection({
-      path: '/views',
-      limit: 200,
-      offset: 0,
-      columns: [
-        'title',
-        'tablePath',
-        'viewId',
-        'mode',
-        'sortField',
-        'sortDir',
-        'sorts',
-        'query',
-        'groupBy',
-        'columns',
-        'filters',
-        'filterTree',
-        'tree',
-        'wrap',
-        'truncate',
-        'pageSize',
-        'columnWidths',
-      ],
+      path: '/views', limit: 200, offset, sortField: 'id', requestScope: scope, columns: VIEW_LIST_COLUMNS,
     })
-    const byPath = new Map<string, SavedView[]>()
-    for (const row of page.items) {
-      const tablePath = String(row.tablePath ?? '').trim()
-      const view = savedViewFromRecord(row)
-      if (!tablePath || !view) continue
-      const list = byPath.get(tablePath) ?? []
-      list.push(view)
-      byPath.set(tablePath, list)
-    }
+    if (viewsKey('') !== scope) return null
+    if (!Number.isSafeInteger(page.total) || page.total < 0 || page.total > MAX_PULLED_VIEWS
+      || (total !== undefined && total !== page.total)) return null
+    total = page.total
+    if (!page.items.length && offset < total) return null
+    if (!collectViewRows(page.items, byPath)) return null
+    offset += page.items.length
+  } while (offset < total)
+  return byPath
+}
+
+async function pullSavedViewsNow(collectionPaths: readonly string[], scope: string) {
+  const revisions = new Map(viewCacheRevisions)
+  try {
+    const snapshot = await snapshotViews(scope)
+    const byPath = snapshot === 'unsupported' ? await pagedViews(scope) : snapshot
+    if (!byPath || viewsKey('') !== scope) return false
     const paths = new Set([...collectionPaths, ...byPath.keys()])
+    pruneForeignViewCaches()
+    let complete = true
     for (const path of paths) {
-      const views = byPath.get(path) ?? []
+      const key = viewsKey(path)
+      if ((viewCacheRevisions.get(key) ?? 0) !== (revisions.get(key) ?? 0)) {
+        complete = false
+        continue
+      }
+      const views = [...(byPath.get(path)?.values() ?? [])]
       rememberViews(path, views)
+      if (!saveQueues.has(key)) confirmViews(key, views)
       try {
-        if (views.length) localStorage.setItem(viewsKey(path), JSON.stringify(views))
-        else localStorage.removeItem(viewsKey(path))
+        if (views.length) localStorage.setItem(key, JSON.stringify(views))
+        else localStorage.removeItem(key)
       } catch {
         /* ignore */
       }
     }
+    return complete
   } catch {
-    /* ignore */
+    return false
   }
 }
 

@@ -78,8 +78,12 @@ export class SessionStoreService extends Service implements SessionStore {
     return this.inner.list()
   }
 
-  listSummaries() {
-    return this.inner.listSummaries()
+  async listSummaries(options?: { sessionIds?: readonly string[] }) {
+    if (options?.sessionIds?.length === 0) return []
+    const rows = await this.inner.listSummaries(options)
+    if (options?.sessionIds === undefined) return rows
+    const ids = new Set(options.sessionIds)
+    return rows.filter(row => ids.has(row.id))
   }
 
   delete(id: string) {

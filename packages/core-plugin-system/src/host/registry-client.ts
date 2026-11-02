@@ -183,12 +183,30 @@ export class PluginRegistryClient {
     private readonly operatorAccess?: () => boolean,
   ) {}
 
-  private token() {
+  private tokens() {
     const accountId = currentAccountId()
     const path = accountId
       ? registryTokenPath(dirname(dirname(this.defaultTokenPath)), accountId)
       : this.defaultTokenPath
-    return loadOrCreateRegistryToken(path)
+    const primary = loadOrCreateRegistryToken(path)
+    if (String(process.env.BIU_PLUGIN_TOKEN ?? '').trim()) return [primary]
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as { previousTokens?: unknown }
+    const previous = Array.isArray(raw.previousTokens)
+      ? raw.previousTokens.filter((value): value is string => typeof value === 'string' && Boolean(value.trim())).map(value => value.trim())
+      : []
+    return [...new Set([primary, ...previous])]
+  }
+
+  private token(ownerId?: string) {
+    const tokens = this.tokens()
+    if (!ownerId) return tokens[0]!
+    const matched = tokens.find(token => ownerIdForToken(token) === ownerId)
+    if (!matched) throw new Error('plugin owner token required')
+    return matched
+  }
+
+  ownsPublisher(ownerId: string) {
+    return this.tokens().some(token => ownerIdForToken(token) === ownerId)
   }
 
   isOperator() {
@@ -212,20 +230,40 @@ export class PluginRegistryClient {
   }
 
   private async index() {
-    const listed = await this.transport.search('', '', this.token())
-    return listed
+    return this.search('', '')
   }
 
   async search(q?: string, tag?: string) {
-    return this.transport.search(q, tag, this.token())
+    const results = await Promise.all(this.tokens().map(token => this.transport.search(q, tag, token)))
+    const registryId = results[0]?.registryId || this.registryId
+    const plugins = new Map<string, RegistryIndexEntry>()
+    for (const result of results) {
+      if (result.registryId && result.registryId !== registryId) throw new Error('plugin registry identity mismatch')
+      for (const row of result.plugins) {
+        const prior = plugins.get(row.id)
+        if (!prior || (row.ownedByRequester && !prior.ownedByRequester)) plugins.set(row.id, row)
+      }
+    }
+    return { registryId, plugins: [...plugins.values()] }
   }
 
   searchPublic() {
     return this.transport.search('', '')
   }
 
-  detail(id: string) {
-    return this.transport.detail(id, this.token())
+  private async detailWithToken(id: string) {
+    const tokens = this.tokens()
+    let fallback: { detail: RegistryDetail | null; token: string } = { detail: null, token: tokens[0]! }
+    for (const token of tokens) {
+      const detail = await this.transport.detail(id, token)
+      if (detail?.ownedByRequester) return { detail, token }
+      if (detail && !fallback.detail) fallback = { detail, token }
+    }
+    return fallback
+  }
+
+  async detail(id: string) {
+    return (await this.detailWithToken(id)).detail
   }
 
   async flags(): Promise<Record<string, RemoteFlag>> {
@@ -276,8 +314,7 @@ export class PluginRegistryClient {
   }
 
   async install(id: string, version?: string, confirmation?: { confirmOlder?: boolean; localCodeVersion?: string; remoteCodeVersion?: string }) {
-    const token = this.token()
-    const detail = await this.transport.detail(id, token)
+    const { token, detail } = await this.detailWithToken(id)
     if (!detail) throw new Error(`unknown registry plugin: ${id}`)
     const codeVersion = String(version ?? '').trim() || detail.codeVersion
     const local = (await this.store.list()).find((row) => row.id === id)
@@ -294,8 +331,7 @@ export class PluginRegistryClient {
   }
 
   async update(id: string, confirmation?: { confirmOlder?: boolean; localCodeVersion?: string; remoteCodeVersion?: string }) {
-    const token = this.token()
-    const detail = await this.transport.detail(id, token)
+    const { token, detail } = await this.detailWithToken(id)
     if (!detail) throw new Error(`unknown registry plugin: ${id}`)
     const local = (await this.store.list()).find((row) => row.id === id)
     if (!(await this.store.isInstalledForCurrentWorkspace(id))) throw new Error(`plugin not installed for current account: ${id}`)
@@ -321,7 +357,7 @@ export class PluginRegistryClient {
     if (id === 'platform-operations') return false
     const origin = this.store.originOf(id)
     if (!origin?.ownerId) return true
-    return origin.ownerId === ownerIdForToken(this.token())
+    return this.ownsPublisher(origin.ownerId)
   }
 
   async publish(id: string) {
@@ -331,7 +367,8 @@ export class PluginRegistryClient {
     const dir = this.store.pluginPath(id)
     if (!existsSync(join(dir, 'manifest.json'))) throw new Error(`plugin is not packed: ${id}`)
     const { files, assets } = await readPackedFiles(dir)
-    const token = this.token()
+    const remote = await this.detail(id)
+    const token = this.token(remote?.ownerId || this.store.originOf(id)?.ownerId)
     const published = await this.transport.publish(id, files, assets, token)
     const codeVersion = await hashInstalledPluginCode(dir)
     this.store.rememberOrigin(id, {
@@ -342,15 +379,15 @@ export class PluginRegistryClient {
   }
 
   async withdraw(id: string) {
-    const detail = await this.detail(id)
+    const { detail, token } = await this.detailWithToken(id)
     if (!detail?.ownedByRequester) throw new Error('only the uploader can withdraw this plugin')
-    return this.transport.withdraw(id, detail.codeVersion, this.token())
+    return this.transport.withdraw(id, detail.codeVersion, token)
   }
 
   async unpublish(id: string) {
-    const detail = await this.detail(id)
+    const { detail, token } = await this.detailWithToken(id)
     if (!detail?.ownedByRequester) throw new Error('only the uploader can unpublish this plugin')
-    return this.transport.unpublish(id, detail.codeVersion, this.token())
+    return this.transport.unpublish(id, detail.codeVersion, token)
   }
 
   async reviews(status = '') {

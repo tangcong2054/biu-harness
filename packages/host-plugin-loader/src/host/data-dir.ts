@@ -176,6 +176,41 @@ export function currentAccountId() {
   return accountScope.getStore() || ''
 }
 
+/**
+ * 一次 HTTP 请求内的身份缓存：token 解析、成员身份等在同一请求里只查一次库。
+ * 只活到请求结束，不跨请求复用，所以不需要跨实例失效；本请求内改了成员关系要调 clearRequestMemo。
+ */
+const requestMemoScope = new AsyncLocalStorage<Map<string, Promise<unknown>>>()
+
+export function runWithRequestMemo<T>(fn: () => T): T {
+  return requestMemoScope.run(new Map(), fn)
+}
+
+/** 请求外（后台任务、测试）直接计算，不缓存。失败的结果不留在缓存里。 */
+export function requestMemo<T>(key: string, compute: () => Promise<T>): Promise<T> {
+  const memo = requestMemoScope.getStore()
+  if (!memo) return compute()
+  const hit = memo.get(key)
+  if (hit) return hit as Promise<T>
+  const pending = compute()
+  memo.set(key, pending)
+  pending.catch(() => {
+    if (memo.get(key) === pending) memo.delete(key)
+  })
+  return pending
+}
+
+/** 作废当前请求里以 prefix 开头的缓存；不传则全部作废。 */
+export function clearRequestMemo(prefix = '') {
+  const memo = requestMemoScope.getStore()
+  if (!memo) return
+  if (!prefix) {
+    memo.clear()
+    return
+  }
+  for (const key of memo.keys()) if (key.startsWith(prefix)) memo.delete(key)
+}
+
 /** 浏览器这次请求显式选择的空间。没有请求头时为空。 */
 export function currentRequestWorkspaceId() {
   return requestWorkspaceScope.getStore() || ''

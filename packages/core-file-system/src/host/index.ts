@@ -17,8 +17,8 @@ import {
   isOnlineRuntime,
 } from '@biu/host-plugin-loader/data-dir'
 import { asPublicProfile, readWorkspaceProfile, writeWorkspaceProfile } from '@biu/host-workspace'
-import { authorizeCollection, roleCoversAction, type Action as PermissionAction, type AuthorizationService } from '@biu/host-account/authorization'
-import { mysqlRecordVisible, resolveRecordScope, type DataScope, type ScopeSource } from './record-scope.ts'
+import { authorizeCollection, roleCoversAction, type Action as PermissionAction, type AuthorizationService, type ResourceRole } from '@biu/host-account/authorization'
+import { effectiveScopePolicy, mysqlRecordVisible, resolveRecordScope, type DataScope, type ScopeSource } from './record-scope.ts'
 import { isRegisteredBuiltinPlugin } from '@biu/host-account/store'
 import { forwardCloud, forwardCloudBytes } from '@biu/host-account/mirror'
 import { Service, type Context } from 'cordis'
@@ -57,13 +57,15 @@ import {
   parseContentJump,
 } from '@biu/type-file-system'
 import { parsePageBanner, type PageBanner } from '../page-banner.ts'
-import { SavedViewsStore, clientViewFromDbRow, viewsCollection, type StoredView } from './saved-views.ts'
+import { SavedViewsStore, clientViewFromDbRow, viewsCollection } from './saved-views.ts'
+import type { SavedViewMutation } from '@biu/host-plugin-loader/metadata-runtime'
+import { accessMemberViewMatches, accessRecordViewMatches } from './access-matchers.ts'
 import { publicShareUrl } from './share-origin.ts'
 import { readSharePluginWebJs, zipSharePluginSource } from './share-plugin-pack.ts'
 import { collectShareResources } from '../share-resources.ts'
 import { FacetStore } from './facets-store.ts'
-import { SharesStore, dropSharesForRemovedViews } from './shares-store.ts'
-import { builtinAllView, builtinAllViewId, builtinMemberViews, displayNameForView, isReadOnlyViewId, stubBuiltinAllView, stubBuiltinMemberView } from '../catalog-views.ts'
+import { SharesStore } from './shares-store.ts'
+import { builtinAllView, builtinAllViewId, builtinMemberViews, displayNameForView, isBuiltinScopeViewId, isReadOnlyViewId, parseBuiltinScopeViewId, stubBuiltinAllView, stubBuiltinMemberView } from '../catalog-views.ts'
 import { isIndexCollection, isSystemCollection } from '../web/database-path.ts'
 import { effectiveDataScope, highestViewRole, recordMatchesGrantedView, type DataScopeName, type ViewGrantRole } from '../view-access.ts'
 import { buildShareSnapshot } from './share-payload.ts'
@@ -685,11 +687,21 @@ export const DEFAULT_PAGE_SIZE = 20
 export const MAX_PAGE_SIZE = 200
 const HARD_DELETE_PATHS = new Set(['/events', '/trash', '/workspace-members'])
 
+type MysqlCollectionGrants = {
+  records: Record<string, string>
+  views: Array<{ viewId: string; grantedBy: string; role: string }>
+  savedViews: Array<{ id: string; filters?: Record<string, unknown>; filterTree?: unknown }>
+}
+
+const GRANT_ROLE_RANK: Record<ResourceRole, number> = { viewer: 1, editor: 2, manager: 3, owner: 4 }
+
 type VisibleSortedPack = {
   rows: DbRecord[]
   personal: DbRecord[]
   workspace: DbRecord[]
   shared: DbRecord[]
+  /** MySQL 模式下分组时用到的归属，按行 id。分享列直接复用，避免缓存失效后两边算得不一样。 */
+  scopes?: Map<string, DataScope>
 }
 
 type WorkspaceMembership = {
@@ -772,6 +784,12 @@ export class DatabaseService extends Service implements Database {
   private mysqlScopes = new Map<string, DataScope | null>()
   /** 同一条键上，MySQL 策略是否允许当前账号看见。没有键表示这条记录还没在 MySQL 落归属。 */
   private mysqlVisible = new Map<string, boolean>()
+  /** 归属判为不可见、但当前账号通过记录授权或视图授权获得的最高角色。键同 mysqlVisible。 */
+  private mysqlGrantRoles = new Map<string, ResourceRole>()
+  /** 同一条键上，当前账号的成员类型：协作者看到“私人”记录时，按它是内部成员还是外部来显示“空间”或“共享”。 */
+  private mysqlGrantAudience = new Map<string, 'workspace' | 'shared'>()
+  /** 当前这一页装饰时，分组阶段已经算好的归属。 */
+  private scopeHints: Map<string, DataScope> | null = null
   private boundAuth?: AuthorizationService
   private unbindAuth?: () => void
   recycleAssets?: () => void
@@ -938,11 +956,12 @@ export class DatabaseService extends Service implements Database {
   }
 
   /** 只装饰当前页，避免为整张表逐行读取 owner、view grant 和人物信息。 */
-  private decorateSlice(spec: CollectionSpec, rows: DbRecord[]) {
+  private decorateSlice(spec: CollectionSpec, rows: DbRecord[], scopes?: Map<string, DataScope>) {
     this.ownershipCache = null
     this.ownerCache = null
     this.viewAudienceCache = null
     this.viewShareCache = null
+    this.scopeHints = scopes ?? null
     try {
       return rows.map((row) => this.decorateRecord(spec, row))
     } finally {
@@ -950,6 +969,7 @@ export class DatabaseService extends Service implements Database {
       this.ownerCache = null
       this.viewAudienceCache = null
       this.viewShareCache = null
+      this.scopeHints = null
     }
   }
 
@@ -1060,12 +1080,19 @@ export class DatabaseService extends Service implements Database {
   ) {
     const authorization = this.authorization()
     const actor = authorization?.currentActor()
+    if (collection === '/plugin-catalog' && (action === 'resource:read' || action === 'resource:list')) {
+      return rows
+    }
     const keep = <R extends T>(row: R, sqliteAllows: () => boolean) => {
       // 已按账号·空间安装的插件包跨空间复用：记录归属在别的空间也要可见，不能被 MySQL 归属否决。
       if (collection === '/plugins' && actor?.type === 'account' && 'pluginPath' in row &&
         (action === 'resource:read' || action === 'resource:list') &&
         this.installedPluginVisible(String(row.id ?? ''), actor.accountId, actor.workspaceId)) return true
       const mysql = this.mysqlVisibility(collection, row)
+      if (mysql === false) {
+        const role = this.mysqlGrantedRole(collection, row)
+        return Boolean(role && roleCoversAction(role, action))
+      }
       if (mysql != null) return mysql
       return sqliteAllows()
     }
@@ -1096,7 +1123,13 @@ export class DatabaseService extends Service implements Database {
       }))
     }
     const membership = this.workspaceMembership()
-    if (!membership) return rows.filter((row) => this.mysqlVisibility(collection, row) !== false)
+    if (!membership) {
+      return rows.filter((row) => {
+        if (this.mysqlVisibility(collection, row) !== false) return true
+        const role = this.mysqlGrantedRole(collection, row)
+        return Boolean(role && roleCoversAction(role, action))
+      })
+    }
     const store = this.collabStore()
     const workspaceId = store?.activeWorkspaceId() ?? ''
     const grants = new Map<string, Map<string, Set<string>>>()
@@ -1157,6 +1190,14 @@ export class DatabaseService extends Service implements Database {
     })
   }
 
+  mayAllowViaView(collection: string) {
+    const authorization = this.authorization()
+    const actor = authorization?.currentActor()
+    if (!authorization || !actor) return false
+    const store = this.collabStore()
+    return Boolean(store?.viewGrantsFor?.(actor.workspaceId, collection).length)
+  }
+
   allowsViaView(collection: string, record: { id?: unknown }, action: PermissionAction = 'resource:read') {
     const authorization = this.authorization()
     const actor = authorization?.currentActor()
@@ -1189,7 +1230,9 @@ export class DatabaseService extends Service implements Database {
         recordId: target.id,
       })
       const ownerId = this.recordOwner(target.collection, target.id)
-      if (recordMatchesGrantedView(record as never, grant.view_id, saved, scope, { grantedBy: grant.granted_by, recordOwnerId: ownerId })) roles.push(grant.role)
+      const spec = this.collection(collection)
+      if (recordMatchesGrantedView(record as never, grant.view_id, saved, scope, { grantedBy: grant.granted_by, recordOwnerId: ownerId },
+        spec ? schemaFor(spec) : undefined, this.facets.list())) roles.push(grant.role)
     }
     return highestViewRole(roles)
   }
@@ -1364,7 +1407,7 @@ export class DatabaseService extends Service implements Database {
     action: PermissionAction,
     record?: { id?: unknown },
   ) {
-    if (await this.mysqlAllowsRecord(spec.path, id, record)) return
+    if (await this.mysqlAllowsRecord(spec.path, id, record, action)) return
     const authorization = this.authorization()
     const actor = authorization?.currentActor()
     if (authorization && actor) {
@@ -1394,7 +1437,12 @@ export class DatabaseService extends Service implements Database {
   }
 
   /** @returns true 表示 MySQL 已允许，调用方不要再用 SQLite 否决。没有云端归属时返回 false。 */
-  private async mysqlAllowsRecord(collection: string, id: string, record?: { id?: unknown }) {
+  private async mysqlAllowsRecord(
+    collection: string,
+    id: string,
+    record?: { id?: unknown },
+    action: PermissionAction = 'resource:read',
+  ) {
     const account = this.mysqlAccount()
     const mysql = account?.usesMysqlAccounts?.() ? account.mysql : undefined
     const workspaceId = currentRequestWorkspaceId()
@@ -1414,9 +1462,27 @@ export class DatabaseService extends Service implements Database {
     if (direct?.accessMode === 'inherit' && direct.parentCollection) await load(direct.parentCollection)
     const known = Boolean(direct) || Boolean(sources.get(target.collection)?.owners.has(target.id))
     if (!known) return false
-    if (!mysqlRecordVisible(target.collection, target.id, sources, accountId)) {
-      throw new Error(`unknown record: ${collection}/${id}`)
+    const visibleKey = this.mysqlVisibleKey(workspaceId, accountId, target.collection, target.id)
+    const ownVisible = mysqlRecordVisible(target.collection, target.id, sources, accountId)
+    this.mysqlVisible.set(visibleKey, ownVisible)
+    if (ownVisible) this.mysqlGrantRoles.delete(visibleKey)
+    if (!ownVisible) {
+      let role: ResourceRole | null = null
+      if (mysql.collectionGrantSources) {
+        const grants = new Map<string, MysqlCollectionGrants>()
+        const names = [...new Set([collection, ...sources.keys()])]
+        const loaded = await Promise.all(names.map((name) => mysql.collectionGrantSources!(accountId, workspaceId, name)))
+        names.forEach((name, index) => grants.set(name, loaded[index]!))
+        role = this.computeMysqlGrantRole(collection, record ?? { id }, target, sources, grants)
+      }
+      if (!role || !roleCoversAction(role, action)) throw new Error(`unknown record: ${collection}/${id}`)
+      this.mysqlGrantRoles.set(visibleKey, role)
+      this.mysqlGrantAudience.set(visibleKey, member.memberKind === 'member' ? 'workspace' : 'shared')
     }
+    this.mysqlScopes.set(
+      this.mysqlScopeKey(workspaceId, target.collection, target.id),
+      resolveRecordScope(target.collection, target.id, sources),
+    )
     return true
   }
 
@@ -1431,6 +1497,84 @@ export class DatabaseService extends Service implements Database {
     const key = this.mysqlVisibleKey(workspaceId, currentAccountId(), target.collection, target.id)
     if (!this.mysqlVisible.has(key)) return null
     return this.mysqlVisible.get(key) === true
+  }
+
+  private mysqlGrantedRole(
+    collection: string,
+    row: { id?: unknown; pageId?: unknown; collection?: unknown; sessionId?: unknown; sourceId?: unknown; tablePath?: unknown },
+  ) {
+    const workspaceId = currentRequestWorkspaceId()
+    if (!workspaceId) return null
+    const target = this.scopeTarget(collection, String(row.id ?? ''), row)
+    const key = this.mysqlVisibleKey(workspaceId, currentAccountId(), target.collection, target.id)
+    // 只有归属判为不可见的记录才看授权；归属本身可见时（自己的、对成员开放的）授权角色不参与。
+    if (this.mysqlVisible.get(key) !== false) return null
+    return this.mysqlGrantRoles.get(key) ?? null
+  }
+
+  /**
+   * 协作者视角的归属：只有归属本身是“私人”、靠授权才看得到时才改写，
+   * 内部成员显示“空间”、外部成员显示“共享”，与分享面板和撤销后重算的规则一致。
+   */
+  private mysqlViewerScope(
+    collection: string,
+    row: { id?: unknown; pageId?: unknown; collection?: unknown; sessionId?: unknown; sourceId?: unknown; tablePath?: unknown },
+    stored: DataScope | null | undefined,
+  ): DataScope | null | undefined {
+    if (stored && stored !== 'personal') return stored
+    if (!this.mysqlGrantedRole(collection, row)) return stored
+    const workspaceId = currentRequestWorkspaceId()
+    const target = this.scopeTarget(collection, String(row.id ?? ''), row)
+    return this.mysqlGrantAudience.get(this.mysqlVisibleKey(workspaceId, currentAccountId(), target.collection, target.id)) ?? 'workspace'
+  }
+
+  /**
+   * MySQL 授权：记录授权（含继承链上的父记录）和视图授权（记录符合视图条件），取最高角色。
+   * 与详情页 MysqlAccessReader 是同一套规则；视图条件按装饰后的记录匹配，与列表筛选一致。
+   */
+  private computeMysqlGrantRole(
+    listed: string,
+    row: { id?: unknown },
+    target: { collection: string; id: string },
+    sources: ReadonlyMap<string, ScopeSource>,
+    grants: ReadonlyMap<string, MysqlCollectionGrants>,
+  ): ResourceRole | null {
+    const roles: string[] = []
+    const seen = new Set<string>()
+    let collection = target.collection
+    let id = target.id
+    while (id && seen.size < 64 && !seen.has(`${collection}\t${id}`)) {
+      seen.add(`${collection}\t${id}`)
+      const role = grants.get(collection)?.records[id]
+      if (role) roles.push(role)
+      const policy = sources.get(collection)?.policies[id]
+      if (policy?.accessMode !== 'inherit' || !policy.parentRecordId) break
+      collection = policy.parentCollection || collection
+      id = policy.parentRecordId
+    }
+    const viewGrants = grants.get(listed)
+    if (viewGrants?.views.length) {
+      const spec = this.collection(listed)
+      const record = (spec
+        ? this.applyMetaOverlay(spec, this.applyPersonOverlay(spec, this.applyFacetOverlay(spec, row as DbRecord)))
+        : row) as DbRecord
+      const scope = resolveRecordScope(target.collection, target.id, sources)
+      const ownerId = effectiveScopePolicy(target.collection, target.id, sources)?.ownerAccountId ?? ''
+      const views = [{ id: `builtin-all:${listed}` }, ...viewGrants.savedViews]
+      const schema = spec ? schemaFor(spec) : undefined
+      const packs = this.facets.list()
+      for (const grant of viewGrants.views) {
+        // 视图只能转授授权人自己看得到的记录：自己的，或对空间成员开放的。不能借视图转授别人的私人记录。
+        if (!grant.grantedBy || !mysqlRecordVisible(target.collection, target.id, sources, grant.grantedBy)) continue
+        if (accessRecordViewMatches(grant.viewId, record, views, scope, ownerId, grant.grantedBy, schema, packs)) roles.push(grant.role)
+      }
+    }
+    let best: ResourceRole | null = null
+    for (const role of roles) {
+      if (!(role in GRANT_ROLE_RANK)) continue
+      if (!best || GRANT_ROLE_RANK[role as ResourceRole] > GRANT_ROLE_RANK[best]) best = role as ResourceRole
+    }
+    return best
   }
 
   private mysqlAccount() {
@@ -1453,6 +1597,11 @@ export class DatabaseService extends Service implements Database {
             workspaceId: string,
             collection: string,
           ) => Promise<{ policies: ScopeSource['policies']; owners: string[] }>
+          collectionGrantSources?: (
+            accountId: string,
+            workspaceId: string,
+            collection: string,
+          ) => Promise<MysqlCollectionGrants>
           attachPolicy?: (input: {
             actorId: string
             workspaceId: string
@@ -1709,6 +1858,7 @@ export class DatabaseService extends Service implements Database {
         sources.set(name, { policies: loaded.policies, owners: new Set(loaded.owners) })
       }
     }
+    const hidden: Array<{ row: DbRecord; target: { collection: string; id: string }; key: string }> = []
     for (const row of rows) {
       const target = this.scopeTarget(collection, String(row.id ?? ''), row)
       const source = sources.get(target.collection)
@@ -1716,10 +1866,23 @@ export class DatabaseService extends Service implements Database {
       if (!known || !workspaceId || !member || !accountId) continue
       const key = this.mysqlScopeKey(workspaceId, target.collection, target.id)
       this.mysqlScopes.set(key, resolveRecordScope(target.collection, target.id, sources))
-      this.mysqlVisible.set(
-        this.mysqlVisibleKey(workspaceId, accountId, target.collection, target.id),
-        mysqlRecordVisible(target.collection, target.id, sources, accountId),
-      )
+      const visibleKey = this.mysqlVisibleKey(workspaceId, accountId, target.collection, target.id)
+      const visible = mysqlRecordVisible(target.collection, target.id, sources, accountId)
+      this.mysqlVisible.set(visibleKey, visible)
+      if (!visible) hidden.push({ row, target, key: visibleKey })
+      else this.mysqlGrantRoles.delete(visibleKey)
+    }
+    if (hidden.length && mysql.collectionGrantSources && workspaceId && accountId) {
+      const grants = new Map<string, MysqlCollectionGrants>()
+      const loaded = await Promise.all([...names].map((name) => mysql.collectionGrantSources!(accountId, workspaceId, name)))
+      ;[...names].forEach((name, index) => grants.set(name, loaded[index]!))
+      for (const item of hidden) {
+        const role = this.computeMysqlGrantRole(collection, item.row, item.target, sources, grants)
+        if (role) {
+          this.mysqlGrantRoles.set(item.key, role)
+          this.mysqlGrantAudience.set(item.key, member?.memberKind === 'member' ? 'workspace' : 'shared')
+        } else this.mysqlGrantRoles.delete(item.key)
+      }
     }
     return true
   }
@@ -1737,7 +1900,7 @@ export class DatabaseService extends Service implements Database {
     if (!this.mysqlAccount()?.usesMysqlAccounts?.()) return undefined
     const workspaceId = currentRequestWorkspaceId()
     if (!workspaceId) return null
-    return this.mysqlScopes.get(this.mysqlScopeKey(workspaceId, collection, id))
+    return this.mysqlScopes.get(this.mysqlScopeKey(workspaceId, collection, id)) ?? null
   }
 
   private partitionVisibleRows(collection: string, rows: DbRecord[], mysql: boolean): VisibleSortedPack {
@@ -1748,18 +1911,24 @@ export class DatabaseService extends Service implements Database {
       const personal: DbRecord[] = []
       const workspace: DbRecord[] = []
       const shared: DbRecord[] = []
+      const scopes = new Map<string, DataScope>()
       for (const row of rows) {
-        if (collection === '/plugins' && (row as { builtin?: unknown }).builtin === true) {
+        const id = String(row.id ?? '')
+        if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) {
           shared.push(row)
+          scopes.set(id, 'shared')
           continue
         }
-        const target = this.scopeTarget(collection, String(row.id ?? ''), row)
-        const scope = this.mysqlScopeOf(target.collection, target.id)
-        if (scope === 'personal') personal.push(row)
-        else if (scope === 'workspace') workspace.push(row)
+        const target = this.scopeTarget(collection, id, row)
+        // 云端还没落归属的记录，分享列按“私人”显示，分组也归到私人，两边保持一致。
+        // 通过授权才看得到的记录，对当前账号来说是“别人共享给我的”，分组和分享列都按共享算。
+        const scope = this.mysqlViewerScope(collection, row, this.mysqlScopeOf(target.collection, target.id)) ?? 'personal'
+        scopes.set(id, scope)
+        if (scope === 'workspace') workspace.push(row)
         else if (scope === 'shared') shared.push(row)
+        else personal.push(row)
       }
-      return { rows, personal, workspace, shared }
+      return { rows, personal, workspace, shared, scopes }
     }
     const personal: DbRecord[] = []
     const workspace: DbRecord[] = []
@@ -1786,6 +1955,27 @@ export class DatabaseService extends Service implements Database {
       else if (scope === 'shared') shared.push(row)
     }
     return { rows, personal, workspace, shared }
+  }
+
+  /**
+   * 分组和分享列共用同一条规则：开了公开链接的记录一律算“共享”，
+   * 从私人 / 空间分组里拿掉。只改分组归类，不改可见范围。
+   */
+  private visibleRowsForScope(collection: string, pack: VisibleSortedPack, scope: DataScope) {
+    let publicIds: Set<string>
+    try {
+      publicIds = this.shares.recordIds(collection)
+    } catch {
+      return pack[scope]
+    }
+    if (!publicIds.size) return pack[scope]
+    const scopedIds = new Set(pack[scope].map((row) => String(row.id ?? '')))
+    if (scope === 'shared') {
+      for (const id of publicIds) scopedIds.add(id)
+    } else {
+      for (const id of publicIds) scopedIds.delete(id)
+    }
+    return pack.rows.filter((row) => scopedIds.has(String(row.id ?? '')))
   }
 
   private async scanCollectionRowsNow(spec: CollectionSpec, query: CollectionListQuery, overlay: boolean) {
@@ -1852,6 +2042,8 @@ export class DatabaseService extends Service implements Database {
     this.visibleCache.clear()
     this.mysqlScopes.clear()
     this.mysqlVisible.clear()
+    this.mysqlGrantRoles.clear()
+    this.mysqlGrantAudience.clear()
   }
 
   private notifyChange() {
@@ -2133,13 +2325,13 @@ export class DatabaseService extends Service implements Database {
     try {
       const overlay = listNeedsMatchOverlay(liveFilter, q, sortField, page?.sorts)
       const pack = await this.visibleSortedCollectionRows(spec, query, sortField, sortDir, page?.sorts, overlay)
-      const visible = scopeFilter ? pack[scopeFilter] : pack.rows
+      const visible = scopeFilter ? this.visibleRowsForScope(spec.path, pack, scopeFilter) : pack.rows
       const tagFilter = spec.path === '/facets' ? String(filter?.facetId ?? '').trim() : ''
       if (tagFilter) schema = schemaWithTagPack(schema, this.facets.get(tagFilter))
       const packs = this.facets.list()
       const sorted = visible.filter((row) => matchListFilter(row, liveFilter, schema, packs) && matchQuery(row, q, packs))
       const total = sorted.length
-      const slice = this.decorateSlice(spec, sorted.slice(offset, offset + limit))
+      const slice = this.decorateSlice(spec, sorted.slice(offset, offset + limit), pack.scopes)
       return {
         kind: 'collection' as const,
         path: spec.path,
@@ -2184,6 +2376,16 @@ export class DatabaseService extends Service implements Database {
     }
   }
 
+  async readAccessMatchRecord(workspaceId: string, collection: string, recordId: string) {
+    if (!workspaceId || workspaceId !== currentRequestWorkspaceId()) return null
+    const spec = this.collection(collection)
+    if (!spec) return null
+    await this.facets.prepare()
+    const row = await spec.get(recordId)
+    if (!row || this.facets.isDeleted(collection, recordId)) return null
+    return this.applyMetaOverlay(spec, this.applyPersonOverlay(spec, this.applyFacetOverlay(spec, row)))
+  }
+
   private decorateRecord(spec: CollectionSpec, row: DbRecord): DbRecord {
     const withFacet = this.applyFacetOverlay(spec, row)
     const withPeople = this.applyPersonOverlay(spec, withFacet)
@@ -2200,8 +2402,9 @@ export class DatabaseService extends Service implements Database {
 
   private shareScopeLabel(collection: string, id: string, record: DbRecord, stored: 'personal' | 'workspace' | 'shared') {
     const target = this.scopeTarget(collection, id, record)
-    const mysqlScope = this.mysqlScopeOf(target.collection, target.id)
-    if (mysqlScope === 'personal' || mysqlScope === 'workspace' || mysqlScope === 'shared') {
+    const mysqlScope = this.scopeHints?.get(id)
+      ?? this.mysqlViewerScope(collection, { ...record, id }, this.mysqlScopeOf(target.collection, target.id))
+    if (mysqlScope !== undefined) {
       if (this.hasPublicShare(collection, id) || mysqlScope === 'shared') return '共享'
       if (mysqlScope === 'workspace') return '空间'
       return '私人'
@@ -2846,10 +3049,16 @@ export class DatabaseService extends Service implements Database {
   async listTrash() {
     await this.prepareMetadata()
     const items = []
+    let sessionSummaries: Map<string, DbRecord> | undefined
     for (const row of this.facets.listDeleted()) {
       const spec = this.collection(row.collection)
       if (!spec) continue
-      const record = await spec.get(row.record_id)
+      if (row.collection === '/sessions' && !sessionSummaries) {
+        sessionSummaries = new Map((await spec.list()).map(record => [record.id, record]))
+      }
+      const record = row.collection === '/sessions'
+        ? sessionSummaries?.get(row.record_id)
+        : await spec.get(row.record_id)
       if (!record) continue
       if (this.builtinShared(row.collection, record as { id?: unknown; builtin?: unknown })) continue
       const authorization = this.authorization()
@@ -3544,6 +3753,14 @@ export function apply(ctx: Context) {
     authorization?: AuthorizationService
     usesMysqlAccounts?: () => boolean
     mysql?: {
+      setAccessMatchers?: (matchers: {
+        readRecord: (workspaceId: string, collection: string, recordId: string) => Promise<DbRecord | null>
+        memberView: typeof accessMemberViewMatches
+        recordView: (
+          viewId: string, record: DbRecord, views: Array<{ id: string; filters?: Record<string, unknown>; filterTree?: unknown }>,
+          scope: 'personal' | 'workspace' | 'shared' | null, ownerId: string, grantedBy: string, collection: string,
+        ) => boolean
+      }) => void
       externallySharedRecords?: (
         accountId: string,
         workspaceId: string,
@@ -3581,8 +3798,20 @@ export function apply(ctx: Context) {
     return workspaceId && account?.workspaceLocation?.(workspaceId) === 'cloud' ? 'cloud' : 'device'
   }
   db.viewCatalog = savedViews
+  account?.mysql?.setAccessMatchers?.({
+    readRecord: (workspaceId, collection, recordId) => db.readAccessMatchRecord(workspaceId, collection, recordId),
+    memberView: accessMemberViewMatches,
+    recordView: (viewId, record, views, scope, ownerId, grantedBy, collection) => {
+      const spec = db.collection(collection)
+      return accessRecordViewMatches(viewId, record, views, scope, ownerId, grantedBy,
+        spec ? schemaFor(spec) : undefined, db.facets.list())
+    },
+  })
   ctx.inject(['sessions'], (inner) => {
-    inner.sessions.viewAccess = (id, record) => db.allowsViaView('/sessions', { ...record, id })
+    inner.sessions.viewAccess = Object.assign(
+      (id: string, record?: { id?: unknown }) => db.allowsViaView('/sessions', { ...record, id }),
+      { mayAllow: () => db.mayAllowViaView('/sessions') },
+    )
   })
   account?.authorization?.setMemberViewMatcher((workspaceId, viewId, accountId) => {
     const view = savedViews.viewsFor('/workspace-members').find((item) => item.id === viewId)
@@ -4318,22 +4547,73 @@ export function apply(ctx: Context) {
     }
   })
   ctx.http.route('GET', '/api/db/trash', (route) => send(route, () => db.listTrash()))
+  ctx.http.route('GET', '/api/db/saved-views', async (route) => {
+    if (await forwardCloudRead(route, '/api/db/saved-views')) return
+    await send(route, async () => {
+      // 一次性返回当前空间、当前账号的全部视图：同一份内存快照，分页之间被别的窗口改动不会拼出不一致的列表。
+      await db.requirePath('/views', 'resource:read')
+      const tables = db.collectionsList().map((item) => db.publishCollection(item))
+      const items = savedViews.rows(tables, currentAccountId() ?? '')
+        .filter((row) => !isReadOnlyViewId(String(row.viewId ?? '')))
+      return { items, total: items.length, snapshot: true }
+    })
+  })
   ctx.http.route('POST', '/api/db/saved-views', async (route) => {
     try {
-      const body = (await route.json()) as { path?: string; views?: StoredView[] }
-      const path = String(body?.path ?? '')
-      const next = Array.isArray(body.views) ? body.views : []
+      const body = (await route.json()) as { path?: unknown; mutations?: unknown; views?: unknown } | null
+      const path = normalizeCollectionPath(String(body?.path ?? ''))
       await db.requirePath(path, 'resource:update')
-      if (isIndexCollection(path)) {
-        savedViews.replaceOwned(path, next, currentAccountId())
-      } else {
-        dropSharesForRemovedViews(shares, path, savedViews.viewsFor(path), next)
-        savedViews.replace(path, next)
+      if (!Array.isArray(body?.mutations)) {
+        route.send(409, { code: 'SAVED_VIEW_PROTOCOL', error: '视图保存方式已升级，请刷新页面后重试' })
+        return
       }
-      await Promise.all([savedViews.flush(), shares.flush()])
+      const mutations = (body.mutations as Array<Record<string, unknown>>).map((item) => {
+        if (!item || typeof item !== 'object' || normalizeCollectionPath(String(item.collection ?? '')) !== path) {
+          throw Object.assign(new Error('Invalid saved view change'), { code: 'SAVED_VIEW_INVALID', status: 400 })
+        }
+        if (item.type === 'delete') return { type: 'delete', collection: path, id: item.id, expectedRevision: item.expectedRevision }
+        const view = item.view && typeof item.view === 'object' && !Array.isArray(item.view)
+          ? (({ createdBy: _c, revision: _r, deletedAt: _d, ...rest }) => rest)(item.view as Record<string, unknown>)
+          : item.view
+        return item.type === 'create'
+          ? { type: 'create', collection: path, id: item.id, view }
+          : { type: item.type, collection: path, id: item.id, expectedRevision: item.expectedRevision, view }
+      }) as unknown as SavedViewMutation[]
+      const results = await savedViews.mutate(currentAccountId() ?? '', mutations)
+      const deleted = mutations.filter((item) => item.type === 'delete').map((item) => item.id)
+      if (deleted.length) {
+        try {
+          for (const id of deleted) {
+            for (const viewId of ['personal', 'workspace', 'shared'].map((scope) => `builtin-scope:${scope}:${encodeURIComponent(id)}`)) {
+              shares.revokeView(path, viewId)
+            }
+          }
+          await shares.flush()
+        } catch {
+          /* 权威库已在同一事务内撤销；本地分享缓存下次 prepare 时重载。 */
+        }
+      }
       ctx.emit('database/change')
-      route.send(200, { ok: true })
+      route.send(200, {
+        ok: true,
+        views: results.map((result) => ({
+          id: result.id,
+          revision: result.view.revision,
+          ...(result.view.deletedAt != null ? { deleted: true } : {}),
+        })),
+      })
     } catch (error) {
+      const failure = error as { code?: unknown; status?: unknown } | null
+      const code = typeof failure?.code === 'string' ? failure.code : ''
+      if (code === 'SAVED_VIEW_CACHE_FAILED') ctx.emit('database/change')
+      if (code.startsWith('SAVED_VIEW_') && typeof failure?.status === 'number') {
+        const message = code === 'SAVED_VIEW_CONFLICT' ? '视图已在其他窗口或设备上修改，请刷新后重试'
+          : code === 'SAVED_VIEW_DENIED' ? '没有权限修改该视图'
+          : code === 'SAVED_VIEW_CACHE_FAILED' ? '视图已保存，但缓存刷新失败，请刷新页面'
+          : '视图保存请求无效'
+        route.send(failure.status, { code, error: message })
+        return
+      }
       route.send(400, { error: String(error) })
     }
   })
@@ -4478,6 +4758,27 @@ export function apply(ctx: Context) {
       resources,
     })
   })
+  /**
+   * 公开链接与“邀请协作”同一规则：自定义视图（含 builtin-scope:* 包着的自定义视图）只有创建者能开关。
+   * 整表与内置视图仍只看 resource:share。已删除的视图只允许关闭，方便清理残留链接。
+   */
+  function publicViewShareAllowed(collection: string, viewId: string, disabling: boolean) {
+    const accountId = currentAccountId()
+    if (!accountId) return true
+    let base = viewId
+    if (viewId.startsWith('builtin-scope:')) {
+      // 范围包装只认 personal / workspace / shared；格式不对的不能冒充内置视图。
+      if (!isBuiltinScopeViewId(viewId)) return false
+      const parsed = parseBuiltinScopeViewId(viewId)
+      if (!parsed || isBuiltinScopeViewId(parsed.viewId)) return false
+      base = parsed.viewId
+    }
+    if (!base || /^builtin(?:-|:)/.test(base)) return true
+    const view = savedViews.viewsFor(normalizeCollectionPath(collection)).find((item) => item.id === base)
+    if (!view) return disabling
+    const owner = typeof view.createdBy === 'string' ? view.createdBy.trim() : ''
+    return !owner || owner === accountId
+  }
   ctx.http.route('POST', '/api/db/shares', async (route) => {
     try {
       const body = (await route.json()) as {
@@ -4503,6 +4804,10 @@ export function apply(ctx: Context) {
         return
       }
       await db.requirePath(kind === 'record' ? `${collection}/${recordId}` : collection, 'resource:share')
+      if (kind === 'view' && !publicViewShareAllowed(collection, String(body.viewId ?? ''), body.enabled === false)) {
+        route.send(403, { code: 'VIEW_SHARE_DENIED', error: '只有视图的创建者可以开启或关闭它的公开链接' })
+        return
+      }
       if (body.enabled === false) {
         if (kind === 'record') shares.revokeRecord(collection, recordId)
         else shares.revokeTarget(kind, collection, body.viewId ?? '', body.recordId ?? '')
@@ -4522,7 +4827,11 @@ export function apply(ctx: Context) {
       await shares.flush()
       route.send(200, { share: { ...share, url: publicShareUrl(route.req, share.token) } })
     } catch (error) {
-      route.send(400, { error: String(error) })
+      if ((error as { code?: string } | null)?.code === 'SHARE_CONFLICT') {
+        route.send(409, { code: 'SHARE_CONFLICT', error: '分享设置已变更，请刷新后重试' })
+      } else {
+        route.send(400, { error: String(error) })
+      }
     }
   })
   ctx.http.route('GET', '/api/share/:token', async (route) => shares.withTokenWorkspace(route.params.token ?? '', async () => {

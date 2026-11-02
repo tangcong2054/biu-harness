@@ -197,6 +197,31 @@ test('MysqlSessionStore CRUD, ordering, concurrent append, and delete', async ()
   await verifyStoreContract(store, 'unit_session')
 })
 
+test('session summaries aggregate only event keys and retain empty-session fallbacks', async () => {
+  let query = ''
+  const pool = {
+    async query(sql: string) {
+      query = sql.replace(/\s+/g, ' ').trim()
+      return [[
+        { id: 'empty', version: SESSION_FORMAT_VERSION, project_json: null, mascot_json: null, config_json: null, event_count: 0, title: 'Empty', updated_at: 300, first_event_at: null, last_message_at: null },
+        { id: 'messages', version: SESSION_FORMAT_VERSION, project_json: null, mascot_json: null, config_json: JSON.stringify({ createdAt: 10 }), event_count: 3, title: 'Messages', updated_at: 200, first_event_at: 20, last_message_at: 180 },
+        { id: 'no-user', version: SESSION_FORMAT_VERSION, project_json: null, mascot_json: null, config_json: null, event_count: 1, title: 'No user', updated_at: 100, first_event_at: 30, last_message_at: null },
+      ], []]
+    },
+  }
+  const rows = await new MysqlSessionStore(pool as never, 'biu_test').listSummaries()
+  expect(query).toContain("LEFT JOIN ( SELECT session_id, MAX(CASE WHEN type = 'user/message' THEN ts END)")
+  expect(query).toContain('FROM `biu_test`.`events` GROUP BY session_id ) e ON e.session_id = s.id')
+  expect(query).not.toContain('GROUP BY s.')
+  expect(query).toContain('ORDER BY s.updated_at DESC')
+  expect(rows.map(row => row.id)).toEqual(['empty', 'messages', 'no-user'])
+  expect(rows[0]).toMatchObject({ eventCount: 0, config: { createdAt: 300 } })
+  expect(rows[0]).not.toHaveProperty('lastMessageAt')
+  expect(rows[1]).toMatchObject({ eventCount: 3, lastMessageAt: 180, config: { createdAt: 10 } })
+  expect(rows[2]).toMatchObject({ config: { createdAt: 30 } })
+  expect(rows[2]).not.toHaveProperty('lastMessageAt')
+})
+
 describe.skipIf(!testUrl)('MysqlSessionStore integration', () => {
   test('passes the Store contract against MySQL', async () => {
     const parsed = new URL(testUrl!)

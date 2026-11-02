@@ -541,6 +541,160 @@ export const PRODUCT_MIGRATIONS: readonly MysqlMigration[] = [
       ) ${MYSQL_TABLE}`,
     ],
   },
+  {
+    version: 13,
+    name: 'session_order_and_workspace_subject_indexes',
+    statements: [
+      `ALTER TABLE sessions
+       ADD INDEX sessions_updated (updated_at DESC), ALGORITHM=INPLACE, LOCK=NONE`,
+      `ALTER TABLE record_grants
+       ADD INDEX record_grants_workspace_subject (workspace_id, subject_type, subject_id),
+       ALGORITHM=INPLACE, LOCK=NONE`,
+      `ALTER TABLE view_grants
+       ADD INDEX view_grants_workspace_subject (workspace_id, subject_type, subject_id),
+       ALGORITHM=INPLACE, LOCK=NONE`,
+    ],
+  },
+  {
+    version: 14,
+    name: 'session_event_time_projection',
+    statements: [
+      `ALTER TABLE sessions
+       ADD COLUMN first_event_at BIGINT NULL,
+       ADD COLUMN last_user_message_at BIGINT NULL,
+       ADD COLUMN event_times_ready TINYINT(1) NOT NULL DEFAULT 0,
+       ALGORITHM=INSTANT`,
+      `CREATE TRIGGER events_summary_insert AFTER INSERT ON events FOR EACH ROW
+       UPDATE sessions SET
+         first_event_at = IF(first_event_at IS NULL, NEW.ts, LEAST(first_event_at, NEW.ts)),
+         last_user_message_at = IF(NEW.type = 'user/message',
+           IF(last_user_message_at IS NULL, NEW.ts, GREATEST(last_user_message_at, NEW.ts)),
+           last_user_message_at)
+       WHERE id = NEW.session_id AND event_times_ready = 1`,
+      `CREATE TRIGGER events_summary_delete AFTER DELETE ON events FOR EACH ROW
+       UPDATE sessions SET event_times_ready = 0 WHERE id = OLD.session_id`,
+      `CREATE TRIGGER events_summary_update AFTER UPDATE ON events FOR EACH ROW
+       UPDATE sessions SET event_times_ready = 0
+       WHERE id IN (OLD.session_id, NEW.session_id)`,
+    ],
+  },
+  {
+    version: 15,
+    name: 'saved_views_account_owner',
+    statements: [
+      // 视图按创建账号隔离。迁移前没有归属的历史视图统一交给空间所有者。
+      `UPDATE saved_views v JOIN workspaces w ON w.id = v.workspace_id
+       SET v.payload_json = JSON_SET(v.payload_json, '$.createdBy', w.owner_id)
+       WHERE JSON_VALID(v.payload_json) AND w.owner_id <> ''
+         AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(v.payload_json, '$.createdBy')), '') IN ('', 'null')`,
+    ],
+  },
+  {
+    version: 16,
+    name: 'record_scope_from_collaborators',
+    statements: [
+      // 之前 MySQL 加协作者不会重算归属，留下“有协作者却仍是私人”的记录；按 SQLite 同一规则补齐。
+      `UPDATE resource_policies p
+       SET p.ownership = CASE WHEN EXISTS (
+             SELECT 1 FROM record_grants g
+             JOIN workspace_members m ON m.workspace_id = g.workspace_id AND m.account_id = g.subject_id
+             WHERE g.workspace_id = p.workspace_id AND g.collection = p.collection AND g.record_id = p.record_id
+               AND g.subject_type = 'account' AND g.subject_id <> p.owner_account_id
+               AND m.member_kind IN ('external', 'guest')
+           ) THEN 'shared' ELSE 'workspace' END,
+           p.access_mode = IF(p.access_mode = 'private', 'restricted', p.access_mode)
+       WHERE p.ownership = 'personal'
+         AND EXISTS (
+           SELECT 1 FROM record_grants g
+           WHERE g.workspace_id = p.workspace_id AND g.collection = p.collection AND g.record_id = p.record_id
+             AND NOT (g.subject_type = 'account' AND g.subject_id = p.owner_account_id)
+         )`,
+    ],
+  },
+  {
+    version: 17,
+    name: 'shares_drop_untenanted_target_index',
+    statements: [
+      // 从 SQLite 导入时带来的 shares_target(kind, collection, view_id, record_id) 不含 workspace_id：
+      // 两个空间分享同一目标会撞唯一约束，按冲突更新写入时还会改写别的空间的分享。
+      // 第 11 版已加了按空间的 shares_tenant_target，这里只删旧索引；不存在时什么也不做。
+      `SET @biu_drop_shares_target = (
+         SELECT IF(COUNT(*) > 0, 'ALTER TABLE shares DROP INDEX shares_target', 'DO 0')
+         FROM information_schema.statistics
+         WHERE table_schema = DATABASE() AND table_name = 'shares' AND index_name = 'shares_target'
+       )`,
+      'PREPARE biu_drop_shares_target FROM @biu_drop_shares_target',
+      'EXECUTE biu_drop_shares_target',
+      'DEALLOCATE PREPARE biu_drop_shares_target',
+    ],
+  },
+  {
+    version: 18,
+    name: 'record_scope_narrow_after_revoke',
+    statements: [
+      // 撤销协作只在之后的授权变更时收窄归属；这里按 reconcileRecordScope 同一规则补算历史记录。
+      // 只动“共享”与“受限的空间”两类：它们是撤销后可能留下的过宽状态。
+      `UPDATE resource_policies p
+       SET p.ownership = CASE
+             WHEN EXISTS (
+               SELECT 1 FROM record_grants g
+               JOIN workspace_members m ON m.workspace_id = g.workspace_id AND m.account_id = g.subject_id
+               WHERE g.workspace_id = p.workspace_id AND g.collection = p.collection AND g.record_id = p.record_id
+                 AND g.subject_type = 'account' AND g.subject_id <> p.owner_account_id
+                 AND m.member_kind IN ('external', 'guest')
+             ) OR EXISTS (
+               SELECT 1 FROM shares s
+               WHERE s.workspace_id = p.workspace_id AND s.kind = 'record'
+                 AND s.collection = p.collection AND s.record_id = p.record_id
+             ) THEN 'shared'
+             WHEN p.access_mode = 'members' OR EXISTS (
+               SELECT 1 FROM record_grants g
+               WHERE g.workspace_id = p.workspace_id AND g.collection = p.collection AND g.record_id = p.record_id
+                 AND NOT (g.subject_type = 'account' AND g.subject_id = p.owner_account_id)
+             ) THEN 'workspace'
+             ELSE 'personal'
+           END,
+           p.access_mode = CASE
+             WHEN p.access_mode NOT IN ('private', 'restricted') THEN p.access_mode
+             WHEN EXISTS (
+               SELECT 1 FROM record_grants g
+               WHERE g.workspace_id = p.workspace_id AND g.collection = p.collection AND g.record_id = p.record_id
+                 AND NOT (g.subject_type = 'account' AND g.subject_id = p.owner_account_id)
+             ) THEN 'restricted'
+             ELSE 'private'
+           END
+       WHERE p.ownership = 'shared' OR (p.ownership = 'workspace' AND p.access_mode = 'restricted')`,
+    ],
+  },
+  {
+    version: 19,
+    name: 'view_grants_key_includes_grantor',
+    statements: [
+      // “全部”视图按人隔离：同一对象可以分别被不同管理者授权。主键不含授权人时只能存一条，
+      // 后授的会改写先授的范围。主键加上 granted_by；已经包含时什么也不做。
+      // 从 SQLite 导入的 granted_by 是 LONGTEXT，不能进主键；先改成与其余键列一致的 VARCHAR(128) utf8mb4_bin。
+      `SET @biu_view_grants_grantor = (
+         SELECT IF(MAX(data_type) <> 'varchar' OR MAX(character_maximum_length) <> 128 OR MAX(collation_name) <> 'utf8mb4_bin',
+           'ALTER TABLE view_grants MODIFY granted_by VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL',
+           'DO 0')
+         FROM information_schema.columns
+         WHERE table_schema = DATABASE() AND table_name = 'view_grants' AND column_name = 'granted_by'
+       )`,
+      'PREPARE biu_view_grants_grantor FROM @biu_view_grants_grantor',
+      'EXECUTE biu_view_grants_grantor',
+      'DEALLOCATE PREPARE biu_view_grants_grantor',
+      `SET @biu_view_grants_pk = (
+         SELECT IF(SUM(column_name = 'granted_by') = 0,
+           'ALTER TABLE view_grants DROP PRIMARY KEY, ADD PRIMARY KEY (workspace_id, collection, view_id, subject_type, subject_id, granted_by)',
+           'DO 0')
+         FROM information_schema.statistics
+         WHERE table_schema = DATABASE() AND table_name = 'view_grants' AND index_name = 'PRIMARY'
+       )`,
+      'PREPARE biu_view_grants_pk FROM @biu_view_grants_pk',
+      'EXECUTE biu_view_grants_pk',
+      'DEALLOCATE PREPARE biu_view_grants_pk',
+    ],
+  },
 ]
 
 export const OPERATIONS_MIGRATIONS: readonly MysqlMigration[] = [

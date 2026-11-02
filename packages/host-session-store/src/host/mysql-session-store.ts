@@ -66,6 +66,7 @@ export class MysqlSessionStore implements SessionStore {
   constructor(
     private readonly pool: Pick<Pool, 'query' | 'getConnection'>,
     database = 'biu',
+    private readonly summaryProjection = process.env.BIU_SESSION_SUMMARY_PROJECTION === '1',
   ) {
     if (!SAFE_DATABASE.test(database)) throw new Error(`unsafe MySQL database name: ${database}`)
     this.database = `\`${database}\``
@@ -121,6 +122,7 @@ export class MysqlSessionStore implements SessionStore {
       const storedCount = await this.lockOrCreateSession(connection, record)
       await this.syncEvents(connection, record.id, record.events, storedCount)
       await this.writeMetadata(connection, record, record.events.length)
+      if (this.summaryProjection) await this.refreshEventTimes(connection, record.id)
       await connection.commit()
     } catch (error) {
       await connection.rollback()
@@ -167,6 +169,7 @@ export class MysqlSessionStore implements SessionStore {
           ? [seq + 1, ts, id]
           : [seq + 1, ts, title, id],
       )
+      if (this.summaryProjection) await this.refreshEventTimes(connection, id)
       await connection.commit()
       return event
     } catch (error) {
@@ -178,6 +181,22 @@ export class MysqlSessionStore implements SessionStore {
   }
 
   async deleteEvents(id: string, connection?: PoolConnection): Promise<number> {
+    if (!connection && this.summaryProjection) {
+      const owned = await this.pool.getConnection()
+      try {
+        await owned.beginTransaction()
+        await owned.query(`SELECT id FROM ${this.table('sessions')} WHERE id = ? FOR UPDATE`, [id])
+        const count = await this.deleteEvents(id, owned)
+        await this.refreshEventTimes(owned, id)
+        await owned.commit()
+        return count
+      } catch (error) {
+        await owned.rollback()
+        throw error
+      } finally {
+        owned.release()
+      }
+    }
     const executor = connection ?? this.pool
     const [result] = await executor.query<ResultSetHeader>(
       `DELETE FROM ${this.table('events')} WHERE session_id = ?`,
@@ -193,17 +212,62 @@ export class MysqlSessionStore implements SessionStore {
     return rows.map((row) => String(row.id))
   }
 
-  async listSummaries(): Promise<SessionSummary[]> {
+  private async refreshEventTimes(connection: PoolConnection, id: string) {
+    const [rows] = await connection.query<Array<RowDataPacket & { event_times_ready: number }>>(
+      `SELECT event_times_ready FROM ${this.table('sessions')} WHERE id = ? FOR UPDATE`, [id],
+    )
+    if (!rows.length || Number(rows[0].event_times_ready) === 1) return
+    await connection.query(
+      `UPDATE ${this.table('sessions')} s SET
+         first_event_at = (SELECT MIN(ts) FROM ${this.table('events')} WHERE session_id = ?),
+         last_user_message_at = (SELECT MAX(ts) FROM ${this.table('events')} WHERE session_id = ? AND type = 'user/message'),
+         event_times_ready = 1
+       WHERE s.id = ?`,
+      [id, id, id],
+    )
+  }
+
+  async backfillEventTimes(id: string): Promise<void> {
+    const connection = await this.pool.getConnection()
+    try {
+      await connection.beginTransaction()
+      await this.refreshEventTimes(connection, id)
+      await connection.commit()
+    } catch (error) {
+      await connection.rollback()
+      throw error
+    } finally {
+      connection.release()
+    }
+  }
+
+  async listSummaries(options?: { sessionIds?: readonly string[] }): Promise<SessionSummary[]> {
+    const ids = options?.sessionIds === undefined ? undefined : [...new Set(options.sessionIds)]
+    if (ids?.length === 0) return []
+    const where = ids ? `WHERE s.id IN (${ids.map(() => '?').join(', ')})` : ''
+    const times = this.summaryProjection
+      ? `CASE WHEN s.event_times_ready = 1 THEN s.last_user_message_at ELSE
+           (SELECT MAX(ts) FROM ${this.table('events')} WHERE session_id = s.id AND type = 'user/message')
+         END AS last_message_at,
+         CASE WHEN s.event_times_ready = 1 THEN s.first_event_at ELSE
+           (SELECT MIN(ts) FROM ${this.table('events')} WHERE session_id = s.id)
+         END AS first_event_at`
+      : 'e.last_message_at, e.first_event_at'
+    const join = this.summaryProjection ? '' : `LEFT JOIN (
+         SELECT session_id,
+                MAX(CASE WHEN type = 'user/message' THEN ts END) AS last_message_at,
+                MIN(ts) AS first_event_at
+         FROM ${this.table('events')}
+         GROUP BY session_id
+       ) e ON e.session_id = s.id`
     const [rows] = await this.pool.query<Array<SessionRow & { last_message_at: number | null; first_event_at: number | null }>>(
       `SELECT s.id, s.version, s.project_json, s.mascot_json, s.config_json,
-              s.event_count, s.title, s.updated_at,
-              MAX(CASE WHEN e.type = 'user/message' THEN e.ts END) AS last_message_at,
-              MIN(e.ts) AS first_event_at
+              s.event_count, s.title, s.updated_at, ${times}
        FROM ${this.table('sessions')} s
-       LEFT JOIN ${this.table('events')} e ON e.session_id = s.id
-       GROUP BY s.id, s.version, s.project_json, s.mascot_json, s.config_json,
-                s.event_count, s.title, s.updated_at
+       ${join}
+       ${where}
        ORDER BY s.updated_at DESC`,
+      ids ?? [],
     )
     return rows.map((row) => {
       const project = parseProject(row.project_json)

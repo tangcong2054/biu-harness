@@ -1,4 +1,5 @@
 import type { Pool, ResultSetHeader, RowDataPacket } from 'mysql2/promise'
+import { syncMysqlOperations } from './mysql-operations-projection.ts'
 
 export type MysqlOperationsKind = 'account' | 'workspace' | 'usage' | 'device' | 'sync' | 'security'
 
@@ -18,10 +19,24 @@ type QueryPool = Pick<Pool, 'query'>
 
 export class MysqlOperationsStore {
   private readonly database: string
+  private lastSyncAt = 0
+  private syncPending?: Promise<boolean>
 
-  constructor(private readonly pool: QueryPool, database = 'biu_ops') {
+  constructor(private readonly pool: QueryPool, database = 'biu_ops', private readonly productDatabase?: string) {
     if (!SAFE_DATABASE.test(database)) throw new Error(`unsafe MySQL database name: ${database}`)
+    if (productDatabase && !SAFE_DATABASE.test(productDatabase)) throw new Error('unsafe MySQL product database name')
     this.database = `\`${database}\``
+  }
+
+  async syncFromPlatform(force = false): Promise<boolean> {
+    if (!this.productDatabase) throw new Error('MySQL operations requires an explicit product database')
+    if (this.syncPending) return this.syncPending
+    if (!force && Date.now() - this.lastSyncAt < 3000) return true
+    this.syncPending = syncMysqlOperations(this.pool, this.productDatabase, this).then(result => {
+      this.lastSyncAt = Date.now()
+      return result
+    }).finally(() => { this.syncPending = undefined })
+    return this.syncPending
   }
 
   async list(kind: MysqlOperationsKind, q = '') {
@@ -245,7 +260,9 @@ export class MysqlOperationsStore {
 }
 
 function sanitize(input: Record<string, unknown>) {
-  return Object.fromEntries(Object.entries(input).filter(([key]) => !SECRET_KEYS.test(key)))
+  return Object.fromEntries(Object.entries(input).filter(([key, value]) =>
+    !SECRET_KEYS.test(key) || (key === 'tokens' && typeof value === 'number' && Number.isFinite(value)),
+  ))
 }
 
 function text(value: unknown) {

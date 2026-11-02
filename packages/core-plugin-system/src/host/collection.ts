@@ -129,7 +129,9 @@ export function pluginsCollection(store: PluginStoreService, registry?: PluginRe
         // 避免点了才被商店或记录权限打成 permission denied。
         // installed 要在 omitEmpty 抹掉 false 之前看原始 listing。
         const remoteOwner = String(flags[id]?.ownerId ?? '')
-        const ownedRemotely = !remoteOwner || remoteOwner === registry?.ownerId?.()
+        const ownedRemotely = !remoteOwner || (registry?.ownsPublisher
+          ? registry.ownsPublisher(remoteOwner)
+          : remoteOwner === registry?.ownerId?.())
         const publishable = Boolean(
           registry && listing && listing.installed !== false && ownedRemotely && registry.canPublish(id),
         )

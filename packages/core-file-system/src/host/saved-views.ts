@@ -1,17 +1,18 @@
+import { randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { currentRequestWorkspaceId, openAndMigrateBiu } from '@biu/host-plugin-loader/data-dir'
 import type { CollectionInfo, CollectionSpec, DbRecord } from '@biu/type-file-system'
 import { normalizeSchemaValue, recordBuiltinValues, REQUIRED_RECORD_FIELDS } from '@biu/type-file-system'
-import { builtinAllView, freshViewId, isReadOnlyViewId } from '../catalog-views.ts'
+import { builtinAllView, isReadOnlyViewId } from '../catalog-views.ts'
 import { normalizeColumnWidths, normalizePageSize, type SavedView } from '../web/saved-view.ts'
 import { isViewModeId } from '../web/fields.ts'
 import { normalizeCollectionPath } from '../paths.ts'
-import { isIndexCollection } from '../web/database-path.ts'
 import {
   SqliteMetadataRuntime,
   type MetadataRepository,
   type MetadataRuntimeMode,
+  type SavedViewMutation,
 } from '@biu/host-plugin-loader/metadata-runtime'
 import {
   countFilterRules,
@@ -50,14 +51,25 @@ export function parseViewColumnsInput(value: unknown): string[] {
   return [...new Set(text.split(',').map((item) => item.trim()).filter(Boolean))]
 }
 
-export type StoredView = Partial<SavedView> & Pick<SavedView, 'id' | 'name'> & { createdBy?: string }
+export type StoredView = Partial<SavedView> & Pick<SavedView, 'id' | 'name'> & {
+  createdBy?: string
+  revision?: number
+  deletedAt?: number
+}
 
 type ViewRow = { workspace_id: string; collection: string; payload_json: string }
 
 export class SavedViewsStore {
   private byPath = new Map<string, StoredView[]>()
-  private db: DatabaseSync | null = null
+  private base: DatabaseSync | null = null
   private runtime: SqliteMetadataRuntime | null = null
+  private incrementalViews = false
+
+  /** MySQL 模式下是当前请求工作区自己的覆盖层；未打开时为 null。 */
+  private get db(): DatabaseSync | null {
+    if (!this.base) return null
+    return this.runtime ? this.runtime.database() : this.base
+  }
 
   configureRuntime(
     mode: MetadataRuntimeMode,
@@ -68,11 +80,12 @@ export class SavedViewsStore {
       mode,
       repository,
       () => {
-        if (!this.db) this.open(':memory:')
-        return this.db!
+        if (!this.base) this.open(':memory:')
+        return this.base!
       },
       ['saved_views'],
       onShadowError,
+      { workspaceDb: () => openAndMigrateBiu(':memory:', { foreignKeys: false }) },
     )
   }
 
@@ -85,9 +98,41 @@ export class SavedViewsStore {
     await this.runtime?.flush()
   }
 
+  async mutate(accountId: string, mutations: readonly SavedViewMutation[]) {
+    if (!this.runtime) this.configureRuntime('sqlite', null)
+    if (mutations.length) this.incrementalViews = true
+    try {
+      const results = await this.runtime!.mutateSavedViews(accountId, mutations)
+      this.hydrate()
+      return results
+    } catch (error) {
+      if ((error as { committed?: boolean } | null)?.committed) this.dropCachedViews()
+      throw error
+    }
+  }
+
+  /** 丢掉缓存的视图；按工作区隔离时只丢本空间的。 */
+  private dropCachedViews() {
+    if (!this.runtime?.isolated) {
+      this.byPath.clear()
+      return
+    }
+    const prefix = `${this.workspaceId()}\0`
+    for (const key of [...this.byPath.keys()]) if (key.startsWith(prefix)) this.byPath.delete(key)
+  }
+
+  private requireLegacyViews() {
+    if (this.incrementalViews) throw new Error('Saved views require incremental mutations')
+    const versioned = this.db?.prepare(`SELECT 1 FROM saved_views
+      WHERE CASE WHEN json_valid(payload_json)
+        THEN json_type(payload_json, '$.revision') IS NOT NULL OR json_type(payload_json, '$.deletedAt') IS NOT NULL
+        ELSE 0 END LIMIT 1`).get()
+    if (versioned) throw new Error('Saved views require incremental mutations')
+  }
+
   open(path = ':memory:') {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
-    this.db = openAndMigrateBiu(path, { foreignKeys: false })
+    this.base = openAndMigrateBiu(path, { foreignKeys: false })
     this.hydrate()
     return this
   }
@@ -108,9 +153,11 @@ export class SavedViewsStore {
   }
 
   private hydrate() {
-    if (!this.db) return
-    this.byPath.clear()
-    const rows = this.db.prepare('SELECT workspace_id, collection, payload_json FROM saved_views').all() as ViewRow[]
+    const db = this.db
+    if (!db) return
+    this.dropCachedViews()
+    if (this.runtime && !this.runtime.savedViewCacheValid) return
+    const rows = db.prepare('SELECT workspace_id, collection, payload_json FROM saved_views').all() as ViewRow[]
     for (const row of rows) {
       const collection = normalizeCollectionPath(row.collection)
       if (!collection || collection === '/' || collection === '/views') continue
@@ -123,7 +170,7 @@ export class SavedViewsStore {
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue
       const id = String(parsed.id ?? '').trim()
       const name = String(parsed.name ?? id).trim()
-      if (!id || isReadOnlyViewId(id) || parsed.builtin) continue
+      if (!id || isReadOnlyViewId(id) || parsed.builtin || parsed.deletedAt != null) continue
       const key = this.key(collection, row.workspace_id)
       const list = this.byPath.get(key) ?? []
       list.push({ ...parsed, id, name })
@@ -137,18 +184,19 @@ export class SavedViewsStore {
 
   /** 多张表一起落盘：包在同一个事务里，失败时整批回滚，避免内存改完而磁盘只写了一半。 */
   private persistPaths(collectionPaths: readonly string[]) {
-    if (!this.db) return
+    const db = this.db
+    if (!db) return
     const paths = [...new Set(collectionPaths.map((item) => normalizeCollectionPath(item)))]
     if (!paths.length) return
     const workspaceId = this.workspaceId()
-    const upsert = this.db.prepare(
+    const upsert = db.prepare(
       `INSERT INTO saved_views (workspace_id, collection, view_id, payload_json, updated_at)
        VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(workspace_id, collection, view_id)
        DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`,
     )
-    const wipe = this.db.prepare('DELETE FROM saved_views WHERE workspace_id = ? AND collection = ?')
-    this.db.exec('BEGIN IMMEDIATE')
+    const wipe = db.prepare('DELETE FROM saved_views WHERE workspace_id = ? AND collection = ?')
+    db.exec('BEGIN IMMEDIATE')
     try {
       for (const path of paths) {
         wipe.run(workspaceId, path)
@@ -157,35 +205,46 @@ export class SavedViewsStore {
           upsert.run(workspaceId, path, String(view.id), JSON.stringify(view), Date.now())
         }
       }
-      this.db.exec('COMMIT')
+      db.exec('COMMIT')
       this.runtime?.changed('saved_views')
     } catch (error) {
-      this.db.exec('ROLLBACK')
+      db.exec('ROLLBACK')
       throw error
     }
   }
 
-  viewsFor(collectionPath: string, accountId = ''): StoredView[] {
+  /**
+   * 不传 accountId 时返回本空间全部视图，供视图授权、公开分享等内部判断使用；
+   * 传入账号时只返回该账号自己的视图。
+   */
+  viewsFor(collectionPath: string, accountId?: string): StoredView[] {
     const views = this.byPath.get(this.key(collectionPath)) ?? []
-    if (!isIndexCollection(collectionPath)) return views
-    return views.filter((view) => ownsIndexView(view, accountId))
+    if (accountId === undefined) return views
+    return views.filter((view) => ownsView(view, accountId))
   }
 
-  /** 索引表上的视图按创建人分开存：这次写入只替换当前账号自己的视图。 */
+  /** 视图按创建账号分开存：这次写入只替换当前账号自己的视图。 */
   replaceOwned(collectionPath: string, views: StoredView[], accountId: string) {
+    this.requireLegacyViews()
+    if (!this.db) this.open(':memory:')
     const path = normalizeCollectionPath(collectionPath)
     const key = this.key(path)
     const prev = this.byPath.get(key) ?? []
-    const kept = prev.filter((view) => view.createdBy && view.createdBy !== accountId)
+    const kept = prev.filter((view) => !ownsView(view, accountId))
     const foreign = new Set(kept.map((view) => view.id))
     const mine = views
       .filter((view) => !view.builtin && !isReadOnlyViewId(String(view.id)) && !foreign.has(String(view.id)))
-      .map((view) => ({ ...view, id: String(view.id), name: String(view.name || view.id), createdBy: accountId }))
+      .map((view) => {
+        const { createdBy: _ignored, ...rest } = view
+        return { ...rest, id: String(view.id), name: String(view.name || view.id), ...(accountId ? { createdBy: accountId } : {}) }
+      })
     this.byPath.set(key, [...kept, ...mine])
     this.persistPath(path)
   }
 
   replace(collectionPath: string, views: StoredView[]) {
+    this.requireLegacyViews()
+    if (!this.db) this.open(':memory:')
     const path = normalizeCollectionPath(collectionPath)
     const key = this.key(path)
     this.byPath.set(
@@ -215,7 +274,7 @@ export class SavedViewsStore {
       emit(path, label, all)
       for (const view of this.byPath.get(this.key(path)) ?? []) {
         if (view.builtin || isReadOnlyViewId(view.id)) continue
-        if (isIndexCollection(path) && !ownsIndexView(view, accountId)) continue
+        if (!ownsView(view, accountId)) continue
         emit(path, label, view)
       }
     }
@@ -223,22 +282,22 @@ export class SavedViewsStore {
       if (tables.some((table) => normalizeCollectionPath(table.path) === path)) continue
       for (const view of views) {
         if (view.builtin || isReadOnlyViewId(view.id)) continue
-        if (isIndexCollection(path) && !ownsIndexView(view, accountId)) continue
+        if (!ownsView(view, accountId)) continue
         emit(path, labels.get(path) ?? path, view)
       }
     }
     return out.sort((a, b) => String(a.table).localeCompare(String(b.table)) || String(a.title).localeCompare(String(b.title)))
   }
 
-  create(fields: Record<string, unknown>, tables: CollectionInfo[], accountId = ''): DbRecord {
-    return this.createMany([fields], tables, accountId)[0]!
+  async create(fields: Record<string, unknown>, tables: CollectionInfo[], accountId = ''): Promise<DbRecord> {
+    return (await this.createMany([fields], tables, accountId))[0]!
   }
 
   /**
    * 批量新建：先在内存里校验并构造全部视图（含同批之间撞 id / 撞名），全部通过后再落盘。
    * 任一行不合法时一条都不写，避免“前面的已持久化、后面的报错”。
    */
-  createMany(rows: Array<Record<string, unknown>>, tables: CollectionInfo[], accountId = ''): DbRecord[] {
+  async createMany(rows: Array<Record<string, unknown>>, tables: CollectionInfo[], accountId = ''): Promise<DbRecord[]> {
     const pending = new Map<string, StoredView[]>()
     const out: Array<{ path: string; label: string; view: StoredView }> = []
     for (const fields of rows) {
@@ -249,10 +308,13 @@ export class SavedViewsStore {
       const label = table.view?.title ?? table.label ?? tablePath
       const views = pending.get(tablePath) ?? [...(this.byPath.get(this.key(tablePath)) ?? [])]
       const wanted = String(fields.viewId ?? '').trim()
-      const id = wanted || freshViewId(views)
+      const id = wanted || `view-${randomUUID()}`
       if (isReadOnlyViewId(id)) throw new Error('builtin view is read-only')
       if (views.some((view) => view.id === id)) throw new Error(`view exists: ${id}`)
-      const name = uniqueViewName(String(fields.title ?? fields.name ?? '新视图').trim() || '新视图', views)
+      const name = uniqueViewName(
+        String(fields.title ?? fields.name ?? '新视图').trim() || '新视图',
+        views.filter((view) => ownsView(view, accountId)),
+      )
       const now = Date.now()
       const view: StoredView = {
         id,
@@ -272,72 +334,47 @@ export class SavedViewsStore {
         columnWidths: normalizeColumnWidths(fields.columnWidths),
         createdAt: now,
         updatedAt: now,
-        ...(isIndexCollection(tablePath) ? { createdBy: accountId } : {}),
+        ...(accountId ? { createdBy: accountId } : {}),
       }
       pending.set(tablePath, [...views, view])
       out.push({ path: tablePath, label, view })
     }
-    // 落盘失败时把内存一起回滚，避免内存与磁盘分叉。
-    const backup = new Map([...pending.keys()].map((path) => [path, this.byPath.get(this.key(path))]))
-    for (const [path, views] of pending) this.byPath.set(this.key(path), views)
-    try {
-      this.persistPaths([...pending.keys()])
-    } catch (error) {
-      for (const [path, prev] of backup) {
-        if (prev) this.byPath.set(this.key(path), prev)
-        else this.byPath.delete(this.key(path))
-      }
-      throw error
-    }
-    return out.map(({ path, label, view }) => asRecord(path, label, view))
+    const results = await this.mutate(accountId, out.map(({ path, view }) => ({
+      type: 'create', collection: path, id: view.id, view: { ...view },
+    })))
+    return results.map((result, index) => asRecord(result.collection, out[index]!.label, result.view as StoredView))
   }
 
   /** 批量删除：先确认每个 id 都存在且有权删除，再统一删除；任一不合法时一条都不删。 */
-  removeMany(ids: readonly string[], accountId = ''): string[] {
+  async removeMany(ids: readonly string[], accountId = ''): Promise<string[]> {
     const unique = [...new Set(ids.map((id) => String(id ?? '').trim()).filter(Boolean))]
     const entries = this.scopedEntries()
-    const byPath = new Map<string, Set<string>>()
+    const mutations: SavedViewMutation[] = []
     for (const id of unique) {
       if (isReadOnlyViewId(viewIdOfRow(id))) throw new Error('builtin view is read-only')
       let found = false
       for (const [path, views] of entries) {
         const hit = views.find((view) => rowId(path, view.id) === id)
         if (!hit) continue
-        if (isIndexCollection(path) && !ownsIndexView(hit, accountId)) throw new Error('unknown view: ' + id)
-        const set = byPath.get(path) ?? new Set<string>()
-        set.add(id)
-        byPath.set(path, set)
+        if (!ownsView(hit, accountId)) throw new Error('unknown view: ' + id)
+        mutations.push({ type: 'delete', collection: path, id: hit.id, expectedRevision: hit.revision ?? 0 })
         found = true
         break
       }
       if (!found) throw new Error(`unknown view: ${id}`)
     }
-    // 落盘失败时把内存一起回滚，避免内存与磁盘分叉。
-    const backup = new Map([...byPath.keys()].map((path) => [path, this.byPath.get(this.key(path))]))
-    for (const [path, removing] of byPath) {
-      const views = this.byPath.get(this.key(path)) ?? []
-      this.byPath.set(this.key(path), views.filter((view) => !removing.has(rowId(path, view.id))))
-    }
-    try {
-      this.persistPaths([...byPath.keys()])
-    } catch (error) {
-      for (const [path, prev] of backup) {
-        if (prev) this.byPath.set(this.key(path), prev)
-        else this.byPath.delete(this.key(path))
-      }
-      throw error
-    }
+    await this.mutate(accountId, mutations)
     return unique
   }
 
-  write(id: string, patch: Record<string, unknown>, accountId = ''): DbRecord {
+  async write(id: string, patch: Record<string, unknown>, accountId = ''): Promise<DbRecord> {
     if (isReadOnlyViewId(viewIdOfRow(id))) throw new Error('builtin view is read-only')
     for (const [path, views] of this.scopedEntries()) {
       const idx = views.findIndex((view) => rowId(path, view.id) === id)
       if (idx < 0) continue
       const cur = views[idx]!
       if (cur.builtin || isReadOnlyViewId(cur.id)) throw new Error('builtin view is read-only')
-      if (isIndexCollection(path) && !ownsIndexView(cur, accountId)) throw new Error('unknown view: ' + id)
+      if (!ownsView(cur, accountId)) throw new Error('unknown view: ' + id)
       const next: StoredView = {
         ...cur,
         ...(typeof patch.title === 'string' ? { name: patch.title } : {}),
@@ -361,9 +398,12 @@ export class SavedViewsStore {
         updatedAt: Date.now(),
         createdAt: Number((cur as { createdAt?: number }).createdAt) || Date.now(),
       }
-      views[idx] = next
-      this.persistPath(path)
-      return asRecord(path, path, next)
+      const [result] = await this.mutate(accountId, [{
+        type: 'update', collection: path, id: cur.id,
+        expectedRevision: (patch.expectedRevision !== undefined ? patch.expectedRevision : cur.revision ?? 0) as number,
+        view: { ...next },
+      }])
+      return asRecord(path, path, result!.view as StoredView)
     }
     throw new Error(`unknown view: ${id}`)
   }
@@ -374,11 +414,13 @@ function rowId(path: string, viewId: string) {
 }
 
 /**
- * 索引表上的视图按创建人分开看。早于 createdBy 字段的历史视图没有归属，
+ * 视图按创建账号分开看。没有 createdBy 的只剩无账号的本机历史数据，
  * 这里归给所有人：否则它们既不出现在列表里、也删不掉，永久残留。
+ * 云端历史视图由 MySQL 迁移补上空间所有者。
  */
-function ownsIndexView(view: { createdBy?: string }, accountId: string) {
-  return !view.createdBy || view.createdBy === accountId
+function ownsView(view: { createdBy?: unknown }, accountId: string) {
+  const owner = typeof view.createdBy === 'string' ? view.createdBy.trim() : ''
+  return !owner || owner === accountId
 }
 
 function viewIdOfRow(id: string) {
@@ -450,6 +492,7 @@ function asRecord(path: string, tableName: string, view: StoredView): DbRecord {
     table: tableName,
     tablePath: path,
     viewId: view.id,
+    revision: view.revision ?? 0,
     mode: view.mode ?? 'table',
     sortField: sorts[0]?.field || view.sortField || 'title',
     sortDir: sorts[0]?.dir ?? (view.sortDir === 'desc' ? 'desc' : 'asc'),
@@ -480,6 +523,7 @@ export function clientViewFromDbRow(row: Record<string, unknown> | undefined) {
   return {
     id,
     tablePath: normalizeCollectionPath(String(row.tablePath ?? '')),
+    revision: row.revision,
     name: String(row.title ?? row.name ?? id),
     mode: row.mode,
     sortField: sortsPatch.sortField,
@@ -528,6 +572,8 @@ export function viewsCollection(
         table: { type: 'string', label: '来源表' },
         tablePath: { type: 'string', label: '表路径', writable: true },
         viewId: { type: 'string', label: '视图 ID' },
+        revision: { type: 'number', label: '版本' },
+        expectedRevision: { type: 'number', label: '预期版本', writable: true },
         mode: { type: 'string', label: '呈现', writable: true },
         sortField: { type: 'string', label: '排序字段', writable: true },
         sortDir: { type: 'select', label: '升降序', writable: true, enum: ['asc', 'desc'] },

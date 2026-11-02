@@ -15,6 +15,27 @@ test('system prompt sections assemble in id order', async () => {
   assert.match(text, /可用工具/)
 })
 
+test('prepare runs section preparers before assemble and survives failures', async () => {
+  const ctx = new Context()
+  await ctx.plugin(tools)
+  await ctx.plugin(systemPrompt)
+  let value = '旧'
+  ctx.systemPrompt.register('data', () => `数据=${value}`, {
+    prepare: async () => {
+      value = '新'
+    },
+  })
+  ctx.systemPrompt.register('broken', '坏片段仍输出', {
+    prepare: async () => {
+      throw new Error('boom')
+    },
+  })
+  await ctx.systemPrompt.prepare()
+  const text = ctx.systemPrompt.assemble()
+  assert.match(text, /数据=新/)
+  assert.match(text, /坏片段仍输出/)
+})
+
 test('assemble appends live ui context', async () => {
   const ctx = new Context()
   await ctx.plugin(tools)

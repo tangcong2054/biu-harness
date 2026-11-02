@@ -9,6 +9,7 @@ import {
   type RuntimeRepositoryMode,
 } from '@biu/host-cloud-storage'
 import type { RouteContext } from '@biu/type-http'
+import { toRecordAccessDetails, toViewAccessDetails } from '@biu/type-file-system/access'
 import {
   CollabError,
   CollabStore,
@@ -83,6 +84,8 @@ export class AccountService extends Service {
     if (this.accountMode !== 'sqlite' && !this.mysql) {
       throw new Error(`BIU_ACCOUNT_MYSQL_MODE=${this.accountMode} requires the MySQL account repository`)
     }
+    // 外部协作者被自动移出空间等成员变化，不经过成员管理接口；仓储递增全空间授权版本时一并清插件授权缓存。
+    const unsubscribe = this.mysql?.onWorkspaceAuthzChange?.((workspaceId) => this.forgetPluginAccess({ workspaceId }))
     if ((isOnlineRuntime() && this.accountMode === 'sqlite' && !process.env.VITEST) || isOperationsRuntime()) {
       this.store.bootstrapOperations({
         email: process.env.BIU_OPERATIONS_ADMIN_EMAIL || 'admin',
@@ -132,7 +135,10 @@ export class AccountService extends Service {
         ),
       ),
     )
-    ctx.on('dispose', () => db.close())
+    ctx.on('dispose', () => {
+      unsubscribe?.()
+      db.close()
+    })
   }
 
   usesMysqlAccounts() {
@@ -184,9 +190,8 @@ export class AccountService extends Service {
   }
 
   async isMemberAsync(accountId: string, workspaceId: string) {
-    if (this.usesMysqlAccounts()) {
-      return (await this.mysql!.listWorkspaces(accountId)).some((item) => item.id === workspaceId)
-    }
+    // 直接查这一行成员关系（按请求缓存），不再列出账号的全部空间再逐个比较。
+    if (this.usesMysqlAccounts()) return Boolean(await this.mysql!.membership(accountId, workspaceId))
     return this.store.isMember(accountId, workspaceId)
   }
 
@@ -652,6 +657,11 @@ function purgeSessionEvents(sessionIds: string[]) {
 }
 
 function fail(route: RouteContext, error: unknown) {
+  const code = error instanceof Error ? (error as { code?: string }).code : undefined
+  if (code === 'ACCESS_DETAILS_DENIED' || code === 'VIEW_SHARE_DENIED') {
+    route.send(403, { code, error: (error as Error).message })
+    return
+  }
   if (error instanceof CollabError) {
     route.send(error.status, { error: error.message })
     return
@@ -1988,24 +1998,49 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
     }
   })
 
+  /** 改完授权后操作者自己可能已看不到这条记录的协作详情，此时返回 { ok: true, access: null }。 */
+  async function recordAccessAfterChange(actorId: string, workspaceId: string, collection: string, recordId: string) {
+    try {
+      return recordDetails(await account.mysql!.recordAccess(actorId, workspaceId, collection, recordId))
+    } catch (error) {
+      if (error instanceof Error && (error as { code?: string }).code === 'ACCESS_DETAILS_DENIED') {
+        return { ok: true as const, access: null }
+      }
+      throw error
+    }
+  }
+
+  function localRecordAccessAfterChange(actorId: string, collection: string, recordId: string) {
+    try {
+      return recordDetails(account.store.recordAccess(actorId, collection, recordId))
+    } catch (error) {
+      if (error instanceof CollabError && error.status === 403) return { ok: true as const, access: null }
+      throw error
+    }
+  }
+
+  // 两条路径的权限详情都在这里收口成同一份契约（@biu/type-file-system/access）。
+  const recordDetails = (raw: unknown) => toRecordAccessDetails(raw as Record<string, unknown>)
+  const viewDetails = (raw: unknown, viewId: string) => toViewAccessDetails(raw as Record<string, unknown>, viewId)
+
   ctx.http.route('GET', '/api/account/access', async (route) => {
     try {
       if (account.usesMysqlAccounts()) {
         const me = await mysqlActor(route)
-        const workspaceId = me.activeWorkspaceId
+        const workspaceId = currentRequestWorkspaceId() || me.activeWorkspaceId
         if (!workspaceId) throw new CollabError('没有工作区', 400)
         const collection = String(route.query.get('collection') ?? '')
         const viewId = String(route.query.get('viewId') ?? '')
         route.send(
           200,
           viewId
-            ? await account.mysql!.viewAccess(me.id, workspaceId, collection, viewId)
-            : await account.mysql!.recordAccess(
+            ? viewDetails(await account.mysql!.viewAccess(me.id, workspaceId, collection, viewId), viewId)
+            : recordDetails(await account.mysql!.recordAccess(
                 me.id,
                 workspaceId,
                 collection,
                 String(route.query.get('recordId') ?? ''),
-              ),
+              )),
         )
         return
       }
@@ -2026,8 +2061,8 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
       route.send(
         200,
         viewId
-          ? account.store.viewAccess(me.id, collection, viewId)
-          : account.store.recordAccess(me.id, collection, String(route.query.get('recordId') ?? '')),
+          ? viewDetails(account.store.viewAccess(me.id, collection, viewId), viewId)
+          : recordDetails(account.store.recordAccess(me.id, collection, String(route.query.get('recordId') ?? ''))),
       )
     } catch (error) {
       fail(route, error)
@@ -2043,7 +2078,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
           groupId?: string; memberViewId?: string; role?: ResourceRole;
           collaboratorKind?: 'internal' | 'external'
         }
-        const workspaceId = me.activeWorkspaceId
+        const workspaceId = currentRequestWorkspaceId() || me.activeWorkspaceId
         if (!workspaceId) throw new CollabError('没有工作区', 400)
         const collection = String(body.collection ?? '')
         const role: ResourceRole =
@@ -2074,7 +2109,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
             })
             if (!target) throw new CollabError('没有这个邮箱，对方需要先注册', 404)
           }
-          route.send(200, await account.mysql!.viewAccess(me.id, workspaceId, collection, String(body.viewId)))
+          route.send(200, viewDetails(await account.mysql!.viewAccess(me.id, workspaceId, collection, String(body.viewId)), String(body.viewId)))
           return
         }
         let subjectType: 'account' | 'group' | 'member_view'
@@ -2097,7 +2132,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
             now: Date.now(),
           })
           if (!target) throw new CollabError('没有这个邮箱，对方需要先注册', 404)
-          route.send(200, await account.mysql!.recordAccess(
+          route.send(200, await recordAccessAfterChange(
             me.id,
             workspaceId,
             collection,
@@ -2115,7 +2150,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
           role,
           now: Date.now(),
         })
-        route.send(200, await account.mysql!.recordAccess(
+        route.send(200, await recordAccessAfterChange(
           me.id,
           workspaceId,
           collection,
@@ -2143,18 +2178,19 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
       const role: ResourceRole =
         body.role === 'viewer' || body.role === 'manager' || body.role === 'owner' ? body.role : 'editor'
       const kind = body.collaboratorKind === 'internal' ? 'internal' : 'external'
-      route.send(
-        200,
-        viewId
-          ? body.memberViewId
+      if (viewId) {
+        route.send(200, viewDetails(
+          body.memberViewId
             ? account.store.grantViewMemberView(me.id, collection, viewId, String(body.memberViewId), role)
-            : account.store.shareViewWithEmail(me.id, collection, viewId, String(body.email ?? ''), role, kind)
-          : body.memberViewId
-          ? account.store.grantMemberView(me.id, collection, recordId, String(body.memberViewId), role)
-          : body.groupId
-          ? account.store.grantGroup(me.id, collection, recordId, String(body.groupId), role)
-          : account.store.shareWithEmail(me.id, collection, recordId, String(body.email ?? ''), role, kind),
-      )
+            : account.store.shareViewWithEmail(me.id, collection, viewId, String(body.email ?? ''), role, kind),
+          viewId,
+        ))
+        return
+      }
+      if (body.memberViewId) account.store.grantMemberView(me.id, collection, recordId, String(body.memberViewId), role)
+      else if (body.groupId) account.store.grantGroup(me.id, collection, recordId, String(body.groupId), role)
+      else account.store.shareWithEmail(me.id, collection, recordId, String(body.email ?? ''), role, kind)
+      route.send(200, localRecordAccessAfterChange(me.id, collection, recordId))
     } catch (error) {
       fail(route, error)
     }
@@ -2168,7 +2204,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
           collection?: string; recordId?: string; viewId?: string;
           subjectType?: 'account' | 'group' | 'member_view'; subjectId?: string
         }
-        const workspaceId = me.activeWorkspaceId
+        const workspaceId = currentRequestWorkspaceId() || me.activeWorkspaceId
         if (!workspaceId) throw new CollabError('没有工作区', 400)
         const collection = String(body.collection ?? '')
         const subjectType =
@@ -2182,12 +2218,12 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
             subjectType: subjectType === 'member_view' ? 'member_view' : 'account',
             subjectId: String(body.subjectId ?? ''),
           })
-          route.send(200, await account.mysql!.viewAccess(
+          route.send(200, viewDetails(await account.mysql!.viewAccess(
             me.id,
             workspaceId,
             collection,
             String(body.viewId),
-          ))
+          ), String(body.viewId)))
           return
         }
         await account.mysql!.revokeRecordGrant({
@@ -2198,7 +2234,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
           subjectType,
           subjectId: String(body.subjectId ?? ''),
         })
-        route.send(200, await account.mysql!.recordAccess(
+        route.send(200, await recordAccessAfterChange(
           me.id,
           workspaceId,
           collection,
@@ -2220,24 +2256,24 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
       const viewId = String(body.viewId ?? '')
       const subjectType =
         body.subjectType === 'group' || body.subjectType === 'member_view' ? body.subjectType : 'account'
-      route.send(
-        200,
-        viewId
-          ? account.store.revokeViewGrant(
-              me.id,
-              String(body.collection ?? ''),
-              viewId,
-              subjectType === 'member_view' ? 'member_view' : 'account',
-              String(body.subjectId ?? ''),
-            )
-          : account.store.revokeRecordGrant(
-              me.id,
-              String(body.collection ?? ''),
-              String(body.recordId ?? ''),
-              subjectType,
-              String(body.subjectId ?? ''),
-            ),
+      if (viewId) {
+        route.send(200, viewDetails(account.store.revokeViewGrant(
+          me.id,
+          String(body.collection ?? ''),
+          viewId,
+          subjectType === 'member_view' ? 'member_view' : 'account',
+          String(body.subjectId ?? ''),
+        ), viewId))
+        return
+      }
+      account.store.revokeRecordGrant(
+        me.id,
+        String(body.collection ?? ''),
+        String(body.recordId ?? ''),
+        subjectType,
+        String(body.subjectId ?? ''),
       )
+      route.send(200, localRecordAccessAfterChange(me.id, String(body.collection ?? ''), String(body.recordId ?? '')))
     } catch (error) {
       fail(route, error)
     }

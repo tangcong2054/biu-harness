@@ -20,6 +20,7 @@ async function boot() {
   const members = new Set(['ada\tws_a', 'bob\tws_a', 'cara\tws_b'])
   const policies: Record<string, Record<string, Policy>> = { ws_a: {}, ws_b: {} }
   const owners: Record<string, Set<string>> = { ws_a: new Set(), ws_b: new Set() }
+  const parents: Record<string, Record<string, Policy>> = {}
   class AccountBridge extends Service {
     usesMysqlAccounts() {
       return true
@@ -29,7 +30,7 @@ async function boot() {
         return members.has(`${accountId}\t${workspaceId}`) ? { role: 'member', memberKind: 'member' } : null
       },
       async collectionScopeSources(workspaceId: string, collection: string) {
-        if (collection !== '/sessions') return { policies: {}, owners: [] }
+        if (collection !== '/sessions') return { policies: parents[`${workspaceId}:${collection}`] ?? {}, owners: [] }
         return { policies: { ...(policies[workspaceId] ?? {}) }, owners: [...(owners[workspaceId] ?? [])] }
       },
       async attachPolicy(input: { actorId: string; workspaceId: string; recordId: string; ownership: string; accessMode: string }) {
@@ -52,7 +53,7 @@ async function boot() {
   await ctx.plugin(AccountBridge)
   const as = <T,>(accountId: string, workspaceId: string, fn: () => T) =>
     runWithAccount(accountId, () => runWithRequestWorkspace(workspaceId, fn))
-  return { ctx, as, policies, owners }
+  return { ctx, as, policies, owners, parents, members }
 }
 
 test('MySQL: private sessions are not visible to other members or other workspaces', async () => {
@@ -94,4 +95,60 @@ test('MySQL: sessions without cloud ownership and calls without context fail clo
   assert.deepEqual((await ctx.sessions.listSummaries()).map((item) => item.id), [])
   // 同步入口在 MySQL 下不再读本机空表放行。
   assert.equal(as('ada', 'ws_a', () => ctx.sessions.inWorkspace(legacy.id)), false)
+})
+
+test('scope pushdown is equivalent across identities, ownership, inheritance, view grants and revocation', async () => {
+  const originalFlag = process.env.BIU_SESSION_SCOPE_PUSHDOWN
+  const { ctx, as, policies, owners, parents, members } = await boot()
+  const list = (account: string, workspace: string, enabled: boolean) => {
+    process.env.BIU_SESSION_SCOPE_PUSHDOWN = enabled ? '1' : '0'
+    return as(account, workspace, () => ctx.sessions.listSummaries())
+  }
+  const compare = async () => {
+    for (const [account, workspace] of [['ada', 'ws_a'], ['bob', 'ws_a'], ['cara', 'ws_b'], ['cara', 'ws_a'], ['', ''], ['ada', 'ws_a']]) {
+      const before = await list(account, workspace, false)
+      const after = await list(account, workspace, true)
+      assert.deepEqual(after, before)
+    }
+  }
+  try {
+    const own = await as('ada', 'ws_a', () => ctx.sessions.create('private'))
+    const shared = await as('ada', 'ws_a', () => ctx.sessions.create('shared'))
+    policies.ws_a[shared.id].accessMode = 'members'
+    policies.ws_a[shared.id].ownership = 'workspace'
+    const policyOnly = await as('ada', 'ws_a', () => ctx.sessions.create('policy-only'))
+    owners.ws_a.delete(policyOnly.id)
+    const ownerOnly = await as('ada', 'ws_a', () => ctx.sessions.create('owner-only'))
+    delete policies.ws_a[ownerOnly.id]
+    const other = await as('cara', 'ws_b', () => ctx.sessions.create('other-workspace'))
+    const inherited = await as('ada', 'ws_a', () => ctx.sessions.create('inherited'))
+    policies.ws_a[inherited.id] = { ownership: 'workspace', accessMode: 'inherit', parentCollection: '/pages', parentRecordId: 'parent', ownerAccountId: 'bob' }
+    parents['ws_a:/pages'] = { parent: { ownership: 'personal', accessMode: 'private', parentCollection: '', parentRecordId: '', ownerAccountId: 'ada' } }
+    await compare()
+    const bob = await list('bob', 'ws_a', true)
+    assert.ok(bob.some(s => s.id === shared.id))
+    assert.ok(!bob.some(s => s.id === own.id || s.id === policyOnly.id || s.id === inherited.id || s.id === other.id))
+    const originalView = ctx.sessions.viewAccess
+    ctx.sessions.viewAccess = (id, row) => id === other.id && row?.id === other.id
+    await compare()
+    assert.ok((await list('ada', 'ws_a', true)).some(s => s.id === other.id))
+    ctx.sessions.viewAccess = originalView
+    members.delete('bob\tws_a')
+    parents['ws_a:/pages'].parent.ownerAccountId = 'cara'
+    delete policies.ws_a[shared.id]
+    owners.ws_a.delete(shared.id)
+    await compare()
+    assert.deepEqual(await list('bob', 'ws_a', true), [])
+    const delegate = ctx.sessionStore.listSummaries.bind(ctx.sessionStore)
+    let requested: readonly string[] | undefined
+    ctx.sessionStore.listSummaries = async options => { requested = options?.sessionIds; return delegate(options) }
+    await list('ada', 'ws_a', true)
+    assert.ok(requested?.includes(own.id))
+    assert.ok(!requested?.includes(other.id))
+    await list('cara', 'ws_a', true)
+    assert.deepEqual(requested, [])
+  } finally {
+    if (originalFlag === undefined) delete process.env.BIU_SESSION_SCOPE_PUSHDOWN
+    else process.env.BIU_SESSION_SCOPE_PUSHDOWN = originalFlag
+  }
 })

@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createPool, type Pool } from 'mysql2/promise'
+import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise'
 import { PRODUCT_MIGRATIONS } from './migrations.ts'
 import {
   MysqlAccountRepository,
@@ -18,31 +18,86 @@ describe('account control mode', () => {
 })
 
 const mysqlUrl = process.env.BIU_TEST_MYSQL_URL
+/** 设置后直接使用这个已授权的专用库，不需要建库删库权限；该库必须为空。 */
+const existingDatabase = process.env.BIU_TEST_MYSQL_DATABASE?.trim() || ''
 const integration = mysqlUrl ? describe : describe.skip
 
 integration('MySQL account/workspace/authz integration', () => {
-  const database = `biu_account_test_${process.pid}_${randomBytes(4).toString('hex')}`
+  const database = existingDatabase || `biu_account_test_${process.pid}_${randomBytes(4).toString('hex')}`
   let pool: Pool
   let accounts: MysqlAccountRepository
   let authz: MysqlAuthorizationRepository
+  let ownsTables = false
+
+  const listTables = async () => {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT table_name AS name FROM information_schema.tables WHERE table_schema = ?',
+      [database],
+    )
+    return rows.map((row) => String(row.name))
+  }
 
   beforeAll(async () => {
+    if (existingDatabase && !/^[A-Za-z0-9_]{1,64}$/.test(existingDatabase)) {
+      throw new Error('BIU_TEST_MYSQL_DATABASE must be a plain database name')
+    }
     pool = createPool({ uri: mysqlUrl!, connectionLimit: 2 })
-    await pool.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`)
+    if (existingDatabase) {
+      const leftovers = await listTables()
+      if (leftovers.length) {
+        throw new Error(`BIU_TEST_MYSQL_DATABASE ${database} must be empty; found: ${leftovers.slice(0, 5).join(', ')}`)
+      }
+    } else {
+      await pool.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`)
+    }
+    ownsTables = true
     for (const migration of PRODUCT_MIGRATIONS.filter((item) => (item.version >= 8 && item.version <= 10) || item.version === 12)) {
       for (const statement of migration.statements) {
         await pool.query(statement.replaceAll('CREATE TABLE IF NOT EXISTS ', `CREATE TABLE IF NOT EXISTS \`${database}\`.`)
           .replaceAll('ALTER TABLE ', `ALTER TABLE \`${database}\`.`))
       }
     }
+    await pool.query(`CREATE TABLE \`${database}\`.shares (
+      token VARCHAR(128) NOT NULL PRIMARY KEY,
+      workspace_id VARCHAR(64) NOT NULL,
+      kind VARCHAR(16) NOT NULL,
+      collection VARCHAR(128) NOT NULL,
+      record_id VARCHAR(128) NOT NULL,
+      view_id VARCHAR(128) NOT NULL DEFAULT ''
+    )`)
+    await pool.query(`CREATE TABLE \`${database}\`.saved_views (
+      workspace_id VARCHAR(64) NOT NULL,
+      collection VARCHAR(128) NOT NULL,
+      view_id VARCHAR(128) NOT NULL,
+      payload_json LONGTEXT NOT NULL,
+      updated_at BIGINT NOT NULL,
+      PRIMARY KEY (workspace_id, collection, view_id)
+    )`)
     accounts = new MysqlAccountRepository(pool, database)
     authz = new MysqlAuthorizationRepository(pool, database)
   })
 
   afterAll(async () => {
     if (!pool) return
-    await pool.query(`DROP DATABASE IF EXISTS \`${database}\``)
-    await pool.end()
+    try {
+      if (!ownsTables) return
+      if (existingDatabase) {
+        const connection = await pool.getConnection()
+        try {
+          await connection.query('SET FOREIGN_KEY_CHECKS = 0')
+          for (const table of await listTables()) {
+            await connection.query(`DROP TABLE IF EXISTS \`${database}\`.\`${table.replaceAll('`', '``')}\``)
+          }
+        } finally {
+          await connection.query('SET FOREIGN_KEY_CHECKS = 1').catch(() => {})
+          connection.release()
+        }
+      } else {
+        await pool.query(`DROP DATABASE IF EXISTS \`${database}\``)
+      }
+    } finally {
+      await pool.end()
+    }
   })
 
   it('supports login session, workspace membership, grant/revoke and tenant isolation', async () => {
@@ -110,6 +165,19 @@ integration('MySQL account/workspace/authz integration', () => {
     expect(await authz.grantsForSubject({
       workspaceId: 'ws_b', collection: '/pages', accountId: 'acc_member', recordIds: ['page_1'],
     })).toHaveLength(0)
+    const shared = await accounts.recordAccess('acc_owner', 'ws_a', '/pages', 'page_1')
+    expect(shared.scope).toBe('workspace')
+    expect(shared.ownerId).toBe('acc_owner')
+    expect(shared).not.toHaveProperty('policy')
+    expect(shared).not.toHaveProperty('grants')
+    expect(shared.roleChain).toEqual([{ id: 'ws_a\t/pages\tpage_1', title: '这条内容', detail: '你是创建者', role: 'owner' }])
+    expect(shared.private).toBe(false)
+    expect(shared.people.find((row) => row.id === 'acc_member')).toMatchObject({
+      email: 'member@example.test',
+      role: 'editor',
+      memberKind: 'member',
+    })
+    expect(Array.isArray(shared.viewGrants)).toBe(true)
 
     await accounts.revokeRecordGrant({
       actorId: 'acc_owner',
@@ -122,6 +190,12 @@ integration('MySQL account/workspace/authz integration', () => {
     expect(await authz.grantsForSubject({
       workspaceId: 'ws_a', collection: '/pages', accountId: 'acc_member', recordIds: ['page_1'],
     })).toHaveLength(0)
+    const [policies] = await pool.query(
+      `SELECT ownership, access_mode FROM \`${database}\`.resource_policies
+       WHERE workspace_id = 'ws_a' AND collection = '/pages' AND record_id = 'page_1'`,
+    )
+    expect((policies as Array<Record<string, unknown>>)[0]).toMatchObject({ ownership: 'personal', access_mode: 'private' })
+    expect((await accounts.recordAccess('acc_owner', 'ws_a', '/pages', 'page_1')).scope).toBe('personal')
   })
 
   it('covers workspace invites, groups and view grants with revision invalidation', async () => {
@@ -146,6 +220,11 @@ integration('MySQL account/workspace/authz integration', () => {
     await accounts.addGroupMember('acc_owner', 'ws_a', 'grp_1', 'acc_member', now)
     expect(await accounts.groupMembers('acc_owner', 'ws_a', 'grp_1')).toHaveLength(1)
 
+    await pool.query(
+      `INSERT INTO \`${database}\`.saved_views (workspace_id, collection, view_id, payload_json, updated_at)
+       VALUES ('ws_a', '/pages', 'view_1', ?, ?)`,
+      [JSON.stringify({ id: 'view_1', name: 'View 1', createdBy: 'acc_owner', revision: 1 }), now],
+    )
     await accounts.grantView({
       actorId: 'acc_owner',
       workspaceId: 'ws_a',
@@ -156,7 +235,10 @@ integration('MySQL account/workspace/authz integration', () => {
       role: 'viewer',
       now,
     })
-    expect((await accounts.viewAccess('acc_owner', 'ws_a', '/pages', 'view_1')).grants).toHaveLength(1)
+    const viewShared = await accounts.viewAccess('acc_owner', 'ws_a', '/pages', 'view_1')
+    // 只返回契约字段，不再带原始授权行（里面有其他协作者的邮箱与授权人）。
+    expect(viewShared).not.toHaveProperty('grants')
+    expect(viewShared.people.map((row) => row.id)).toEqual(['acc_member'])
     expect(await authz.viewGrants({
       workspaceId: 'ws_a',
       collection: '/pages',
@@ -171,7 +253,7 @@ integration('MySQL account/workspace/authz integration', () => {
       subjectType: 'account',
       subjectId: 'acc_member',
     })
-    expect((await accounts.viewAccess('acc_owner', 'ws_a', '/pages', 'view_1')).grants).toHaveLength(0)
+    expect((await accounts.viewAccess('acc_owner', 'ws_a', '/pages', 'view_1')).people).toHaveLength(0)
   })
 
   it('covers sync, locks, presence, tenant lookup and plugin metadata', async () => {

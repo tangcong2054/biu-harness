@@ -72,6 +72,20 @@ test('MysqlOperationsStore implements the operations SQL contract', async () => 
   assert.equal(calls.filter((call) => call.sql.includes('DELETE FROM')).length, 2)
 })
 
+test('MysqlOperationsStore preserves numeric usage tokens but rejects secret strings', async () => {
+  const values: unknown[][] = []
+  const query = async (sql: string, params?: unknown[]) => {
+    if (sql.startsWith('INSERT')) values.push(params ?? [])
+    return [[], []]
+  }
+  const store = new MysqlOperationsStore({ query } as unknown as Pool, 'ops_test')
+  await store.upsert('usage', { id: 'usage', day: '2026-10-29', tokens: 123, token: 'secret', apiKey: 'secret' })
+  assert.equal(values[0]?.[4], 123)
+  assert.equal(values.flat().includes('secret'), false)
+  await store.upsert('usage', { id: 'usage', day: '2026-10-29', tokens: 'secret' })
+  assert.equal(values[1]?.[4], 0)
+})
+
 test('MysqlOperationsStore rejects unsafe database identifiers', () => {
   assert.throws(
     () => new MysqlOperationsStore({} as Pool, 'biu_ops; DROP DATABASE biu'),

@@ -160,6 +160,7 @@ export class PageBlocksIndex {
       },
       ['page_block_index', 'page_block_cover', 'page_block_index_meta', 'block_refs'],
       onShadowError,
+      mode === 'mysql' ? { workspaceDb: () => openAndMigrateBiu(':memory:', { foreignKeys: false }) } : {},
     )
   }
 
@@ -184,6 +185,7 @@ export class PageBlocksIndex {
   }
 
   private async db() {
+    if (this.runtime?.isolated) return this.runtime.database()
     return this.runtimeDb ?? this.store.sqlite()
   }
 

@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, test } from 'vitest'
-import { runWithRequestWorkspace } from './data-dir.ts'
+import { currentRequestWorkspaceId, runWithRequestWorkspace } from './data-dir.ts'
 import { SqliteMetadataRuntime, type MetadataRepository } from './metadata-runtime.ts'
 
 class MemoryRepository implements MetadataRepository {
@@ -117,5 +117,46 @@ describe('SqliteMetadataRuntime', () => {
       else process.env.BIU_METADATA_RELOAD_MS = previous
       db.close()
     }
+  })
+
+  test('another workspace preparing does not replace this workspace overlay', async () => {
+    const schema = () => {
+      const db = new DatabaseSync(':memory:')
+      db.exec(`CREATE TABLE record_meta (
+        collection TEXT NOT NULL, record_id TEXT NOT NULL, deleted_at INTEGER,
+        PRIMARY KEY(collection, record_id)
+      )`)
+      return db
+    }
+    const byWorkspace = new Map<string, Array<Record<string, unknown>>>([
+      ['ws-a', [{ collection: '/sessions', record_id: 's-deleted', deleted_at: 10 }]],
+      ['ws-b', []],
+    ])
+    const repository: MetadataRepository = {
+      async list() {
+        return (byWorkspace.get(currentRequestWorkspaceId()) ?? []).map((row) => ({ ...row }))
+      },
+      async replaceTable() {},
+    }
+    const base = schema()
+    const runtime = new SqliteMetadataRuntime('mysql', repository, () => base, ['record_meta'], undefined, {
+      workspaceDb: schema,
+    })
+    const deleted = () => (runtime.database()
+      .prepare('SELECT record_id FROM record_meta WHERE deleted_at > 0').all() as Array<{ record_id: string }>)
+      .map((row) => row.record_id)
+
+    await runWithRequestWorkspace('ws-a', async () => {
+      await runtime.prepare()
+      expect(deleted()).toEqual(['s-deleted'])
+      // 别的空间的请求在 A 的两次读取之间装载了自己的元数据。
+      await runWithRequestWorkspace('ws-b', () => runtime.prepare())
+      expect(deleted()).toEqual(['s-deleted'])
+    })
+    await runWithRequestWorkspace('ws-b', async () => {
+      expect(deleted()).toEqual([])
+    })
+    expect(runtime.isolated).toBe(true)
+    base.close()
   })
 })
