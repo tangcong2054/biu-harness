@@ -861,12 +861,12 @@ function OptionMatrix({
       key="zoom"
       type="button"
       data-page-block-expand=""
-      title={presentation ? '在独立窗口打开' : zoom.max ? '退出放大（Esc）' : '放大到全屏看'}
-      aria-label={presentation ? '独立窗口' : zoom.max ? '退出放大' : '放大'}
-      onClick={() => (presentation ? zoom.open() : zoom.max ? zoom.close() : zoom.open())}
+      title={zoom.max ? '放回页面' : presentation?.detached ? '聚焦独立窗口' : presentation ? '独立窗口' : '放大到全屏看'}
+      aria-label={zoom.max ? '放回页面' : presentation?.detached ? '聚焦独立窗口' : presentation ? '独立窗口' : '全屏放大'}
+      onClick={() => (zoom.max ? zoom.close() : zoom.open())}
       style={btn({ fontSize: '0.82em', padding: '2px 8px', fontWeight: 700, whiteSpace: 'nowrap' })}
     >
-      {presentation ? (presentation.detached ? '聚焦窗口' : '独立窗口') : zoom.max ? '⤡ 缩小' : '⤢ 放大'}
+      {zoom.max ? '⤡ 缩小' : '⤢ 放大'}
     </button>,
   ]
 

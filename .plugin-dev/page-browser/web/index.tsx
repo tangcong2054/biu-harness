@@ -299,8 +299,8 @@ function BrowserSurface({
             type="button"
             tabIndex={-1}
             data-testid="page-browser-zoom"
-            title={detached ? '在独立窗口打开' : '放大浏览器'}
-            aria-label={detached ? '独立窗口' : '放大浏览器'}
+            title={detached ? '聚焦独立窗口' : '独立窗口'}
+            aria-label={detached ? '聚焦独立窗口' : '独立窗口'}
             onMouseDown={(event) => event.preventDefault()}
             onClick={onZoom}
             style={iconBtn}
@@ -459,7 +459,7 @@ function BrowserCard({
       zoomed={zoomed}
       onZoom={() => (presentation ? presentation.maximize() : setZoom(true))}
       onClose={() => (presentation ? presentation.inline() : setZoom(false))}
-      detached={Boolean(presentation)}
+      detached={Boolean(presentation?.detached)}
     />
   )
 

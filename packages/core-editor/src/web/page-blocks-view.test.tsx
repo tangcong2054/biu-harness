@@ -6,6 +6,7 @@ import { resolve } from 'node:path'
 import { Context } from 'cordis'
 import { PageEditorService } from './service.ts'
 import { parsePageBlockRowData, PageBlocksView, PageBlockContent, PageBlockStage, openSourcePage, openBlockInInspector, pageLabelOf, pageNameFromRecord, mergeLiveBlockData, persistBlockDataPatch } from './page-blocks-view.tsx'
+import { stashPageBlockHandoff } from './page-block-sync.ts'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -161,6 +162,30 @@ test('block data that fails to save rolls back and tells the user', async () => 
   const alert = await findByRole('alert')
   assert.match(alert.textContent ?? '', /只读成员/)
   assert.equal(button().textContent, '1')
+})
+
+test('a detached block mounts the live handoff instead of the saved row', () => {
+  const ctx = new Context()
+  new PageEditorService(ctx)
+  ctx.pageEditor.registerBlock({
+    kind: 'counter',
+    plugin: 'counter-block',
+    label: '计数',
+    View: ({ data }) => <span data-testid="counter">{String(data.n ?? 0)}</span>,
+  })
+  const id = 'live::block'
+  stashPageBlockHandoff(id, { n: 9, sql: 'select 1' })
+  try {
+    const { container } = render(
+      <PageBlockStage
+        row={{ id, title: '计数', blockKind: 'counter', plugin: 'counter-block', data: '{"n":1}' }}
+        liveRecordId={id}
+      />,
+    )
+    assert.equal(container.querySelector('[data-testid="counter"]')?.textContent, '9')
+  } finally {
+    localStorage.removeItem(`biu:page-block-live:${id}`)
+  }
 })
 
 test('block title that fails to save goes back to the stored title', async () => {

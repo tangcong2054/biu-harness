@@ -5,7 +5,7 @@ import type { CollectionViewType, FsContentProps, FsViewProps } from '@biu/type-
 import { PageBlockMissing } from './page-block-view.tsx'
 import { bindPageBlockPlugin } from './page-block-plugin-host.ts'
 import { getPageEditor, usePageEditorVersion } from './service.ts'
-import { usePageBlockSync } from './page-block-sync.ts'
+import { readPageBlockHandoff, usePageBlockSync } from './page-block-sync.ts'
 
 export const PAGE_BLOCKS_VIEW_ID = 'blocks'
 export const PAGE_REVEAL_EVENT = 'biu:inspector-reveal'
@@ -153,11 +153,14 @@ export function PageBlockStage({
   raw,
   writable = true,
   onChange,
+  liveRecordId,
 }: {
   row: DbRecord
   raw?: unknown
   writable?: boolean
   onChange?: (next: Record<string, unknown>) => void
+  /** 独立窗口打开时用这个 id 取原页面交出的当前数据，不读数据库里的旧版本。 */
+  liveRecordId?: string
 }) {
   usePageEditorVersion()
   const kind = String(row.blockKind ?? row.kind ?? '').trim()
@@ -167,23 +170,44 @@ export function PageBlockStage({
   const source = raw ?? row.data
   const packed = typeof source === 'string' ? source : JSON.stringify(source ?? {})
   const recordTitle = String(row.title ?? '').trim()
+  const recordId = String(row.id ?? '').trim()
+  const liveKey = (liveRecordId ?? '').trim() || recordId
+  const fromLive = useRef(false)
   const [data, setData] = useState(() => {
-    const parsed = parsePageBlockRowData(source)
+    const live = readPageBlockHandoff(liveKey)
+    fromLive.current = live != null
+    const parsed = live ? { ...live } : parsePageBlockRowData(source)
     if (recordTitle) parsed.title = recordTitle
     return parsed
   })
-  const recordId = String(row.id ?? '').trim()
-  const publishData = usePageBlockSync(recordId, data, (next) => setData(next))
+  const liveRef = useRef(data)
+  const renderedRef = useRef(data)
+  if (renderedRef.current !== data) {
+    renderedRef.current = data
+    liveRef.current = data
+  }
+  const applyRemoteData = (next: Record<string, unknown>) => {
+    liveRef.current = next
+    setData(next)
+  }
+  const publishData = usePageBlockSync(recordId, data, applyRemoteData)
   useEffect(() => {
+    // 第一帧已经用上原页面交出的数据，不要被数据库里的旧版本盖掉。
+    if (fromLive.current) {
+      fromLive.current = false
+      return
+    }
     const parsed = parsePageBlockRowData(source)
     if (recordTitle) parsed.title = recordTitle
+    liveRef.current = parsed
     setData(parsed)
   }, [packed, recordTitle])
   const [saveError, setSaveError] = useState('')
   const writeGen = useRef(0)
   const update = (patch: Record<string, unknown>, opts?: { replace?: boolean }) => {
-    const previous = data
-    const next = mergeLiveBlockData(data, patch, { replace: opts?.replace, title: recordTitle })
+    const previous = liveRef.current
+    const next = mergeLiveBlockData(previous, patch, { replace: opts?.replace, title: recordTitle })
+    liveRef.current = next
     setData(next)
     const toWrite = persistBlockDataPatch(next, patch)
     publishData(next)
@@ -196,6 +220,7 @@ export function PageBlockStage({
     void writeBlockData(recordId, toWrite).catch((error: unknown) => {
       // 只回滚最后一次写入；中间又有新写入时交给新写入决定最终状态。
       if (gen !== writeGen.current) return
+      liveRef.current = previous
       setData(previous)
       publishData(previous)
       setSaveError(error instanceof Error ? error.message : String(error))
@@ -275,7 +300,7 @@ export function PageBlockPopout() {
         <button type="button" onClick={close}>关闭窗口</button>
       </header>
       <div className="page-block-popout-stage">
-        {row ? <PageBlockStage row={row} /> : <div className="page-block-missing">{error || '正在加载插件…'}</div>}
+        {row ? <PageBlockStage row={row} liveRecordId={recordId} /> : <div className="page-block-missing">{error || '正在加载插件…'}</div>}
       </div>
     </main>
   )

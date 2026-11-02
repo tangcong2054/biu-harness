@@ -1,6 +1,7 @@
 import { Service, type Context } from 'cordis'
 import { useEffect, useRef, useSyncExternalStore, type ReactNode } from 'react'
 import { ViewColumnsIcon } from '@heroicons/react/16/solid'
+import { PAGE_BLOCK_HANDOFF_EVENT } from './page-block-sync.ts'
 
 export type PagePresentationMode = 'inline' | 'sidebar' | 'maximized' | 'minimized'
 
@@ -74,9 +75,16 @@ const STYLE = `
 .page-presentation-content[data-presentation-mode=maximized] .pt-card{height:100%!important;min-height:0}
 .page-presentation-content[data-presentation-mode=sidebar] .pt-pane,
 .page-presentation-content[data-presentation-mode=maximized] .pt-pane{height:auto!important;flex:1!important}
-.page-presentation-content[data-presentation-mode=sidebar] .wsp-root{height:100%;border:0;border-radius:0}
-.page-presentation-content[data-presentation-mode=sidebar] .wsp-body{grid-template-columns:1fr;height:auto;min-height:100%}
-.page-presentation-content[data-presentation-mode=sidebar] .wsp-side{max-height:260px;border-right:0;border-bottom:1px solid var(--dsw-border)}
+.page-presentation-content[data-presentation-mode=sidebar] .wsp-root,
+.page-presentation-content[data-presentation-mode=maximized] .wsp-root{height:100%;border:0;border-radius:0}
+.page-presentation-content[data-presentation-mode=sidebar] .wsp-body,
+.page-presentation-content[data-presentation-mode=maximized] .wsp-body{grid-template-columns:1fr;height:auto;min-height:100%}
+.page-presentation-content[data-presentation-mode=sidebar] .wsp-side,
+.page-presentation-content[data-presentation-mode=maximized] .wsp-side{max-height:260px;border-right:0;border-bottom:1px solid var(--dsw-border)}
+.page-presentation-max-layer{position:fixed;inset:0;z-index:70;display:flex;flex-direction:column;background:var(--dsw-bg);color:var(--dsw-label)}
+.page-presentation-max{display:flex;flex:1;min-width:0;min-height:0;flex-direction:column;overflow:hidden}
+html.biu-electron:not(.biu-electron-fullscreen) .page-presentation-max-layer .page-presentation-bar{padding-left:86px}
+.page-presentation-parking{position:fixed;inset:0;z-index:-1;overflow:hidden;visibility:hidden;pointer-events:none}
 .page-block-popout{display:flex;width:100vw;height:100vh;min-width:0;min-height:0;flex-direction:column;overflow:hidden;background:var(--dsw-bg);color:var(--dsw-label)}
 .page-block-popout-head{display:flex;flex:none;align-items:center;gap:12px;height:42px;padding:0 12px;border-bottom:1px solid var(--dsw-border);background:var(--dsw-sidebar);-webkit-app-region:drag}
 .page-block-popout-head strong{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -135,7 +143,8 @@ export function getPagePresentation() {
 export class PagePresentationService extends Service {
   private entries = new Map<string, Entry>()
   private listeners = new Set<() => void>()
-  private targets = new Map<string, HTMLElement>()
+  private sidebarTargets = new Map<string, HTMLElement>()
+  private maximizedTargets = new Map<string, HTMLElement>()
   private parking: HTMLElement | null = null
   private browserWindows = new Map<string, Window>()
   private seq = 0
@@ -200,7 +209,8 @@ export class PagePresentationService extends Service {
     return () => {
       if (this.entries.get(meta.id) !== item) return
       this.entries.delete(meta.id)
-      this.targets.delete(meta.id)
+      this.sidebarTargets.delete(meta.id)
+      this.maximizedTargets.delete(meta.id)
       meta.host.remove()
       if (item.mode === 'sidebar') this.closeInspector(item.id)
       this.bump()
@@ -214,7 +224,9 @@ export class PagePresentationService extends Service {
       detached: item?.detached ?? false,
       inline: () => this.setMode(id, 'inline'),
       sidebar: () => this.setMode(id, 'sidebar'),
-      maximize: () => void this.openDetached(id),
+      maximize: () => {
+        void this.openDetached(id)
+      },
       minimize: () => this.setMode(id, 'minimized'),
       restore: () => this.restore(id),
     }
@@ -237,12 +249,15 @@ export class PagePresentationService extends Service {
     if (!item) return
     if (item.mode === mode) return
     const previous = item.mode
-    if (mode === 'maximized') {
-      void this.openDetached(id)
-      return
-    }
     if (mode === 'minimized' && previous !== 'minimized') {
       item.restoreMode = previous === 'maximized' ? 'inline' : previous
+    }
+    if (mode === 'maximized') {
+      for (const other of this.entries.values()) {
+        if (other.id === id || other.mode !== 'maximized') continue
+        other.mode = 'inline'
+        this.place(other)
+      }
     }
     item.mode = mode
     if (previous === 'sidebar' && mode !== 'sidebar') this.closeInspector(id)
@@ -263,6 +278,8 @@ export class PagePresentationService extends Service {
   async openDetached(id: string) {
     const item = this.entries.get(id)
     if (!item || !item.recordId) return
+    // 先于新窗口加载：原页面同步交出当前块数据，新窗口第一帧就能用，不用等数据库。
+    window.dispatchEvent(new CustomEvent(PAGE_BLOCK_HANDOFF_EVENT, { detail: { recordId: item.recordId } }))
     const request = { recordId: item.recordId, title: item.title }
     const bridge = this.bridge()
     if (bridge?.available && bridge.open) {
@@ -283,15 +300,16 @@ export class PagePresentationService extends Service {
     this.bump()
   }
 
-  attachTarget(id: string, target: HTMLElement) {
-    this.targets.set(id, target)
+  attachTarget(id: string, target: HTMLElement, slot: 'sidebar' | 'maximized' = 'sidebar') {
+    const map = slot === 'maximized' ? this.maximizedTargets : this.sidebarTargets
+    map.set(id, target)
     const item = this.entries.get(id)
-    if (item) this.place(item)
+    if (item?.mode === slot) this.place(item)
     return () => {
-      if (this.targets.get(id) !== target) return
-      this.targets.delete(id)
+      if (map.get(id) !== target) return
+      map.delete(id)
       const current = this.entries.get(id)
-      if (current?.mode === 'sidebar') {
+      if (current?.mode === slot) {
         current.mode = 'inline'
         this.place(current)
         this.bump()
@@ -314,7 +332,7 @@ export class PagePresentationService extends Service {
   private park() {
     if (this.parking?.isConnected) return this.parking
     const el = document.createElement('div')
-    el.hidden = true
+    el.className = 'page-presentation-parking'
     el.setAttribute('data-page-presentation-parking', '')
     document.body.appendChild(el)
     this.parking = el
@@ -325,7 +343,8 @@ export class PagePresentationService extends Service {
     let target: HTMLElement | null = null
     if (item.mode === 'inline') target = item.inlineTarget
     else if (item.mode === 'minimized') target = this.park()
-    else target = this.targets.get(item.id) ?? null
+    else if (item.mode === 'maximized') target = this.maximizedTargets.get(item.id) ?? null
+    else target = this.sidebarTargets.get(item.id) ?? null
     item.host.dataset.presentationMode = item.mode
     if (target && item.host.parentElement !== target) target.appendChild(item.host)
     requestAnimationFrame(() => window.dispatchEvent(new Event('resize')))
@@ -359,33 +378,49 @@ function PresentationTarget({
   service,
   id,
   className,
+  slot = 'sidebar',
 }: {
   service: PagePresentationService
   id: string
   className: string
+  slot?: 'sidebar' | 'maximized'
 }) {
   const targetRef = useRef<HTMLDivElement | null>(null)
   useEffect(() => {
     const target = targetRef.current
-    return target ? service.attachTarget(id, target) : undefined
-  }, [service, id])
+    return target ? service.attachTarget(id, target, slot) : undefined
+  }, [service, id, slot])
   return <div ref={targetRef} className={className} data-page-presentation-target={id} />
 }
 
 export function PagePresentationLayer({ presentation }: { presentation?: PagePresentationService }) {
   const service = presentation ?? bound
+  useSyncExternalStore(
+    (fn) => (service ? service.subscribe(fn) : () => undefined),
+    () => service?.version() ?? 0,
+    () => 0,
+  )
   if (!service) return null
-  return null
+  const maximized = service.snapshots().filter((item) => item.mode === 'maximized')
+  if (maximized.length === 0) return null
+  return (
+    <div className="page-presentation-max-layer" data-testid="page-presentation-max-layer">
+      {maximized.map((entry) => (
+        <div key={entry.id} className="page-presentation-max">
+          <PresentationBar service={service} entry={entry} />
+          <PresentationTarget service={service} id={entry.id} slot="maximized" className="page-presentation-stage" />
+        </div>
+      ))}
+    </div>
+  )
 }
 
 function PresentationBar({
   service,
   entry,
-  where,
 }: {
   service: PagePresentationService
   entry: EntrySnapshot
-  where: 'sidebar'
 }) {
   return (
     <div className="page-presentation-bar" data-biu-ignore>
@@ -409,9 +444,11 @@ function PresentationBar({
         <button
           type="button"
           className="page-presentation-light is-max"
-          title={entry.detached ? '聚焦独立窗口' : '在独立窗口打开'}
-          aria-label={entry.detached ? '聚焦独立窗口' : '在独立窗口打开'}
-          onClick={() => void service.openDetached(entry.id)}
+          title={entry.detached ? '聚焦独立窗口' : '独立窗口'}
+          aria-label={entry.detached ? '聚焦独立窗口' : '独立窗口'}
+          onClick={() => {
+            void service.openDetached(entry.id)
+          }}
         >
           <MacZoomGlyph />
         </button>
@@ -441,7 +478,7 @@ function PagePresentationInspectorInner({ service, id }: { service: PagePresenta
   if (!item) return <div className="page-presentation-sidebar">插件实例已关闭。</div>
   return (
     <div className="page-presentation-sidebar">
-      <PresentationBar service={service} entry={item} where="sidebar" />
+      <PresentationBar service={service} entry={item} />
       <PresentationTarget service={service} id={id} className="page-presentation-stage" />
     </div>
   )
@@ -464,8 +501,8 @@ export function PagePresentationInlineActions({
       <button
         type="button"
         className="page-presentation-light is-max"
-        title={controls.detached ? '聚焦独立窗口' : '在独立窗口打开'}
-        aria-label={controls.detached ? '聚焦独立窗口' : '在独立窗口打开'}
+        title={controls.detached ? '聚焦独立窗口' : '独立窗口'}
+        aria-label={controls.detached ? '聚焦独立窗口' : '独立窗口'}
         onClick={controls.maximize}
       >
         <MacZoomGlyph />
@@ -508,7 +545,7 @@ export function PagePresentationPlaceholder({
   mode: Exclude<PagePresentationMode, 'inline'>
   onRestore: () => void
 }) {
-  const label = mode === 'sidebar' ? '右侧栏' : mode === 'maximized' ? '独立窗口' : '最小化栏'
+  const label = mode === 'sidebar' ? '右侧栏' : mode === 'maximized' ? '全屏' : '最小化栏'
   return (
     <div className="page-presentation-placeholder" data-biu-ignore>
       <span>该插件正在{label}显示</span>
