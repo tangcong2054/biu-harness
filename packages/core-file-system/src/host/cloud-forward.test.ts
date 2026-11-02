@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, test } from 'vitest'
-import { Context } from 'cordis'
+import { Context, Service } from 'cordis'
 import * as http from '@biu/host-http'
 import * as account from '@biu/host-account'
 import * as tools from '@biu/host-tools'
@@ -64,10 +64,26 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
       return
     }
     if (url.startsWith('/api/db/list')) {
+      const listedPath = new URL(url, 'http://127.0.0.1').searchParams.get('path')
+      if (listedPath === '/plugins' || listedPath === '/plugin-catalog') {
+        res.end(JSON.stringify({
+          items: [
+            { id: 'page-terminal', title: '终端' },
+            { id: 'page-html-blocks', title: 'HTML', installed: true, running: true },
+          ],
+          total: 2,
+        }))
+        return
+      }
       res.end(JSON.stringify({ items: [{ id: 'p018', title: '云端页' }], total: 1 }))
       return
     }
     if (url.startsWith('/api/db/read')) {
+      const readPath = new URL(url, 'http://127.0.0.1').searchParams.get('path') ?? ''
+      if (readPath.startsWith('/plugins/') || readPath.startsWith('/plugin-catalog/')) {
+        res.end(JSON.stringify({ kind: 'record', path: readPath, value: { id: 'page-terminal', title: '终端' } }))
+        return
+      }
       res.end(JSON.stringify({ kind: 'record', path: '/pages/p018', value: { id: 'p018', title: '云端页' } }))
       return
     }
@@ -189,6 +205,35 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
     assert.equal(listedPages.status, 200)
     assert.equal((await listedPages.json() as { total?: number }).total, 1)
     assert.equal(captured.some((item) => item.url.startsWith('/api/db/list') && item.method === 'GET' && item.workspaceId === 'cloud-ws'), true)
+
+    class LocalPlugins extends Service {
+      constructor(inner: Context) {
+        super(inner, 'pluginStore')
+      }
+
+      list() {
+        return Promise.resolve([{ id: 'page-terminal', installed: true, running: true, enabled: true }])
+      }
+    }
+    await ctx.plugin(LocalPlugins)
+    captured.length = 0
+    const listedPlugins = await fetch(`${origin}/api/db/list?path=${encodeURIComponent('/plugins')}&limit=20`, { headers })
+    assert.equal(listedPlugins.status, 200)
+    const pluginPage = await listedPlugins.json() as { items?: Array<{ id?: string; installed?: boolean; running?: boolean }> }
+    const terminal = pluginPage.items?.find((item) => item.id === 'page-terminal')
+    const html = pluginPage.items?.find((item) => item.id === 'page-html-blocks')
+    assert.equal(terminal?.installed, true)
+    assert.equal(terminal?.running, true)
+    assert.equal(html?.installed, undefined)
+    assert.equal(html?.running, undefined)
+    assert.equal(captured.some((item) => decodeURIComponent(item.url).includes('/plugins') && item.workspaceId === 'cloud-ws'), true)
+
+    captured.length = 0
+    const openedPlugin = await fetch(`${origin}/api/db/read?path=${encodeURIComponent('/plugins/page-terminal')}`, { headers })
+    assert.equal(openedPlugin.status, 200)
+    const pluginRecord = await openedPlugin.json() as { value?: { installed?: boolean; running?: boolean } }
+    assert.equal(pluginRecord.value?.installed, true)
+    assert.equal(pluginRecord.value?.running, true)
 
     captured.length = 0
     const opened = await fetch(`${origin}/api/db/read?path=${encodeURIComponent('/pages/p018')}`, { headers })

@@ -13,6 +13,8 @@ dist/
 # 本机插件商店数据。地址在 plugin-registry.config.json
 .plugin-registry/
 .workspace/
+# 临时外部接口调试脚本，含硬编码凭据，不入库
+scripts/test-roles-api.mjs
 *.log
 .DS_Store
 .vscode/

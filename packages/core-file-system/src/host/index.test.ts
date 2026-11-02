@@ -2468,6 +2468,39 @@ test('installing cached plugin in another workspace leaves its record ownership 
   await assert.rejects(() => run(owner.id, second.id, () => db.update('/plugins/shared-plugin', { title: 'No' })))
 })
 
+test('repacking an already installed plugin in another workspace keeps the original owner', async () => {
+  const ctx = new Context()
+  const db = new DatabaseService(ctx)
+  const dir = mkdtempSync(join(tmpdir(), 'biu-plugin-repack-'))
+  const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
+  class AccountBridge extends Service {
+    store = collab
+    authorization = collab.authorization
+    constructor(inner: Context) { super(inner, 'account') }
+  }
+  await ctx.plugin(AccountBridge)
+  const owner = collab.register('Owner')
+  const first = collab.createWorkspace(owner.id, 'Local')
+  const second = collab.createWorkspace(owner.id, 'Cloud')
+  collab.recordPluginPackage(owner.id, { id: 'page-terminal', version: 'v1', packageHash: 'v1',
+    packagePath: '/tmp/page-terminal', sourceKind: 'registry', trustState: 'approved', tenantMode: 'assigned',
+    hasWeb: true, hasHost: false, manifest: { id: 'page-terminal' } })
+  runWithAccount(owner.id, () => runWithRequestWorkspace(first.id, () => collab.claim(owner.id, first.id, '/plugins', 'page-terminal')))
+  let packed = 0
+  db.register({
+    id: 'plugins', path: '/plugins', schema: { fields: { ...REQUIRED_RECORD_FIELDS } },
+    list: () => [{ id: 'page-terminal', pluginPath: '/tmp/page-terminal', sandbox: true, installed: true }],
+    get: (id) => id === 'page-terminal'
+      ? { id, pluginPath: '/tmp/page-terminal', sandbox: true, installed: true }
+      : null,
+    actions: [{ id: 'pack', label: '安装', when: { sandbox: true }, requiredAction: 'resource:read',
+      run: () => { packed += 1; return { packed: true } } }],
+  })
+  await runWithAccount(owner.id, () => runWithRequestWorkspace(second.id, () => db.action('/plugins/page-terminal', 'pack')))
+  assert.equal(packed, 1)
+  assert.equal(collab.recordWorkspace('/plugins', 'page-terminal'), first.id)
+})
+
 test('builtin plugins stay visible in the workspace plugin list', async () => {
   const previous = process.env.BIU_ONLINE
   process.env.BIU_ONLINE = '1'
