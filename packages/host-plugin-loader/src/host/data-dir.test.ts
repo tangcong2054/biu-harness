@@ -270,3 +270,37 @@ test('adoptCasAssets ledgers doc files and block_refs from page_block_index', ()
   again.close()
 })
 
+
+test('request memo deduplicates within one request and never leaks across requests', async () => {
+  const { runWithRequestMemo, requestMemo, clearRequestMemo } = await import('./data-dir.ts')
+  let calls = 0
+  const first = await runWithRequestMemo(async () => {
+    const compute = () => Promise.resolve(++calls)
+    const a = await requestMemo('identity', compute)
+    const b = await requestMemo('identity', compute)
+    const c = await requestMemo('other', compute)
+    clearRequestMemo('identity')
+    const d = await requestMemo('identity', compute)
+    return [a, b, c, d]
+  })
+  assert.deepEqual(first, [1, 1, 2, 3])
+  const outside = await requestMemo('identity', () => Promise.resolve(++calls))
+  assert.equal(outside, 4)
+  const second = await runWithRequestMemo(() => requestMemo('identity', () => Promise.resolve(++calls)))
+  assert.equal(second, 5)
+})
+
+test('a failed request memo is not reused, and a full clear drops every entry', async () => {
+  const { runWithRequestMemo, requestMemo, clearRequestMemo } = await import('./data-dir.ts')
+  const result = await runWithRequestMemo(async () => {
+    let calls = 0
+    const failing = () => Promise.reject(new Error('database down'))
+    await assert.rejects(requestMemo('fail', failing))
+    const get = () => Promise.resolve(++calls)
+    await requestMemo('a', get)
+    await requestMemo('b', get)
+    clearRequestMemo()
+    return [await requestMemo('a', get), await requestMemo('b', get)]
+  })
+  assert.deepEqual(result, [3, 4])
+})

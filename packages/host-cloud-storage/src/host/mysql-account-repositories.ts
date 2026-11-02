@@ -2,6 +2,13 @@ import type { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql
 import { randomUUID } from 'node:crypto'
 import { resolveRuntimeRepositoryMode, type RuntimeRepositoryMode } from './mysql-runtime-repositories.ts'
 import { accessDenied, MysqlAccessReader, type AccessMatchers } from './mysql-access-reader.ts'
+import { clearRequestMemo, requestMemo } from '@biu/host-plugin-loader/data-dir'
+
+const MEMBERSHIP_MEMO = 'membership\t'
+const TOKEN_MEMO = 'token\t'
+const SUSPENDED_MEMO = 'suspended\t'
+/** 会话活跃时间不需要逐请求精确；一分钟写一次，避免每个请求都写库。 */
+const LAST_SEEN_THROTTLE_MS = 60_000
 
 const SAFE_DATABASE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
 
@@ -113,7 +120,11 @@ export class MysqlAccountRepository {
     this.operationsDb = operationsDatabase ? databaseName(operationsDatabase) : null
   }
 
-  async isSuspended(accountId: string) {
+  isSuspended(accountId: string) {
+    return requestMemo(`${SUSPENDED_MEMO}${accountId}`, () => this.loadSuspended(accountId))
+  }
+
+  private async loadSuspended(accountId: string) {
     if (!this.operationsDb) return false
     const [rows] = await this.pool.query<RowDataPacket[]>(
       `SELECT status FROM ${this.operationsDb}.ops_account_governance WHERE account_id = ?`,
@@ -183,6 +194,8 @@ export class MysqlAccountRepository {
         [input.sessionId, input.accountId, input.sessionTokenHash, input.deviceName, input.expiresAt, input.now, input.now],
       )
       await connection.commit()
+      clearRequestMemo(MEMBERSHIP_MEMO)
+      clearRequestMemo(TOKEN_MEMO)
     } catch (error) {
       await connection.rollback()
       throw error
@@ -191,32 +204,32 @@ export class MysqlAccountRepository {
     }
   }
 
-  async accountByTokenHash(tokenHash: string, now = Date.now()) {
-    const connection = await this.pool.getConnection()
-    try {
-      await connection.beginTransaction()
-      const [rows] = await connection.query<RowDataPacket[]>(
-        `SELECT a.id, a.name, a.email, a.password_hash, a.active_workspace_id,
-                a.must_change_password, a.created_at, s.id AS session_id
-         FROM ${this.db}.auth_sessions s JOIN ${this.db}.accounts a ON a.id = s.account_id
-         WHERE s.token_hash = ? AND s.revoked_at IS NULL
-           AND (s.expires_at IS NULL OR s.expires_at > ?) FOR UPDATE`,
-        [tokenHash, now],
+  /**
+   * 每个请求都要解析 token：只读查询，不再开写事务锁会话行。
+   * last_seen_at 只在超过 LAST_SEEN_THROTTLE_MS 才写一次，条件更新，并发请求不会互相等待。
+   */
+  accountByTokenHash(tokenHash: string, now = Date.now()) {
+    return requestMemo(`${TOKEN_MEMO}${tokenHash}`, () => this.loadAccountByTokenHash(tokenHash, now))
+  }
+
+  private async loadAccountByTokenHash(tokenHash: string, now: number) {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT a.id, a.name, a.email, a.password_hash, a.active_workspace_id,
+              a.must_change_password, a.created_at, s.id AS session_id, s.last_seen_at
+       FROM ${this.db}.auth_sessions s JOIN ${this.db}.accounts a ON a.id = s.account_id
+       WHERE s.token_hash = ? AND s.revoked_at IS NULL
+         AND (s.expires_at IS NULL OR s.expires_at > ?)`,
+      [tokenHash, now],
+    )
+    const row = rows[0]
+    if (!row) return null
+    if (now - Number(row.last_seen_at ?? 0) >= LAST_SEEN_THROTTLE_MS) {
+      await this.pool.query(
+        `UPDATE ${this.db}.auth_sessions SET last_seen_at = ? WHERE id = ? AND last_seen_at < ?`,
+        [now, row.session_id, now - LAST_SEEN_THROTTLE_MS],
       )
-      const row = rows[0]
-      if (!row) {
-        await connection.rollback()
-        return null
-      }
-      await connection.query(`UPDATE ${this.db}.auth_sessions SET last_seen_at = ? WHERE id = ?`, [now, row.session_id])
-      await connection.commit()
-      return accountRow(row)
-    } catch (error) {
-      await connection.rollback()
-      throw error
-    } finally {
-      connection.release()
     }
+    return accountRow(row)
   }
 
   async openSession(input: {
@@ -231,6 +244,7 @@ export class MysqlAccountRepository {
   }
 
   async revokeSession(tokenHash: string, now = Date.now()) {
+    clearRequestMemo(TOKEN_MEMO)
     await this.pool.query(
       `UPDATE ${this.db}.auth_sessions SET revoked_at = ?
        WHERE token_hash = ? AND revoked_at IS NULL`,
@@ -248,6 +262,7 @@ export class MysqlAccountRepository {
   }
 
   async revokeSessionById(accountId: string, sessionId: string, now = Date.now()) {
+    clearRequestMemo(TOKEN_MEMO)
     const [result] = await this.pool.query<ResultSetHeader>(
       `UPDATE ${this.db}.auth_sessions SET revoked_at = ?
        WHERE id = ? AND account_id = ? AND revoked_at IS NULL`,
@@ -257,6 +272,7 @@ export class MysqlAccountRepository {
   }
 
   async changePassword(accountId: string, passwordHash: string, keepTokenHash: string, now = Date.now()) {
+    clearRequestMemo(TOKEN_MEMO)
     const connection = await this.pool.getConnection()
     try {
       await connection.beginTransaction()
@@ -279,7 +295,15 @@ export class MysqlAccountRepository {
     }
   }
 
-  async membership(accountId: string, workspaceId: string): Promise<{
+  /** 同一请求内按 (账号, 空间) 只查一次；请求外直接查库。 */
+  membership(accountId: string, workspaceId: string): Promise<{
+    role: WorkspaceRow['role']
+    memberKind: MemberRow['member_kind']
+  } | null> {
+    return requestMemo(`${MEMBERSHIP_MEMO}${accountId}\t${workspaceId}`, () => this.loadMembership(accountId, workspaceId))
+  }
+
+  private async loadMembership(accountId: string, workspaceId: string): Promise<{
     role: WorkspaceRow['role']
     memberKind: MemberRow['member_kind']
   } | null> {
@@ -348,6 +372,7 @@ export class MysqlAccountRepository {
       )
       await connection.query(`UPDATE ${this.db}.accounts SET active_workspace_id = ? WHERE id = ?`, [input.id, input.ownerId])
       await connection.commit()
+      clearRequestMemo(MEMBERSHIP_MEMO)
       return { ...input, role: 'owner' as const }
     } catch (error) {
       await connection.rollback()
@@ -418,6 +443,7 @@ export class MysqlAccountRepository {
         [workspaceId],
       )
       await connection.commit()
+      clearRequestMemo(MEMBERSHIP_MEMO)
       const next = (await this.listWorkspaces(actorId))[0]?.id ?? ''
       if (next) await this.setActiveWorkspace(actorId, next)
       return {
@@ -674,6 +700,7 @@ export class MysqlAccountRepository {
         [invite.id],
       )
       await this.bumpRevision(connection, String(invite.workspace_id), String(invite.collection))
+      await this.bumpRevision(connection, String(invite.workspace_id), '*')
       await connection.commit()
       return {
         id: input.accountId,
@@ -1389,6 +1416,8 @@ export class MysqlAccountRepository {
              VALUES (?, ?, 'member', ?, '', '', 'external')`,
             [input.workspaceId, target.id, input.now],
           )
+          // 成员集合变了：所有按成员身份缓存的集合都要失效，不止当前这张表。
+          await this.bumpRevision(connection, input.workspaceId, '*')
         }
       }
       await connection.query(
@@ -1467,6 +1496,8 @@ export class MysqlAccountRepository {
              VALUES (?, ?, 'member', ?, '', '', 'external')`,
             [input.workspaceId, target.id, input.now],
           )
+          // 成员集合变了：所有按成员身份缓存的集合都要失效，不止当前这张表。
+          await this.bumpRevision(connection, input.workspaceId, '*')
         }
       }
       await connection.query(
@@ -2030,6 +2061,7 @@ export class MysqlAccountRepository {
         `DELETE FROM ${this.db}.workspace_members WHERE workspace_id = ? AND account_id = ?`,
         [workspaceId, accountId],
       )
+      await this.bumpRevision(connection, workspaceId, '*')
     }
   }
 
@@ -2252,6 +2284,8 @@ export class MysqlAccountRepository {
   }
 
   private bumpRevision(connection: PoolConnection, workspaceId: string, collection: string) {
+    // 本请求里刚改过授权或成员关系，之后的读取不能再用请求开头缓存的成员身份。
+    clearRequestMemo(MEMBERSHIP_MEMO)
     return connection.query(
       `INSERT INTO ${this.db}.authz_revisions (workspace_id, collection_name, revision, updated_at)
        VALUES (?, ?, 1, ?) ON DUPLICATE KEY UPDATE revision = revision + 1, updated_at = VALUES(updated_at)`,

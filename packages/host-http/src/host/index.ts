@@ -14,6 +14,7 @@ import {
   profilePath,
   runWithAccount,
   runWithRequestWorkspace,
+  runWithRequestMemo,
   isOnlineRuntime,
 } from '@biu/host-plugin-loader/data-dir'
 import { isShareApiPath, isSharePublicPath } from './share-gate.ts'
@@ -542,77 +543,79 @@ export class HttpService extends Service {
       }
       const started = Date.now()
       try {
-        const header = String(req.headers.authorization ?? '')
-        const bearerToken = /^Bearer\s+(\S+)$/i.exec(header)?.[1] ?? ''
-        const cookie = String(req.headers.cookie ?? '')
-        const encoded = cookie.split(';').map((part) => part.trim()).find((part) => part.startsWith('biu_account='))
-        const legacyEncoded = cookie
-          .split(';')
-          .map((part) => part.trim())
-          .find((part) => part.startsWith('biu_legacy_account='))
-        const accountToken = encoded ? decodeURIComponent(encoded.slice('biu_account='.length)) : ''
-        const legacyToken = legacyEncoded ? decodeURIComponent(legacyEncoded.slice('biu_legacy_account='.length)) : ''
-        const token = bearerToken || accountToken || legacyToken
-        let accountId = ''
-        const accountService = this.ctx.get('account') as {
-          accountByToken?(token: string): Promise<{ id: string } | null>
-          activeWorkspaceFor?(accountId: string): Promise<string>
-          isMemberAsync?(accountId: string, workspaceId: string): Promise<boolean>
-          canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): Promise<boolean>
-          store?: {
-            accountByToken?(token: string): { id: string } | null
-            isMember?(accountId: string, workspaceId: string): boolean
-            activeWorkspaceId?(): string | null
-            canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): boolean
-          }
-        } | undefined
-        if (token) {
-          try {
-            accountId = accountService?.accountByToken
-              ? (await accountService.accountByToken(token))?.id ?? ''
-              : accountService?.store?.accountByToken?.(token)?.id ?? ''
-          } catch {
-            accountId = ''
-          }
-        }
-        if (accountId && legacyToken && !accountToken) {
-          res.setHeader('set-cookie', [
-            `biu_account=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict`,
-            'biu_legacy_account=; Path=/; SameSite=Strict; Max-Age=0',
-          ])
-        }
-        const hasAccountSystem = Boolean(
-          accountService?.accountByToken || accountService?.store?.accountByToken,
-        )
-        const publicApi =
-          url.pathname.startsWith('/api/account/') ||
-          url.pathname.startsWith('/api/share/') ||
-          url.pathname === '/api/mcp' ||
-          url.pathname.startsWith('/api/mcp/') ||
-          (method === 'GET' && url.pathname.startsWith('/api/plugin-store/files/'))
-        if (hasAccountSystem && url.pathname.startsWith('/api/') && !publicApi && !accountId) {
-          context.send(401, { error: '需要登录' })
-          return
-        }
-        const headerWorkspace = String(req.headers['x-biu-workspace-id'] ?? '').trim()
-        const accountStore = accountService?.store
-        const requestedWorkspace = await runWithAccount(accountId, async () => {
-          if (headerWorkspace) {
-            // 浏览器可能还缓存着已删除或已退出的 workspaceId。不要让这个陈旧值
-            // 把所有 API 都拦成 403，否则工作区选择器本身也加载不出来，用户无法自救。
-            const member = accountService?.isMemberAsync
-              ? await accountService.isMemberAsync(accountId, headerWorkspace)
-              : accountStore?.isMember?.(accountId, headerWorkspace)
-            if (!accountId || member) {
-              return headerWorkspace
+        // 同一请求里 token、成员身份只查一次库（入口和路由各自鉴权时复用）。
+        await runWithRequestMemo(async () => {
+          const header = String(req.headers.authorization ?? '')
+          const bearerToken = /^Bearer\s+(\S+)$/i.exec(header)?.[1] ?? ''
+          const cookie = String(req.headers.cookie ?? '')
+          const encoded = cookie.split(';').map((part) => part.trim()).find((part) => part.startsWith('biu_account='))
+          const legacyEncoded = cookie
+            .split(';')
+            .map((part) => part.trim())
+            .find((part) => part.startsWith('biu_legacy_account='))
+          const accountToken = encoded ? decodeURIComponent(encoded.slice('biu_account='.length)) : ''
+          const legacyToken = legacyEncoded ? decodeURIComponent(legacyEncoded.slice('biu_legacy_account='.length)) : ''
+          const token = bearerToken || accountToken || legacyToken
+          let accountId = ''
+          const accountService = this.ctx.get('account') as {
+            accountByToken?(token: string): Promise<{ id: string } | null>
+            activeWorkspaceFor?(accountId: string): Promise<string>
+            isMemberAsync?(accountId: string, workspaceId: string): Promise<boolean>
+            canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): Promise<boolean>
+            store?: {
+              accountByToken?(token: string): { id: string } | null
+              isMember?(accountId: string, workspaceId: string): boolean
+              activeWorkspaceId?(): string | null
+              canAccessPlugin?(accountId: string, workspaceId: string, pluginId: string): boolean
+            }
+          } | undefined
+          if (token) {
+            try {
+              accountId = accountService?.accountByToken
+                ? (await accountService.accountByToken(token))?.id ?? ''
+                : accountService?.store?.accountByToken?.(token)?.id ?? ''
+            } catch {
+              accountId = ''
             }
           }
-          if (!isOnlineRuntime() || !accountId) return ''
-          return String(
-            accountService?.activeWorkspaceFor
-              ? await accountService.activeWorkspaceFor(accountId)
-              : accountStore?.activeWorkspaceId?.() ?? '',
-          ).trim()
+          if (accountId && legacyToken && !accountToken) {
+            res.setHeader('set-cookie', [
+              `biu_account=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict`,
+              'biu_legacy_account=; Path=/; SameSite=Strict; Max-Age=0',
+            ])
+          }
+          const hasAccountSystem = Boolean(
+            accountService?.accountByToken || accountService?.store?.accountByToken,
+          )
+          const publicApi =
+            url.pathname.startsWith('/api/account/') ||
+            url.pathname.startsWith('/api/share/') ||
+            url.pathname === '/api/mcp' ||
+            url.pathname.startsWith('/api/mcp/') ||
+            (method === 'GET' && url.pathname.startsWith('/api/plugin-store/files/'))
+          if (hasAccountSystem && url.pathname.startsWith('/api/') && !publicApi && !accountId) {
+            context.send(401, { error: '需要登录' })
+            return
+          }
+          const headerWorkspace = String(req.headers['x-biu-workspace-id'] ?? '').trim()
+          const accountStore = accountService?.store
+          const requestedWorkspace = await runWithAccount(accountId, async () => {
+            if (headerWorkspace) {
+              // 浏览器可能还缓存着已删除或已退出的 workspaceId。不要让这个陈旧值
+              // 把所有 API 都拦成 403，否则工作区选择器本身也加载不出来，用户无法自救。
+              const member = accountService?.isMemberAsync
+                ? await accountService.isMemberAsync(accountId, headerWorkspace)
+                : accountStore?.isMember?.(accountId, headerWorkspace)
+              if (!accountId || member) {
+                return headerWorkspace
+              }
+            }
+            if (!isOnlineRuntime() || !accountId) return ''
+            return String(
+              accountService?.activeWorkspaceFor
+                ? await accountService.activeWorkspaceFor(accountId)
+                : accountStore?.activeWorkspaceId?.() ?? '',
+            ).trim()
         })
         if (
           isOnlineRuntime() &&
@@ -648,6 +651,7 @@ export class HttpService extends Service {
           }
         }
         await runWithAccount(accountId, () => runWithRequestWorkspace(requestedWorkspace, () => match.handler(context)))
+        })
       } catch (error) {
         this.ctx.logger('http').error(error)
         if (!res.headersSent) context.send(500, { error: String(error) })
