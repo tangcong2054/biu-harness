@@ -175,14 +175,16 @@ integration('MySQL view access details and view sharing permissions', () => {
     await expect(read(plain, all)).rejects.toMatchObject(denied)
   })
 
-  it('never silently takes over or revokes another manager grant on the "all" view', async () => {
+  it('lets two managers grant the same person on the per-person "all" view independently', async () => {
     const all = 'builtin-all:/pages'
-    await grant(all, friend, admin)
-    await expect(share(owner, all, `${friend}@example.test`)).rejects.toMatchObject({ status: 409, code: 'VIEW_GRANT_TAKEN' })
-    await expect(revoke(owner, all, friend)).rejects.toThrow('view grant not found')
-    expect(await grants(all)).toEqual([`${friend}<-${admin}`])
     await share(admin, all, `${friend}@example.test`)
+    await share(owner, all, `${friend}@example.test`)
+    expect(await grants(all)).toEqual([`${friend}<-${admin}`, `${friend}<-${owner}`])
+    expect((await read(admin, all)).people.map((row) => row.id)).toEqual([friend])
+    // 撤销只撤自己授出的那条，不影响另一位管理者的授权。
+    await revoke(owner, all, friend)
     expect(await grants(all)).toEqual([`${friend}<-${admin}`])
+    await expect(revoke(owner, all, friend)).rejects.toThrow('view grant not found')
   })
 
   it('only lets the view creator issue a guest link for a custom view', async () => {

@@ -13,6 +13,7 @@ function fixture() {
   const state = {
     rows: new Map<string, string>(), shares: [] as Share[], members: new Set(['ws/owner', 'ws/other', 'elsewhere/owner']),
     failShares: false, sqlError: '', workspace: 'ws',
+    granted: new Set<string>(), bumps: [] as unknown[],
   }
   let backup: { rows: Map<string, string>; shares: Share[] }
   const query = vi.fn(async (sql: string, params: unknown[]) => {
@@ -24,6 +25,14 @@ function fixture() {
       expect(sql).toContain('WHERE workspace_id = ? AND collection = ? AND view_id = ? FOR UPDATE')
       const payload = state.rows.get(keyOf(...params as [unknown, unknown, unknown]))
       return [payload === undefined ? [] : [{ payload_json: payload }]]
+    }
+    if (sql.includes('SELECT 1 AS hit')) {
+      expect(sql).toContain('workspace_id = ?')
+      return [params.some((value) => state.granted.has(String(value))) ? [{ hit: 1 }] : []]
+    }
+    if (sql.startsWith('INSERT INTO `test`.authz_revisions')) {
+      state.bumps.push(params[1])
+      return [{ affectedRows: 1 }]
     }
     if (state.sqlError) throw Object.assign(new Error('database write failed'), { code: state.sqlError })
     if (sql.startsWith('INSERT INTO `test`.saved_views')) {
@@ -272,6 +281,20 @@ describe('MySQL saved view mutation transaction', () => {
     const f = fixture()
     await expect(f.save(batch as SavedViewMutation[])).rejects.toMatchObject({ code: 'SAVED_VIEW_INVALID', status: 400 })
     expect(f.pool.getConnection).not.toHaveBeenCalled()
+  })
+
+  it('bumps the authz revision only when a changed view carries grants', async () => {
+    const f = fixture()
+    await f.save([create('a'), create('b')])
+    expect(f.state.bumps).toEqual([])
+    await f.save([update('a', 1, 'plain edit')])
+    expect(f.state.bumps).toEqual([])
+    f.state.granted.add('builtin-scope:shared:b')
+    await f.save([update('b', 1, 'narrowed')])
+    expect(f.state.bumps).toEqual(['/pages'])
+    f.state.granted.add('a')
+    await f.save([remove('a', 2)])
+    expect(f.state.bumps).toEqual(['/pages', '/pages'])
   })
 
   it('skips empty changes without a transaction', async () => {

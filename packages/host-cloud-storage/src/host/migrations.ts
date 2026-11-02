@@ -628,6 +628,73 @@ export const PRODUCT_MIGRATIONS: readonly MysqlMigration[] = [
       'DEALLOCATE PREPARE biu_drop_shares_target',
     ],
   },
+  {
+    version: 18,
+    name: 'record_scope_narrow_after_revoke',
+    statements: [
+      // 撤销协作只在之后的授权变更时收窄归属；这里按 reconcileRecordScope 同一规则补算历史记录。
+      // 只动“共享”与“受限的空间”两类：它们是撤销后可能留下的过宽状态。
+      `UPDATE resource_policies p
+       SET p.ownership = CASE
+             WHEN EXISTS (
+               SELECT 1 FROM record_grants g
+               JOIN workspace_members m ON m.workspace_id = g.workspace_id AND m.account_id = g.subject_id
+               WHERE g.workspace_id = p.workspace_id AND g.collection = p.collection AND g.record_id = p.record_id
+                 AND g.subject_type = 'account' AND g.subject_id <> p.owner_account_id
+                 AND m.member_kind IN ('external', 'guest')
+             ) OR EXISTS (
+               SELECT 1 FROM shares s
+               WHERE s.workspace_id = p.workspace_id AND s.kind = 'record'
+                 AND s.collection = p.collection AND s.record_id = p.record_id
+             ) THEN 'shared'
+             WHEN p.access_mode = 'members' OR EXISTS (
+               SELECT 1 FROM record_grants g
+               WHERE g.workspace_id = p.workspace_id AND g.collection = p.collection AND g.record_id = p.record_id
+                 AND NOT (g.subject_type = 'account' AND g.subject_id = p.owner_account_id)
+             ) THEN 'workspace'
+             ELSE 'personal'
+           END,
+           p.access_mode = CASE
+             WHEN p.access_mode NOT IN ('private', 'restricted') THEN p.access_mode
+             WHEN EXISTS (
+               SELECT 1 FROM record_grants g
+               WHERE g.workspace_id = p.workspace_id AND g.collection = p.collection AND g.record_id = p.record_id
+                 AND NOT (g.subject_type = 'account' AND g.subject_id = p.owner_account_id)
+             ) THEN 'restricted'
+             ELSE 'private'
+           END
+       WHERE p.ownership = 'shared' OR (p.ownership = 'workspace' AND p.access_mode = 'restricted')`,
+    ],
+  },
+  {
+    version: 19,
+    name: 'view_grants_key_includes_grantor',
+    statements: [
+      // “全部”视图按人隔离：同一对象可以分别被不同管理者授权。主键不含授权人时只能存一条，
+      // 后授的会改写先授的范围。主键加上 granted_by；已经包含时什么也不做。
+      // 从 SQLite 导入的 granted_by 是 LONGTEXT，不能进主键；先改成与其余键列一致的 VARCHAR(128) utf8mb4_bin。
+      `SET @biu_view_grants_grantor = (
+         SELECT IF(MAX(data_type) <> 'varchar' OR MAX(character_maximum_length) <> 128 OR MAX(collation_name) <> 'utf8mb4_bin',
+           'ALTER TABLE view_grants MODIFY granted_by VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL',
+           'DO 0')
+         FROM information_schema.columns
+         WHERE table_schema = DATABASE() AND table_name = 'view_grants' AND column_name = 'granted_by'
+       )`,
+      'PREPARE biu_view_grants_grantor FROM @biu_view_grants_grantor',
+      'EXECUTE biu_view_grants_grantor',
+      'DEALLOCATE PREPARE biu_view_grants_grantor',
+      `SET @biu_view_grants_pk = (
+         SELECT IF(SUM(column_name = 'granted_by') = 0,
+           'ALTER TABLE view_grants DROP PRIMARY KEY, ADD PRIMARY KEY (workspace_id, collection, view_id, subject_type, subject_id, granted_by)',
+           'DO 0')
+         FROM information_schema.statistics
+         WHERE table_schema = DATABASE() AND table_name = 'view_grants' AND index_name = 'PRIMARY'
+       )`,
+      'PREPARE biu_view_grants_pk FROM @biu_view_grants_pk',
+      'EXECUTE biu_view_grants_pk',
+      'DEALLOCATE PREPARE biu_view_grants_pk',
+    ],
+  },
 ]
 
 export const OPERATIONS_MIGRATIONS: readonly MysqlMigration[] = [

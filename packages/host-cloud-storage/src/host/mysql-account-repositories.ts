@@ -1421,8 +1421,6 @@ export class MysqlAccountRepository {
     const connection = await this.pool.getConnection()
     try {
       await connection.beginTransaction()
-      await this.requireOwnViewGrantSlot(connection, input.actorId, input.workspaceId, input.collection,
-        input.viewId, input.subjectType, input.subjectId)
       await connection.query(
         `INSERT INTO ${this.db}.view_grants
          (workspace_id, collection, view_id, subject_type, subject_id, role, granted_by, created_at)
@@ -1471,8 +1469,6 @@ export class MysqlAccountRepository {
           )
         }
       }
-      await this.requireOwnViewGrantSlot(connection, input.actorId, input.workspaceId, input.collection,
-        input.viewId, 'account', target.id)
       await connection.query(
         `INSERT INTO ${this.db}.view_grants
          (workspace_id, collection, view_id, subject_type, subject_id, role, granted_by, created_at)
@@ -2179,25 +2175,6 @@ export class MysqlAccountRepository {
       if (owner !== actorId) throw denied()
     }
     if (view.kind === 'missing' && purpose === 'grant') throw denied()
-  }
-
-  /**
-   * view_grants 主键不含授权人，“全部”视图上同一对象只能有一条授权。
-   * 别人已经授过时不覆盖：覆盖会把对方看到的范围从别人的记录换成自己的。
-   */
-  private async requireOwnViewGrantSlot(
-    connection: PoolConnection, actorId: string, workspaceId: string, collection: string,
-    viewId: string, subjectType: string, subjectId: string,
-  ) {
-    if (!viewId.startsWith('builtin-all:')) return
-    const [rows] = await connection.query<RowDataPacket[]>(
-      `SELECT granted_by FROM ${this.db}.view_grants
-       WHERE workspace_id = ? AND collection = ? AND view_id = ? AND subject_type = ? AND subject_id = ? FOR UPDATE`,
-      [workspaceId, collection, viewId, subjectType, subjectId],
-    )
-    if (rows[0] && String(rows[0].granted_by) !== actorId) {
-      throw Object.assign(new Error('对方已通过其他成员的“全部”视图获得授权'), { status: 409, code: 'VIEW_GRANT_TAKEN' })
-    }
   }
 
   private async requireOwner(accountId: string, workspaceId: string) {

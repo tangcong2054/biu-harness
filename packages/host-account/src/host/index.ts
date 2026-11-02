@@ -657,10 +657,6 @@ function fail(route: RouteContext, error: unknown) {
     route.send(403, { code, error: (error as Error).message })
     return
   }
-  if (code === 'VIEW_GRANT_TAKEN') {
-    route.send(409, { code, error: (error as Error).message })
-    return
-  }
   if (error instanceof CollabError) {
     route.send(error.status, { error: error.message })
     return

@@ -397,6 +397,7 @@ export class MysqlFileSystemMetadataRepository extends MysqlRuntimeRepository {
         }
         results[index] = result
       }
+      await this.bumpGrantedViewRevisions(connection, workspaceId, mutations)
       await connection.commit()
       return results
     } catch (error) {
@@ -414,6 +415,46 @@ export class MysqlFileSystemMetadataRepository extends MysqlRuntimeRepository {
     } finally {
       if (discardConnection) connection.destroy()
       else connection.release()
+    }
+  }
+
+  /**
+   * 视图条件决定授权范围：改了或删了一个承载授权的视图（数据视图授权，或被当作成员视图授权对象），
+   * 别的实例按授权版本缓存的可见性就过期了。这里递增版本号；没有授权引用时不写。
+   */
+  private async bumpGrantedViewRevisions(
+    connection: PoolConnection, workspaceId: string, mutations: readonly SavedViewMutation[],
+  ) {
+    const changed = mutations.filter((item) => item.type !== 'create')
+    if (!changed.length) return
+    const bumps = new Set<string>()
+    for (const mutation of changed) {
+      const ids = [mutation.id, ...['personal', 'workspace', 'shared']
+        .map((scope) => `builtin-scope:${scope}:${encodeURIComponent(mutation.id)}`)]
+      const [dataGrants] = await connection.query<RowDataPacket[]>(
+        `SELECT 1 AS hit FROM ${this.database}.view_grants
+         WHERE workspace_id = ? AND collection = ? AND view_id IN (?, ?, ?, ?) LIMIT 1`,
+        [workspaceId, mutation.collection, ...ids],
+      )
+      if (dataGrants.length) bumps.add(mutation.collection)
+      if (mutation.collection === '/workspace-members') {
+        const [memberGrants] = await connection.query<RowDataPacket[]>(
+          `SELECT 1 AS hit FROM ${this.database}.view_grants
+           WHERE workspace_id = ? AND subject_type = 'member_view' AND subject_id = ?
+           UNION ALL
+           SELECT 1 AS hit FROM ${this.database}.record_grants
+           WHERE workspace_id = ? AND subject_type = 'member_view' AND subject_id = ? LIMIT 1`,
+          [workspaceId, mutation.id, workspaceId, mutation.id],
+        )
+        if (memberGrants.length) bumps.add('*')
+      }
+    }
+    for (const name of bumps) {
+      await connection.query(
+        `INSERT INTO ${this.database}.authz_revisions (workspace_id, collection_name, revision, updated_at)
+         VALUES (?, ?, 1, ?) ON DUPLICATE KEY UPDATE revision = revision + 1, updated_at = VALUES(updated_at)`,
+        [workspaceId, name, Date.now()],
+      )
     }
   }
 
