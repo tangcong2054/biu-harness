@@ -200,6 +200,17 @@ export function requestMemo<T>(key: string, compute: () => Promise<T>): Promise<
   return pending
 }
 
+/** 同步版：请求外直接计算。只用于请求内不会变化的值（例如服务引用）。 */
+export function requestMemoSync<T>(key: string, compute: () => T): T {
+  const memo = requestMemoScope.getStore()
+  if (!memo) return compute()
+  const slot = `sync\t${key}`
+  if (memo.has(slot)) return memo.get(slot) as T
+  const value = compute()
+  memo.set(slot, value as Promise<unknown>)
+  return value
+}
+
 /** 作废当前请求里以 prefix 开头的缓存；不传则全部作废。 */
 export function clearRequestMemo(prefix = '') {
   const memo = requestMemoScope.getStore()

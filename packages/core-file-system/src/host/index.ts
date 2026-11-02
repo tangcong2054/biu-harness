@@ -15,6 +15,8 @@ import {
   ASSET_GC_INTERVAL_MS,
   isDesktopRuntime,
   isOnlineRuntime,
+  clearRequestMemo,
+  requestMemoSync,
 } from '@biu/host-plugin-loader/data-dir'
 import { asPublicProfile, readWorkspaceProfile, writeWorkspaceProfile } from '@biu/host-workspace'
 import { authorizeCollection, roleCoversAction, type Action as PermissionAction, type AuthorizationService, type ResourceRole } from '@biu/host-account/authorization'
@@ -172,7 +174,19 @@ function higherAccess(left: keyof typeof ACCESS_RANK | null, right: keyof typeof
   return ACCESS_RANK[left] >= ACCESS_RANK[right] ? left : right
 }
 
+const ACTOR_MEMO = 'sync\tactor\t'
+
+/** 列表会对每条记录多次取表结构；结果只取决于 spec，按请求缓存，不跨请求复用。 */
 function schemaFor(spec: CollectionSpec): CollectionSchema {
+  const cache = requestMemoSync('schemaFor', () => new WeakMap<CollectionSpec, CollectionSchema>())
+  const hit = cache.get(spec)
+  if (hit) return hit
+  const schema = buildSchema(spec)
+  cache.set(spec, schema)
+  return schema
+}
+
+function buildSchema(spec: CollectionSpec): CollectionSchema {
   const contentField = spec.schema.contentField ?? 'content'
   const raw = withBuiltinFields(spec.schema.fields, contentField, 'title')
   const fields: CollectionFields = { ...raw }
@@ -973,9 +987,14 @@ export class DatabaseService extends Service implements Database {
     }
   }
 
+  /** 列表会对每条记录取账号服务；cordis 每次取服务都要构造一个带调用栈的 Error，按请求只取一次。 */
+  private accountService() {
+    return requestMemoSync('ctx.account', () => this.ctx.get('account') as unknown)
+  }
+
   private collabStore() {
     try {
-      return (this.ctx.get('account') as { store?: WorkspaceFiles } | undefined)?.store
+      return (this.accountService() as { store?: WorkspaceFiles } | undefined)?.store
     } catch {
       return undefined
     }
@@ -983,7 +1002,7 @@ export class DatabaseService extends Service implements Database {
 
   private authorization() {
     try {
-      const auth = (this.ctx.get('account') as { authorization?: AuthorizationService } | undefined)?.authorization
+      const auth = (this.accountService() as { authorization?: AuthorizationService } | undefined)?.authorization
       if (auth && auth !== this.boundAuth) {
         this.unbindAuth?.()
         this.boundAuth = auth
@@ -2044,6 +2063,7 @@ export class DatabaseService extends Service implements Database {
     this.mysqlVisible.clear()
     this.mysqlGrantRoles.clear()
     this.mysqlGrantAudience.clear()
+    clearRequestMemo(ACTOR_MEMO)
   }
 
   private notifyChange() {
@@ -2392,15 +2412,15 @@ export class DatabaseService extends Service implements Database {
     const withMeta = this.applyMetaOverlay(spec, withPeople)
     if (isSystemCollection(spec.path) || isIndexCollection(spec.path)) return withMeta
     if (this.builtinShared(spec.path, row)) return { ...withMeta, shareScope: '共享', shareRole: '阅读' }
-    const stored = this.ownershipOf(spec.path, String(row.id ?? ''))
+    // MySQL 归属已知时用不到本地归属，不再为每条记录查一次本地账号库。
     return {
       ...withMeta,
-      shareScope: this.shareScopeLabel(spec.path, String(row.id ?? ''), withMeta, stored),
+      shareScope: this.shareScopeLabel(spec.path, String(row.id ?? ''), withMeta, () => this.ownershipOf(spec.path, String(row.id ?? ''))),
       shareRole: this.shareRoleLabel(spec, withMeta),
     }
   }
 
-  private shareScopeLabel(collection: string, id: string, record: DbRecord, stored: 'personal' | 'workspace' | 'shared') {
+  private shareScopeLabel(collection: string, id: string, record: DbRecord, storedScope: () => 'personal' | 'workspace' | 'shared') {
     const target = this.scopeTarget(collection, id, record)
     const mysqlScope = this.scopeHints?.get(id)
       ?? this.mysqlViewerScope(collection, { ...record, id }, this.mysqlScopeOf(target.collection, target.id))
@@ -2409,6 +2429,7 @@ export class DatabaseService extends Service implements Database {
       if (mysqlScope === 'workspace') return '空间'
       return '私人'
     }
+    const stored = storedScope()
     if (this.hasPublicShare(collection, id) || stored === 'shared') return '共享'
     const scope = this.effectiveScope(collection, record, stored)
     if (scope === 'workspace') return '空间'
@@ -2418,7 +2439,9 @@ export class DatabaseService extends Service implements Database {
 
   private hasPublicShare(collection: string, id: string) {
     try {
-      return Boolean(this.shares.findRecord(collection, id))
+      // 列表里每条记录都要判断；按请求、按集合只查一次有公开链接的记录 ID。
+      const key = `shares.records\t${currentRequestWorkspaceId()}\t${normalizeCollectionPath(collection)}`
+      return requestMemoSync(key, () => this.shares.recordIds(collection)).has(id)
     } catch {
       return false
     }
@@ -2427,7 +2450,10 @@ export class DatabaseService extends Service implements Database {
   /** 当前用户对这一条的权限。记录上的角色和视图授权取较高的一级。 */
   private shareRoleLabel(spec: CollectionSpec, record: DbRecord) {
     const authorization = this.authorization()
-    const actor = authorization?.currentActor()
+    // 当前操作者在一次请求里不变，按请求只解析一次；授权变化时 invalidateCaches 会作废。
+    const actor = authorization
+      ? requestMemoSync(`${ACTOR_MEMO}${currentAccountId()}\t${currentRequestWorkspaceId()}`, () => authorization.currentActor())
+      : null
     if (!authorization || !actor) return '管理'
     const target = this.scopeTarget(spec.path, String(record.id ?? ''), record)
     const decision = authorization.authorize(actor, 'resource:read', {

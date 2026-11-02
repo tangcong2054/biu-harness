@@ -304,3 +304,18 @@ test('a failed request memo is not reused, and a full clear drops every entry', 
   })
   assert.deepEqual(result, [3, 4])
 })
+
+test('sync request memo shares a value within one request only', async () => {
+  const { runWithRequestMemo, requestMemoSync, clearRequestMemo } = await import('./data-dir.ts')
+  let calls = 0
+  const inside = runWithRequestMemo(() => {
+    const a = requestMemoSync('svc', () => ++calls)
+    const b = requestMemoSync('svc', () => ++calls)
+    clearRequestMemo('sync\tsvc')
+    const c = requestMemoSync('svc', () => ++calls)
+    return [a, b, c]
+  })
+  assert.deepEqual(inside, [1, 1, 2])
+  assert.equal(requestMemoSync('svc', () => ++calls), 3)
+  assert.equal(runWithRequestMemo(() => requestMemoSync('svc', () => ++calls)), 4)
+})

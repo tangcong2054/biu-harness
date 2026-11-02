@@ -26,6 +26,44 @@ function ensureSqliteDir(path: string) {
   mkdirSync(dirname(path), { recursive: true })
 }
 
+/** 动态拼接的 SQL（IN 列表长度不同等）会产生很多不同语句；超过上限按最久未用淘汰。 */
+export const SQLITE_STATEMENT_CACHE_LIMIT = 256
+const STATEMENT_CACHE = Symbol.for('biu.sqlite.statementCache')
+
+type StatementSync = ReturnType<DatabaseSync['prepare']>
+
+/**
+ * 同一条 SQL 只编译一次，之后复用同一个语句对象。
+ * 列表装饰会对每条记录查元数据、分享、成员身份，每次重新 prepare 时编译开销占了一半 CPU。
+ * 复用是安全的：get/all/run 每次执行前都会重置语句；本仓库不使用 iterate 或修改语句设置；
+ * 表结构变化时 SQLite 会自动重新编译。带额外参数的 prepare 不缓存。
+ */
+export function cacheSqliteStatements(db: DatabaseSync) {
+  const target = db as DatabaseSync & { [STATEMENT_CACHE]?: Map<string, StatementSync> }
+  if (target[STATEMENT_CACHE]) return db
+  const prepare = db.prepare.bind(db) as (sql: string, ...rest: unknown[]) => StatementSync
+  const cache = new Map<string, StatementSync>()
+  Object.defineProperty(target, STATEMENT_CACHE, { value: cache })
+  Object.defineProperty(target, 'prepare', {
+    configurable: true,
+    writable: true,
+    value: (sql: string, ...rest: unknown[]) => {
+      if (rest.length || typeof sql !== 'string') return prepare(sql, ...rest)
+      const hit = cache.get(sql)
+      if (hit) {
+        cache.delete(sql)
+        cache.set(sql, hit)
+        return hit
+      }
+      const statement = prepare(sql)
+      cache.set(sql, statement)
+      if (cache.size > SQLITE_STATEMENT_CACHE_LIMIT) cache.delete(cache.keys().next().value!)
+      return statement
+    },
+  })
+  return db
+}
+
 function isCorruptSqlite(error: unknown) {
   const err = error as { errcode?: number; code?: string; message?: string }
   return err?.errcode === 11 || err?.errcode === 26 || err?.code === 'SQLITE_CORRUPT' || err?.code === 'SQLITE_NOTADB' || /malformed|corrupt|not a database/i.test(String(err?.message ?? ''))
@@ -57,7 +95,7 @@ export function openSqlite(path: string, opts?: { foreignKeys?: boolean; checkpo
   const openFresh = () => {
     const db = new DatabaseSync(path)
     configureSqlite(db, opts)
-    return db
+    return cacheSqliteStatements(db)
   }
   let db: DatabaseSync | undefined
   try {

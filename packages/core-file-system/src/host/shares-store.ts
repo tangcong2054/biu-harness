@@ -1,6 +1,6 @@
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { currentRequestWorkspaceId, openAndMigrateBiu } from '@biu/host-plugin-loader/data-dir'
+import { clearRequestMemo, currentRequestWorkspaceId, openAndMigrateBiu } from '@biu/host-plugin-loader/data-dir'
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
 import { normalizeCollectionPath } from '../paths.ts'
 import type { ShareKind, ShareRecord } from '../share-snapshot.ts'
@@ -55,6 +55,9 @@ function publicShare(row: ShareRow): ShareRecord {
   }
 }
 
+/** 请求内缓存的分享查询（列表装饰时按集合取一次）都以这个前缀开头，写入时作废。 */
+export const SHARE_MEMO = 'sync\tshares.'
+
 export class SharesStore {
   private base: DatabaseSync | null = null
   private runtime: SqliteMetadataRuntime | null = null
@@ -75,7 +78,8 @@ export class SharesStore {
   }
 
   prepare() {
-    return this.runtime?.prepare() ?? Promise.resolve()
+    // 远端分享可能刚被重新载入；本请求里之前缓存的分享查询作废。
+    return (this.runtime?.prepare() ?? Promise.resolve()).then(() => { clearRequestMemo(SHARE_MEMO) })
   }
 
   prepareToken(token: string) {
@@ -180,6 +184,7 @@ export class SharesStore {
     sharePlugins?: boolean
     allowCopy?: boolean
   }): ShareRecord {
+    clearRequestMemo(SHARE_MEMO)
     this.runtime?.requireShareWriter()
     const kind = asKind(input.kind)
     if (!kind) throw new Error('invalid share kind')
@@ -247,12 +252,14 @@ export class SharesStore {
   }
 
   revoke(token: string) {
+    clearRequestMemo(SHARE_MEMO)
     this.runtime?.requireShareWriter()
     this.conn().prepare(`DELETE FROM shares WHERE token = ? AND workspace_id IN (?, '')`).run(token, this.workspace())
     this.runtime?.deleteShareToken(token)
   }
 
   revokeTarget(kind: ShareKind, collection: string, viewId = '', recordId = '') {
+    clearRequestMemo(SHARE_MEMO)
     this.runtime?.requireShareWriter()
     const path = normalizeCollectionPath(collection)
     this.conn().prepare(
@@ -262,6 +269,7 @@ export class SharesStore {
   }
 
   revokeRecord(collection: string, recordId: string) {
+    clearRequestMemo(SHARE_MEMO)
     const id = String(recordId ?? '').trim()
     if (!id) return
     this.runtime?.requireShareWriter()
@@ -272,6 +280,7 @@ export class SharesStore {
   }
 
   revokeView(collection: string, viewId: string) {
+    clearRequestMemo(SHARE_MEMO)
     const id = String(viewId ?? '').trim()
     if (!id) return
     this.runtime?.requireShareWriter()
