@@ -1,18 +1,42 @@
 import { Service, type Context } from 'cordis'
 import { formatLiveUiContext, type LiveUiContext } from '@biu/type-session'
 
+export type SystemPromptSectionOptions = {
+  /**
+   * 回合开头、`assemble()` 之前在当前请求的账号 / 空间上下文里执行。
+   * 片段需要异步数据（按账号查库）时在这里备好，`source` 仍同步读。
+   */
+  prepare?: () => Promise<void> | void
+}
+
 export class SystemPromptService extends Service {
   private sections = new Map<string, () => string>()
+  private preparers = new Map<string, () => Promise<void> | void>()
 
   constructor(ctx: Context) {
     super(ctx, 'systemPrompt')
   }
 
-  register(id: string, source: string | (() => string)) {
+  register(id: string, source: string | (() => string), options: SystemPromptSectionOptions = {}) {
     return this.ctx.effect(() => {
       this.sections.set(id, typeof source === 'string' ? () => source : source)
-      return () => this.sections.delete(id)
+      if (options.prepare) this.preparers.set(id, options.prepare)
+      return () => {
+        this.sections.delete(id)
+        this.preparers.delete(id)
+      }
     }, `systemPrompt.register ${id}`)
+  }
+
+  /** 并行执行各片段的 prepare。单个失败只记日志，不挡住回合，该片段按已有数据输出。 */
+  async prepare() {
+    const entries = [...this.preparers.entries()]
+    const results = await Promise.allSettled(entries.map(([, run]) => run()))
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        this.ctx.logger('system-prompt').warn(`prepare ${entries[index]![0]} failed: ${String(result.reason)}`)
+      }
+    })
   }
 
   assemble(live?: LiveUiContext) {

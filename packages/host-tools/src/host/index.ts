@@ -257,6 +257,11 @@ export class ToolsService extends Service {
     return [...this.tools.keys()].filter((name) => this.visible(name))
   }
 
+  /** 某个商店插件注册、且当前上下文可见的工具名。 */
+  namesForPlugin(pluginId: string) {
+    return this.names().filter((name) => this.pluginIds.get(name) === pluginId).sort()
+  }
+
   executionMode(name: string, args: Record<string, unknown> = {}): ToolExecutionMode {
     const execution = this.tools.get(name)?.execution
     if (typeof execution !== 'function') return execution ?? 'exclusive'

@@ -8,6 +8,7 @@ import { httpRegistryTransport, localRegistryTransport, PluginRegistryClient, re
 import { registerRegistryRoutes } from './registry-http.ts'
 import { loadRegistryAdminToken, PluginRegistryStore } from './registry.ts'
 import { bindPlatformOperationsAccount, ensurePlatformOperationsPlugin } from './operations-plugin.ts'
+import { registerPluginsPrompt } from './prompt.ts'
 import { openStore } from './store.ts'
 
 export const name = 'core-plugin-system'
@@ -57,10 +58,12 @@ export async function apply(ctx: Context) {
     inner.database.register(pluginCatalogCollection(client))
     if (operations) inner.database.register(pluginReviewsCollection(client))
   })
+  registerPluginsPrompt(ctx, store)
   ctx.inject(['systemPrompt'], (inner) => {
     inner.systemPrompt.register(
       'plugin.creation',
-      '创建插件前，先查看是否已有相似插件：用 db_list /plugin-catalog q=关键词确认商店里没有能用的插件。没有再在 /plugins 里 sandbox、pack。插件描述必须和其它插件明显不同。创建插件时，必须说明它支持哪些 Action（包括 ui_action）。',
+      '创建插件前，先查看是否已有相似插件：用 db_list /plugin-catalog q=关键词确认商店里没有能用的插件。没有再在 /plugins 里 sandbox、pack。插件描述必须和其它插件明显不同。创建插件时，必须说明它支持哪些 Action（包括 ui_action）。' +
+        '插件 README（介绍）必须包含「什么时候用」和「示例写法」两段：前者写清用户说什么、要做什么时该用它，后者给出可直接照抄的用法（页面块给完整 :::pageBlock，工具给调用示例）。Agent 只靠插件名和这份介绍决定要不要用它。',
     )
     if (operations) {
       inner.systemPrompt.register(

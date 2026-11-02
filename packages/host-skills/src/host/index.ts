@@ -47,7 +47,10 @@ export class SkillsService extends Service {
     super(ctx, 'skills')
     this.store = new SkillsStore()
     ctx.inject(['systemPrompt'], (inner) => {
-      inner.systemPrompt.register('skills', () => this.promptSection())
+      inner.systemPrompt.register('skills', () => this.promptSection(), {
+        // 没有账号 / MySQL 时 ensureOwned 自己直接返回。
+        prepare: () => this.ensureOwned(),
+      })
     })
     ctx.inject(['database'], (inner) => {
       inner.database.register(skillsCollection(this))
