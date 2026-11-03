@@ -448,6 +448,14 @@ export class SessionsService extends Service {
   /** 视图授权能不能看见这条会话。由数据库在启动时接上。 */
   viewAccess: ((id: string, record?: { id?: unknown }) => boolean) & { mayAllow?: () => boolean } =
     Object.assign(() => false, { mayAllow: () => false })
+  /**
+   * MySQL 控制面下的授权判断（记录授权 + 视图授权），由数据库在启动时接上。
+   * 接上后不再用 viewAccess：那个读的是本地 SQLite 副本里的视图授权，线上是过期数据。
+   */
+  mysqlGrants: {
+    readable(items: Array<{ id: string } & Record<string, unknown>>): Promise<Set<string>>
+    mayGrant(): Promise<boolean>
+  } | null = null
 
   constructor(ctx: Context) {
     super(ctx, 'sessions')
@@ -811,7 +819,9 @@ export class SessionsService extends Service {
   async inWorkspaceAsync(id: string, record?: { id?: unknown }) {
     if (!this.mysqlAccount()) return this.inWorkspace(id, record)
     const visible = await this.mysqlVisibleSessions([id])
-    return visible.has(id) || this.viewAccess(id, record)
+    if (visible.has(id)) return true
+    if (this.mysqlGrants) return (await this.mysqlGrants.readable([{ ...record, id }])).has(id)
+    return this.viewAccess(id, record)
   }
 
   /**
@@ -852,6 +862,14 @@ export class SessionsService extends Service {
     return out
   }
 
+  private usesMysqlAccounts() {
+    try {
+      return (this.ctx.get('account') as { usesMysqlAccounts?: () => boolean } | undefined)?.usesMysqlAccounts?.() === true
+    } catch {
+      return false
+    }
+  }
+
   private mysqlAccount() {
     let account: {
       usesMysqlAccounts?: () => boolean
@@ -886,18 +904,26 @@ export class SessionsService extends Service {
   }
 
   async listSummaries() {
+    const mysqlGrants = this.mysqlAccount() ? this.mysqlGrants : null
+    // 有授权可能命中时不能只按归属下推，否则别人分享过来的会话会被漏掉。
+    const mayGrant = mysqlGrants ? await mysqlGrants.mayGrant() : this.viewAccess.mayAllow?.() !== false
     const narrowed = process.env.BIU_SESSION_SCOPE_PUSHDOWN === '1'
-      && Boolean(this.mysqlAccount()) && this.viewAccess.mayAllow?.() === false
+      && Boolean(this.mysqlAccount()) && !mayGrant
     const candidateIds = narrowed ? [...await this.mysqlVisibleSessions()] : undefined
     let all = await this.ctx.sessionStore.listSummaries(
       candidateIds === undefined ? undefined : { sessionIds: candidateIds },
     )
-    if (narrowed && this.viewAccess.mayAllow?.() !== false) {
+    if (narrowed && !mysqlGrants && this.viewAccess.mayAllow?.() !== false) {
       all = await this.ctx.sessionStore.listSummaries()
     }
     const mysqlVisible = this.mysqlAccount() ? await this.mysqlVisibleSessions(all.map((item) => item.id)) : null
+    const granted = mysqlVisible && mysqlGrants && mayGrant
+      ? await mysqlGrants.readable(all.filter((item) => !mysqlVisible.has(item.id)) as unknown as Array<{ id: string } & Record<string, unknown>>)
+      : null
     const items = all.filter((item) =>
-      mysqlVisible ? mysqlVisible.has(item.id) || this.viewAccess(item.id, item) : this.inWorkspace(item.id, item),
+      mysqlVisible
+        ? mysqlVisible.has(item.id) || (granted ? granted.has(item.id) : !mysqlGrants && this.viewAccess(item.id, item))
+        : this.inWorkspace(item.id, item),
     )
     const out = []
     for (const item of items) {
@@ -976,6 +1002,9 @@ export class SessionsService extends Service {
   }
 
   private attachSession(id: string) {
+    // MySQL 控制面下归属只写 MySQL（新建时 attachMysqlSession）。以前每次读会话都往本地副本写一次归属，
+    // 副本里空间不存在或归属冲突时直接抛错，会话打不开；写进去的归属也可能挂错空间。
+    if (this.usesMysqlAccounts()) return
     const store = this.collabStore()
     const workspaceId = store?.activeWorkspaceId()
     if (!store || !workspaceId) return
@@ -985,6 +1014,7 @@ export class SessionsService extends Service {
   /** 新建和分叉要把私人归属写进 MySQL。只挂本机 SQLite 时，重新登录后会话不在当前空间的分组里。 */
   private async attachNewSession(id: string) {
     const mysqlAttached = await this.attachMysqlSession(id)
+    if (this.usesMysqlAccounts()) return
     try {
       this.attachSession(id)
     } catch (error) {

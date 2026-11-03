@@ -196,6 +196,37 @@ integration('MySQL account/workspace/authz integration', () => {
     )
     expect((policies as Array<Record<string, unknown>>)[0]).toMatchObject({ ownership: 'personal', access_mode: 'private' })
     expect((await accounts.recordAccess('acc_owner', 'ws_a', '/pages', 'page_1')).scope).toBe('personal')
+
+    // 记录已有主人时，别的成员“挂归属”不能把自己升成主人（以前会写一条 owner 授权）。
+    const attach = (actorId: string, recordId: string) => accounts.attachPolicy({
+      actorId, workspaceId: 'ws_a', collection: '/plugins', recordId, ownership: 'personal', accessMode: 'private', now,
+    })
+    const ownerGrants = async (recordId: string) => {
+      const [rows] = await pool.query(
+        `SELECT subject_id FROM \`${database}\`.record_grants
+         WHERE workspace_id = 'ws_a' AND collection = '/plugins' AND record_id = ? AND role = 'owner' ORDER BY subject_id`,
+        [recordId],
+      )
+      return (rows as Array<{ subject_id: string }>).map((row) => row.subject_id)
+    }
+    await attach('acc_owner', 'plug_1')
+    await attach('acc_member', 'plug_1')
+    expect(await ownerGrants('plug_1')).toEqual(['acc_owner'])
+    expect(await accounts.recordOwnerships('/plugins', 'plug_1')).toEqual([{ workspaceId: 'ws_a', ownerId: 'acc_owner' }])
+    // 只有旧 record_owners、还没有策略：新策略沿用原创建者，调用者拿不到主人。
+    await pool.query(
+      `INSERT INTO \`${database}\`.record_owners (workspace_id, collection, record_id, owner_id, version, updated_at)
+       VALUES ('ws_a', '/plugins', 'plug_2', 'acc_owner', 0, ?)`,
+      [now],
+    )
+    await attach('acc_member', 'plug_2')
+    expect(await ownerGrants('plug_2')).toEqual([])
+    const [legacyPolicy] = await pool.query(
+      `SELECT owner_account_id FROM \`${database}\`.resource_policies
+       WHERE workspace_id = 'ws_a' AND collection = '/plugins' AND record_id = 'plug_2'`,
+    )
+    expect((legacyPolicy as Array<Record<string, unknown>>)[0]).toMatchObject({ owner_account_id: 'acc_owner' })
+    expect(await accounts.recordOwnerships('/plugins', 'missing')).toEqual([])
   })
 
   it('covers workspace invites, groups and view grants with revision invalidation', async () => {

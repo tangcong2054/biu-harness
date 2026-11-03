@@ -6,6 +6,7 @@ import { DatabaseService } from './index.ts'
 test('registry-filtered catalog reads are not denied by legacy private metadata', () => {
   const db = {
     authorization: () => null,
+    mysqlUserMode: () => null,
     workspaceMembership: () => null,
     mysqlVisibility: () => false,
     mysqlGrantedRole: () => null,

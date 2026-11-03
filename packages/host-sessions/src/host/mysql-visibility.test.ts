@@ -152,3 +152,47 @@ test('scope pushdown is equivalent across identities, ownership, inheritance, vi
     else process.env.BIU_SESSION_SCOPE_PUSHDOWN = originalFlag
   }
 })
+
+test('MySQL: reading a session does not write ownership into the local replica', async () => {
+  const { ctx, as } = await boot()
+  const attachCalls: string[] = []
+  const account = ctx.get('account') as unknown as { store?: unknown }
+  // 线上账号服务总带着本机副本；以前每次读会话都会往里写一次归属，副本里空间不存在时直接抛错。
+  account.store = {
+    activeWorkspaceId: () => 'ws_stale',
+    attach: (_ws: string, _collection: string, id: string) => {
+      attachCalls.push(id)
+      throw new Error('工作区不存在')
+    },
+  }
+  const created = await as('ada', 'ws_a', () => ctx.sessions.create('ada'))
+  assert.ok(await as('ada', 'ws_a', () => ctx.sessions.get(created.id)))
+  assert.ok(await as('ada', 'ws_a', () => ctx.sessions.get(created.id)))
+  assert.deepEqual(attachCalls, [])
+})
+
+test('MySQL: shared sessions are decided by MySQL grants, not the local view-grant hook', async () => {
+  const { ctx, as } = await boot()
+  const shared = await as('ada', 'ws_a', () => ctx.sessions.create('ada-private'))
+  const granted = new Set<string>()
+  const hookCalls: string[] = []
+  ctx.sessions.viewAccess = Object.assign((id: string) => { hookCalls.push(id); return true }, { mayAllow: () => true })
+  ctx.sessions.mysqlGrants = {
+    readable: async (items) => new Set(items.map((item) => item.id).filter((id) => granted.has(id))),
+    mayGrant: async () => granted.size > 0,
+  }
+  assert.equal(await as('bob', 'ws_a', () => ctx.sessions.inWorkspaceAsync(shared.id)), false)
+  assert.deepEqual((await as('bob', 'ws_a', () => ctx.sessions.listSummaries())).map((item) => item.id), [])
+  granted.add(shared.id)
+  assert.equal(await as('bob', 'ws_a', () => ctx.sessions.inWorkspaceAsync(shared.id)), true)
+  const previous = process.env.BIU_SESSION_SCOPE_PUSHDOWN
+  process.env.BIU_SESSION_SCOPE_PUSHDOWN = '1'
+  try {
+    assert.deepEqual((await as('bob', 'ws_a', () => ctx.sessions.listSummaries())).map((item) => item.id), [shared.id])
+  } finally {
+    if (previous === undefined) delete process.env.BIU_SESSION_SCOPE_PUSHDOWN
+    else process.env.BIU_SESSION_SCOPE_PUSHDOWN = previous
+  }
+  // 本地副本里的视图授权（可能早已在 MySQL 撤销）不再参与判断。
+  assert.deepEqual(hookCalls, [])
+})

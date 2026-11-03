@@ -28,10 +28,33 @@ export function memberDefaultAccess(policy: ScopePolicy, membershipRole: string)
   return 'viewer'
 }
 
+const ROLE_RANK: Record<MysqlRole, number> = { viewer: 1, editor: 2, manager: 3, owner: 4 }
+
+/** 与 SQLite authorize 一致：空间“查看者”不管拿到什么授权，最多只能阅读。 */
+export function capMysqlRole(role: MysqlRole | null, member: MysqlMember): MysqlRole | null {
+  if (!role) return null
+  return member.role === 'viewer' && ROLE_RANK[role] > ROLE_RANK.viewer ? 'viewer' : role
+}
+
 /**
- * 不看授权时，当前账号凭归属能拿到的权限（与 SQLite roleChain 同一顺序）：
+ * 不看单条策略、按空间角色决定的集合（与 SQLite authorize 的特例一致）：
+ * 成员表所有成员都能读；视图表里没有云端归属的（内置视图）按空间角色。返回 undefined 表示走一般规则。
+ */
+export function mysqlFixedRole(collection: string, member: MysqlMember, hasOwnership: boolean): MysqlRole | undefined {
+  if (collection === '/workspace-members') {
+    return member.role === 'owner' ? 'owner' : member.role === 'admin' ? 'manager' : 'viewer'
+  }
+  if (collection === '/views' && !hasOwnership) {
+    return member.role === 'owner' ? 'owner' : member.role === 'viewer' ? 'viewer' : 'manager'
+  }
+  return undefined
+}
+
+/**
+ * 不看授权时，当前账号凭归属能拿到的权限（与 SQLite effectiveRole / roleChain 同一顺序）：
  * 创建者 → 对成员开放时的成员默认权限 → 继承上一级。拿不到返回 null，再由授权决定。
- * 没有任何策略的记录（只有旧的 record_owners 或完全未知）按空间角色给默认权限。
+ * 没有策略的旧记录：只有 record_owners 记了创建者才按空间角色给权限（外部成员不给）；
+ * 当前空间里完全没有归属的记录一律拒绝——它可能属于别的空间（插件、技能等全局表）。
  */
 export function mysqlOwnershipRole(
   collection: string,
@@ -40,11 +63,6 @@ export function mysqlOwnershipRole(
   accountId: string,
   member: MysqlMember,
 ): MysqlRole | null {
-  const fallback = (): MysqlRole => {
-    if (member.memberKind !== 'member') return 'viewer'
-    if (member.role === 'owner' || member.role === 'admin') return 'manager'
-    return member.role === 'viewer' ? 'viewer' : 'editor'
-  }
   const seen = new Set<string>()
   const walk = (currentCollection: string, currentId: string): MysqlRole | null => {
     const key = `${currentCollection}\t${currentId}`
@@ -54,8 +72,10 @@ export function mysqlOwnershipRole(
     const policy = source?.policies[currentId]
     if (!policy) {
       const legacyOwner = source?.legacyOwners?.[currentId]
-      if (legacyOwner && legacyOwner === accountId) return 'owner'
-      return fallback()
+      if (!legacyOwner) return null
+      if (legacyOwner === accountId) return 'owner'
+      if (member.memberKind !== 'member') return null
+      return member.role === 'viewer' ? 'viewer' : 'editor'
     }
     if (policy.ownerAccountId && policy.ownerAccountId === accountId) return 'owner'
     if (policy.accessMode === 'members' && member.memberKind === 'member') return memberDefaultAccess(policy, member.role)
@@ -124,7 +144,8 @@ export function mysqlRecordVisible(
   memberKind = 'member',
 ): boolean {
   const policy = effectiveScopePolicy(collection, recordId, sources)
-  if (!policy) return true
+  // 没有策略的旧记录（只有 record_owners）沿用空间可见，但只对内部成员；外部协作者和访客要靠授权。
+  if (!policy) return memberKind === 'member'
   if (!policy.ownerAccountId || policy.ownerAccountId === accountId) return true
   // “对成员开放”只对内部成员开放；外部协作者和访客只能看到授权给他们的记录（由授权判断）。
   if (memberKind !== 'member') return false

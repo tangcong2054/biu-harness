@@ -16,6 +16,7 @@ test('trash loads session summaries once without events and retains authorizatio
     facets: { listDeleted: () => ['allowed', 'denied', 'missing'].map(record_id => ({ collection: '/sessions', record_id, deleted_at: 10 })) },
     collection: () => spec,
     builtinShared: () => false,
+    mysqlUserMode: () => null,
     authorization: () => ({
       currentActor: () => ({ accountId: 'account', workspaceId: 'workspace' }),
       authorize: (_actor: unknown, _action: unknown, resource: { recordId: string }) => ({ allowed: resource.recordId === 'allowed' }),

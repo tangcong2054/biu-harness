@@ -945,6 +945,29 @@ export class MysqlAccountRepository {
     return rows.map((row) => String(row.record_id))
   }
 
+  /** 一条记录在各空间的归属（策略的 owner，没有策略时取 record_owners）。插件、技能等全局表用它判断主人。 */
+  async recordOwnerships(collection: string, recordId: string) {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT o.workspace_id, COALESCE(NULLIF(p.owner_account_id, ''), o.owner_id) AS owner_id
+       FROM ${this.db}.record_owners o
+       LEFT JOIN ${this.db}.resource_policies p
+         ON p.workspace_id = o.workspace_id AND p.collection = o.collection AND p.record_id = o.record_id
+       WHERE o.collection = ? AND o.record_id = ?
+       UNION
+       SELECT p.workspace_id, p.owner_account_id AS owner_id
+       FROM ${this.db}.resource_policies p
+       WHERE p.collection = ? AND p.record_id = ?`,
+      [collection, recordId, collection, recordId],
+    )
+    const out = new Map<string, string>()
+    for (const row of rows) {
+      const workspaceId = String(row.workspace_id)
+      const ownerId = String(row.owner_id ?? '')
+      if (!out.get(workspaceId)) out.set(workspaceId, ownerId)
+    }
+    return [...out].map(([workspaceId, ownerId]) => ({ workspaceId, ownerId }))
+  }
+
   async tenantForRecord(collection: string, recordId: string) {
     const [rows] = await this.pool.query<RowDataPacket[]>(
       `SELECT workspace_id, owner_id FROM ${this.db}.record_owners
@@ -1141,6 +1164,16 @@ export class MysqlAccountRepository {
          ON DUPLICATE KEY UPDATE owner_id = owner_id`,
         [input.workspaceId, input.collection, input.recordId, input.actorId, input.now],
       )
+      // 记录已经有别的主人时（策略或 record_owners 早就存在），不能借“挂归属”把调用者升成主人。
+      const [owners] = await connection.query<RowDataPacket[]>(
+        `SELECT COALESCE(NULLIF(p.owner_account_id, ''), o.owner_id) AS owner_id
+         FROM ${this.db}.record_owners o
+         LEFT JOIN ${this.db}.resource_policies p
+           ON p.workspace_id = o.workspace_id AND p.collection = o.collection AND p.record_id = o.record_id
+         WHERE o.workspace_id = ? AND o.collection = ? AND o.record_id = ? FOR UPDATE`,
+        [input.workspaceId, input.collection, input.recordId],
+      )
+      const ownerId = String(owners[0]?.owner_id ?? '')
       await connection.query(
         `INSERT INTO ${this.db}.resource_policies
          (workspace_id, collection, record_id, ownership, owner_account_id, access_mode,
@@ -1148,18 +1181,20 @@ export class MysqlAccountRepository {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE record_id = record_id`,
         [
-          input.workspaceId, input.collection, input.recordId, input.ownership, input.actorId,
+          input.workspaceId, input.collection, input.recordId, input.ownership, ownerId || input.actorId,
           input.accessMode, input.memberDefaultRole ?? 'viewer', input.parentCollection ?? '',
           input.parentRecordId ?? '', input.actorId, input.now,
         ],
       )
-      await connection.query(
-        `INSERT INTO ${this.db}.record_grants
-         (workspace_id, collection, record_id, subject_type, subject_id, role, granted_by, created_at)
-         VALUES (?, ?, ?, 'account', ?, 'owner', ?, ?)
-         ON DUPLICATE KEY UPDATE role = 'owner', granted_by = VALUES(granted_by), created_at = VALUES(created_at)`,
-        [input.workspaceId, input.collection, input.recordId, input.actorId, input.actorId, input.now],
-      )
+      if (ownerId === input.actorId) {
+        await connection.query(
+          `INSERT INTO ${this.db}.record_grants
+           (workspace_id, collection, record_id, subject_type, subject_id, role, granted_by, created_at)
+           VALUES (?, ?, ?, 'account', ?, 'owner', ?, ?)
+           ON DUPLICATE KEY UPDATE role = 'owner', granted_by = VALUES(granted_by), created_at = VALUES(created_at)`,
+          [input.workspaceId, input.collection, input.recordId, input.actorId, input.actorId, input.now],
+        )
+      }
       await this.bumpRevision(connection, input.workspaceId, input.collection)
       await connection.commit()
     } catch (error) {

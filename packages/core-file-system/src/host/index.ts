@@ -20,7 +20,7 @@ import {
 } from '@biu/host-plugin-loader/data-dir'
 import { asPublicProfile, readWorkspaceProfile, writeWorkspaceProfile } from '@biu/host-workspace'
 import { authorizeCollection, roleCoversAction, type Action as PermissionAction, type AuthorizationService, type ResourceRole } from '@biu/host-account/authorization'
-import { effectiveScopePolicy, mysqlOwnershipRole, mysqlRecordVisible, resolveRecordScope, type DataScope, type ScopeSource } from './record-scope.ts'
+import { capMysqlRole, effectiveScopePolicy, mysqlFixedRole, mysqlOwnershipRole, mysqlRecordVisible, resolveRecordScope, type DataScope, type MysqlMember, type ScopeSource } from './record-scope.ts'
 import { isRegisteredBuiltinPlugin } from '@biu/host-account/store'
 import { forwardCloud, forwardCloudBytes } from '@biu/host-account/mirror'
 import { Service, type Context } from 'cordis'
@@ -807,6 +807,8 @@ export class DatabaseService extends Service implements Database {
    * 以前这一列用本地 SQLite 账号库计算，而线上那份是过期副本：成员不全、角色不对、没有视图授权。
    */
   private mysqlRoles = new Map<string, ResourceRole | null>()
+  /** 当前账号在当前空间的 MySQL 成员身份；随 visibleGen 失效（成员变化会递增授权版本）。 */
+  private mysqlMembers = new Map<string, MysqlMember>()
   /** 当前这一页装饰时，分组阶段已经算好的归属。 */
   private scopeHints: Map<string, DataScope> | null = null
   private boundAuth?: AuthorizationService
@@ -1102,11 +1104,13 @@ export class DatabaseService extends Service implements Database {
     rows: T[],
     action: PermissionAction = 'resource:read',
   ) {
-    const authorization = this.authorization()
-    const actor = authorization?.currentActor()
     if (collection === '/plugin-catalog' && (action === 'resource:read' || action === 'resource:list')) {
       return rows
     }
+    const mode = this.mysqlUserMode()
+    if (mode) return rows.filter((row) => this.mysqlKeeps(collection, row, action, mode))
+    const authorization = this.authorization()
+    const actor = authorization?.currentActor()
     const keep = <R extends T>(row: R, sqliteAllows: () => boolean) => {
       // 已按账号·空间安装的插件包跨空间复用：记录归属在别的空间也要可见，不能被 MySQL 归属否决。
       if (collection === '/plugins' && actor?.type === 'account' && 'pluginPath' in row &&
@@ -1176,6 +1180,56 @@ export class DatabaseService extends Service implements Database {
       if (!people || people.size === 0) return true
       return people.has(currentAccountId())
     }))
+  }
+
+  /** MySQL 用户请求：这些记录里当前账号能读到哪些（归属、记录授权、视图授权，与列表同一规则）。 */
+  async mysqlReadableIds(collection: string, rows: DbRecord[]) {
+    const out = new Set<string>()
+    const mode = this.mysqlUserMode()
+    if (!mode?.workspaceId || !rows.length) return out
+    await this.loadMysqlScopes(collection, rows)
+    for (const row of rows) if (this.mysqlKeeps(collection, row, 'resource:read', mode)) out.add(String(row.id))
+    return out
+  }
+
+  /** 当前账号在这张表上有没有任何记录授权或视图授权（没有时列表可以只按归属下推）。 */
+  async mysqlMayGrant(collection: string) {
+    const mode = this.mysqlUserMode()
+    const mysql = this.mysqlAccount()?.mysql
+    if (!mode?.workspaceId || !mysql?.collectionGrantSources) return false
+    const grants = await mysql.collectionGrantSources(mode.accountId, mode.workspaceId, collection)
+    return Object.keys(grants.records).length > 0 || grants.views.length > 0
+  }
+
+  /**
+   * MySQL 用户请求的列表过滤，规则与 mysqlAllowsRecord 一致，不读本地 SQLite。
+   * 依赖之前 loadMysqlScopes 装载的结果；没装载到（例如不是成员）一律不保留。
+   */
+  private mysqlKeeps(
+    collection: string,
+    row: { id?: unknown; pageId?: unknown; collection?: unknown; sessionId?: unknown; sourceId?: unknown; tablePath?: unknown; builtin?: unknown },
+    action: PermissionAction,
+    mode: { accountId: string; workspaceId: string },
+  ) {
+    const reading = action === 'resource:read' || action === 'resource:list'
+    if (collection === '/plugin-catalog' || collection === '/plugin-reviews' || isOperationsMetadata(collection)) return reading
+    if (this.builtinShared(collection, row)) return reading
+    if (collection === '/plugins' && reading && 'pluginPath' in row &&
+      this.installedPluginVisible(String(row.id ?? ''), mode.accountId, mode.workspaceId)) return true
+    const role = this.mysqlRoleOf(collection, row)
+    const visible = this.mysqlVisibility(collection, row)
+    if (reading) {
+      if (visible === true) return true
+      if (visible === false) {
+        const granted = this.mysqlGrantedRole(collection, row)
+        return Boolean(granted && roleCoversAction(granted, action))
+      }
+      // MySQL 里没有归属的记录：合集目录按贴过的源记录判断，其余按固定规则或旧创建者记录。
+      if (collection === '/facets' && !String(row.sourceId ?? '') && !String(row.tablePath ?? '')) {
+        return this.indexFacetVisible(String(row.id ?? ''), mode.accountId)
+      }
+    }
+    return Boolean(role && roleCoversAction(role, action))
   }
 
   /** 合集目录只留下当前用户能读到的源记录上贴过的合集；还没贴到公开数据上的，只留给创建人。 */
@@ -1416,7 +1470,10 @@ export class DatabaseService extends Service implements Database {
       return Promise.reject(new Error('permission denied: INSUFFICIENT_PERMISSION'))
     }
     if (spec.path === '/plugins' && (action === 'resource:read' || action === 'resource:list')) {
-      const actor = this.authorization()?.currentActor()
+      const mode = this.mysqlUserMode()
+      const actor = mode
+        ? { type: 'account' as const, accountId: mode.accountId, workspaceId: mode.workspaceId }
+        : this.authorization()?.currentActor()
       if (actor?.type === 'account' && record && 'pluginPath' in record &&
         this.installedPluginVisible(id, actor.accountId, actor.workspaceId)) return Promise.resolve()
     }
@@ -1432,6 +1489,7 @@ export class DatabaseService extends Service implements Database {
     record?: { id?: unknown },
   ) {
     if (await this.mysqlAllowsRecord(spec.path, id, record, action)) return
+    // MySQL 用户请求已在上面判定（不允许会抛错）；走到这里只剩本机模式和没有账号的系统调用。
     const authorization = this.authorization()
     const actor = authorization?.currentActor()
     if (authorization && actor) {
@@ -1460,7 +1518,11 @@ export class DatabaseService extends Service implements Database {
     }
   }
 
-  /** @returns true 表示 MySQL 已允许，调用方不要再用 SQLite 否决。没有云端归属时返回 false。 */
+  /**
+   * MySQL 控制面下有登录账号时，单条记录的权限只按 MySQL 判断：允许返回 true，不允许直接抛 unknown record。
+   * 返回 false 只表示这不是 MySQL 用户请求（本机模式或没有账号的系统调用），调用方走原逻辑。
+   * 读取看可见性（自己的、对成员开放的，或授权覆盖读取）；编辑、删除等按角色（归属、授权取最高，查看者封顶）。
+   */
   private async mysqlAllowsRecord(
     collection: string,
     id: string,
@@ -1471,9 +1533,12 @@ export class DatabaseService extends Service implements Database {
     const mysql = account?.usesMysqlAccounts?.() ? account.mysql : undefined
     const workspaceId = currentRequestWorkspaceId()
     const accountId = currentAccountId()
-    if (!mysql?.membership || !mysql.collectionScopeSources || !workspaceId || !accountId) return false
+    if (!mysql?.membership || !mysql.collectionScopeSources || !accountId) return false
+    const deny = (): never => { throw new Error(`unknown record: ${collection}/${id}`) }
+    if (!workspaceId) deny()
     const member = await mysql.membership(accountId, workspaceId)
-    if (!member) return false
+    if (!member) return deny()
+    this.mysqlMembers.set(this.mysqlMemberKey(workspaceId, accountId), member)
     const target = this.scopeTarget(collection, id, record)
     const sources = new Map<string, ScopeSource>()
     const load = async (name: string) => {
@@ -1482,41 +1547,47 @@ export class DatabaseService extends Service implements Database {
       sources.set(name, { policies: loaded.policies, owners: new Set(loaded.owners), legacyOwners: loaded.legacyOwners })
     }
     await load(target.collection)
+    // 沿继承链把上级所在的表都装进来，跨表继承（页面块 → 页面等）也能算对。
+    let cursor = sources.get(target.collection)?.policies[target.id]
+    for (let depth = 0; cursor?.accessMode === 'inherit' && cursor.parentRecordId && depth < 64; depth++) {
+      const parentCollection = cursor.parentCollection || target.collection
+      await load(parentCollection)
+      cursor = sources.get(parentCollection)?.policies[cursor.parentRecordId]
+    }
     const direct = sources.get(target.collection)?.policies[target.id]
-    if (direct?.accessMode === 'inherit' && direct.parentCollection) await load(direct.parentCollection)
     const known = Boolean(direct) || Boolean(sources.get(target.collection)?.owners.has(target.id))
     const visibleKey = this.mysqlVisibleKey(workspaceId, accountId, target.collection, target.id)
-    const base = mysqlOwnershipRole(target.collection, target.id, sources, accountId, member)
-    let labelRole: ResourceRole | null = base
-    if (base !== 'owner' && mysql.collectionGrantSources) {
+    const fixed = mysqlFixedRole(target.collection, member, known)
+    const base = fixed ?? mysqlOwnershipRole(target.collection, target.id, sources, accountId, member)
+    let granted: ResourceRole | null = null
+    if (fixed === undefined && base !== 'owner' && mysql.collectionGrantSources) {
       const grants = new Map<string, MysqlCollectionGrants>()
       const names = [...new Set([collection, ...sources.keys()])]
       const loaded = await Promise.all(names.map((name) => mysql.collectionGrantSources!(accountId, workspaceId, name)))
       names.forEach((name, index) => grants.set(name, loaded[index]!))
-      labelRole = higherAccess(base, this.computeMysqlGrantRole(collection, record ?? { id }, target, sources, grants)) as ResourceRole | null
+      granted = capMysqlRole(this.computeMysqlGrantRole(collection, record ?? { id }, target, sources, grants), member)
     }
-    this.mysqlRoles.set(visibleKey, labelRole)
-    if (!known) return false
-    const ownVisible = mysqlRecordVisible(target.collection, target.id, sources, accountId, member.memberKind)
-    this.mysqlVisible.set(visibleKey, ownVisible)
-    if (ownVisible) this.mysqlGrantRoles.delete(visibleKey)
-    if (!ownVisible) {
-      let role: ResourceRole | null = null
-      if (mysql.collectionGrantSources) {
-        const grants = new Map<string, MysqlCollectionGrants>()
-        const names = [...new Set([collection, ...sources.keys()])]
-        const loaded = await Promise.all(names.map((name) => mysql.collectionGrantSources!(accountId, workspaceId, name)))
-        names.forEach((name, index) => grants.set(name, loaded[index]!))
-        role = this.computeMysqlGrantRole(collection, record ?? { id }, target, sources, grants)
+    const role = capMysqlRole(higherAccess(base, granted) as ResourceRole | null, member)
+    this.mysqlRoles.set(visibleKey, role)
+    const reading = action === 'resource:read' || action === 'resource:list'
+    if (known) {
+      const ownVisible = mysqlRecordVisible(target.collection, target.id, sources, accountId, member.memberKind)
+      this.mysqlVisible.set(visibleKey, ownVisible)
+      if (ownVisible || !granted) this.mysqlGrantRoles.delete(visibleKey)
+      else {
+        this.mysqlGrantRoles.set(visibleKey, granted)
+        this.mysqlGrantAudience.set(visibleKey, member.memberKind === 'member' ? 'workspace' : 'shared')
       }
-      if (!role || !roleCoversAction(role, action)) throw new Error(`unknown record: ${collection}/${id}`)
-      this.mysqlGrantRoles.set(visibleKey, role)
-      this.mysqlGrantAudience.set(visibleKey, member.memberKind === 'member' ? 'workspace' : 'shared')
+      this.mysqlScopes.set(
+        this.mysqlScopeKey(workspaceId, target.collection, target.id),
+        resolveRecordScope(target.collection, target.id, sources),
+      )
+      if (reading) {
+        if (!ownVisible && !(granted && roleCoversAction(granted, action))) deny()
+        return true
+      }
     }
-    this.mysqlScopes.set(
-      this.mysqlScopeKey(workspaceId, target.collection, target.id),
-      resolveRecordScope(target.collection, target.id, sources),
-    )
+    if (!role || !roleCoversAction(role, action)) deny()
     return true
   }
 
@@ -1892,6 +1963,7 @@ export class DatabaseService extends Service implements Database {
         sources.set(name, { policies: loaded.policies, owners: new Set(loaded.owners), legacyOwners: loaded.legacyOwners })
       }
     }
+    if (workspaceId && accountId && member) this.mysqlMembers.set(this.mysqlMemberKey(workspaceId, accountId), member)
     const hidden: Array<{ row: DbRecord; target: { collection: string; id: string }; key: string }> = []
     const needGrants: Array<{ row: DbRecord; target: { collection: string; id: string }; key: string; base: ResourceRole | null }> = []
     for (const row of rows) {
@@ -1900,9 +1972,10 @@ export class DatabaseService extends Service implements Database {
       const known = Boolean(source?.policies[target.id] || source?.owners.has(target.id))
       if (workspaceId && member && accountId) {
         const roleKey = this.mysqlVisibleKey(workspaceId, accountId, target.collection, target.id)
-        const base = mysqlOwnershipRole(target.collection, target.id, sources, accountId, member)
-        this.mysqlRoles.set(roleKey, base)
-        if (base !== 'owner') needGrants.push({ row, target, key: roleKey, base })
+        const fixed = mysqlFixedRole(target.collection, member, known)
+        const base = fixed ?? mysqlOwnershipRole(target.collection, target.id, sources, accountId, member)
+        this.mysqlRoles.set(roleKey, capMysqlRole(base, member))
+        if (fixed === undefined && base !== 'owner') needGrants.push({ row, target, key: roleKey, base })
       }
       if (!known || !workspaceId || !member || !accountId) continue
       const key = this.mysqlScopeKey(workspaceId, target.collection, target.id)
@@ -1919,7 +1992,7 @@ export class DatabaseService extends Service implements Database {
       ;[...names].forEach((name, index) => grants.set(name, loaded[index]!))
       for (const item of needGrants) {
         const granted = this.computeMysqlGrantRole(collection, item.row, item.target, sources, grants)
-        this.mysqlRoles.set(item.key, higherAccess(item.base, granted) as ResourceRole | null)
+        this.mysqlRoles.set(item.key, capMysqlRole(higherAccess(item.base, granted) as ResourceRole | null, member!))
       }
       for (const item of hidden) {
         const role = this.computeMysqlGrantRole(collection, item.row, item.target, sources, grants)
@@ -1938,6 +2011,31 @@ export class DatabaseService extends Service implements Database {
 
   private mysqlVisibleKey(workspaceId: string, accountId: string, collection: string, id: string) {
     return `${this.visibleGen}\t${workspaceId}\t${accountId}\t${collection}\t${id}`
+  }
+
+  private mysqlMemberKey(workspaceId: string, accountId: string) {
+    return `${this.visibleGen}\t${workspaceId}\t${accountId}`
+  }
+
+  /**
+   * MySQL 控制面下、有登录账号的请求：权限只按 MySQL 判断，不再回退到本地 SQLite 副本
+   * （线上那份是过期副本，新账号在里面根本没有成员关系，旧的回退逻辑会直接放行）。
+   * 没有账号的系统调用（定时任务、启动流程）仍走原逻辑。
+   */
+  private mysqlUserMode() {
+    if (!this.mysqlAccount()?.usesMysqlAccounts?.()) return null
+    const accountId = currentAccountId()
+    if (!accountId) return null
+    return { accountId, workspaceId: currentRequestWorkspaceId() }
+  }
+
+  /** 列表或单条读取已算好的 MySQL 权限（归属、授权、固定规则取最高，查看者封顶）。undefined 表示没装载。 */
+  private mysqlRoleOf(collection: string, row: { id?: unknown }): ResourceRole | null | undefined {
+    const mode = this.mysqlUserMode()
+    if (!mode?.workspaceId) return undefined
+    const target = this.scopeTarget(collection, String(row.id ?? ''), row as { pageId?: unknown })
+    const key = this.mysqlVisibleKey(mode.workspaceId, mode.accountId, target.collection, target.id)
+    return this.mysqlRoles.has(key) ? this.mysqlRoles.get(key) ?? null : undefined
   }
 
   /** `undefined` 表示这条列表不是 MySQL 拆分；`null` 表示已拆分但没有归属。 */
@@ -2090,6 +2188,7 @@ export class DatabaseService extends Service implements Database {
     this.mysqlGrantRoles.clear()
     this.mysqlGrantAudience.clear()
     this.mysqlRoles.clear()
+    this.mysqlMembers.clear()
     clearRequestMemo(ACTOR_MEMO)
   }
 
@@ -2566,6 +2665,23 @@ export class DatabaseService extends Service implements Database {
     return this.ownerCache.map.get(id) ?? ''
   }
 
+  /**
+   * 插件记录在当前空间有没有主人、是否已属于别的空间。
+   * MySQL 控制面读 MySQL；本地副本里查不到主人时旧逻辑会把操作者挂成主人，同空间成员就能拿到别人插件的主人权限。
+   */
+  private async pluginOwnership(recordId: string) {
+    const mode = this.mysqlUserMode()
+    const mysql = this.mysqlAccount()?.mysql as { recordOwnerships?: (c: string, r: string) => Promise<Array<{ workspaceId: string; ownerId: string }>> } | undefined
+    if (mode && mysql?.recordOwnerships) {
+      const owners = await mysql.recordOwnerships('/plugins', recordId)
+      return {
+        here: owners.find((item) => item.workspaceId === mode.workspaceId)?.ownerId ?? '',
+        elsewhere: owners.some((item) => item.workspaceId !== mode.workspaceId),
+      }
+    }
+    return { here: this.recordOwner('/plugins', recordId), elsewhere: this.pluginOwnedByAnotherWorkspace(recordId) }
+  }
+
   /** 插件记录已经属于别的空间时，当前空间安装或重新打包不能把它改挂过来。 */
   private pluginOwnedByAnotherWorkspace(recordId: string) {
     const store = this.collabStore() as {
@@ -2923,17 +3039,33 @@ export class DatabaseService extends Service implements Database {
     const spec = this.collection(`/${parts[0]}`)
     if (!spec) throw new Error(`unknown collection: /${parts[0]}`)
     if (!spec.records?.create || !spec.create) throw new Error(`collection cannot create: ${spec.path}`)
-    const authorization = this.authorization()
-    const actor = authorization?.currentActor()
-    if (authorization && actor) {
-      authorization.requireCurrent('resource:create', {
-        type: 'collection',
-        workspaceId: actor.workspaceId,
-        collection: spec.path,
-      })
+    const mysqlCreate = this.mysqlUserMode() ? await this.mysqlCollectionDecision(spec.path, 'resource:create') : null
+    if (mysqlCreate) {
+      // MySQL 控制面按 MySQL 成员身份判断能不能在这张表新建；查看者、外部协作者、访客不能新建。
+      if (!mysqlCreate.allowed) throw new Error(`permission denied: ${mysqlCreate.reason}`)
+    } else {
+      const authorization = this.authorization()
+      const actor = authorization?.currentActor()
+      if (authorization && actor) {
+        authorization.requireCurrent('resource:create', {
+          type: 'collection',
+          workspaceId: actor.workspaceId,
+          collection: spec.path,
+        })
+      }
     }
     const schema = schemaFor(spec)
     const rows = parseRecords(content)
+    const parentKey = spec.schema.parentField
+    if (mysqlCreate && parentKey) {
+      // 挂到别人的记录下面等于往别人的树里写：要求对上级有“编辑”权限。
+      const parents = new Set(rows.map((row) => String((row as Record<string, unknown>)[parentKey] ?? '').trim()).filter(Boolean))
+      for (const parentId of parents) {
+        const parent = await spec.get(parentId)
+        if (!parent) throw new Error(`unknown record: ${spec.path}/${parentId}`)
+        await this.assertLiveRecord(spec, parent.id, 'resource:create-child', parent)
+      }
+    }
     const records: Record<string, unknown>[] = []
     const banners: Array<PageBanner | null | undefined> = []
     for (const row of rows) {
@@ -3107,10 +3239,29 @@ export class DatabaseService extends Service implements Database {
     return this.finishMetadata({ kind: 'restored' as const, path: spec.path, ids })
   }
 
+  /** 回收站的 MySQL 过滤：插件回收站给全体成员，其余要能读到这条记录。 */
+  private async mysqlTrashAllowed(mode: { accountId: string; workspaceId: string }) {
+    const account = this.mysqlAccount()
+    const member = mode.workspaceId && account?.mysql
+      ? await account.mysql.membership(mode.accountId, mode.workspaceId)
+      : null
+    return async (spec: CollectionSpec, record: DbRecord) => {
+      if (!member) return false
+      if (spec.path === '/plugins') return true
+      try {
+        return await this.mysqlAllowsRecord(spec.path, record.id, record, 'resource:read')
+      } catch {
+        return false
+      }
+    }
+  }
+
   async listTrash() {
     await this.prepareMetadata()
     const items = []
     let sessionSummaries: Map<string, DbRecord> | undefined
+    const mode = this.mysqlUserMode()
+    const mysqlAllowed = mode ? await this.mysqlTrashAllowed(mode) : null
     for (const row of this.facets.listDeleted()) {
       const spec = this.collection(row.collection)
       if (!spec) continue
@@ -3124,7 +3275,10 @@ export class DatabaseService extends Service implements Database {
       if (this.builtinShared(row.collection, record as { id?: unknown; builtin?: unknown })) continue
       const authorization = this.authorization()
       const actor = authorization?.currentActor()
-      if (authorization && actor) {
+      if (mysqlAllowed) {
+        // MySQL 用户请求：按 MySQL 权限过滤，不能回退到本地副本（新账号在副本里没有成员关系，会看到全部回收站）。
+        if (!(await mysqlAllowed(spec, record))) continue
+      } else if (authorization && actor) {
         const pluginTrash = row.collection === '/plugins'
           && Boolean(this.collabStore()?.isMember?.(actor.accountId, actor.workspaceId))
         if (!pluginTrash && !authorization.authorize(actor, 'resource:read', {
@@ -3171,9 +3325,9 @@ export class DatabaseService extends Service implements Database {
     } else if (pluginAuthor) {
       await this.requirePath(spec.path, 'resource:read')
       if (loaded) {
-        const owner = this.recordOwner(spec.path, record.id)
-        if (!owner) {
-          if (!this.pluginOwnedByAnotherWorkspace(record.id)) {
+        const ownership = await this.pluginOwnership(record.id)
+        if (!ownership.here) {
+          if (!ownership.elsewhere) {
             await this.attachWorkspaceRecord(spec.path, record.id, { ownership: 'personal', accessMode: 'private' })
           }
         } else await this.assertLiveRecord(spec, record.id, 'resource:read', record)
@@ -3185,10 +3339,11 @@ export class DatabaseService extends Service implements Database {
     }
     if (!matchActionWhen(record, action.when)) throw new Error(`action not available: ${actionId}`)
     const result = await action.run(parts[1]!, record, args)
-    if (spec.path === '/plugins' && actionId === 'sandbox' && !this.recordOwner(spec.path, parts[1]!) && !this.pluginOwnedByAnotherWorkspace(parts[1]!)) {
+    const after = spec.path === '/plugins' ? await this.pluginOwnership(parts[1]!) : null
+    if (after && actionId === 'sandbox' && !after.here && !after.elsewhere) {
       await this.attachWorkspaceRecord(spec.path, parts[1]!, { ownership: 'personal', accessMode: 'private' })
     }
-    if (pluginAuthor && !this.pluginOwnedByAnotherWorkspace(parts[1]!)) {
+    if (pluginAuthor && !after?.elsewhere) {
       await this.stampActor(spec.path, parts[1]!)
     }
     const next = (await spec.get(parts[1]!)) ?? record
@@ -3873,6 +4028,12 @@ export function apply(ctx: Context) {
       (id: string, record?: { id?: unknown }) => db.allowsViaView('/sessions', { ...record, id }),
       { mayAllow: () => db.mayAllowViaView('/sessions') },
     )
+    if (account?.usesMysqlAccounts?.()) {
+      inner.sessions.mysqlGrants = {
+        readable: (items) => db.mysqlReadableIds('/sessions', items as DbRecord[]),
+        mayGrant: () => db.mysqlMayGrant('/sessions'),
+      }
+    }
   })
   account?.authorization?.setMemberViewMatcher((workspaceId, viewId, accountId) => {
     const view = savedViews.viewsFor('/workspace-members').find((item) => item.id === viewId)
