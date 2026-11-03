@@ -1010,7 +1010,44 @@ export class PluginStoreService extends Service {
     return readFile(path, 'utf8')
   }
 
+  /**
+   * 线上 MySQL 正文仓储（db_content /plugins/<id> 读写的就是它）。有它时插件介绍不再读写本地 biu.sqlite：
+   * 以前读介绍走 SQLite 副本，db_content 走 MySQL，两边会不一致；每次读介绍还要打开 SQLite 并跑迁移。
+   */
+  private cloudReadme() {
+    try {
+      const cloud = this.ctx.get('cloudStorage') as {
+        editorContentMode?: string
+        ensureProductMigrations?: () => Promise<void>
+        editorContentRepository?: {
+          read(collection: string, recordId: string): Promise<{ body: string; version: number }>
+          write(collection: string, recordId: string, body: string): Promise<unknown>
+        } | null
+      } | undefined
+      return cloud?.editorContentMode === 'mysql' && cloud.editorContentRepository ? cloud : null
+    } catch {
+      return null
+    }
+  }
+
   async readReadme(id: string) {
+    const cloud = this.cloudReadme()
+    if (cloud) {
+      try {
+        await cloud.ensureProductMigrations?.()
+        const current = await cloud.editorContentRepository!.read('/plugins', id)
+        if (current.body) return current.body
+        const text = await this.readDiskReadme(id)
+        // 没写过介绍时用磁盘 README，并补进当前空间的 MySQL 正文，db_content 读到的就是同一份。
+        if (text && current.version === 0) {
+          await cloud.editorContentRepository!.write('/plugins', id, text).catch((error) => this.warnReadme(error))
+        }
+        return text
+      } catch (error) {
+        this.warnReadme(error)
+        return this.readDiskReadme(id)
+      }
+    }
     const sqlitePath = this.contentSqlitePath()
     if (existsSync(sqlitePath)) {
       try {
@@ -1039,13 +1076,21 @@ export class PluginStoreService extends Service {
   async writeReadme(id: string, markdown: string) {
     if (isOnlineRuntime()) await this.requireWorkspaceMember()
     const text = String(markdown ?? '')
-    const sqlitePath = this.contentSqlitePath()
-    mkdirSync(dirname(sqlitePath), { recursive: true })
-    const db = openAndMigrateBiu(sqlitePath)
-    try {
-      writeEditorContent(db, '/plugins', id, text)
-    } finally {
-      db.close()
+    const cloud = this.cloudReadme()
+    if (cloud) {
+      await cloud.ensureProductMigrations?.()
+      // db_content 已经先写过 MySQL；内容相同就不再写，免得正文版本被多加一次。
+      const current = await cloud.editorContentRepository!.read('/plugins', id)
+      if (current.body !== text) await cloud.editorContentRepository!.write('/plugins', id, text)
+    } else {
+      const sqlitePath = this.contentSqlitePath()
+      mkdirSync(dirname(sqlitePath), { recursive: true })
+      const db = openAndMigrateBiu(sqlitePath)
+      try {
+        writeEditorContent(db, '/plugins', id, text)
+      } finally {
+        db.close()
+      }
     }
     for (const dir of [this.sandboxPath(id), this.pluginPath(id)]) {
       if (!existsSync(join(dir, 'manifest.json'))) continue

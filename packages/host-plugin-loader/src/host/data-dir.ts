@@ -109,9 +109,16 @@ export function migrateLegacyPageDir(fromRoot: string, toRoot = fromRoot) {
   rmSync(src, { recursive: true, force: true })
 }
 
-/** Rename leftover `.cordis` to `.biu`. If both exist, move unique files then drop the old dir. */
+const migratedDataDirs = new Set<string>()
+
+/**
+ * Rename leftover `.cordis` to `.biu`. If both exist, move unique files then drop the old dir.
+ * 每个目录每个进程只迁移一次：dataPath()/dataDir() 在请求里被频繁调用（技能、聊天配置等），
+ * 以前每次都会打开 biu.sqlite、跑一遍迁移并截断 WAL。目录被删掉后再调用会重新迁移。
+ */
 export function migrateDataDir(parent: string): string {
   const dest = join(parent, DATA_DIR_NAME)
+  if (migratedDataDirs.has(dest) && existsSync(dest)) return dest
   const src = join(parent, LEGACY_DATA_DIR_NAME)
   if (existsSync(src)) {
     if (!existsSync(dest)) {
@@ -134,6 +141,7 @@ export function migrateDataDir(parent: string): string {
   } finally {
     db?.close()
   }
+  migratedDataDirs.add(dest)
   return dest
 }
 

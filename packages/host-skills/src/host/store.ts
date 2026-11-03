@@ -250,7 +250,16 @@ export function packSkillImport(files: SkillImportFile[]) {
 }
 
 export class SkillsStore {
-  constructor(private root = skillRoot()) {}
+  /**
+   * localContent=false（线上 MySQL）时正文只认 SKILL.md：不再打开本地 biu.sqlite 读写 editor_content 副本。
+   * 线上写正文时 db_content 已写 MySQL，并经 put() 写回 SKILL.md，两者一致。
+   */
+  constructor(private root = skillRoot(), private localContent: () => boolean = () => true) {}
+
+  private openLocal(checkpointOnOpen?: boolean) {
+    if (!this.localContent()) return null
+    return openAndMigrateBiu(biuSqlitePath(), checkpointOnOpen === undefined ? undefined : { checkpointOnOpen })
+  }
 
   private ensureRoot() {
     mkdirSync(this.root, { recursive: true })
@@ -308,7 +317,7 @@ export class SkillsStore {
     // 列表只打开一次 SQLite，所有正文共用同一个连接。
     let db: ReturnType<typeof openAndMigrateBiu> | null = null
     try {
-      db = openAndMigrateBiu(biuSqlitePath(), { checkpointOnOpen: false })
+      db = this.openLocal(false)
     } catch {
       /* sqlite unavailable；仍可从 markdown 读取元数据和正文 */
     }
@@ -340,7 +349,7 @@ export class SkillsStore {
   get(id: string) {
     let db: ReturnType<typeof openAndMigrateBiu> | null = null
     try {
-      db = openAndMigrateBiu(biuSqlitePath(), { checkpointOnOpen: false })
+      db = this.openLocal(false)
       return this.load(id, db)
     } catch {
       return this.load(id)
@@ -364,9 +373,11 @@ export class SkillsStore {
     }
     writeFileSync(skillFile(this.ensureRoot(), next.id), dumpSkill(next))
     try {
-      const db = openAndMigrateBiu(biuSqlitePath())
-      writeEditorContent(db, '/skills', next.id, next.notes)
-      db.close()
+      const db = this.openLocal()
+      if (db) {
+        writeEditorContent(db, '/skills', next.id, next.notes)
+        db.close()
+      }
     } catch {
       /* sqlite unavailable */
     }

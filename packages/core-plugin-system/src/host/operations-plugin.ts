@@ -1186,14 +1186,14 @@ function operatorChat(ctx: Context): OperatorLlmChat | null {
   }
 }
 
-export function readOperatorLlm(ctx: Context, chat: OperatorLlmChat) {
-  if (!checkOperator(ctx)) return { status: 403 as const, body: { error: '没有平台运营权限' } }
+export async function readOperatorLlm(ctx: Context, chat: OperatorLlmChat) {
+  if (!(await checkOperator(ctx))) return { status: 403 as const, body: { error: '没有平台运营权限' } }
   chat.activateAccount()
   return { status: 200 as const, body: chat.operatorPublicView() }
 }
 
-export function writeOperatorLlm(ctx: Context, chat: OperatorLlmChat, payload: Record<string, unknown> | null) {
-  if (!checkOperator(ctx)) return { status: 403 as const, body: { error: '没有平台运营权限' } }
+export async function writeOperatorLlm(ctx: Context, chat: OperatorLlmChat, payload: Record<string, unknown> | null) {
+  if (!(await checkOperator(ctx))) return { status: 403 as const, body: { error: '没有平台运营权限' } }
   chat.activateAccount()
   const body = payload && typeof payload === 'object' ? payload : {}
   const updates = adminKeyUpdates(body.setApiKey)
@@ -1225,7 +1225,7 @@ export async function testOperatorLlm(
   chat: OperatorLlmChat,
   payload: { endpointId?: string; apiKey?: string; baseUrl?: string; model?: string },
 ) {
-  if (!checkOperator(ctx)) return { status: 403 as const, body: { ok: false, error: '没有平台运营权限' } }
+  if (!(await checkOperator(ctx))) return { status: 403 as const, body: { ok: false, error: '没有平台运营权限' } }
   chat.activateAccount()
   const draft = typeof payload.apiKey === 'string' ? payload.apiKey : ''
   try {
@@ -1276,13 +1276,13 @@ export async function testOperatorLlm(
 }
 
 export function registerOperatorLlmRoutes(ctx: Context) {
-  ctx.http.route('GET', '/api/operations/v1/llm', (route) => {
+  ctx.http.route('GET', '/api/operations/v1/llm', async (route) => {
     const chat = operatorChat(ctx)
     if (!chat) {
       route.send(503, { error: '模型服务还没就绪' })
       return
     }
-    const result = readOperatorLlm(ctx, chat)
+    const result = await readOperatorLlm(ctx, chat)
     route.send(result.status, result.body)
   })
   ctx.http.route('POST', '/api/operations/v1/llm', async (route) => {
@@ -1293,7 +1293,7 @@ export function registerOperatorLlmRoutes(ctx: Context) {
     }
     try {
       const payload = (await route.json().catch(() => null)) as Record<string, unknown> | null
-      const result = writeOperatorLlm(ctx, chat, payload)
+      const result = await writeOperatorLlm(ctx, chat, payload)
       route.send(result.status, result.body)
     } catch {
       route.send(400, { error: '保存模型配置失败' })
@@ -1396,6 +1396,12 @@ export function bindPlatformOperationsAccount(ctx: Context) {
     recordPluginPackage?: (accountId: string, input: Record<string, unknown>) => Promise<unknown>
     installPluginForAccount?: (accountId: string, workspaceId: string, pluginId: string, version?: string) => Promise<unknown>
     setPluginLoad?: (accountId: string, workspaceId: string, pluginId: string, loaded: boolean) => Promise<unknown>
+    mysql?: {
+      attachPolicy?: (input: {
+        actorId: string; workspaceId: string; collection: string; recordId: string
+        ownership: 'workspace'; accessMode: 'members'; now: number
+      }) => Promise<unknown>
+    } | null
     authorization?: {
       attach?: (
         actor: { type: 'account'; accountId: string; workspaceId: string },
@@ -1406,22 +1412,8 @@ export function bindPlatformOperationsAccount(ctx: Context) {
   } | undefined
   try {
     const dir = join(defaultPluginDir(), PLATFORM_OPERATIONS_PLUGIN_ID)
-    account?.store?.syncInstalledPluginPackage?.({
-      id: PLATFORM_OPERATIONS_PLUGIN_ID,
-      version: 'ops-v1',
-      packageHash: 'ops-v1',
-      packagePath: dir,
-      sourceKind: 'legacy-installed',
-      trustState: 'approved',
-      tenantMode: 'assigned',
-      hasWeb: true,
-      hasHost: true,
-      manifest: MANIFEST,
-    })
-    account?.store?.installPluginForAccount?.('acc_operations_admin', 'ws_operations', PLATFORM_OPERATIONS_PLUGIN_ID, 'ops-v1')
-    account?.store?.setPluginLoad?.('acc_operations_admin', 'ws_operations', PLATFORM_OPERATIONS_PLUGIN_ID, true)
     if (account?.usesMysqlAccounts?.()) {
-      // MySQL 控制面只认账号级授权；SQLite 镜像写入不会影响 Online 鉴权。
+      // 线上只写 MySQL：以前这里先往本地 SQLite 副本写一份插件包、安装、加载和归属，线上没人读。
       const mysqlAccount = account
       void (async () => {
         await mysqlAccount.recordPluginPackage?.('acc_operations_admin', {
@@ -1438,10 +1430,34 @@ export function bindPlatformOperationsAccount(ctx: Context) {
         })
         await mysqlAccount.installPluginForAccount?.('acc_operations_admin', 'ws_operations', PLATFORM_OPERATIONS_PLUGIN_ID, 'ops-v1')
         await mysqlAccount.setPluginLoad?.('acc_operations_admin', 'ws_operations', PLATFORM_OPERATIONS_PLUGIN_ID, true)
+        await mysqlAccount.mysql?.attachPolicy?.({
+          actorId: 'acc_operations_admin',
+          workspaceId: 'ws_operations',
+          collection: '/plugins',
+          recordId: PLATFORM_OPERATIONS_PLUGIN_ID,
+          ownership: 'workspace',
+          accessMode: 'members',
+          now: Date.now(),
+        })
       })().catch((error) => {
         ctx.logger('core-plugin-system').warn('platform-operations MySQL assignment skipped: %s', String(error))
       })
+      return
     }
+    account?.store?.syncInstalledPluginPackage?.({
+      id: PLATFORM_OPERATIONS_PLUGIN_ID,
+      version: 'ops-v1',
+      packageHash: 'ops-v1',
+      packagePath: dir,
+      sourceKind: 'legacy-installed',
+      trustState: 'approved',
+      tenantMode: 'assigned',
+      hasWeb: true,
+      hasHost: true,
+      manifest: MANIFEST,
+    })
+    account?.store?.installPluginForAccount?.('acc_operations_admin', 'ws_operations', PLATFORM_OPERATIONS_PLUGIN_ID, 'ops-v1')
+    account?.store?.setPluginLoad?.('acc_operations_admin', 'ws_operations', PLATFORM_OPERATIONS_PLUGIN_ID, true)
     account?.authorization?.attach?.(
       { type: 'account', accountId: 'acc_operations_admin', workspaceId: 'ws_operations' },
       { type: 'record', workspaceId: 'ws_operations', collection: '/plugins', recordId: PLATFORM_OPERATIONS_PLUGIN_ID },

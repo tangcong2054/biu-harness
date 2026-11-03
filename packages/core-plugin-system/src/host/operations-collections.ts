@@ -26,9 +26,9 @@ function schema(label: string, columns: string[], fields: Record<string, { type:
   }
 }
 
-function collection(store: OperationsRepository, spec: (typeof KINDS)[number], canAccess?: () => boolean): CollectionSpec {
+function collection(store: OperationsRepository, spec: (typeof KINDS)[number], canAccess?: () => boolean | Promise<boolean>): CollectionSpec {
   const list = async (query?: { q?: string }) => {
-    if (canAccess && !canAccess()) return []
+    if (canAccess && !(await canAccess())) return []
     await syncOperationsFromPlatform(store)
     return await store.list(spec.kind, query?.q) as DbRecord[]
   }
@@ -49,7 +49,7 @@ function collection(store: OperationsRepository, spec: (typeof KINDS)[number], c
               description: '暂停平台用户。只改变运营状态，不读取用户正文。',
               parameters: { type: 'object', properties: {} },
               run: async (id: string) => {
-                if (canAccess && !canAccess()) throw new Error('没有平台运营权限')
+                if (canAccess && !(await canAccess())) throw new Error('没有平台运营权限')
                 return store.setAccountStatus(id, 'suspended', currentAccountId() || 'operator')
               },
             },
@@ -59,7 +59,7 @@ function collection(store: OperationsRepository, spec: (typeof KINDS)[number], c
               description: '恢复已暂停的平台用户。',
               parameters: { type: 'object', properties: {} },
               run: async (id: string) => {
-                if (canAccess && !canAccess()) throw new Error('没有平台运营权限')
+                if (canAccess && !(await canAccess())) throw new Error('没有平台运营权限')
                 return store.setAccountStatus(id, 'active', currentAccountId() || 'operator')
               },
             },
@@ -69,7 +69,7 @@ function collection(store: OperationsRepository, spec: (typeof KINDS)[number], c
   }
 }
 
-export function operationsCollections(store: OperationsRepository, canAccess?: () => boolean): CollectionSpec[] {
+export function operationsCollections(store: OperationsRepository, canAccess?: () => boolean | Promise<boolean>): CollectionSpec[] {
   return [
     ...KINDS.map((spec) => collection(store, spec, canAccess)),
     {
@@ -83,12 +83,12 @@ export function operationsCollections(store: OperationsRepository, canAccess?: (
         summary: { type: 'string', label: '说明' },
       }),
       list: async (query?: { q?: string }) => {
-        if (canAccess && !canAccess()) return []
+        if (canAccess && !(await canAccess())) return []
         await syncOperationsFromPlatform(store)
         return await store.audits(query?.q)
       },
       get: async (id) => {
-        if (canAccess && !canAccess()) return null
+        if (canAccess && !(await canAccess())) return null
         await syncOperationsFromPlatform(store)
         return (await store.audits()).find((row) => row.id === id) ?? null
       },
@@ -96,15 +96,22 @@ export function operationsCollections(store: OperationsRepository, canAccess?: (
   ]
 }
 
-function checkOperator(ctx: Context) {
-  const account = ctx.get('account') as { store?: { isOperationsOperator?(id: string, workspaceId?: string): boolean } } | undefined
-  return account?.store?.isOperationsOperator?.(currentAccountId(), currentRequestWorkspaceId() || undefined) === true
+/** 平台运营权限。线上按 MySQL 成员关系判断，不读本地 SQLite 副本。 */
+export async function checkOperator(ctx: Context) {
+  const account = ctx.get('account') as {
+    isOperationsOperatorAsync?(id: string, workspaceId?: string): Promise<boolean>
+    store?: { isOperationsOperator?(id: string, workspaceId?: string): boolean }
+  } | undefined
+  const accountId = currentAccountId()
+  const workspaceId = currentRequestWorkspaceId() || undefined
+  if (account?.isOperationsOperatorAsync) return (await account.isOperationsOperatorAsync(accountId, workspaceId)) === true
+  return account?.store?.isOperationsOperator?.(accountId, workspaceId) === true
 }
 
 export function registerOperationsIngest(ctx: Context, store: OperationsRepository) {
   ctx.http.route('POST', '/api/operations/v1/events', async (route) => {
     try {
-      if (!checkOperator(ctx)) {
+      if (!(await checkOperator(ctx))) {
         route.send(403, { error: '没有平台运营权限' })
         return
       }
@@ -120,7 +127,7 @@ export function registerOperationsIngest(ctx: Context, store: OperationsReposito
     }
   })
   ctx.http.route('GET', '/api/operations/v1/summary', async (route) => {
-    if (!checkOperator(ctx)) {
+    if (!(await checkOperator(ctx))) {
       route.send(403, { error: '没有平台运营权限' })
       return
     }
@@ -132,7 +139,7 @@ export function registerOperationsIngest(ctx: Context, store: OperationsReposito
     })
   })
   ctx.http.route('POST', '/api/operations/v1/sync', async (route) => {
-    if (!checkOperator(ctx)) {
+    if (!(await checkOperator(ctx))) {
       route.send(403, { error: '没有平台运营权限' })
       return
     }
@@ -685,7 +692,6 @@ export async function syncOperationsFromPlatform(store: OperationsRepository, ro
   }
 }
 
-export { checkOperator }
 
 export async function seedOperationsIdentity(ctx: Context, store: OperationsRepository) {
   if (await syncOperationsFromPlatform(store, process.cwd(), true)) {
@@ -694,10 +700,14 @@ export async function seedOperationsIdentity(ctx: Context, store: OperationsRepo
     }
     return
   }
+  type Identity = { id: string; email: string; name: string; workspaceId: string; workspaceName: string }
   const account = ctx.get('account') as {
-    store?: { operationsIdentity?: () => { id: string; email: string; name: string; workspaceId: string; workspaceName: string } | null }
+    operationsIdentityAsync?: () => Promise<Identity | null>
+    store?: { operationsIdentity?: () => Identity | null }
   } | undefined
-  const identity = account?.store?.operationsIdentity?.()
+  const identity = account?.operationsIdentityAsync
+    ? await account.operationsIdentityAsync()
+    : account?.store?.operationsIdentity?.()
   const now = Date.now()
   const accountId = identity?.id || OPERATIONS_ADMIN_ACCOUNT_ID
   const workspaceId = identity?.workspaceId || OPERATIONS_WORKSPACE_ID

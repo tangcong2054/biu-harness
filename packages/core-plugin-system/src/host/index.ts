@@ -1,6 +1,6 @@
 import { dirname } from 'node:path'
 import type { Context } from 'cordis'
-import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime, isOperationsRuntime } from '@biu/host-plugin-loader/data-dir'
+import { isOnlineRuntime, isOperationsRuntime } from '@biu/host-plugin-loader/data-dir'
 import { pluginCatalogCollection, pluginReviewsCollection } from './catalog.ts'
 import { pluginsCollection } from './collection.ts'
 import { loadRegistryConfig } from './registry-config.ts'
@@ -8,6 +8,7 @@ import { httpRegistryTransport, localRegistryTransport, PluginRegistryClient, re
 import { registerRegistryRoutes } from './registry-http.ts'
 import { loadRegistryAdminToken, PluginRegistryStore } from './registry.ts'
 import { bindPlatformOperationsAccount, ensurePlatformOperationsPlugin } from './operations-plugin.ts'
+import { checkOperator } from './operations-collections.ts'
 import { registerPluginsPrompt } from './prompt.ts'
 import { openStore } from './store.ts'
 
@@ -44,12 +45,9 @@ export async function apply(ctx: Context) {
     config.id,
     registryTokenPath(dirname(store.sandboxDir)),
     operations ? loadRegistryAdminToken(config.dataDir) : '',
-    () => {
+    async () => {
       if (!operations) return false
-      const account = ctx.get('account') as {
-        store?: { isOperationsOperator?(accountId: string, workspaceId: string): boolean }
-      } | undefined
-      return account?.store?.isOperationsOperator?.(currentAccountId(), currentRequestWorkspaceId()) === true
+      return checkOperator(ctx)
     },
   )
   store.attachRegistry(client)

@@ -319,3 +319,27 @@ test('sync request memo shares a value within one request only', async () => {
   assert.equal(requestMemoSync('svc', () => ++calls), 3)
   assert.equal(runWithRequestMemo(() => requestMemoSync('svc', () => ++calls)), 4)
 })
+
+test('migrateDataDir migrates each directory once per process and again after it is removed', async () => {
+  const { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { migrateDataDir } = await import('./data-dir.ts')
+  const root = mkdtempSync(join(tmpdir(), 'biu-migrate-once-'))
+  try {
+    const dest = migrateDataDir(root)
+    assert.ok(existsSync(join(dest, 'biu.sqlite')))
+    // 已迁移过：后来出现的旧目录不会再被搬（证明没有重跑迁移）。
+    mkdirSync(join(root, '.cordis'))
+    writeFileSync(join(root, '.cordis', 'late.txt'), 'x')
+    assert.equal(migrateDataDir(root), dest)
+    assert.ok(existsSync(join(root, '.cordis', 'late.txt')))
+    // 目录被删后重新迁移。
+    rmSync(dest, { recursive: true, force: true })
+    assert.equal(migrateDataDir(root), dest)
+    assert.ok(existsSync(join(dest, 'late.txt')))
+    assert.ok(existsSync(join(dest, 'biu.sqlite')))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})

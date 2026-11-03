@@ -180,7 +180,7 @@ export class PluginRegistryClient {
     readonly registryId: string,
     private readonly defaultTokenPath: string,
     private readonly adminToken = '',
-    private readonly operatorAccess?: () => boolean,
+    private readonly operatorAccess?: () => boolean | Promise<boolean>,
   ) {}
 
   private tokens() {
@@ -209,8 +209,8 @@ export class PluginRegistryClient {
     return this.tokens().some(token => ownerIdForToken(token) === ownerId)
   }
 
-  isOperator() {
-    if (this.operatorAccess) return this.operatorAccess()
+  async isOperator() {
+    if (this.operatorAccess) return await this.operatorAccess()
     const accountId = currentAccountId()
     let fileOperators: string[] = []
     try {
@@ -391,14 +391,14 @@ export class PluginRegistryClient {
   }
 
   async reviews(status = '') {
-    if (!this.isOperator()) return []
+    if (!(await this.isOperator())) return []
     const token = this.adminToken || String(process.env.BIU_PLUGIN_REGISTRY_ADMIN_TOKEN ?? '').trim()
     if (!token) throw new Error('registry operator token is not configured')
     return this.transport.reviews(status, token)
   }
 
   async review(id: string, version: string, status: OperatorReviewStatus, reason = '') {
-    if (!this.isOperator()) throw new Error('registry operator permission required')
+    if (!(await this.isOperator())) throw new Error('registry operator permission required')
     const token = this.adminToken || String(process.env.BIU_PLUGIN_REGISTRY_ADMIN_TOKEN ?? '').trim()
     if (!token) throw new Error('registry operator token is not configured')
     return this.transport.review(id, version, status, reason, token)

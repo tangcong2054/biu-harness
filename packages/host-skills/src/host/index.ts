@@ -24,7 +24,7 @@ type SkillAccount = {
       recordId: string
       now: number
     }): Promise<void>
-    membership(accountId: string, workspaceId: string): Promise<{ role: string } | null>
+    membership(accountId: string, workspaceId: string): Promise<{ role: string; memberKind?: string } | null>
     ownedRecordIds(workspaceId: string, collection: string): Promise<string[]>
     ownerWorkspaceIds(collection: string, recordId: string): Promise<string[]>
   }
@@ -42,10 +42,12 @@ export class SkillsService extends Service {
   private store: SkillsStore
   /** MySQL 模式下当前进程已知的「工作区 → 技能 id」。列表请求会先刷新。 */
   private ownedByWorkspace = new Map<string, Set<string>>()
+  /** MySQL 成员类型（账号·空间），ensureOwned 时刷新；系统技能可见性只认它，不读本地副本。 */
+  private mysqlMemberKinds = new Map<string, string>()
 
   constructor(ctx: Context) {
     super(ctx, 'skills')
-    this.store = new SkillsStore()
+    this.store = new SkillsStore(undefined, () => !this.account()?.usesMysqlAccounts?.())
     ctx.inject(['systemPrompt'], (inner) => {
       inner.systemPrompt.register('skills', () => this.promptSection(), {
         // 没有账号 / MySQL 时 ensureOwned 自己直接返回。
@@ -78,11 +80,12 @@ export class SkillsService extends Service {
   }
 
   private workspaceId() {
-    return (
-      currentRequestWorkspaceId().trim() ||
-      this.account()?.store?.activeWorkspaceId?.()?.trim() ||
-      String(process.env.BIU_SKILL_DEFAULT_WORKSPACE ?? '').trim()
-    )
+    const requested = currentRequestWorkspaceId().trim()
+    if (requested) return requested
+    // 线上不读本地副本里的“当前空间”（过期数据，可能指向别的空间）。
+    const account = this.account()
+    const local = account?.usesMysqlAccounts?.() ? '' : account?.store?.activeWorkspaceId?.()?.trim()
+    return local || String(process.env.BIU_SKILL_DEFAULT_WORKSPACE ?? '').trim()
   }
 
   private rememberOwned(workspaceId: string, id: string) {
@@ -103,10 +106,13 @@ export class SkillsService extends Service {
       return
     }
     const member = await mysql.membership(accountId, workspaceId)
+    const memberKey = `${workspaceId}\t${accountId}`
     if (!member) {
+      this.mysqlMemberKinds.delete(memberKey)
       this.ownedByWorkspace.set(workspaceId, new Set())
       return
     }
+    this.mysqlMemberKinds.set(memberKey, member.memberKind ?? 'member')
     this.ownedByWorkspace.set(workspaceId, new Set(await mysql.ownedRecordIds(workspaceId, '/skills')))
   }
 
@@ -197,13 +203,14 @@ export class SkillsService extends Service {
   private builtinScope(): { key: string; online: false } | { key: string; online: true; accountId: string } | null {
     try {
       const account = this.ctx.get('account') as {
+        usesMysqlAccounts?: () => boolean
         authorization?: { authorize?: unknown }
         store?: { activeWorkspaceId?: () => string | null }
       } | undefined
       if (!account?.authorization?.authorize) return { key: 'local', online: false }
-      const workspaceId =
-        account.store?.activeWorkspaceId?.()?.trim() ||
-        String(process.env.BIU_SKILL_DEFAULT_WORKSPACE ?? '').trim()
+      const workspaceId = account.usesMysqlAccounts?.()
+        ? this.workspaceId()
+        : account.store?.activeWorkspaceId?.()?.trim() || String(process.env.BIU_SKILL_DEFAULT_WORKSPACE ?? '').trim()
       const accountId = currentAccountId()
       if (!workspaceId || !accountId) return null
       return { key: workspaceId, online: true, accountId }
@@ -214,6 +221,8 @@ export class SkillsService extends Service {
 
   /** 云端按「空间」规则：本空间正式成员（owner/admin/member/viewer）可见，外部协作者、访客不可见。 */
   private isWorkspaceMember(accountId: string, workspaceId: string) {
+    // 线上：按 ensureOwned 读到的 MySQL 成员类型。新账号在本地副本里没有成员关系，以前会看不到系统技能。
+    if (this.account()?.usesMysqlAccounts?.()) return this.mysqlMemberKinds.get(`${workspaceId}\t${accountId}`) === 'member'
     try {
       const account = this.ctx.get('account') as {
         store?: { members?: (actorId: string, workspaceId: string) => Array<{ id: string; member_kind?: string }> }

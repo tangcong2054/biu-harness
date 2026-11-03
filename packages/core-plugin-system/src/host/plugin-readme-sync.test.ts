@@ -154,3 +154,43 @@ test('readReadme still returns disk text when sqlite path cannot be opened', asy
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('MySQL: plugin intro reads and writes the MySQL editor content, never the local replica', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-readme-mysql-'))
+  try {
+    await writeManifest(join(dir, '.plugin-dev', 'demo'), 'demo', '# from disk\n')
+    await writeManifest(join(dir, '.plugin-dev', 'edited'), 'edited', '# disk copy\n')
+    const rows = new Map<string, { body: string; version: number }>([['edited', { body: '# edited online\n', version: 3 }]])
+    const writes: string[] = []
+    const ctx = new Context()
+    stubHub(ctx)
+    ctx.provide('cloudStorage', {
+      editorContentMode: 'mysql',
+      editorContentRepository: {
+        async read(_collection: string, id: string) {
+          return rows.get(id) ?? { body: '', version: 0 }
+        },
+        async write(_collection: string, id: string, body: string) {
+          writes.push(id)
+          rows.set(id, { body, version: (rows.get(id)?.version ?? 0) + 1 })
+        },
+      },
+    })
+    const store = new PluginStoreService(ctx, join(dir, '.plugin'), join(dir, 'store.json'), join(dir, '.plugin-dev')).open()
+    // 线上编辑过的介绍以 MySQL 为准。
+    assert.equal(await store.readReadme('edited'), '# edited online\n')
+    // 没写过：用磁盘 README，并补进 MySQL。
+    assert.equal(await store.readReadme('demo'), '# from disk\n')
+    assert.deepEqual(writes, ['demo'])
+    // db_content 已写过同样内容时不重复写；内容不同才写。
+    await store.writeReadme('edited', '# edited online\n')
+    assert.deepEqual(writes, ['demo'])
+    await store.writeReadme('edited', '# second\n')
+    assert.deepEqual(writes, ['demo', 'edited'])
+    assert.equal(await readFile(join(dir, '.plugin-dev', 'edited', 'README.md'), 'utf8'), '# second\n')
+    // 本地 biu.sqlite 不会被创建或写入。
+    assert.equal((await import('node:fs')).existsSync(sqlitePath(dir)), false)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})

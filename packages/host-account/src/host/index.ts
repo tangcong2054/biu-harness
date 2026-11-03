@@ -84,12 +84,16 @@ export class AccountService extends Service {
     if (this.accountMode !== 'sqlite' && !this.mysql) {
       throw new Error(`BIU_ACCOUNT_MYSQL_MODE=${this.accountMode} requires the MySQL account repository`)
     }
+    if (isOnlineRuntime() && this.accountMode !== 'mysql' && !process.env.VITEST && !isOperationsRuntime()) {
+      throw new Error('BIU_ONLINE=1 requires MySQL accounts (BIU_STORAGE_BACKEND=mysql); online SQLite is no longer supported')
+    }
     // 外部协作者被自动移出空间等成员变化，不经过成员管理接口；仓储递增全空间授权版本时一并清插件授权缓存。
     const unsubscribe = this.mysql?.onWorkspaceAuthzChange?.((workspaceId) => this.forgetPluginAccess({ workspaceId }))
-    if ((isOnlineRuntime() && this.accountMode === 'sqlite' && !process.env.VITEST) || isOperationsRuntime()) {
+    if (isOperationsRuntime() && this.accountMode === 'sqlite') {
+      // 只给单独的运营控制台用；线上只支持 MySQL，不再用默认密码自动建运营账号。
       this.store.bootstrapOperations({
         email: process.env.BIU_OPERATIONS_ADMIN_EMAIL || 'admin',
-        password: process.env.BIU_OPERATIONS_ADMIN_PASSWORD || (isOperationsRuntime() ? undefined : '97ortanon'),
+        password: process.env.BIU_OPERATIONS_ADMIN_PASSWORD,
         name: process.env.BIU_OPERATIONS_ADMIN_NAME || '平台管理员',
         workspaceName: process.env.BIU_OPERATIONS_WORKSPACE_NAME || 'Biu 平台运营',
       })
@@ -187,6 +191,26 @@ export class AccountService extends Service {
   activeWorkspaceId() {
     if (this.usesMysqlAccounts()) return currentRequestWorkspaceId()
     return this.store.activeWorkspaceId()
+  }
+
+  /** 平台运营权限：运营空间的所有者或管理者（内部成员）。线上读 MySQL，不再读本地副本。 */
+  async isOperationsOperatorAsync(accountId: string, workspaceId = OPERATIONS_WORKSPACE_ID) {
+    const target = workspaceId || OPERATIONS_WORKSPACE_ID
+    if (!accountId || target !== OPERATIONS_WORKSPACE_ID) return false
+    if (this.usesMysqlAccounts()) {
+      const member = await this.mysql!.membership(accountId, OPERATIONS_WORKSPACE_ID)
+      return Boolean(member && member.memberKind === 'member' && (member.role === 'owner' || member.role === 'admin'))
+    }
+    return this.store.isOperationsOperator(accountId, target)
+  }
+
+  async operationsIdentityAsync() {
+    if (!this.usesMysqlAccounts()) return this.store.operationsIdentity()
+    const account = await this.mysql!.accountById(OPERATIONS_ADMIN_ACCOUNT_ID)
+    if (!account) return null
+    const workspace = (await this.mysql!.listWorkspaces(OPERATIONS_ADMIN_ACCOUNT_ID)).find((item) => item.id === OPERATIONS_WORKSPACE_ID)
+    if (!workspace) return null
+    return { id: account.id, email: account.email ?? '', name: account.name ?? '', workspaceId: workspace.id, workspaceName: workspace.name }
   }
 
   async isMemberAsync(accountId: string, workspaceId: string) {

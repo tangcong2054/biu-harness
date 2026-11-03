@@ -145,3 +145,56 @@ test('系统技能不可修改；sys- 前缀不能被新建或导入占用；动
   const remove = spec.actions!.find((item) => item.id === 'remove-builtin')!
   assert.throws(() => remove.run(normal.id, { id: normal.id }), /unknown builtin skill/)
 })
+
+test('MySQL：系统技能可见性按 MySQL 成员类型，不读本地副本', async () => {
+  dir = mkdtempSync(join(tmpdir(), 'biu-skills-builtin-mysql-'))
+  process.env.BIU_SKILL_ROOT = join(dir, 'skill')
+  process.env.BIU_SKILLS_DIR = join(dir, 'legacy-skills')
+  const mysqlMembers: Record<string, { role: string; memberKind: string }> = {
+    acc_new: { role: 'member', memberKind: 'member' },
+    acc_ext: { role: 'member', memberKind: 'external' },
+  }
+  const staleCalls: string[] = []
+  class FakeAccount extends Service {
+    usesMysqlAccounts() {
+      return true
+    }
+    mysql = {
+      async membership(accountId: string, workspaceId: string) {
+        return workspaceId === 'ws_a' ? mysqlMembers[accountId] ?? null : null
+      },
+      async ownedRecordIds() {
+        return []
+      },
+    }
+    // 过期副本：新账号不在里面，当前空间也是旧的。
+    store = {
+      activeWorkspaceId: () => { staleCalls.push('activeWorkspaceId'); return 'ws_stale' },
+      claim: () => ({ ok: true }),
+      members: () => { staleCalls.push('members'); throw new Error('not a member') },
+    }
+    authorization = {
+      currentActor: () => null,
+      authorize: () => ({ allowed: false }),
+    }
+    constructor(ctx: Context) {
+      super(ctx, 'account')
+    }
+  }
+  const ctx = new Context()
+  new FakeDatabase(ctx)
+  new FakeHttp(ctx)
+  new FakeAccount(ctx)
+  await ctx.plugin(tools)
+  await ctx.plugin(systemPrompt)
+  await ctx.plugin(skills)
+  const { runWithRequestWorkspace } = await import('@biu/host-plugin-loader/data-dir')
+  const asMember = async (accountId: string) => runWithAccount(accountId, () => runWithRequestWorkspace('ws_a', async () => {
+    await ctx.skills.ensureOwned()
+    return ctx.skills.listAll()
+  }))
+  assert.deepEqual(ids(await asMember('acc_new')), BUILTIN)
+  assert.deepEqual(await asMember('acc_ext'), [])
+  assert.deepEqual(await asMember('acc_stranger'), [])
+  assert.deepEqual(staleCalls, [])
+})

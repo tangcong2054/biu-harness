@@ -129,3 +129,56 @@ test('workspace-wide authorization changes from the repository forget that works
   assert.equal(account.canAccessPluginCached('ada', 'ws_a', 'demo'), false)
   assert.equal(account.canAccessPluginCached('ada', 'ws_b', 'demo'), true)
 })
+
+test('operations access and identity come from MySQL membership in MySQL mode', async () => {
+  const ctx = new Context()
+  const roles: Record<string, { role: string; memberKind: string }> = {
+    acc_operations_admin: { role: 'owner', memberKind: 'member' },
+    ops_admin: { role: 'admin', memberKind: 'member' },
+    ops_member: { role: 'member', memberKind: 'member' },
+    ops_external: { role: 'admin', memberKind: 'external' },
+  }
+  const repository = {
+    async membership(accountId: string, workspaceId: string) {
+      return workspaceId === 'ws_operations' ? roles[accountId] ?? null : null
+    },
+    async accountById(id: string) {
+      return id === 'acc_operations_admin' ? { id, email: 'admin', name: '平台运营' } : null
+    },
+    async listWorkspaces(accountId: string) {
+      return accountId === 'acc_operations_admin' ? [{ id: 'ws_operations', name: '平台运营' }] : []
+    },
+  }
+  class CloudStorage extends Service {
+    accountMode = 'mysql' as const
+    accountRepository = repository
+    constructor(inner: Context) {
+      super(inner, 'cloudStorage')
+    }
+  }
+  new CloudStorage(ctx)
+  const account = new AccountService(ctx, { sqlitePath: join(dir, 'biu.sqlite') })
+  // 本地副本里没有任何运营成员；MySQL 才是真实数据。
+  assert.equal(await account.isOperationsOperatorAsync('acc_operations_admin'), true)
+  assert.equal(await account.isOperationsOperatorAsync('ops_admin'), true)
+  assert.equal(await account.isOperationsOperatorAsync('ops_member'), false)
+  assert.equal(await account.isOperationsOperatorAsync('ops_external'), false)
+  assert.equal(await account.isOperationsOperatorAsync('ops_admin', 'ws_other'), false)
+  assert.equal(await account.isOperationsOperatorAsync(''), false)
+  assert.deepEqual(await account.operationsIdentityAsync(), {
+    id: 'acc_operations_admin', email: 'admin', name: '平台运营', workspaceId: 'ws_operations', workspaceName: '平台运营',
+  })
+})
+
+test('online accounts refuse to start on SQLite', async () => {
+  const previousVitest = process.env.VITEST
+  delete process.env.VITEST
+  try {
+    assert.throws(
+      () => new AccountService(new Context(), { sqlitePath: join(dir, 'biu.sqlite') }),
+      /online SQLite is no longer supported/,
+    )
+  } finally {
+    process.env.VITEST = previousVitest
+  }
+})

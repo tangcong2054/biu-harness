@@ -51,8 +51,8 @@ function chatDouble() {
 
 test('people outside the operations workspace cannot read or write model keys', async () => {
   const { chat, calls } = chatDouble()
-  const read = readOperatorLlm(ctx(false), chat)
-  const write = writeOperatorLlm(ctx(false), chat, { setApiKey: { deepseek: FIXTURE } })
+  const read = await readOperatorLlm(ctx(false), chat)
+  const write = await writeOperatorLlm(ctx(false), chat, { setApiKey: { deepseek: FIXTURE } })
   const tested = await testOperatorLlm(ctx(false), chat, { apiKey: FIXTURE })
   assert.equal(read.status, 403)
   assert.equal(write.status, 403)
@@ -62,9 +62,9 @@ test('people outside the operations workspace cannot read or write model keys', 
   assert.equal(JSON.stringify(tested.body).includes(FIXTURE), false)
 })
 
-test('operator model save reuses the chat patch and admin key writer', () => {
+test('operator model save reuses the chat patch and admin key writer', async () => {
   const { chat, calls } = chatDouble()
-  const result = writeOperatorLlm(ctx(true), chat, {
+  const result = await writeOperatorLlm(ctx(true), chat, {
     endpointId: 'deepseek',
     model: 'deepseek-v4-flash',
     setApiKey: { deepseek: FIXTURE },
@@ -83,4 +83,26 @@ test('connection failures do not echo the submitted key', async () => {
   const body = JSON.stringify(result.body)
   assert.equal(body.includes(FIXTURE), false)
   assert.equal(body.includes('rejected'), true)
+})
+
+test('in MySQL mode operator access comes from MySQL membership, not the local replica', async () => {
+  const chat = chatDouble().chat
+  const calls: string[] = []
+  const mysqlCtx = (role: string | null) => ({
+    get(name: string) {
+      if (name !== 'account') return undefined
+      return {
+        // 本地副本说是运营管理员，MySQL 才是真实数据。
+        store: { isOperationsOperator: () => true },
+        async isOperationsOperatorAsync(accountId: string) {
+          calls.push(accountId)
+          return role === 'owner' || role === 'admin'
+        },
+      }
+    },
+  }) as unknown as Context
+  assert.equal((await readOperatorLlm(mysqlCtx(null), chat)).status, 403)
+  assert.equal((await readOperatorLlm(mysqlCtx('member'), chat)).status, 403)
+  assert.equal((await readOperatorLlm(mysqlCtx('admin'), chat)).status, 200)
+  assert.equal(calls.length, 3)
 })

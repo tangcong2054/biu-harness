@@ -28,6 +28,11 @@ export function loadCloudStorageConfig(
     throw new Error('BIU_STORAGE_BACKEND must be sqlite, dual, or mysql')
   }
   const backend = raw as StorageBackend
+  if (env.BIU_ONLINE === '1' && backend !== 'mysql' && !env.VITEST && env.BIU_OPERATIONS !== '1') {
+    // 线上不再支持 SQLite / dual：账号、权限、页面等只认 MySQL。以前线上 SQLite 会静默生效，
+    // 切到 MySQL 后留下的本地副本也会被部分代码继续读写。
+    throw new Error('BIU_ONLINE=1 requires BIU_STORAGE_BACKEND=mysql (online SQLite and dual are no longer supported)')
+  }
   if (backend === 'sqlite') return { backend, enabled: false }
   if (env.BIU_ONLINE !== '1') {
     // Offline 永远使用本机 SQLite；允许与 Online 共用同一套 dual/mysql 环境模板。
