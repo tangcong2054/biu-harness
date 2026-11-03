@@ -91,6 +91,12 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
       res.end(JSON.stringify({ kind: 'collection', path: '/pages' }))
       return
     }
+    if (url === '/api/db/saved-views') {
+      res.end(JSON.stringify(req.method === 'POST'
+        ? { ok: true, views: [{ id: 'view-cloud', revision: 3 }] }
+        : { items: [{ id: 'view-cloud' }], total: 1, snapshot: true }))
+      return
+    }
     if (url === '/api/db/delete' || url === '/api/db/restore' || url === '/api/db/shares' || url.startsWith('/api/db/shares?')) {
       res.end(JSON.stringify({ ok: true, share: url.includes('shares') ? { token: 's1', url: '/share/s1' } : undefined }))
       return
@@ -285,6 +291,23 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
     assert.equal(revoked.status, 200)
     assert.equal(captured.some((item) => item.url === '/api/db/shares' && item.body.enabled === false && item.workspaceId === 'cloud-ws'), true)
 
+    // 视图读走云端，写也必须走云端，否则刚保存的视图下一次读取就"消失"。
+    captured.length = 0
+    const savedViewsBody = {
+      path: '/pages',
+      mutations: [{ type: 'create', collection: '/pages', id: 'view-cloud', view: { id: 'view-cloud', name: '云端视图' } }],
+    }
+    const savedView = await fetch(`${origin}/api/db/saved-views`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(savedViewsBody),
+    })
+    assert.equal(savedView.status, 200)
+    assert.deepEqual(await savedView.json(), { ok: true, views: [{ id: 'view-cloud', revision: 3 }] })
+    const viewHit = captured.find((item) => item.url === '/api/db/saved-views' && item.method === 'POST')
+    assert.equal(viewHit?.workspaceId, 'cloud-ws')
+    assert.deepEqual(viewHit?.body, savedViewsBody)
+
     assert.equal((await fetch(`${origin}/api/account/active`, {
       method: 'POST',
       headers: auth,
@@ -307,6 +330,12 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
       headers: { ...auth, 'x-biu-workspace-id': registered.workspaceId },
     })
     await localRead.json()
+    const localView = await fetch(`${origin}/api/db/saved-views`, {
+      method: 'POST',
+      headers: { ...auth, 'x-biu-workspace-id': registered.workspaceId },
+      body: JSON.stringify({ path: '/pages', mutations: [] }),
+    })
+    await localView.json()
     assert.equal(captured.length, 0)
   } finally {
     await accountFiber.dispose()

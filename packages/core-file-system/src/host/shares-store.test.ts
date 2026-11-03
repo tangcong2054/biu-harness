@@ -8,6 +8,7 @@ import { SharesStore, dropSharesForRemovedViews } from './shares-store.ts'
 import { buildShareSnapshot } from './share-payload.ts'
 import { parseSharePath } from '../share-snapshot.ts'
 import { builtinAllViewId } from '../catalog-views.ts'
+import { runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 
 test('share tokens mint unique links and can set a password', () => {
   const store = new SharesStore().open(':memory:')
@@ -102,6 +103,37 @@ test('deleting a saved view revokes that view share', async () => {
   await db.remove('/views', { ids: [String(created.id)] })
   assert.equal(db.shares.get(share.token), null)
   assert.equal(db.shares.find('view', '/pages', viewId, ''), null)
+})
+
+test('requests without a workspace header reuse the active workspace share instead of minting another', () => {
+  const store = new SharesStore().open(':memory:')
+  let active = 'ws-device'
+  store.setWorkspaceFallback(() => active)
+  const withHeader = runWithRequestWorkspace('ws-device', () =>
+    store.upsert({ kind: 'record', collection: '/pages', recordId: 'p1' }))
+  // 同一空间里不带请求头再分享一次：必须拿回同一个 token，而不是再插一条。
+  const withoutHeader = store.upsert({ kind: 'record', collection: '/pages', recordId: 'p1' })
+  assert.equal(withoutHeader.token, withHeader.token)
+  assert.equal(store.list().length, 1)
+  // 切到另一个空间时互不可见。
+  active = 'ws-other'
+  assert.equal(store.findRecord('/pages', 'p1'), null)
+  assert.equal(store.list().length, 0)
+})
+
+test('legacy unscoped duplicates are hidden behind the workspace share', () => {
+  const store = new SharesStore().open(':memory:')
+  const legacy = store.upsert({ kind: 'record', collection: '/pages', recordId: 'p1' })
+  const scoped = runWithRequestWorkspace('ws-device', () => {
+    // 模拟修复前留下的重复：空空间旧行之外，本空间又各插了一条。
+    ;(store as unknown as { conn(): { prepare(sql: string): { run(...args: unknown[]): unknown } } }).conn()
+      .prepare(`INSERT INTO shares (token, workspace_id, kind, collection, view_id, record_id, password_salt, password_hash,
+        share_plugins, allow_copy, created_at, updated_at) VALUES ('dup', 'ws-device', 'record', '/pages', '', 'p1', '', '', 0, 1, 1, 1)`)
+      .run()
+    return store.list()
+  })
+  assert.deepEqual(scoped.map((item) => item.token), ['dup'])
+  assert.equal(store.list()[0]?.token, legacy.token)
 })
 
 test('list returns every share', () => {

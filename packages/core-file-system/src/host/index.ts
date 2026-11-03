@@ -4061,6 +4061,13 @@ export function apply(ctx: Context) {
   const shares = db.shares
   shares.open(metadataPath)
   shares.configureRuntime(metadataMode, metadataRepository, shadowWarning)
+  // Desktop 有的请求不带空间头：按当前活动空间算，和插件 store 同一口径，避免同一目标分享两次。
+  // Online 每个请求都带空间，没有就是空，不回退。
+  shares.setWorkspaceFallback(() => {
+    if (isOnlineRuntime()) return ''
+    const account = ctx.get('account') as { store?: { activeWorkspaceId?(): string | null } } | undefined
+    return account?.store?.activeWorkspaceId?.() ?? ''
+  })
   const facets = db.facets
   db.register(viewsCollection(savedViews, () => db.collectionsList().map((item) => db.publishCollection(item)), () => currentAccountId()))
   db.register(facetsCollection(facets, () => db.collectionsList().map((item) => ({
@@ -4783,6 +4790,14 @@ export function apply(ctx: Context) {
   ctx.http.route('POST', '/api/db/saved-views', async (route) => {
     try {
       const body = (await route.json()) as { path?: unknown; mutations?: unknown; views?: unknown } | null
+      // 云端空间的视图读的是云端（GET 走 forwardCloudRead），写也必须交给云端：
+      // 只写本地会让刚保存的视图在下一次读取时"消失"，本地 revision 也会和云端对不上。
+      const forwarded = await forwardCloud(ctx, '/views', '', '/api/db/saved-views', { body })
+      if (forwarded) {
+        if (forwarded.status < 300) ctx.emit('database/change')
+        route.send(forwarded.status, forwarded.body)
+        return
+      }
       const path = normalizeCollectionPath(String(body?.path ?? ''))
       await db.requirePath(path, 'resource:update')
       if (!Array.isArray(body?.mutations)) {

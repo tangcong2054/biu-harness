@@ -61,6 +61,21 @@ export const SHARE_MEMO = 'sync\tshares.'
 export class SharesStore {
   private base: DatabaseSync | null = null
   private runtime: SqliteMetadataRuntime | null = null
+  private workspaceFallback: () => string = () => ''
+
+  /**
+   * 请求没带空间头时用哪个空间（Desktop 为当前活动空间）。
+   * 不设时为空串：同一目标在"带空间"和"不带空间"两种请求里会被当成两条分享。
+   */
+  setWorkspaceFallback(resolve: () => string | null | undefined) {
+    this.workspaceFallback = () => {
+      try {
+        return String(resolve() ?? '').trim()
+      } catch {
+        return ''
+      }
+    }
+  }
 
   configureRuntime(
     mode: MetadataRuntimeMode,
@@ -117,7 +132,7 @@ export class SharesStore {
 
   /** 当前请求空间；参数化查询里与空串一起使用，兼容尚未带空间的旧分享。 */
   private workspace() {
-    return currentRequestWorkspaceId()
+    return currentRequestWorkspaceId() || this.workspaceFallback()
   }
 
   private baseConn() {
@@ -293,9 +308,15 @@ export class SharesStore {
   list(): ShareRecord[] {
     const rows = this.conn().prepare(
       `SELECT * FROM shares WHERE workspace_id IN (?, '') ORDER BY updated_at DESC, token DESC`,
-    ).all(this.workspace()) as ShareRow[]
-    return rows.map(publicShare)
+    ).all(this.workspace()) as Array<ShareRow & { workspace_id?: string }>
+    // 修复前同一目标可能留下"带空间"和"空空间"两条；本空间那条优先，旧的空空间行不再重复列出。
+    const scoped = new Set(rows.filter((row) => row.workspace_id).map(shareTargetKey))
+    return rows.filter((row) => row.workspace_id || !scoped.has(shareTargetKey(row))).map(publicShare)
   }
+}
+
+function shareTargetKey(row: ShareRow) {
+  return `${row.kind}\0${row.collection}\0${row.view_id}\0${row.record_id}`
 }
 
 export function dropSharesForRemovedViews(
