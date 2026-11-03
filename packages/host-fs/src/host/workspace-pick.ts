@@ -26,11 +26,19 @@ export async function pickHostDirectory(initial?: string): Promise<string> {
   return pickLinux(initial)
 }
 
+/** 空输出是用户取消（-128）。ERR: 才是默认目录解析失败，可以再弹一次不带默认位置的框。 */
+export function macFolderPickOutcome(stdout: string): 'cancel' | 'retry' | { path: string } {
+  const line = stdout.trim()
+  if (!line) return 'cancel'
+  if (line.startsWith('ERR:')) return 'retry'
+  return { path: line.replace(/\/$/, '') }
+}
+
 async function pickMac(initial?: string) {
   // choose folder 对 default location（当前绑定的项目目录，可能是中文等非 ASCII 路径）
   // 若无法解析成 alias，会抛出 -1700 等非 -128 错误（-128 才是用户取消）。
-  // 旧实现只捕获 -128，导致这类错误直接穿透成 4xx。这里：先带 default location 尝试；
-  // 若带默认位置失败（例如旧路径已失效），则退回不带默认位置重新弹框，让用户仍能选择目录。
+  // 先带 default location 尝试；只有默认位置本身失败时，才退回不带默认位置再弹一次。
+  // 用户取消必须停住，不能落到下一次 choose folder，否则要点两次取消。
   const options = initial
     ? [
         `set chosen to choose folder with prompt "Choose workspace" default location POSIX file ${jsonString(initial)}`,
@@ -51,18 +59,16 @@ async function pickMac(initial?: string) {
     ]
     try {
       const { stdout } = await execFileAsync('osascript', ['-e', lines.join('\n')], { timeout: 300_000 })
-      const line = stdout.trim()
-      if (line.startsWith('ERR:')) {
-        // AppleScript 运行时错误（非用户取消）
-        lastError = new DirectoryPickUnavailable(`osascript 目录选择失败：${line}`)
-        continue // 若存在不带默认位置的兜底选项，则重试
+      const outcome = macFolderPickOutcome(stdout)
+      if (outcome === 'cancel') throw new DirectoryPickCancelled()
+      if (outcome === 'retry') {
+        lastError = new DirectoryPickUnavailable(`osascript 目录选择失败：${stdout.trim()}`)
+        continue
       }
-      const path = line.replace(/\/$/, '')
-      if (!path) throw new DirectoryPickCancelled()
-      return path
+      return outcome.path
     } catch (error) {
+      if (error instanceof DirectoryPickCancelled) throw error
       lastError = error
-      continue
     }
   }
   if (lastError) throw lastError
