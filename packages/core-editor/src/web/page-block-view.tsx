@@ -174,6 +174,32 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
   }
   const View = spec?.View
   const MinimizedView = spec?.MinimizedView
+  useEffect(() => {
+    if (View || !plugin) return
+    let gone = false
+    let timer = 0
+    let attempt = 0
+    const run = () => {
+      if (gone) return
+      const editor = getPageEditor()
+      if (!editor) {
+        if (attempt >= 7) return
+        timer = window.setTimeout(run, 200)
+        attempt += 1
+        return
+      }
+      void editor.ensureBlockPlugin(plugin).catch(() => {
+        if (gone || attempt >= 7) return
+        timer = window.setTimeout(run, Math.min(400 * 2 ** attempt, 4000))
+        attempt += 1
+      })
+    }
+    run()
+    return () => {
+      gone = true
+      window.clearTimeout(timer)
+    }
+  }, [View, plugin])
   const hostRef = useRef<HTMLElement | null>(null)
   const showView = useIdlePageBlockMount(Boolean(View), hostRef)
   const inlineRef = useRef<HTMLDivElement | null>(null)

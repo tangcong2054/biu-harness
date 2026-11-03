@@ -134,6 +134,11 @@ function isSafeId(id: string) {
   return /^[a-z][a-z0-9-]{1,40}$/.test(id)
 }
 
+/** 正在挂载的插件也算出活：否则 offline 会在 fiber 还是 loading 时把 web.js 回成 404。 */
+export function hubPluginIsLive(row: { enabled?: boolean; state?: string }) {
+  return Boolean(row.enabled) || row.state === 'active' || row.state === 'loading' || row.state === 'pending'
+}
+
 /** 用分隔符判断，避免 `.plugin` 误匹配 `.plugin-dev`。 */
 export function isPathInside(root: string, dir: string) {
   const base = resolve(root)
@@ -562,10 +567,10 @@ export class PluginStoreService extends Service {
     return { id: manifest.id, sandboxPath: sandbox, pluginPath: dest }
   }
 
-  /** 插件当前是否在运行：本地 enabled、hub 里已挂上，或任一账号的加载记录。 */
+  /** 插件当前是否在运行：本地 enabled、hub 里已挂上或正在挂，或任一账号的加载记录。 */
   private async isRunning(id: string) {
     if (this.isEnabled(id)) return true
-    if (this.hub().snapshot().plugins.some((row) => row.id === id && (row.enabled || row.state === 'active'))) return true
+    if (this.hub().snapshot().plugins.some((row) => row.id === id && hubPluginIsLive(row))) return true
     // 账号服务上的 loadedPluginIds 是 async。当成同步数组调用 .includes 会抛错，
     // 读 web.js 的接口被吃成 404，前端 import 失败，斜杠里就没有这个块。
     try {

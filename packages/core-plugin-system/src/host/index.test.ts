@@ -8,7 +8,7 @@ import { Context } from 'cordis'
 import { runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import type { CatalogEntry } from '@biu/host-hub'
 import { PluginStoreService, defaultPluginDir, defaultStatePath } from './index.ts'
-import { hashInstalledPluginCode } from './store.ts'
+import { hashInstalledPluginCode, hubPluginIsLive } from './store.ts'
 
 function stubHub(ctx: Context) {
   const adopted: string[] = []
@@ -36,6 +36,14 @@ function stubHub(ctx: Context) {
   }
   return { adopted, dropped, forks }
 }
+
+test('a plugin that is still mounting can serve its web bundle', () => {
+  assert.equal(hubPluginIsLive({ enabled: true, state: 'active' }), true)
+  assert.equal(hubPluginIsLive({ enabled: false, state: 'loading' }), true)
+  assert.equal(hubPluginIsLive({ enabled: false, state: 'pending' }), true)
+  assert.equal(hubPluginIsLive({ enabled: false, state: 'off' }), false)
+  assert.equal(hubPluginIsLive({ enabled: false, state: 'failed' }), false)
+})
 
 test('builtin sandboxes stay in the plugin list without draft permission', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'plugin-builtin-'))

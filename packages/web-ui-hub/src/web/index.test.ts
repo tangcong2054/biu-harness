@@ -7,7 +7,7 @@ import * as snapshot from '@biu/web-snapshot'
 import * as sessionView from '@biu/web-session-view'
 import * as projectView from '@biu/web-project-view'
 import * as uiHub from './index.ts'
-import { isRuntimeWebModule, runtimeWebPlugin } from './index.ts'
+import { isRuntimeWebModule, pluginLoadRetryDelay, runtimeWebPlugin } from './index.ts'
 import { uiPackageLoaders } from 'virtual:cordis-ui-loaders'
 
 const Dummy = () => null
@@ -25,6 +25,15 @@ function plugin(id: string, enabled: boolean, web?: string) {
     ...(web ? { web } : {}),
   }
 }
+
+test('failed store web loads back off and then stop', () => {
+  assert.equal(pluginLoadRetryDelay(0), 400)
+  assert.equal(pluginLoadRetryDelay(1), 800)
+  assert.equal(pluginLoadRetryDelay(2), 1600)
+  assert.equal(pluginLoadRetryDelay(3), 3200)
+  assert.equal(pluginLoadRetryDelay(4), 4000)
+  assert.equal(pluginLoadRetryDelay(8), 4000)
+})
 
 test('store plugin web urls are runtime modules', () => {
   assert.equal(isRuntimeWebModule('/api/plugin-store/files/store-hello/web.js'), true)

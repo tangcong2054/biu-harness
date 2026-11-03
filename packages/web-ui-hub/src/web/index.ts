@@ -14,6 +14,13 @@ export function isRuntimeWebModule(web: string) {
   return web.startsWith('/') || /^https?:\/\//.test(web)
 }
 
+const PLUGIN_LOAD_ATTEMPTS = 8
+
+/** 商店 web.js 偶发 404（宿主还在 restore）时拉开重试，避免失败一次就停到下次刷新。 */
+export function pluginLoadRetryDelay(attempt: number) {
+  return Math.min(400 * 2 ** Math.max(0, attempt), 4000)
+}
+
 /** 动态 import 得到的是模块命名空间；不要只用 default，否则会丢掉 inject / name。 */
 export function runtimeWebPlugin(loaded: unknown): Plugin | undefined {
   if (loaded == null) return undefined
@@ -51,8 +58,10 @@ export function apply(ctx: Context) {
   // 打包后 URL 会带上新的版本号（?v=mtime），据此判断是否需要重新加载，
   // 否则插件的 fork 一旦建立就永远不会更新，改代码看不到效果。
   const forkWebs = new Map<string, string>()
+  const loadAttempts = new Map<string, number>()
   let pending = false
   let running = false
+  let retryTimer: ReturnType<typeof setTimeout> | null = null
 
   async function resolvePlugin(_id: string, web?: string): Promise<Plugin | undefined> {
     if (!web) return undefined
@@ -71,12 +80,15 @@ export function apply(ctx: Context) {
     return undefined
   }
 
+  let retryDelay = 0
+
   async function sync() {
     if (running) {
       pending = true
       return
     }
     running = true
+    retryDelay = 0
     try {
       const rows = ctx.snapshot.get().plugins
       const enabledRows = rows
@@ -100,12 +112,23 @@ export function apply(ctx: Context) {
         forkWebs.delete(id)
       }
 
+      const enabledKeys = new Set(enabledRows.map((row) => `${row.id}\0${row.web ?? ''}`))
+      for (const key of loadAttempts.keys()) if (!enabledKeys.has(key)) loadAttempts.delete(key)
+
       for (const row of enabledRows) {
         if (forks.has(row.id)) continue
+        const attemptKey = `${row.id}\0${row.web ?? ''}`
         const loaded = await resolvePlugin(row.id, row.web)
-        if (!loaded) continue
-        const plugin = runtimeWebPlugin(loaded)
-        if (!plugin) continue
+        const plugin = loaded ? runtimeWebPlugin(loaded) : undefined
+        if (!plugin) {
+          if (isRuntimeWebModule(row.web ?? '')) {
+            const next = (loadAttempts.get(attemptKey) ?? 0) + 1
+            loadAttempts.set(attemptKey, next)
+            if (next < PLUGIN_LOAD_ATTEMPTS) retryDelay = Math.max(retryDelay, pluginLoadRetryDelay(next - 1))
+          }
+          continue
+        }
+        loadAttempts.delete(attemptKey)
         const fiber = ctx.plugin(plugin)
         forks.set(row.id, fiber)
         forkWebs.set(row.id, row.web ?? '')
@@ -124,6 +147,13 @@ export function apply(ctx: Context) {
       }
     } finally {
       running = false
+      if (retryDelay && !retryTimer) {
+        const delay = retryDelay
+        retryTimer = setTimeout(() => {
+          retryTimer = null
+          void sync()
+        }, delay)
+      }
       if (pending) {
         pending = false
         await sync()
@@ -144,6 +174,10 @@ export function apply(ctx: Context) {
     if (key === lastMountKey) return
     lastMountKey = key
     void sync()
+  })
+  ctx.on('dispose', () => {
+    if (retryTimer) clearTimeout(retryTimer)
+    retryTimer = null
   })
   lastMountKey = mountKey()
   return sync()
