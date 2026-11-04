@@ -96,7 +96,7 @@ export class McpService extends Service {
         activeWorkspaceId?(): string | null
       }
     } | undefined
-    const store = account?.store
+    const store = account?.usesMysqlAccounts?.() ? undefined : account?.store
     if (!accountId && !isOnlineRuntime() && !store) return 'local'
     if (account?.usesMysqlAccounts?.()) {
       // MySQL 控制面：成员关系不在本机 SQLite。请求工作区只由 HTTP 鉴权 / Agent 回合

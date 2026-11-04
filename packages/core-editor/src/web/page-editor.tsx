@@ -49,6 +49,21 @@ function jumpToPending(editor: Editor, markdown: string, recordId: string, force
   requestAnimationFrame(run)
 }
 
+/**
+ * 正文解析后与当前文档相同则不必 setContent。
+ * 重复写入同样内容会换掉整棵节点树，之后一次选区变化就可能让 ProseMirror
+ * 匹配错位、把中间的页面块 NodeView 销毁重建（终端、本地文件等会闪一下重新加载）。
+ */
+export function editorHasMarkdown(editor: Editor, markdown: string) {
+  try {
+    const parsed = editor.markdown?.parse(markdown)
+    if (!parsed) return false
+    return editor.schema.nodeFromJSON(parsed).eq(editor.state.doc)
+  } catch {
+    return false
+  }
+}
+
 function asMarkdown(value: unknown) {
   if (value == null) return ''
   if (typeof value === 'string') return value
@@ -398,7 +413,9 @@ export function PageEditor({ record, value, writable, onChange, path, status = '
       if (status !== 'ready') return
       saved.current = md
       hydratedId.current = record.id
-      editor.commands.setContent(md, { contentType: 'markdown', emitUpdate: false })
+      if (!editorHasMarkdown(editor, md)) {
+        editor.commands.setContent(md, { contentType: 'markdown', emitUpdate: false })
+      }
       jumpToPending(editor, md, record.id, true)
       return
     }
@@ -408,7 +425,9 @@ export function PageEditor({ record, value, writable, onChange, path, status = '
     }
     const paint = (next: string) => {
       saved.current = next
-      editor.commands.setContent(next, { contentType: 'markdown', emitUpdate: false })
+      if (!editorHasMarkdown(editor, next)) {
+        editor.commands.setContent(next, { contentType: 'markdown', emitUpdate: false })
+      }
       jumpToPending(editor, next, record.id, true)
     }
     const canPaint = () =>

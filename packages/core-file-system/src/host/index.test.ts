@@ -1812,8 +1812,8 @@ test('file-system CRUD uses the unified account authorization decision', async (
     /unknown record/,
   )
   db.facets.replaceContentRefs('/notes', 'n1', ['private.png'])
-  assert.doesNotThrow(() => runWithAccount(ada.id, () => db.requireAsset('private.png', 'resource:read')))
-  assert.throws(
+  await runWithAccount(ada.id, () => db.requireAsset('private.png', 'resource:read'))
+  await assert.rejects(
     () => runWithAccount(bob.id, () => db.requireAsset('private.png', 'resource:read')),
     /permission denied/,
   )
@@ -1824,8 +1824,8 @@ test('file-system CRUD uses the unified account authorization decision', async (
     bob.id,
     'viewer',
   )
-  assert.doesNotThrow(() => runWithAccount(bob.id, () => db.requireAsset('private.png', 'resource:read')))
-  assert.throws(
+  await runWithAccount(bob.id, () => db.requireAsset('private.png', 'resource:read'))
+  await assert.rejects(
     () => runWithAccount(bob.id, () => db.requireAsset('private.png', 'resource:update')),
     /permission denied/,
   )
@@ -2181,7 +2181,7 @@ test('granting the all-members view lets the other member read the owner private
   assert.equal(ownChain[0]?.detail, '你是创建者')
   assert.equal(ownChain[0]?.role, 'owner')
   db.facets.replaceContentRefs('/tasks', privateId, ['via-view.png'])
-  assert.doesNotThrow(() => runWithAccount(bob.id, () => db.requireAsset('via-view.png', 'resource:read')))
+  await runWithAccount(bob.id, () => db.requireAsset('via-view.png', 'resource:read'))
 })
 
 test('sharing one person all-tasks view does not reclassify the other person private tasks', async () => {

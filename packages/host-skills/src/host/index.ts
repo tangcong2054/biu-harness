@@ -207,7 +207,7 @@ export class SkillsService extends Service {
         authorization?: { authorize?: unknown }
         store?: { activeWorkspaceId?: () => string | null }
       } | undefined
-      if (!account?.authorization?.authorize) return { key: 'local', online: false }
+      if (!account?.usesMysqlAccounts?.() && !account?.authorization?.authorize) return { key: 'local', online: false }
       const workspaceId = account.usesMysqlAccounts?.()
         ? this.workspaceId()
         : account.store?.activeWorkspaceId?.()?.trim() || String(process.env.BIU_SKILL_DEFAULT_WORKSPACE ?? '').trim()

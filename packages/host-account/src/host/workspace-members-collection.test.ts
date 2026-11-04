@@ -77,3 +77,37 @@ test('a device-only workspace exposes no member collection or mutations', async 
     /本机空间不提供成员功能/,
   )
 })
+
+test('online member collection uses only MySQL and the request workspace', async () => {
+  const { runWithRequestWorkspace } = await import('@biu/host-plugin-loader/data-dir')
+  const calls: string[] = []
+  const rows = [
+    { id: 'ada', name: 'Ada', display_name: '', email: 'ada@example.test', role: 'owner', member_kind: 'member' as const, created_at: 1 },
+  ]
+  const local = new Proxy({}, { get() { throw new Error('local account replica must not be read') } }) as CollabStore
+  const mysql = {
+    async members(actor: string, ws: string) { calls.push(`list:${actor}:${ws}`); return rows },
+    async addMemberByEmail(actor: string, ws: string, email: string) {
+      calls.push(`add:${actor}:${ws}:${email}`)
+      rows.push({ id: 'bob', name: 'Bob', display_name: '', email, role: 'member', member_kind: 'member', created_at: 2 })
+      return rows
+    },
+    async updateMemberRole(actor: string, ws: string, id: string, role: 'owner' | 'admin' | 'member' | 'viewer') {
+      calls.push(`update:${actor}:${ws}:${id}`)
+      rows.find((r) => r.id === id)!.role = role
+    },
+    async removeMember(actor: string, ws: string, id: string) {
+      calls.push(`remove:${actor}:${ws}:${id}`)
+      rows.splice(rows.findIndex((r) => r.id === id), 1)
+    },
+  }
+  const spec = workspaceMembersCollection(local, () => true, true, mysql)
+  const asOwner = <T,>(fn: () => T) => runWithAccount('ada', () => runWithRequestWorkspace('ws_mysql', fn))
+  assert.deepEqual((await asOwner(() => spec.list())).map((r) => r.id), ['ada'])
+  assert.equal((await asOwner(() => spec.create!([{ email: 'bob@example.test' }])))[0]?.title, 'Bob')
+  assert.equal((await asOwner(() => spec.update!('bob', { role: 'viewer' }))).role, 'viewer')
+  await asOwner(() => spec.remove!({ ids: ['bob'] }))
+  assert.equal((await asOwner(() => spec.get!('bob'))), null)
+  assert.ok(calls.every((call) => call.includes(':ada:ws_mysql')))
+  await assert.rejects(async () => runWithAccount('ada', () => spec.list()), /UNAUTHENTICATED/)
+})

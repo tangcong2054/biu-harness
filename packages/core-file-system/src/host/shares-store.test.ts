@@ -8,7 +8,7 @@ import { SharesStore, dropSharesForRemovedViews } from './shares-store.ts'
 import { buildShareSnapshot } from './share-payload.ts'
 import { parseSharePath } from '../share-snapshot.ts'
 import { builtinAllViewId } from '../catalog-views.ts'
-import { runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
+import { runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 
 test('share tokens mint unique links and can set a password', () => {
   const store = new SharesStore().open(':memory:')
@@ -267,4 +267,28 @@ test('builtin view snapshot titles use 全部 plus the collection label', async 
   assert.equal(snap.title, '全部页面')
   assert.equal(snap.collectionLabel, '页面')
   assert.equal(snap.view?.name, '全部页面')
+})
+
+test('share creator is server controlled and does not change when another account updates settings', () => {
+  const store = new SharesStore().open(':memory:')
+  const share = runWithAccount('ada', () => store.upsert({ kind: 'record', collection: '/pages', recordId: 'p1' }))
+  assert.equal(store.creatorOf(share.token), 'ada')
+  runWithAccount('bob', () => store.upsert({ kind: 'record', collection: '/pages', recordId: 'p1', allowCopy: false }))
+  assert.equal(store.creatorOf(share.token), 'ada')
+  assert.equal(store.get(share.token)?.allowCopy, false)
+})
+
+test('a missing shared view is not widened to the whole collection', async () => {
+  const views = new SavedViewsStore().open(':memory:')
+  const shares = new SharesStore().open(':memory:')
+  const share = shares.upsert({ kind: 'view', collection: '/pages', viewId: 'deleted-view' })
+  let listed = false
+  const db = {
+    stat: async () => ({ kind: 'collection', schema: { fields: REQUIRED_RECORD_FIELDS } }),
+    list: async () => { listed = true; return { items: [] } },
+    read: async () => ({ value: null }),
+    content: async () => ({ value: '' }),
+  }
+  await assert.rejects(() => buildShareSnapshot(db as unknown as Parameters<typeof buildShareSnapshot>[0], views, share), /unknown shared view/)
+  assert.equal(listed, false)
 })

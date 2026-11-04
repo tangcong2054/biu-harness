@@ -1205,6 +1205,44 @@ export class MysqlAccountRepository {
     }
   }
 
+  async moveRecordPolicy(workspaceId: string, collection: string, recordId: string, parentRecordId: string) {
+    const connection = await this.pool.getConnection()
+    try {
+      await connection.beginTransaction()
+      // 序列化同空间的继承变更，避免并发把两个节点互相挂成父节点。
+      await connection.query(`SELECT id FROM ${this.db}.workspaces WHERE id = ? FOR UPDATE`, [workspaceId])
+      let cursor = parentRecordId
+      let cursorCollection = collection
+      const seen = new Set<string>()
+      while (cursor) {
+        const key = `${cursorCollection}\t${cursor}`
+        if ((cursorCollection === collection && cursor === recordId) || seen.has(key) || seen.size >= 64) {
+          throw new Error('resource parent cycle')
+        }
+        seen.add(key)
+        const [rows] = await connection.query<RowDataPacket[]>(
+          `SELECT parent_collection, parent_record_id FROM ${this.db}.resource_policies
+           WHERE workspace_id = ? AND collection = ? AND record_id = ? FOR UPDATE`,
+          [workspaceId, cursorCollection, cursor],
+        )
+        cursorCollection = String(rows[0]?.parent_collection || cursorCollection)
+        cursor = String(rows[0]?.parent_record_id || '')
+      }
+      await connection.query(
+        `UPDATE ${this.db}.resource_policies SET parent_collection = ?, parent_record_id = ?
+         WHERE workspace_id = ? AND collection = ? AND record_id = ?`,
+        [parentRecordId ? collection : '', parentRecordId, workspaceId, collection, recordId],
+      )
+      await this.bumpRevision(connection, workspaceId, '*')
+      await connection.commit()
+    } catch (error) {
+      await connection.rollback()
+      throw error
+    } finally {
+      connection.release()
+    }
+  }
+
   async grantRecord(input: {
     actorId: string; workspaceId: string; collection: string; recordId: string;
     subjectType: GrantSubject; subjectId: string; role: GrantRole; now: number

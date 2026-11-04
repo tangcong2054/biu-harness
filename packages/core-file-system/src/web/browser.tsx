@@ -1276,6 +1276,7 @@ export function CollectionBrowser({
   const subsetLocked = lockedFilterKeys.length > 0
   const canCreate = Boolean(schema?.records?.create) && !subsetLocked
   const canDelete = Boolean(schema?.records?.delete) && !subsetLocked
+  const canDeleteRow = (row?: DbRecord) => Boolean(row && canDelete && (!row.shareRole || row.shareRole === '管理') && !(collectionPath === '/plugins' && row.builtin === true))
   const canFacet = Boolean(schema?.fields.facet?.writable) && !subsetLocked
   const bulkFields = useMemo(
     () =>
@@ -2535,6 +2536,11 @@ export function CollectionBrowser({
     }
   }
 
+  /** 集合可写，但这一行只有“阅读”权限（别人的记录、只读授权）时，按只读字段渲染。 */
+  function rowFieldOf(row: DbRecord, field: FieldSpec): FieldSpec {
+    return field.writable && row.shareRole === '阅读' ? { ...field, writable: false } : field
+  }
+
   function cellFieldWritable(field: FieldSpec) {
     const kind = resolveFieldType(field)
     return Boolean(field.writable) && kind !== 'file' && kind !== 'action'
@@ -2606,7 +2612,8 @@ export function CollectionBrowser({
       text: cellValueText(row, key, field),
     })
 
-  function renderCell(row: DbRecord, key: string, field: FieldSpec, surface: 'table' | 'detail' = 'detail') {
+  function renderCell(row: DbRecord, key: string, rawField: FieldSpec, surface: 'table' | 'detail' = 'detail') {
+    const field = rowFieldOf(row, rawField)
     if (key === 'shareScope') {
       return (
         <ShareScopeDetail
@@ -2769,7 +2776,7 @@ export function CollectionBrowser({
     const col = columns.find((item) => item.key === cellPop.key)
     if (!row || !col) return null
     const key = col.key
-    const field = col.field
+    const field = rowFieldOf(row, col.field)
     const flat = parseFacetFlatColumnKey(key)
     const initial = flat ? readFacetFlatValue(row, key, facetSourceKey(schema)) : row[key]
     const options = flat
@@ -2819,7 +2826,7 @@ export function CollectionBrowser({
     const key = schema?.labelField
     const field = key && schema ? schema.fields[key] : undefined
     const body =
-      key && field?.writable ? (
+      key && field && rowFieldOf(row, field).writable ? (
         renderCell(row, key, field, 'table')
       ) : chrome?.Title ? (
         <chrome.Title record={row} label={labelOf(row)} />
@@ -3097,7 +3104,7 @@ export function CollectionBrowser({
             className={[
               col.key === schema?.labelField ? 'is-pin-col' : '',
               cellPick?.id === row.id && cellPick.key === col.key
-                ? cellFieldWritable(col.field)
+                ? cellFieldWritable(rowFieldOf(row, col.field))
                   ? 'is-cell-on'
                   : 'is-cell-on is-cell-ro'
                 : '',
@@ -3109,7 +3116,7 @@ export function CollectionBrowser({
               const td = event.currentTarget
               cellAnchorRef.current = td
               cellPickRef.current = { id: row.id, key: col.key }
-              markCellOn(td, cellFieldWritable(col.field))
+              markCellOn(td, cellFieldWritable(rowFieldOf(row, col.field)))
               cellPopPtrRef.current = { x: event.clientX, y: event.clientY, dragged: false }
             }}
             onPointerMove={(event) => {
@@ -3127,7 +3134,7 @@ export function CollectionBrowser({
               if (start?.dragged) return
               if (start && Math.hypot(event.clientX - start.x, event.clientY - start.y) >= CELL_POP_DRAG_PX) return
               const kind = resolveFieldType(col.field)
-              setCellPop(cellUsesPop(kind, col.field.writable) ? { id: row.id, key: col.key } : null)
+              setCellPop(cellUsesPop(kind, rowFieldOf(row, col.field).writable) ? { id: row.id, key: col.key } : null)
             }}
           >
             {col.key === schema?.labelField ? (
@@ -4047,7 +4054,7 @@ export function CollectionBrowser({
                     >
                       {pickedIds.length} 已选
                     </span>
-                    {canDelete && pickedIds.some((id) => !(collectionPath === '/plugins' && items.find((row) => row.id === id)?.builtin === true)) ? (
+                    {pickedIds.some((id) => canDeleteRow(items.find((row) => row.id === id))) ? (
                       <button
                         type="button"
                         className="tasks-icon-btn is-danger"
@@ -4056,7 +4063,7 @@ export function CollectionBrowser({
                         title={`删除选中的 ${pickedIds.length} 条`}
                         onClick={() => setDlg({
                           kind: 'delete-records',
-                          ids: pickedIds.filter((id) => !(collectionPath === '/plugins' && items.find((row) => row.id === id)?.builtin === true)),
+                          ids: pickedIds.filter((id) => canDeleteRow(items.find((row) => row.id === id))),
                         })}
                       >
                         <TrashGlyph aria-hidden className="size-[14px]" />
@@ -4077,14 +4084,17 @@ export function CollectionBrowser({
                       {bulkMenuOpen ? (
                         <HeadlessDismiss onDismiss={() => setBulkMenuOpen(false)} insideRef={bulkRef}>
                           <div className="fsdb-bulk-menu" role="menu">
-                            {canFacet ? (
+                            {canFacet && pickedIds.some((id) => items.find((row) => row.id === id)?.shareRole !== '阅读') ? (
                               <button
                                 type="button"
                                 className="tasks-sort-item"
                                 data-testid="fsdb-bulk-facet"
                                 onClick={() => {
                                   setBulkFacetIds([])
-                                  setDlg({ kind: 'bulk-facet', ids: pickedIds })
+                                  setDlg({
+                                    kind: 'bulk-facet',
+                                    ids: pickedIds.filter((id) => items.find((row) => row.id === id)?.shareRole !== '阅读'),
+                                  })
                                   setBulkMenuOpen(false)
                                 }}
                               >
@@ -4256,7 +4266,7 @@ export function CollectionBrowser({
               />
             ) : undefined
           }
-          onDelete={canDelete && !(collectionPath === '/plugins' && selected.builtin === true) ? () => setDlg({ kind: 'delete-record', row: selected }) : undefined}
+          onDelete={canDeleteRow(selected) ? () => setDlg({ kind: 'delete-record', row: selected }) : undefined}
           onOpenRecord={(recordId, collection) => onOpenRecord?.(recordId, activeViewId, collection)}
           onPrev={total > 1 ? () => void stepViewRecord(-1) : undefined}
           onNext={total > 1 ? () => void stepViewRecord(1) : undefined}

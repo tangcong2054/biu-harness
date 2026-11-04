@@ -1,4 +1,4 @@
-import { currentAccountId } from '@biu/host-plugin-loader/data-dir'
+import { currentAccountId, currentRequestWorkspaceId } from '@biu/host-plugin-loader/data-dir'
 import {
   recordBuiltinValues,
   REQUIRED_RECORD_FIELDS,
@@ -33,18 +33,30 @@ function asRecord(row: MemberRow): DbRecord {
   }
 }
 
+type MysqlMembers = {
+  members(actorId: string, workspaceId: string): Promise<MemberRow[]>
+  addMemberByEmail(actorId: string, workspaceId: string, email: string): Promise<MemberRow[] | null>
+  updateMemberRole(actorId: string, workspaceId: string, accountId: string, role: 'owner' | 'admin' | 'member' | 'viewer'): Promise<void>
+  removeMember(actorId: string, workspaceId: string, accountId: string): Promise<void>
+}
+
 export function workspaceMembersCollection(
   store: CollabStore,
   collaborativeWorkspace: (workspaceId: string) => boolean = () => true,
   exposeView = true,
+  mysql?: MysqlMembers | null,
 ): CollectionSpec {
-  const rows = () => {
+  const rows = async () => {
+    if (mysql) {
+      const { actorId, workspaceId } = identity()
+      return (await mysql.members(actorId, workspaceId)).map(asRecord)
+    }
     const workspaceId = store.activeWorkspaceId()
     if (!workspaceId || !collaborativeWorkspace(workspaceId)) return []
     return store.currentMembers().map(asRecord)
   }
   const list = async (query?: CollectionListQuery) => {
-    let items = rows()
+    let items = await rows()
     if (query?.ids?.length) {
       const wanted = new Set(query.ids)
       items = items.filter((row) => wanted.has(row.id))
@@ -57,7 +69,7 @@ export function workspaceMembersCollection(
   }
   const identity = () => {
     const actorId = currentAccountId()
-    const workspaceId = store.activeWorkspaceId()
+    const workspaceId = mysql ? currentRequestWorkspaceId() : store.activeWorkspaceId()
     if (!actorId || !workspaceId) throw new Error('permission denied: UNAUTHENTICATED')
     if (!collaborativeWorkspace(workspaceId)) throw new Error('本机空间不提供成员功能')
     return { actorId, workspaceId }
@@ -116,21 +128,25 @@ export function workspaceMembersCollection(
           properties: { email: { type: 'string', description: '待加入成员的登录邮箱' } },
           required: ['email'],
         },
-        run: (_id, _record, args = {}) => {
+        run: async (_id, _record, args = {}) => {
           const { actorId, workspaceId } = identity()
-          return store.addMemberByEmail(actorId, workspaceId, String(args.email ?? ''))
+          return mysql
+            ? mysql.addMemberByEmail(actorId, workspaceId, String(args.email ?? ''))
+            : store.addMemberByEmail(actorId, workspaceId, String(args.email ?? ''))
         },
       },
     ],
     list,
-    get: async (id) => rows().find((row) => row.id === id) ?? null,
+    get: async (id) => (await rows()).find((row) => row.id === id) ?? null,
     create: async (records) => {
       const { actorId, workspaceId } = identity()
       const created: DbRecord[] = []
       for (const record of records) {
         const email = String(record.email ?? '').trim()
-        const members = store.addMemberByEmail(actorId, workspaceId, email)
-        const member = members.find((row) => row.email === email.toLowerCase())
+        const members = mysql
+          ? await mysql.addMemberByEmail(actorId, workspaceId, email)
+          : store.addMemberByEmail(actorId, workspaceId, email)
+        const member = members?.find((row) => row.email === email.toLowerCase())
         if (!member) throw new Error('member was not created')
         created.push(asRecord(member))
       }
@@ -139,7 +155,7 @@ export function workspaceMembersCollection(
     update: async (id, patch) => {
       const { actorId, workspaceId } = identity()
       if (!('role' in patch)) {
-        const current = rows().find((row) => row.id === id)
+        const current = (await rows()).find((row) => row.id === id)
         if (!current) throw new Error('member not found')
         return current
       }
@@ -147,12 +163,19 @@ export function workspaceMembersCollection(
       if (role !== 'owner' && role !== 'admin' && role !== 'member' && role !== 'viewer') {
         throw new Error('role must be owner, admin, member or viewer')
       }
-      return asRecord(store.updateMemberRole(actorId, workspaceId, id, role))
+      if (!mysql) return asRecord(store.updateMemberRole(actorId, workspaceId, id, role))
+      await mysql.updateMemberRole(actorId, workspaceId, id, role)
+      const updated = (await rows()).find((row) => row.id === id)
+      if (!updated) throw new Error('member not found')
+      return updated
     },
     remove: async (query) => {
       const { actorId, workspaceId } = identity()
       const ids = query.ids ?? []
-      for (const id of ids) store.removeMember(actorId, workspaceId, id)
+      for (const id of ids) {
+        if (mysql) await mysql.removeMember(actorId, workspaceId, id)
+        else store.removeMember(actorId, workspaceId, id)
+      }
       return ids
     },
   }

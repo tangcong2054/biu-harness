@@ -89,5 +89,5 @@ test('execution leases are shared across Online instances on the MySQL control p
   await b.releaseExecutionLease('ada', 's1', lease.leaseId)
   assert.equal(await a.hasExecutionLease('s1'), false)
   // 本机 SQLite 没有被当成权威写入。
-  assert.equal(a.store.hasExecutionLease('s1'), false)
+  assert.throws(() => a.store.hasExecutionLease('s1'), /SQLite account replica is disabled/)
 })

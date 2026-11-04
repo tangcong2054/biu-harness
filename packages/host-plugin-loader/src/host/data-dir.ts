@@ -118,6 +118,10 @@ const migratedDataDirs = new Set<string>()
  */
 export function migrateDataDir(parent: string): string {
   const dest = join(parent, DATA_DIR_NAME)
+  if (process.env.BIU_ONLINE === '1' && process.env.BIU_STORAGE_BACKEND === 'mysql') {
+    mkdirSync(dest, { recursive: true })
+    return dest
+  }
   if (migratedDataDirs.has(dest) && existsSync(dest)) return dest
   const src = join(parent, LEGACY_DATA_DIR_NAME)
   if (existsSync(src)) {

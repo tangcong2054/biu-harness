@@ -1,6 +1,6 @@
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { clearRequestMemo, currentRequestWorkspaceId, openAndMigrateBiu } from '@biu/host-plugin-loader/data-dir'
+import { clearRequestMemo, currentAccountId, currentRequestWorkspaceId, openAndMigrateBiu } from '@biu/host-plugin-loader/data-dir'
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
 import { normalizeCollectionPath } from '../paths.ts'
 import type { ShareKind, ShareRecord } from '../share-snapshot.ts'
@@ -101,6 +101,11 @@ export class SharesStore {
     return this.runtime?.prepareShareToken(token) ?? Promise.resolve()
   }
 
+  creatorOf(token: string) {
+    const row = this.conn().prepare('SELECT created_by FROM shares WHERE token = ?').get(token) as { created_by?: string } | undefined
+    return String(row?.created_by ?? '')
+  }
+
   withTokenWorkspace<T>(token: string, run: () => Promise<T>) {
     return this.runtime?.withShareWorkspace(token, run) ?? run()
   }
@@ -122,6 +127,7 @@ export class SharesStore {
     if (!names.has('allow_copy')) db.exec('ALTER TABLE shares ADD COLUMN allow_copy INTEGER NOT NULL DEFAULT 1')
     // 分享按空间隔离：本机多空间时同一目标可以各自分享。旧行 workspace_id 为空，按“任意空间都可见”兼容。
     if (!names.has('workspace_id')) db.exec("ALTER TABLE shares ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''")
+    if (!names.has('created_by')) db.exec("ALTER TABLE shares ADD COLUMN created_by TEXT NOT NULL DEFAULT ''")
     const legacy = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'shares_target'").get() as
       | { sql?: string }
       | undefined
@@ -234,9 +240,10 @@ export class SharesStore {
     const token = existing?.token ?? mintToken()
     const workspaceId = previous ? String((previous as { workspace_id?: unknown }).workspace_id ?? '') : this.workspace()
     this.conn().prepare(`
-      INSERT INTO shares (token, workspace_id, kind, collection, view_id, record_id, password_salt, password_hash, share_plugins, allow_copy, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO shares (token, workspace_id, kind, collection, view_id, record_id, password_salt, password_hash, share_plugins, allow_copy, created_at, updated_at, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(workspace_id, kind, collection, view_id, record_id) DO UPDATE SET
+        created_by=CASE WHEN shares.created_by = '' THEN excluded.created_by ELSE shares.created_by END,
         password_salt=excluded.password_salt,
         password_hash=excluded.password_hash,
         share_plugins=excluded.share_plugins,
@@ -255,6 +262,7 @@ export class SharesStore {
       allowCopy ? 1 : 0,
       existing?.createdAt ?? now,
       now,
+      currentAccountId(),
     )
     const saved = this.conn().prepare('SELECT * FROM shares WHERE token = ?').get(token) as ShareRow
     // 远端按请求空间写入；本机这一列不往外传。

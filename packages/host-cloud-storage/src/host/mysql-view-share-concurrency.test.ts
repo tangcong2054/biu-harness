@@ -25,7 +25,7 @@ integration('MySQL saved views and shares under real concurrency', () => {
   const remove = (id: string, expectedRevision: number): SavedViewMutation => ({ type: 'delete', collection: '/pages', id, expectedRevision })
   const shareRow = (token: string, extra: Record<string, unknown> = {}) => ({
     token, kind: 'view', collection: '/pages', view_id: '', record_id: '', password_salt: '', password_hash: '',
-    share_plugins: 0, allow_copy: 1, created_at: 1, updated_at: 1, ...extra,
+    share_plugins: 0, allow_copy: 1, created_at: 1, updated_at: 1, created_by: '', ...extra,
   })
   const readView = async (workspace: string, id: string) => {
     const [rows] = await pool.query<RowDataPacket[]>(

@@ -227,6 +227,16 @@ integration('MySQL account/workspace/authz integration', () => {
     )
     expect((legacyPolicy as Array<Record<string, unknown>>)[0]).toMatchObject({ owner_account_id: 'acc_owner' })
     expect(await accounts.recordOwnerships('/plugins', 'missing')).toEqual([])
+
+    await accounts.attachPolicy({ actorId: 'acc_owner', workspaceId: 'ws_a', collection: '/pages', recordId: 'move_child', ownership: 'personal', accessMode: 'inherit', now })
+    const beforeMove = await accounts.authzWorkspaceRevision('ws_a')
+    await accounts.moveRecordPolicy('ws_a', '/pages', 'move_child', 'page_1')
+    const sources = await accounts.collectionScopeSources('ws_a', '/pages')
+    expect(sources.policies.move_child).toMatchObject({ parentCollection: '/pages', parentRecordId: 'page_1' })
+    expect(await accounts.authzWorkspaceRevision('ws_a')).toBeGreaterThan(beforeMove)
+    await expect(accounts.moveRecordPolicy('ws_a', '/pages', 'page_1', 'move_child')).rejects.toThrow('resource parent cycle')
+    await accounts.moveRecordPolicy('ws_a', '/pages', 'move_child', '')
+    expect((await accounts.collectionScopeSources('ws_a', '/pages')).policies.move_child).toMatchObject({ parentRecordId: '' })
   })
 
   it('covers workspace invites, groups and view grants with revision invalidation', async () => {

@@ -4,10 +4,11 @@ import type { SavedViewsStore } from './saved-views.ts'
 import { freezeSchema, type ShareSnapshot } from '../share-snapshot.ts'
 import { collectShareResources } from '../share-resources.ts'
 import { savedViewRecordPath } from '../paths.ts'
-import { displayNameForView, isReadOnlyViewId } from '../catalog-views.ts'
+import { displayNameForView, isReadOnlyViewId, stubAnyBuiltinView } from '../catalog-views.ts'
 import type { ShareRecord } from './shares-store.ts'
 import { asPublicProfile } from '@biu/host-workspace'
 import { encodeListFilter, resolveViewFilterTree } from '../query-logic.ts'
+import { normalizeSavedView, type SavedView } from '../web/saved-view.ts'
 
 const SHARE_LIMIT = 200
 
@@ -83,8 +84,11 @@ export async function buildShareSnapshot(
       banner: record.banner ?? null,
     }, share)
   }
-  const stored = savedViews.viewsFor(share.collection).find((item) => item.id === share.viewId)
-  const viewName = displayNameForView(share.viewId, table, stored?.name)
+  const available = savedViews.viewsFor(share.collection)
+  const direct = available.find((item) => item.id === share.viewId)
+  const stored = direct ?? stubAnyBuiltinView(share.viewId, available.map((item) => normalizeSavedView(item as unknown as SavedView)))
+  if (!stored) throw new Error('unknown shared view')
+  const viewName = displayNameForView(share.viewId, table, direct?.name)
   const view = {
     id: share.viewId,
     name: viewName,

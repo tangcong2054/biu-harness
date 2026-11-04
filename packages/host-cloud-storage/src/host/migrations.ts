@@ -695,6 +695,20 @@ export const PRODUCT_MIGRATIONS: readonly MysqlMigration[] = [
       'DEALLOCATE PREPARE biu_view_grants_pk',
     ],
   },
+  {
+    version: 20,
+    name: 'public_share_creator',
+    statements: [
+      `SET @biu_share_creator = (
+         SELECT IF(COUNT(*) = 0, 'ALTER TABLE shares ADD COLUMN created_by VARCHAR(64) NOT NULL DEFAULT ''''', 'DO 0')
+         FROM information_schema.columns
+         WHERE table_schema = DATABASE() AND table_name = 'shares' AND column_name = 'created_by'
+       )`,
+      'PREPARE biu_share_creator FROM @biu_share_creator',
+      'EXECUTE biu_share_creator',
+      'DEALLOCATE PREPARE biu_share_creator',
+    ],
+  },
 ]
 
 export const OPERATIONS_MIGRATIONS: readonly MysqlMigration[] = [

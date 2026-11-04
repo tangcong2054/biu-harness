@@ -79,6 +79,7 @@ function baseline(db: DatabaseSync) {
   addColumn(db, 'attachments', 'storage', `storage TEXT NOT NULL DEFAULT 'hash'`)
   addColumn(db, 'shares', 'share_plugins', 'share_plugins INTEGER NOT NULL DEFAULT 0')
   addColumn(db, 'shares', 'allow_copy', 'allow_copy INTEGER NOT NULL DEFAULT 1')
+  addColumn(db, 'shares', 'created_by', "created_by TEXT NOT NULL DEFAULT ''")
   addColumn(db, 'page_block_index', 'page_title', `page_title TEXT NOT NULL DEFAULT ''`)
   addColumn(db, 'sessions', 'mascot_json', 'mascot_json TEXT')
   addColumn(db, 'sessions', 'config_json', 'config_json TEXT')

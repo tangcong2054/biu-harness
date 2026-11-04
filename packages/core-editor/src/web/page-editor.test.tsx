@@ -1,8 +1,10 @@
 import { render, waitFor } from '@testing-library/react'
+import { useEffect } from 'react'
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
 import { Context } from 'cordis'
-import { PageEditor } from './page-editor.tsx'
+import type { Editor } from '@tiptap/core'
+import { PageEditor, editorHasMarkdown } from './page-editor.tsx'
 import { PageEditorService } from './service.ts'
 
 test('page editor paints markdown headings without a chrome toolbar', async () => {
@@ -126,6 +128,66 @@ test('page editor hydrates markdown after content fetch', async () => {
   })
   assert.equal(container.querySelector('[data-testid="algo-view"]')?.textContent, 'Two Sum')
   assert.match(container.textContent ?? '', /一段正文/)
+})
+
+test('hydrating identical markdown keeps the mounted page block', async () => {
+  const ctx = new Context()
+  new PageEditorService(ctx)
+  let mounts = 0
+  let unmounts = 0
+  ctx.pageEditor.registerBlock({
+    kind: 'probe',
+    plugin: 'page-probe',
+    label: '探针',
+    View: () => {
+      useEffect(() => {
+        mounts += 1
+        return () => {
+          unmounts += 1
+        }
+      }, [])
+      return <div data-testid="probe-view">probe</div>
+    },
+  })
+  const src = `# 标题
+
+:::pageBlock {kind=probe plugin=page-probe id=probe001}
+{}
+:::
+
+后文
+`
+  const { container } = render(
+    <PageEditor
+      record={{ id: 'home' }}
+      field="notes"
+      spec={{ type: 'file', label: '正文', writable: true }}
+      value={src}
+      writable
+    />,
+  )
+  await waitFor(() => {
+    assert.ok(container.querySelector('[data-testid="probe-view"]'))
+  })
+  await waitFor(() => assert.equal(mounts, 1))
+  assert.equal(unmounts, 0)
+})
+
+test('editorHasMarkdown compares parsed documents', async () => {
+  const { container } = render(
+    <PageEditor
+      record={{ id: 'eq' }}
+      field="notes"
+      spec={{ type: 'file', label: '正文', writable: true }}
+      value={'# 一\n\n二'}
+      writable
+    />,
+  )
+  await waitFor(() => assert.ok(container.querySelector('h1')))
+  const dom = container.querySelector('.ProseMirror') as HTMLElement & { editor?: Editor }
+  const editor = dom.editor!
+  assert.equal(editorHasMarkdown(editor, '# 一\n\n二'), true)
+  assert.equal(editorHasMarkdown(editor, '# 一\n\n三'), false)
 })
 
 test('page editor applies later value when it is not focused', async () => {

@@ -451,7 +451,7 @@ export class HttpService extends Service {
         }
       } | undefined
     )
-    const store = account?.store
+    const store = account?.isMemberAsync ? undefined : account?.store
     try {
       accountId = token
         ? account?.accountByToken
@@ -598,7 +598,7 @@ export class HttpService extends Service {
             return
           }
           const headerWorkspace = String(req.headers['x-biu-workspace-id'] ?? '').trim()
-          const accountStore = accountService?.store
+          const accountStore = accountService?.isMemberAsync ? undefined : accountService?.store
           const requestedWorkspace = await runWithAccount(accountId, async () => {
             if (headerWorkspace) {
               // 浏览器可能还缓存着已删除或已退出的 workspaceId。不要让这个陈旧值

@@ -108,7 +108,7 @@ const FILE_SYSTEM_METADATA_COLUMNS: Record<FileSystemMetadataTable, readonly str
   saved_views: ['collection', 'view_id', 'payload_json', 'updated_at'],
   shares: [
     'token', 'kind', 'collection', 'view_id', 'record_id', 'password_salt',
-    'password_hash', 'share_plugins', 'allow_copy', 'created_at', 'updated_at',
+    'password_hash', 'share_plugins', 'allow_copy', 'created_at', 'updated_at', 'created_by',
   ],
   attachments: ['name', 'etag', 'mime', 'bytes', 'kind', 'storage', 'created_at'],
   content_refs: ['collection', 'record_id', 'name', 'source'],
@@ -188,7 +188,7 @@ export class MysqlFileSystemMetadataRepository extends MysqlRuntimeRepository {
       checkedColumns('shares', value)
       if (columns.some((column) => value[column] === undefined || value[column] === null)) throw new Error('Incomplete share row')
       const copy = Object.fromEntries(columns.map((column) => [column, value[column]]))
-      for (const column of ['token', 'kind', 'collection', 'view_id', 'record_id', 'password_salt', 'password_hash']) {
+      for (const column of ['token', 'kind', 'collection', 'view_id', 'record_id', 'password_salt', 'password_hash', 'created_by']) {
         if (typeof copy[column] !== 'string') throw new Error('Invalid share row')
       }
       if (!copy.token || !copy.collection || !['view', 'record'].includes(String(copy.kind))) throw new Error('Invalid share target')
@@ -236,6 +236,10 @@ export class MysqlFileSystemMetadataRepository extends MysqlRuntimeRepository {
         const current = rows[0]
         if (!current || columns.some((column) => String(current[column]) !== String(before[column]))) throw conflict()
         const updates = ['password_salt', 'password_hash', 'share_plugins', 'allow_copy', 'updated_at']
+        if (before.created_by !== next.created_by) {
+          if (before.created_by) throw conflict()
+          updates.push('created_by')
+        }
         await connection.query(
           `UPDATE ${this.database}.shares SET ${updates.map((column) => `${safeColumn(column)} = ?`).join(', ')}
            WHERE workspace_id = ? AND token = ?`,

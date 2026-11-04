@@ -197,3 +197,23 @@ test('plugin ownership is read from MySQL, so another member cannot become the o
   assert.deepEqual(await as('bob', () => internal.pluginOwnership('p-other')), { here: '', elsewhere: true })
   assert.deepEqual(await as('bob', () => internal.pluginOwnership('p-new')), { here: '', elsewhere: false })
 })
+
+test('online assets follow MySQL permissions on the referencing record', async () => {
+  const { db, as, grants } = boot()
+  db.facets.replaceContentRefs('/pages', 'p_mine', ['private.png'])
+  await as('ada', () => db.requireAsset('private.png', 'resource:read'))
+  await assert.rejects(() => as('bob', () => db.requireAsset('private.png', 'resource:read')), /permission denied/)
+  grants.bob = { p_mine: 'viewer' }
+  await as('bob', () => db.requireAsset('private.png', 'resource:read'))
+  await assert.rejects(() => as('bob', () => db.requireAsset('private.png', 'resource:update')), /permission denied/)
+  await assert.rejects(() => as('nobody', () => db.requireAsset('private.png', 'resource:read')), /permission denied/)
+})
+
+test('online writable schema comes from MySQL membership, not a missing local actor', async () => {
+  const { db, as } = boot()
+  const viewer = await as('vic', () => db.stat('/pages')) as unknown as { schema: { records: { create: boolean }; fields: { title: { writable: boolean } } } }
+  const member = await as('bob', () => db.stat('/pages')) as unknown as typeof viewer
+  assert.equal(viewer.schema.records.create, false)
+  assert.equal(viewer.schema.fields.title.writable, false)
+  assert.equal(member.schema.records.create, true)
+})

@@ -17,6 +17,8 @@ import {
   isOnlineRuntime,
   clearRequestMemo,
   requestMemoSync,
+  runWithAccount,
+  runWithRequestMemo,
 } from '@biu/host-plugin-loader/data-dir'
 import { asPublicProfile, readWorkspaceProfile, writeWorkspaceProfile } from '@biu/host-workspace'
 import { authorizeCollection, roleCoversAction, type Action as PermissionAction, type AuthorizationService, type ResourceRole } from '@biu/host-account/authorization'
@@ -66,7 +68,7 @@ import { publicShareUrl } from './share-origin.ts'
 import { readSharePluginWebJs, zipSharePluginSource } from './share-plugin-pack.ts'
 import { collectShareResources } from '../share-resources.ts'
 import { FacetStore } from './facets-store.ts'
-import { SharesStore } from './shares-store.ts'
+import { SharesStore, type ShareRecord } from './shares-store.ts'
 import { builtinAllView, builtinAllViewId, builtinMemberViews, displayNameForView, isBuiltinScopeViewId, isReadOnlyViewId, parseBuiltinScopeViewId, stubBuiltinAllView, stubBuiltinMemberView } from '../catalog-views.ts'
 import { isIndexCollection, isSystemCollection } from '../web/database-path.ts'
 import { effectiveDataScope, highestViewRole, recordMatchesGrantedView, type DataScopeName, type ViewGrantRole } from '../view-access.ts'
@@ -1001,7 +1003,8 @@ export class DatabaseService extends Service implements Database {
 
   private collabStore() {
     try {
-      return (this.accountService() as { store?: WorkspaceFiles } | undefined)?.store
+      const account = this.accountService() as { usesMysqlAccounts?: () => boolean; store?: WorkspaceFiles } | undefined
+      return account?.usesMysqlAccounts?.() ? undefined : account?.store
     } catch {
       return undefined
     }
@@ -1021,7 +1024,27 @@ export class DatabaseService extends Service implements Database {
     }
   }
 
-  private schemaForCurrent(spec: CollectionSpec, schema = schemaFor(spec)) {
+  private async schemaForCurrent(spec: CollectionSpec, schema = schemaFor(spec)) {
+    if (this.mysqlAccount()?.usesMysqlAccounts?.()) {
+      const update = await this.mysqlCollectionDecision(spec.path, 'resource:update')
+      const create = await this.mysqlCollectionDecision(spec.path, 'resource:create')
+      const remove = await this.mysqlCollectionDecision(spec.path, 'resource:delete')
+      const member = await this.mysqlAccount()!.mysql!.membership(currentAccountId(), currentRequestWorkspaceId())
+      // 数据记录可通过创建者/单条授权获得写权限，不能仅用集合默认角色隐藏其操作。
+      // 成员表仍严格用集合权限；数据表由每行 shareRole 和服务端单条鉴权最终决定。
+      const rowMayWrite = spec.path !== '/workspace-members' && Boolean(member && member.role !== 'viewer')
+      const canUpdate = Boolean(update?.allowed || rowMayWrite)
+      return {
+        ...schema,
+        fields: canUpdate ? schema.fields : Object.fromEntries(Object.entries(schema.fields).map(([key, field]) => [key, { ...field, writable: false }])),
+        records: {
+          ...schema.records,
+          update: Boolean(schema.records?.update && canUpdate),
+          create: Boolean(schema.records?.create && create?.allowed),
+          delete: Boolean(schema.records?.delete && (remove?.allowed || rowMayWrite)),
+        },
+      }
+    }
     const authorization = this.authorization()
     const actor = authorization?.currentActor()
     if (!authorization || !actor) return schema
@@ -1337,6 +1360,8 @@ export class DatabaseService extends Service implements Database {
     },
   ) {
     const mysqlAttached = this.attachMysqlWorkspaceRecord(collection, recordId, policy)
+    // 线上权威是 MySQL；不得再把归属写入过期的本地 SQLite 副本。
+    if (this.mysqlAccount()?.usesMysqlAccounts?.()) return mysqlAttached.then(() => undefined)
     const store = this.collabStore()
     const requested = currentRequestWorkspaceId()
     const actorId = currentAccountId()
@@ -1420,7 +1445,7 @@ export class DatabaseService extends Service implements Database {
       accessMode: scope === 'workspace' ? 'members' : 'private',
       ...(scope === 'workspace' ? { memberDefaultRole: 'editor' as const } : {}),
     })
-    if (scope === 'workspace') this.grantAllMembersEditable(collection, recordId)
+    if (scope === 'workspace' && !this.mysqlAccount()?.usesMysqlAccounts?.()) this.grantAllMembersEditable(collection, recordId)
     return attached
   }
 
@@ -1687,6 +1712,8 @@ export class DatabaseService extends Service implements Database {
       return this.ctx.get('account') as {
         usesMysqlAccounts?: () => boolean
         mysql?: {
+          accountById?: (id: string) => Promise<{ name: string; email: string } | null>
+          moveRecordPolicy?: (workspaceId: string, collection: string, recordId: string, parentRecordId: string) => Promise<void>
           membership: (
             accountId: string,
             workspaceId: string,
@@ -1768,7 +1795,22 @@ export class DatabaseService extends Service implements Database {
     await this.assertLiveRecord(spec, record.id, action, record)
   }
 
-  requireAsset(name: string, action: 'resource:read' | 'resource:update') {
+  async requireAsset(name: string, action: 'resource:read' | 'resource:update') {
+    if (this.mysqlAccount()?.usesMysqlAccounts?.()) {
+      const refs = this.facets.recordsReferencingAsset(name)
+      for (const ref of refs) {
+        const spec = this.collection(ref.collection)
+        const record = await spec?.get(ref.record_id)
+        if (!record || !spec) continue
+        try {
+          await this.assertLiveRecord(spec, record.id, action, record)
+          return
+        } catch {
+          // 继续检查其他引用；只有对至少一条引用有权限才能读取同名资产。
+        }
+      }
+      throw new Error('permission denied: INSUFFICIENT_PERMISSION')
+    }
     const authorization = this.authorization()
     if (!authorization) return
     const actor = authorization.currentActor()
@@ -2245,7 +2287,7 @@ export class DatabaseService extends Service implements Database {
     if (!spec) throw new Error(`unknown collection: /${parts[0]}`)
     const caps = collectionCaps(spec)
     if (parts.length === 1) {
-      return { kind: 'collection' as const, path: spec.path, id: spec.id, label: spec.label ?? spec.id, view: spec.view ?? null, schema: this.schemaForCurrent(spec), caps }
+      return { kind: 'collection' as const, path: spec.path, id: spec.id, label: spec.label ?? spec.id, view: spec.view ?? null, schema: await this.schemaForCurrent(spec), caps }
     }
     if (parts.length === 2) {
       const record = await spec.get(parts[1]!)
@@ -2256,7 +2298,7 @@ export class DatabaseService extends Service implements Database {
         path: `${spec.path}/${record.id}`,
         id: spec.id,
         label: spec.label ?? spec.id,
-        schema: this.schemaForCurrent(spec),
+        schema: await this.schemaForCurrent(spec),
         caps,
         value: withoutContent(spec, this.withBanner(spec, this.decorateRecord(spec, record))),
       }
@@ -2456,7 +2498,7 @@ export class DatabaseService extends Service implements Database {
           id: spec.id,
           label: spec.label ?? spec.id,
           view: spec.view ?? null,
-          schema: this.schemaForCurrent(spec, schema),
+          schema: await this.schemaForCurrent(spec, schema),
           total: 0,
           offset,
           limit,
@@ -2465,7 +2507,7 @@ export class DatabaseService extends Service implements Database {
       }
       query.ids = [...stamped]
     }
-    const auth = this.authorization()
+    const auth = this.mysqlAccount()?.usesMysqlAccounts?.() ? undefined : this.authorization()
     const actor = auth?.currentActor()
     if (auth && actor) auth.preloadCollection(actor.workspaceId, spec.path, actor.accountId)
     try {
@@ -2484,7 +2526,7 @@ export class DatabaseService extends Service implements Database {
         id: spec.id,
         label: spec.label ?? spec.id,
         view: spec.view ?? null,
-        schema: this.schemaForCurrent(spec, schema),
+        schema: await this.schemaForCurrent(spec, schema),
         total,
         offset,
         limit,
@@ -2795,6 +2837,11 @@ export class DatabaseService extends Service implements Database {
     const sid = currentSessionId()?.trim()
     if (!sid) {
       const accountId = currentAccountId()
+      const account = this.mysqlAccount()
+      if (account?.usesMysqlAccounts?.() && accountId) {
+        const person = await account.mysql?.accountById?.(accountId)
+        return { kind: 'user', name: String(person?.name || person?.email || '用户'), accountId }
+      }
       const member = accountId ? this.collabStore()?.workspacePerson?.(accountId) : null
       if (member?.name) return { kind: 'user', name: member.name, accountId }
       const name = process.env.VITEST ? '用户' : (readWorkspaceProfile().name.trim() || '用户')
@@ -2806,6 +2853,8 @@ export class DatabaseService extends Service implements Database {
 
   private namedPerson(person: PersonValue): PersonValue {
     if (person.kind === 'user' && person.accountId) {
+      // 线上元数据里已存名字；不可用过期的本地副本覆盖。
+      if (this.mysqlAccount()?.usesMysqlAccounts?.()) return person
       const member = this.collabStore()?.workspacePerson?.(person.accountId)
       return member?.name ? { ...person, name: member.name } : person
     }
@@ -2909,7 +2958,7 @@ export class DatabaseService extends Service implements Database {
     const record = await spec.get(parts[1]!)
     if (!record) throw new Error(`unknown record: ${spec.path}/${parts[1]}`)
     await this.assertLiveRecord(spec, record.id, 'resource:read', record)
-    return { kind: 'record' as const, path: `${spec.path}/${record.id}`, schema: this.schemaForCurrent(spec), value: withoutContent(spec, this.withBanner(spec, this.decorateRecord(spec, record))) }
+    return { kind: 'record' as const, path: `${spec.path}/${record.id}`, schema: await this.schemaForCurrent(spec), value: withoutContent(spec, this.withBanner(spec, this.decorateRecord(spec, record))) }
   }
 
   async update(path: string, content: unknown) {
@@ -2984,10 +3033,11 @@ export class DatabaseService extends Service implements Database {
     }
     const patch = pickWritablePatch(schema, raw)
     await assertSameTableLinks(spec, patch, parts[1])
-    const authorization = this.authorization()
+    const mysqlMode = this.mysqlUserMode()
+    const authorization = mysqlMode ? undefined : this.authorization()
     const actor = authorization?.currentActor()
     const parentField = spec.schema.parentField
-    const moving = Boolean(parentField && parentField in patch && authorization && actor)
+    const moving = Boolean(parentField && parentField in patch && (mysqlMode || (authorization && actor)))
     const parentRecordId = moving ? String(patch[parentField!] ?? '').trim() : ''
     const resource = actor
       ? { type: 'record' as const, workspaceId: actor.workspaceId, collection: spec.path, recordId: current.id }
@@ -2996,7 +3046,28 @@ export class DatabaseService extends Service implements Database {
       ? { type: 'record' as const, workspaceId: actor.workspaceId, collection: spec.path, recordId: parentRecordId }
       : null
     if (moving && resource) authorization!.validateMove(actor!, resource, parent)
-    let record = Object.keys(patch).length ? await spec.update(parts[1]!, patch) : current
+    if (moving && mysqlMode) {
+      await this.assertLiveRecord(spec, current.id, 'resource:move', current)
+      if (parentRecordId) {
+        const parentRow = await spec.get(parentRecordId)
+        if (!parentRow) throw new Error(`unknown record: ${spec.path}/${parentRecordId}`)
+        await this.assertLiveRecord(spec, parentRow.id, 'resource:create-child', parentRow)
+      }
+      const mysql = this.mysqlAccount()?.mysql
+      if (!mysql?.moveRecordPolicy) throw new Error('MySQL policy move repository unavailable')
+      await mysql.moveRecordPolicy(mysqlMode.workspaceId, spec.path, current.id, parentRecordId)
+      this.invalidateCaches()
+    }
+    let record: DbRecord
+    try {
+      record = Object.keys(patch).length ? await spec.update(parts[1]!, patch) : current
+    } catch (error) {
+      if (moving && mysqlMode) {
+        await this.mysqlAccount()!.mysql!.moveRecordPolicy!(mysqlMode.workspaceId, spec.path, current.id, String(current[parentField!] ?? '').trim())
+        this.invalidateCaches()
+      }
+      throw error
+    }
     if (moving && resource) authorization!.move(actor!, resource, parent)
     await this.stampActor(spec.path, record.id)
     if ('emoji' in patch || 'tags' in patch) {
@@ -4075,7 +4146,7 @@ export function apply(ctx: Context) {
     path: item.path,
     label: item.label ?? item.id,
   }))))
-  const sqlitePath = biuSqlitePath()
+  const sqlitePath = metadataMode === 'mysql' ? ':memory:' : biuSqlitePath()
   const gcHooks = () => {
     let notices: { push: (input: { kind: 'session'; title: string; body: string; sourceKey: string }) => unknown } | undefined
     try {
@@ -4919,17 +4990,12 @@ export function apply(ctx: Context) {
             const got = (await db.read(`${share.collection}/${share.recordId}`)) as { value?: { title?: unknown; name?: unknown } }
             title = String(got.value?.title ?? got.value?.name ?? share.recordId)
           } catch {
-            shares.revoke(share.token)
-            await shares.flush()
+            // 权限或 MySQL 读取失败不代表目标已删除，不能因此撤销有效链接。
             continue
           }
         } else {
           const named = savedViews.viewsFor(share.collection).find((item) => item.id === share.viewId)
-          if (!named && share.viewId && !isReadOnlyViewId(share.viewId)) {
-            shares.revoke(share.token)
-            await shares.flush()
-            continue
-          }
+          if (!named && share.viewId && !isReadOnlyViewId(share.viewId)) continue
           let collectionLabel = share.collection.replace(/^\//, '')
           try {
             const stat = (await db.stat(share.collection)) as { label?: string; view?: { title?: string } | null }
@@ -5071,6 +5137,31 @@ export function apply(ctx: Context) {
       }
     }
   })
+  async function publicSnapshot(share: ShareRecord) {
+    if (!account?.usesMysqlAccounts?.()) return buildShareSnapshot(db, savedViews, share)
+    const creator = shares.creatorOf(share.token)
+    if (!creator) throw new Error('分享缺少创建者，请登录后重新保存分享设置')
+    const workspaceId = currentRequestWorkspaceId()
+    const mysql = ctx.get('account') as { mysql: { membership(id: string, ws: string): Promise<unknown>; isSuspended(id: string): Promise<boolean> } }
+    const member = await mysql.mysql.membership(creator, workspaceId)
+    if (!member || await mysql.mysql.isSuspended(creator)) throw new Error('分享创建者已无权限')
+    if (!/^\/[A-Za-z0-9_-]+$/.test(share.collection) || /[/\\\\]/.test(share.recordId) || share.recordId === '.' || share.recordId === '..') {
+      throw new Error('invalid share target')
+    }
+    // 只在验证 token/密码后的固定快照构建中使用创建者身份，不开放任意读写接口。
+    return runWithRequestMemo(() => runWithAccount(creator, () => buildShareSnapshot(db, savedViews, share)))
+  }
+  /** 分享附件/插件读快照失败：无权限、目标不存在仍是 404；其余（数据库故障等）记日志并返回 503，便于排查。 */
+  function sendShareSnapshotFailure(route: { send: (status: number, body: unknown) => void }, error: unknown, what: string) {
+    const msg = String(error)
+    if (/unknown (?:record|collection|shared view)|permission denied|分享缺少创建者|分享创建者已无权限|invalid share target/.test(msg)) {
+      route.send(404, { error: 'not found' })
+      return
+    }
+    ctx.logger('share').warn(`public share ${what} snapshot failed: ${msg}`)
+    route.send(503, { error: 'share temporarily unavailable' })
+  }
+
   ctx.http.route('GET', '/api/share/:token', async (route) => shares.withTokenWorkspace(route.params.token ?? '', async () => {
     const token = route.params.token ?? ''
     await shares.prepareToken(token)
@@ -5084,13 +5175,12 @@ export function apply(ctx: Context) {
       return
     }
     try {
-      const snapshot = await buildShareSnapshot(db, savedViews, share)
+      const snapshot = await publicSnapshot(share)
       route.send(200, snapshot)
     } catch (error) {
       const msg = String(error)
       if (share.kind === 'record' && /unknown record/.test(msg)) {
-        shares.revoke(token)
-        await shares.flush()
+        // 无权限和暂时不可读也可能表现为 unknown record；只返回错误，不自动撤销链接。
         route.send(404, { error: 'not found' })
         return
       }
@@ -5111,13 +5201,12 @@ export function apply(ctx: Context) {
       return
     }
     try {
-      const snapshot = await buildShareSnapshot(db, savedViews, share)
+      const snapshot = await publicSnapshot(share)
       route.send(200, snapshot)
     } catch (error) {
       const msg = String(error)
       if (share.kind === 'record' && /unknown record/.test(msg)) {
-        shares.revoke(token)
-        await shares.flush()
+        // 无权限和暂时不可读也可能表现为 unknown record；只返回错误，不自动撤销链接。
         route.send(404, { error: 'not found' })
         return
       }
@@ -5136,8 +5225,14 @@ export function apply(ctx: Context) {
       route.send(401, { needsPassword: true })
       return
     }
+    let snapshot: Awaited<ReturnType<typeof publicSnapshot>>
     try {
-      const snapshot = await buildShareSnapshot(db, savedViews, share)
+      snapshot = await publicSnapshot(share)
+    } catch (error) {
+      sendShareSnapshotFailure(route, error, 'file')
+      return
+    }
+    try {
       const name = route.params.name ?? ''
       if (!snapshot.assets.includes(name)) {
         route.send(404, { error: 'not found' })
@@ -5166,9 +5261,19 @@ export function apply(ctx: Context) {
       route.send(401, { needsPassword: true })
       return
     }
+    if (!share.sharePlugins) {
+      route.send(403, { error: 'plugins are not shared' })
+      return
+    }
     const id = String(route.params.id ?? '')
+    let snapshot: Awaited<ReturnType<typeof publicSnapshot>>
     try {
-      const snapshot = await buildShareSnapshot(db, savedViews, share)
+      snapshot = await publicSnapshot(share)
+    } catch (error) {
+      sendShareSnapshotFailure(route, error, 'plugin web.js')
+      return
+    }
+    try {
       if (!snapshot.pluginIds.includes(id)) {
         route.send(404, { error: 'not found' })
         return
@@ -5205,8 +5310,14 @@ export function apply(ctx: Context) {
       return
     }
     const id = String(route.params.id ?? '').replace(/\.zip$/i, '')
+    let snapshot: Awaited<ReturnType<typeof publicSnapshot>>
     try {
-      const snapshot = await buildShareSnapshot(db, savedViews, share)
+      snapshot = await publicSnapshot(share)
+    } catch (error) {
+      sendShareSnapshotFailure(route, error, 'plugin source')
+      return
+    }
+    try {
       if (!snapshot.pluginIds.includes(id)) {
         route.send(404, { error: 'not found' })
         return
@@ -5256,11 +5367,11 @@ export function apply(ctx: Context) {
     try {
       const name = route.params.name ?? ''
       await db.prepareAssetAccess()
-      db.requireAsset(name, 'resource:read')
+      await db.requireAsset(name, 'resource:read')
       const { bytes, type, etag } = await readAssetWithCloudFallback(ctx, assets, name)
       route.res.writeHead(200, {
         'content-type': type,
-        'cache-control': isHashedAssetName(name) ? 'public, max-age=31536000, immutable' : 'no-store',
+        'cache-control': !isOnlineRuntime() && isHashedAssetName(name) ? 'public, max-age=31536000, immutable' : 'no-store',
         etag: `"${etag}"`,
       })
       route.res.end(bytes)

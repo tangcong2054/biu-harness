@@ -55,6 +55,7 @@ type SessionStoreLike = {
 }
 
 type DatabaseLike = {
+  requirePath?: (path: string, action: 'resource:create' | 'resource:update') => Promise<void>
   syncedRecords: (options?: { since?: number }) => Promise<MirrorSnapshot['collections']>
   applySynced: (path: string, records: MirrorSnapshot['collections'][number]['records']) => Promise<void>
   batchChanges?: <T>(run: () => Promise<T> | T) => Promise<T>
@@ -68,6 +69,11 @@ type DatabaseLike = {
 }
 
 type AccountLike = {
+  usesMysqlAccounts?: () => boolean
+  mysql?: {
+    recordOwnerships(collection: string, id: string): Promise<Array<{ workspaceId: string; ownerId: string }>>
+    attachPolicy(input: { actorId: string; workspaceId: string; collection: string; recordId: string; ownership: 'personal'; accessMode: 'private'; now: number }): Promise<void>
+  } | null
   isRemote?: (collection: string, id: string) => boolean
   markRemote?: (collection: string, id: string) => void
   clearPlace?: (collection: string, id: string) => void
@@ -108,14 +114,24 @@ async function sessionVisible(ctx: Context, id: string, record?: { id?: unknown 
       inWorkspaceAsync?: (id: string, record?: { id?: unknown }) => Promise<boolean>
     } | undefined
     if (typeof sessions?.inWorkspaceAsync === 'function') return await sessions.inWorkspaceAsync(id, record)
-    if (typeof sessions?.inWorkspace === 'function') return sessions.inWorkspace(id, record)
-  } catch {
+    if (typeof sessions?.inWorkspace === 'function' && !accountOf(ctx)?.usesMysqlAccounts?.()) return sessions.inWorkspace(id, record)
+  } catch (error) {
+    if (accountOf(ctx)?.usesMysqlAccounts?.()) throw error
     /* 没有会话服务时按存储里的全部导出，测试走这条 */
   }
+  if (accountOf(ctx)?.usesMysqlAccounts?.()) throw new Error('MySQL snapshot visibility service unavailable')
   return true
 }
 
-function claim(ctx: Context, collection: string, id: string) {
+async function claim(ctx: Context, collection: string, id: string) {
+  const service = accountOf(ctx)
+  if (service?.usesMysqlAccounts?.()) {
+    const actorId = currentAccountId()
+    const workspaceId = currentRequestWorkspaceId()
+    if (!actorId || !workspaceId || !service.mysql) throw new Error('snapshot requires MySQL account and workspace')
+    await service.mysql.attachPolicy({ actorId, workspaceId, collection, recordId: id, ownership: 'personal', accessMode: 'private', now: Date.now() })
+    return
+  }
   try {
     const account = ctx.get('account') as
       | { store?: { activeWorkspaceId(): string | null; attach(workspaceId: string, collection: string, recordId: string): void } }
@@ -204,22 +220,23 @@ async function applySnapshotNow(ctx: Context, snapshot: MirrorSnapshot, mode: Ap
     for (const record of snapshot.sessions ?? []) {
       if (!record?.id) continue
       incoming.add(record.id)
-      const localHome = current.has(record.id) && !account?.isRemote?.('/sessions', record.id)
+      const localHome = mode === 'cache' && current.has(record.id) && !account?.isRemote?.('/sessions', record.id)
       if (mode === 'cache' && localHome) continue
       const incomingAt = Number(record.updatedAt) || 0
       const existingAt = currentUpdatedAt.get(record.id) ?? 0
       if (mode === 'cache' && current.has(record.id) && incomingAt > 0 && existingAt >= incomingAt) {
-        claim(ctx, '/sessions', record.id)
+        await claim(ctx, '/sessions', record.id)
         rememberCloud(ctx, '/sessions', record.id)
         continue
       }
       try {
         await store.save(record)
-        claim(ctx, '/sessions', record.id)
+        await claim(ctx, '/sessions', record.id)
         if (mode === 'cache') rememberCloud(ctx, '/sessions', record.id)
         savedCount += 1
         if (savedCount % 5 === 0) await yieldEventLoop()
       } catch (error) {
+        if (account?.usesMysqlAccounts?.()) throw error
         console.warn('[replica] skip session', record.id, error)
       }
     }
@@ -251,7 +268,7 @@ async function applySnapshotNow(ctx: Context, snapshot: MirrorSnapshot, mode: Ap
       await database.applySynced(collection.path, writable)
       for (const record of writable) {
         if (!record?.id) continue
-        claim(ctx, collection.path, String(record.id))
+        await claim(ctx, collection.path, String(record.id))
         if (mode === 'cache') rememberCloud(ctx, collection.path, String(record.id))
       }
     }
@@ -269,6 +286,26 @@ async function applySnapshotNow(ctx: Context, snapshot: MirrorSnapshot, mode: Ap
 
 export async function applySnapshot(ctx: Context, snapshot: MirrorSnapshot, mode: ApplyMode = 'cache') {
   const database = databaseOf(ctx)
+  const account = accountOf(ctx)
+  if (account?.usesMysqlAccounts?.()) {
+    const workspaceId = currentRequestWorkspaceId()
+    if (!workspaceId || !currentAccountId() || !account.mysql || !database?.requirePath) {
+      throw new Error('snapshot requires MySQL account and workspace')
+    }
+    const targets = [
+      ...(snapshot.sessions ?? []).map((record) => ({ collection: '/sessions', id: record.id })),
+      ...(snapshot.collections ?? []).flatMap((collection) => (collection.records ?? []).map((record) => ({ collection: collection.path, id: record.id }))),
+    ]
+    // 在第一条写入前校验全部目标；不能借同步覆盖别人的记录或把别的空间的记录认领过来。
+    for (const target of targets) {
+      if (!/^\/[A-Za-z0-9_-]+$/.test(target.collection) || !target.id || /[/\\\\]/.test(target.id) || target.id === '.' || target.id === '..') {
+        throw new Error('invalid snapshot target')
+      }
+      const owners = await account.mysql.recordOwnerships(target.collection, target.id)
+      if (owners.some((owner) => owner.workspaceId !== workspaceId)) throw new Error('snapshot target belongs to another workspace')
+      await database.requirePath(owners.length ? `${target.collection}/${target.id}` : target.collection, owners.length ? 'resource:update' : 'resource:create')
+    }
+  }
   if (database?.batchChanges) {
     return database.batchChanges(() => applySnapshotNow(ctx, snapshot, mode))
   }

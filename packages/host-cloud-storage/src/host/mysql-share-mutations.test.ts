@@ -2,8 +2,8 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Pool } from 'mysql2/promise'
 import { MysqlFileSystemMetadataRepository } from './mysql-runtime-repositories.ts'
 
-const columns = ['token', 'kind', 'collection', 'view_id', 'record_id', 'password_salt', 'password_hash', 'share_plugins', 'allow_copy', 'created_at', 'updated_at']
-const row = (token = 'token'): Record<string, unknown> => ({ token, kind: 'record', collection: '/pages', view_id: '', record_id: 'p1', password_salt: '', password_hash: '', share_plugins: 0, allow_copy: 1, created_at: 1, updated_at: 2 })
+const columns = ['token', 'kind', 'collection', 'view_id', 'record_id', 'password_salt', 'password_hash', 'share_plugins', 'allow_copy', 'created_at', 'updated_at', 'created_by']
+const row = (token = 'token'): Record<string, unknown> => ({ token, kind: 'record', collection: '/pages', view_id: '', record_id: 'p1', password_salt: '', password_hash: '', share_plugins: 0, allow_copy: 1, created_at: 1, updated_at: 2, created_by: '' })
 function fixture() {
   const state = { rows: [] as Array<Record<string, unknown>>, workspace: 'ws', view: { id: 'v' } as unknown, writeError: '' }
   let backup: typeof state.rows
@@ -26,8 +26,9 @@ function fixture() {
     }
     if (sql.startsWith('UPDATE `test`.shares')) {
       expect(sql).toContain('WHERE workspace_id = ? AND token = ?')
-      const current = state.rows.find((r) => r.workspace_id === params[5] && r.token === params[6])!
-      for (const [index, column] of ['password_salt', 'password_hash', 'share_plugins', 'allow_copy', 'updated_at'].entries()) current[column] = params[index]
+      const updates = [...sql.split(' WHERE ')[0]!.matchAll(/`([a-z_]+)` = \?/g)].map((match) => match[1]!)
+      const current = state.rows.find((r) => r.workspace_id === params[updates.length] && r.token === params[updates.length + 1])!
+      for (const [index, column] of updates.entries()) current[column] = params[index]
       return [{ affectedRows: 1 }]
     }
     if (sql.startsWith('DELETE FROM `test`.`shares`')) {
@@ -51,6 +52,15 @@ function fixture() {
 }
 
 describe('MySQL share row mutations', () => {
+  it('fills a legacy creator once without allowing creator replacement', async () => {
+    const f = fixture()
+    f.state.rows = [{ workspace_id: 'ws', ...row() }]
+    await f.repository.saveShare({ ...row(), created_by: 'ada' }, row())
+    expect(f.state.rows[0]?.created_by).toBe('ada')
+    await expect(f.repository.saveShare({ ...row(), created_by: 'bob' }, { ...row(), created_by: 'ada' })).rejects.toMatchObject({ code: 'SHARE_CONFLICT' })
+    expect(f.state.rows[0]?.created_by).toBe('ada')
+  })
+
   it('creates one link without changing an unrelated link', async () => {
     const f = fixture()
     f.state.rows = [{ workspace_id: 'ws', ...row('other') }]

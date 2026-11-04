@@ -70,9 +70,6 @@ export class AccountService extends Service {
 
   constructor(ctx: Context, config: AccountConfig = {}) {
     super(ctx, 'account')
-    const db = openAndMigrateBiu(config.sqlitePath ?? biuSqlitePath())
-    this.db = db
-    this.store = new CollabStore(db)
     let cloud: CloudStorageService | undefined
     try {
       cloud = ctx.get('cloudStorage') as CloudStorageService | undefined
@@ -87,6 +84,15 @@ export class AccountService extends Service {
     if (isOnlineRuntime() && this.accountMode !== 'mysql' && !process.env.VITEST && !isOperationsRuntime()) {
       throw new Error('BIU_ONLINE=1 requires MySQL accounts (BIU_STORAGE_BACKEND=mysql); online SQLite is no longer supported')
     }
+    const mysqlOnly = this.usesMysqlAccounts()
+    const unavailable = () => { throw new Error('SQLite account replica is disabled in MySQL mode') }
+    const db = mysqlOnly
+      ? new Proxy({} as ReturnType<typeof openAndMigrateBiu>, { get: (_target, key) => key === 'close' ? () => {} : unavailable })
+      : openAndMigrateBiu(config.sqlitePath ?? biuSqlitePath())
+    this.db = db
+    this.store = mysqlOnly
+      ? new Proxy({} as CollabStore, { get: () => unavailable })
+      : new CollabStore(db)
     // 外部协作者被自动移出空间等成员变化，不经过成员管理接口；仓储递增全空间授权版本时一并清插件授权缓存。
     const unsubscribe = this.mysql?.onWorkspaceAuthzChange?.((workspaceId) => this.forgetPluginAccess({ workspaceId }))
     if (isOperationsRuntime() && this.accountMode === 'sqlite') {
@@ -98,8 +104,8 @@ export class AccountService extends Service {
         workspaceName: process.env.BIU_OPERATIONS_WORKSPACE_NAME || 'Biu 平台运营',
       })
     }
-    this.authorization = this.store.authorization
-    db.exec(`CREATE TABLE IF NOT EXISTS record_place (
+    this.authorization = mysqlOnly ? undefined as unknown as AuthorizationService : this.store.authorization
+    if (!mysqlOnly) db.exec(`CREATE TABLE IF NOT EXISTS record_place (
       collection TEXT NOT NULL,
       record_id TEXT NOT NULL,
       place TEXT NOT NULL,
@@ -136,6 +142,7 @@ export class AccountService extends Service {
           this.store,
           (workspaceId) => this.workspaceLocation(workspaceId) === 'cloud',
           true,
+          this.usesMysqlAccounts() ? this.mysql : null,
         ),
       ),
     )

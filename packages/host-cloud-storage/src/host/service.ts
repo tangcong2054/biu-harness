@@ -83,6 +83,8 @@ export class CloudStorageService extends Service {
     const workspaceId = () => {
       const requested = currentRequestWorkspaceId()
       if (requested) return requested
+      // MySQL 仓储不得以本地 SQLite 的“当前空间”替代请求空间，缺少空间时应明确失败。
+      if (config.enabled && config.backend === 'mysql' && online) return ''
       try {
         const account = ctx.get('account') as { store?: { activeWorkspaceId?(): string | null } } | undefined
         return account?.store?.activeWorkspaceId?.() ?? ''

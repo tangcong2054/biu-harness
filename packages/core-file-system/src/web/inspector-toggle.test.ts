@@ -248,7 +248,8 @@ test('title cell row tools skip the overflow action menu', () => {
   assert.match(browser, /placedActions\(schema, 'row'\)/)
   assert.match(browser, /<Actions actions=\{placed\} record=\{row\}/)
   assert.doesNotMatch(browser, /place="detail"/)
-  assert.match(browser, /onDelete=\{canDelete && !\(collectionPath === '\/plugins' && selected\.builtin === true\) \? \(\) => setDlg\(\{ kind: 'delete-record', row: selected \}\) : undefined\}/)
+  assert.match(browser, /onDelete=\{canDeleteRow\(selected\) \? \(\) => setDlg\(\{ kind: 'delete-record', row: selected \}\) : undefined\}/)
+  assert.match(browser, /row\.shareRole === '管理'/)
   assert.doesNotMatch(browser, /fsdb-detail-more-item/)
   const detail = readFileSync(resolve(import.meta.dirname, './record-detail.tsx'), 'utf8')
   assert.doesNotMatch(detail, /actions=\{toolbar\}/)
@@ -375,7 +376,7 @@ test('deletable tables can pick rows and bulk-act over the table header', () => 
   assert.match(browser, /<FieldValuePop/)
   assert.match(browser, /onSubmit=\{\(next\) => writeCellValue\(row, key, field, next\)\}/)
   assert.match(browser, /const Custom = chrome\?\.cells\?\.\[key\][\s\S]*if \(kind !== 'file'\)/)
-  assert.match(browser, /key && field\?\.writable \?/)
+  assert.match(browser, /key && field && rowFieldOf\(row, field\)\.writable \?/)
   assert.match(browser, /cellUsesPop/)
   assert.match(browser, /CELL_POP_DRAG_PX/)
   assert.match(browser, /start\?\.dragged/)
@@ -442,6 +443,15 @@ test('deletable tables can pick rows and bulk-act over the table header', () => 
   assert.match(browser, /\.fsdb-thumb-btn, \.fsdb-thumb, \.ant-image/)
   assert.match(browser, /\.fsdb-ref-chip/)
   assert.doesNotMatch(browser, /skipBoolean/)
+})
+
+test('rows the current account can only read render table cells read-only', () => {
+  assert.match(browser, /function rowFieldOf\(row: DbRecord, field: FieldSpec\): FieldSpec \{\s*return field\.writable && row\.shareRole === '阅读' \? \{ \.\.\.field, writable: false \} : field/)
+  assert.match(browser, /const field = rowFieldOf\(row, rawField\)/)
+  assert.match(browser, /markCellOn\(td, cellFieldWritable\(rowFieldOf\(row, col\.field\)\)\)/)
+  assert.match(browser, /cellUsesPop\(kind, rowFieldOf\(row, col\.field\)\.writable\)/)
+  assert.match(browser, /const field = rowFieldOf\(row, col\.field\)/)
+  assert.match(browser, /ids: pickedIds\.filter\(\(id\) => items\.find\(\(row\) => row\.id === id\)\?\.shareRole !== '阅读'\)/)
 })
 
 test('creating a record opens that page instead of staying on the list', () => {

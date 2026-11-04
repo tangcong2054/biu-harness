@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, test, vi } from 'vitest'
@@ -158,6 +158,9 @@ test('operations access and identity come from MySQL membership in MySQL mode', 
   }
   new CloudStorage(ctx)
   const account = new AccountService(ctx, { sqlitePath: join(dir, 'biu.sqlite') })
+  assert.equal(existsSync(join(dir, 'biu.sqlite')), false)
+  assert.equal(account.authorization, undefined)
+  assert.throws(() => account.store.activeWorkspaceId(), /SQLite account replica is disabled/)
   // 本地副本里没有任何运营成员；MySQL 才是真实数据。
   assert.equal(await account.isOperationsOperatorAsync('acc_operations_admin'), true)
   assert.equal(await account.isOperationsOperatorAsync('ops_admin'), true)
