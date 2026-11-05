@@ -8,12 +8,12 @@
  *  - 前端侧只需要一个普通页面块插件（按 .inspector-stage-pane 量尺寸即可）
  */
 
-import { app, BrowserWindow, BrowserView, ipcMain, shell, session } from 'electron'
+import { app, BrowserWindow, BrowserView, dialog, ipcMain, shell, session } from 'electron'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { availablePort, adoptPackedUserData, seedPluginSandboxes } from './runtime.js'
+import { availablePort, adoptPackedUserData, seedPackedPlugins, seedPluginSandboxes } from './runtime.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const electronRoot = join(__dirname, '..')
@@ -708,6 +708,7 @@ async function startHost() {
   const pluginDevDir = process.env.BIU_PLUGIN_DEV_DIR || join(workspace, '.plugin-dev')
   adoptPackedUserData(repoRoot, home, workspace)
   seedPluginSandboxes(join(repoRoot, '.plugin-dev'), pluginDevDir)
+  seedPackedPlugins(join(repoRoot, '.plugin'), pluginDir)
   const child = spawn(process.execPath, [entry], {
     cwd: repoRoot,
     stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
@@ -718,12 +719,15 @@ async function startHost() {
       BIU_PORT_FALLBACK: '1',
       BIU_ONLINE: '0',
       HTTP_HOST: hostBind,
+      BIU_PLUGIN_REGISTRY: 'https://tanontang.devcloud.woa.com/api/plugin-registry/v1',
+      BIU_REMOTE_ORIGIN: 'https://tanontang.devcloud.woa.com',
       // 局域网分享复用经过账号鉴权的工作台端口，不再启动第二个 listener。
       SHARE_PORT: String(requestedPort),
       BIU_HOME: home,
       CORDIS_WORKSPACE: workspace,
       BIU_PLUGIN_DIR: pluginDir,
       BIU_PLUGIN_DEV_DIR: pluginDevDir,
+      BIU_AUTOSTART_BUILTINS: '1',
       BIU_PLUGIN_STATE: process.env.BIU_PLUGIN_STATE || join(pluginDir, 'store.json'),
     },
   })
@@ -757,8 +761,13 @@ if (process.platform === 'linux') {
 app.whenReady().then(async () => {
   // 允许被嵌的话就允许；这里只是让一些站少弹无谓的告警
   session.defaultSession.setPermissionRequestHandler((_wc, _permission, callback) => callback(true))
-  await startHost()
-  await createWindow()
+  try {
+    await startHost()
+    await createWindow()
+  } catch (error) {
+    dialog.showErrorBox('Biu 没有启动', error instanceof Error ? error.message : String(error))
+    app.quit()
+  }
 })
 
 app.on('before-quit', () => {
@@ -770,5 +779,6 @@ app.on('window-all-closed', () => {
 })
 
 app.on('activate', () => {
+  if (hostPort <= 0) return
   if (!win || win.isDestroyed()) void createWindow()
 })

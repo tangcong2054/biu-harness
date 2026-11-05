@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { profilePath } from '@biu/host-plugin-loader/data-dir'
+import { isDesktopRuntime, profilePath } from '@biu/host-plugin-loader/data-dir'
 
 export type ThemeMode = 'light' | 'dark'
 export type BodyScale = 'sm' | 'md' | 'lg'
@@ -23,6 +23,11 @@ export const DEFAULT_PAGE_PREFS: PagePrefs = {
   bodyGap: 'md',
 }
 
+/** 桌面版默认宽屏；线上仍用窄栏，已保存的选择优先。 */
+export function defaultPagePrefs(): PagePrefs {
+  return { ...DEFAULT_PAGE_PREFS, wide: isDesktopRuntime() }
+}
+
 export type WorkspaceProfile = {
   name: string
   avatar: string
@@ -30,7 +35,9 @@ export type WorkspaceProfile = {
   pagePrefs: PagePrefs
 }
 
-const EMPTY: WorkspaceProfile = { name: '', avatar: '', theme: 'light', pagePrefs: { ...DEFAULT_PAGE_PREFS } }
+function emptyProfile(): WorkspaceProfile {
+  return { name: '', avatar: '', theme: 'light', pagePrefs: defaultPagePrefs() }
+}
 const SCALES = new Set<BodyScale>(['sm', 'md', 'lg'])
 
 function parseTheme(value: unknown): ThemeMode {
@@ -41,7 +48,7 @@ function asScale(value: unknown, fallback: BodyScale): BodyScale {
   return typeof value === 'string' && SCALES.has(value as BodyScale) ? (value as BodyScale) : fallback
 }
 
-export function parsePagePrefs(value: unknown, fallback: PagePrefs = DEFAULT_PAGE_PREFS): PagePrefs {
+export function parsePagePrefs(value: unknown, fallback: PagePrefs = defaultPagePrefs()): PagePrefs {
   if (!value || typeof value !== 'object') return { ...fallback }
   const rec = value as Partial<PagePrefs>
   return {
@@ -68,7 +75,7 @@ export function readWorkspaceProfile(): WorkspaceProfile {
       pagePrefs: parsePagePrefs(raw.pagePrefs),
     }
   } catch {
-    return { ...EMPTY }
+    return emptyProfile()
   }
 }
 

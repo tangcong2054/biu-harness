@@ -23,11 +23,16 @@ const DEFAULT_PREFS: PagePrefs = {
   bodyGap: 'md',
 }
 
+function defaultPrefs(): PagePrefs {
+  const electron = typeof navigator !== 'undefined' && /Electron/i.test(navigator.userAgent)
+  return { ...DEFAULT_PREFS, wide: electron }
+}
+
 function asScale(value: unknown, fallback: BodyScale): BodyScale {
   return typeof value === 'string' && SCALES.has(value as BodyScale) ? (value as BodyScale) : fallback
 }
 
-export function parsePagePrefs(value: unknown, fallback: PagePrefs = DEFAULT_PREFS): PagePrefs {
+export function parsePagePrefs(value: unknown, fallback: PagePrefs = defaultPrefs()): PagePrefs {
   if (!value || typeof value !== 'object') return { ...fallback }
   const rec = value as Partial<PagePrefs>
   return {
@@ -44,9 +49,11 @@ function readCachedPagePrefs(): PagePrefs {
   try {
     const raw = localStorage.getItem(KEY)
     if (raw) return parsePagePrefs(JSON.parse(raw) as unknown)
-    return { ...DEFAULT_PREFS, wide: localStorage.getItem(LEGACY_WIDTH_KEY) === 'full' }
+    const legacy = localStorage.getItem(LEGACY_WIDTH_KEY)
+    if (legacy === 'full' || legacy === 'max') return { ...defaultPrefs(), wide: legacy === 'full' }
+    return defaultPrefs()
   } catch {
-    return { ...DEFAULT_PREFS }
+    return defaultPrefs()
   }
 }
 
@@ -80,7 +87,7 @@ function postPagePrefs(next: PagePrefs, previous: PagePrefs) {
     })
 }
 
-let prefs: PagePrefs = typeof localStorage === 'undefined' ? { ...DEFAULT_PREFS } : readCachedPagePrefs()
+let prefs: PagePrefs = typeof localStorage === 'undefined' ? defaultPrefs() : readCachedPagePrefs()
 let pageWidthVersion = 0
 const listeners = new Set<() => void>()
 

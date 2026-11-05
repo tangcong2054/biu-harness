@@ -7,6 +7,8 @@ import { asPublicProfile, readWorkspaceProfile, writeWorkspaceProfile } from './
 
 test('workspace profile stores preferred name and rejects oversized avatars', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'biu-profile-'))
+  const previousOnline = process.env.BIU_ONLINE
+  process.env.BIU_ONLINE = '1'
   process.env.BIU_PROFILE = join(dir, 'profile.json')
   assert.equal(readWorkspaceProfile().name, '')
   const saved = writeWorkspaceProfile({ name: '  蓝团  ', avatar: '' })
@@ -28,4 +30,22 @@ test('workspace profile stores preferred name and rejects oversized avatars', as
   assert.equal(readWorkspaceProfile().pagePrefs.bodySize, 'lg')
   assert.equal(writeWorkspaceProfile({ theme: 'light' }).pagePrefs.wide, true)
   assert.throws(() => writeWorkspaceProfile({ avatar: `data:image/jpeg;base64,${'a'.repeat(240_001)}` }))
+  if (previousOnline === undefined) delete process.env.BIU_ONLINE
+  else process.env.BIU_ONLINE = previousOnline
+})
+
+test('desktop profile defaults the page to wide', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'biu-profile-desktop-'))
+  const previousOnline = process.env.BIU_ONLINE
+  const previousProfile = process.env.BIU_PROFILE
+  process.env.BIU_ONLINE = '0'
+  process.env.BIU_PROFILE = join(dir, 'profile.json')
+  try {
+    assert.equal(readWorkspaceProfile().pagePrefs.wide, true)
+  } finally {
+    if (previousOnline === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previousOnline
+    if (previousProfile === undefined) delete process.env.BIU_PROFILE
+    else process.env.BIU_PROFILE = previousProfile
+  }
 })

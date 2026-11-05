@@ -59,6 +59,24 @@ export function adoptPackedUserData(fromRoot: string, dataRoot: string, workspac
   return dest
 }
 
+/** 首次启动复制已经打好的系统插件。用户目录里已有 host.js 或 web.js 时不覆盖。 */
+export function seedPackedPlugins(sourceDir: string, targetDir: string) {
+  if (!existsSync(sourceDir)) return []
+  mkdirSync(targetDir, { recursive: true })
+  const copied: string[] = []
+  for (const id of readdirSync(sourceDir).sort()) {
+    const source = join(sourceDir, id)
+    if (!existsSync(join(source, 'manifest.json'))) continue
+    if (!existsSync(join(source, 'host.js')) && !existsSync(join(source, 'web.js'))) continue
+    const target = join(targetDir, id)
+    if (existsSync(join(target, 'host.js')) || existsSync(join(target, 'web.js'))) continue
+    rmSync(target, { recursive: true, force: true })
+    cpSync(source, target, { recursive: true })
+    copied.push(id)
+  }
+  return copied
+}
+
 /** 首次启动复制内置插件源码；已有沙箱属于用户，不覆盖。 */
 export function seedPluginSandboxes(sourceDir: string, targetDir: string) {
   if (!existsSync(sourceDir)) return []

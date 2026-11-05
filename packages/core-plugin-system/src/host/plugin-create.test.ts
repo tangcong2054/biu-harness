@@ -8,9 +8,33 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { Context } from 'cordis'
 import { PluginStoreService } from './index.ts'
-import { withPluginPackLock } from './plugin-create.ts'
+import { packSandboxDir, resolveNpmLaunch, withPluginPackLock } from './plugin-create.ts'
 import { pluginsCollection } from './collection.ts'
 import type { PluginStoreService as Store } from './store.ts'
+
+test('packSandboxDir writes a runnable bundle and leaves the sandbox manifest alone', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-pack-dir-'))
+  try {
+    const sandbox = join(dir, 'page-browser')
+    await mkdir(join(sandbox, 'host'), { recursive: true })
+    const manifest = {
+      id: 'page-browser',
+      name: '浏览器',
+      blurb: '内置浏览器',
+      builtin: true,
+      headless: true,
+      createdAt: 1,
+    }
+    await writeFile(join(sandbox, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+    await writeFile(join(sandbox, 'host', 'index.ts'), "export const name = 'page-browser'\nexport function apply() {}\n")
+    const dest = join(dir, 'out')
+    assert.equal(await packSandboxDir(sandbox, dest), 'page-browser')
+    assert.match(await readFile(join(dest, 'host.js'), 'utf8'), /\bapply\b/)
+    assert.equal(JSON.parse(await readFile(join(sandbox, 'manifest.json'), 'utf8')).createdAt, 1)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
 
 function stubHub(ctx: Context) {
   ;(ctx as unknown as { hub: unknown }).hub = {
@@ -540,6 +564,26 @@ test('plugin pack lock runs one bundle at a time', async () => {
   )
   assert.equal(max, 1)
   assert.equal(current, 0)
+})
+
+test('plugin pack uses the bundled npm when the desktop PATH has none', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-npm-'))
+  try {
+    const cli = join(dir, 'node_modules', 'npm', 'bin', 'npm-cli.js')
+    await mkdir(join(dir, 'node_modules', 'npm', 'bin'), { recursive: true })
+    await writeFile(cli, '')
+    const launch = resolveNpmLaunch({ PATH: '/usr/bin:/bin', HOME: dir }, '/Applications/Biu.app/Contents/MacOS/Biu', dir)
+    assert.equal(launch.command, '/Applications/Biu.app/Contents/MacOS/Biu')
+    assert.deepEqual(launch.args, [cli])
+    const homebrew = join(dir, 'brew', 'npm')
+    await mkdir(join(dir, 'brew'), { recursive: true })
+    await writeFile(homebrew, '')
+    const fromPath = resolveNpmLaunch({ PATH: join(dir, 'brew'), HOME: dir }, process.execPath, join(dir, 'empty'))
+    assert.equal(fromPath.command, homebrew)
+    assert.deepEqual(fromPath.args, [])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test('native esbuild starts its platform binary without a PATH node executable', () => {

@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, test } from 'vitest'
-import { availablePort, adoptPackedUserData, seedPluginSandboxes } from './runtime.ts'
+import { availablePort, adoptPackedUserData, seedPackedPlugins, seedPluginSandboxes } from './runtime.ts'
 
 const cleanup: string[] = []
 
@@ -64,6 +64,27 @@ test('built-in plugin sources seed once without dependencies or overwriting user
   await writeFile(join(target, 'demo', 'web.tsx'), 'user edit')
   assert.deepEqual(seedPluginSandboxes(source, target), [])
   assert.equal(await readFile(join(target, 'demo', 'web.tsx'), 'utf8'), 'user edit')
+})
+
+test('packed system plugins seed once and keep their runtime files', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'biu-packed-seed-'))
+  cleanup.push(dir)
+  const source = join(dir, 'source')
+  const target = join(dir, 'workspace', '.plugin')
+  await mkdir(join(source, 'page-terminal', 'node_modules', 'node-pty'), { recursive: true })
+  await writeFile(join(source, 'page-terminal', 'manifest.json'), '{"id":"page-terminal","builtin":true}')
+  await writeFile(join(source, 'page-terminal', 'web.js'), 'export const version = 1')
+  await writeFile(join(source, 'page-terminal', 'node_modules', 'node-pty', 'index.js'), 'pty')
+  await mkdir(join(source, 'draft'), { recursive: true })
+  await writeFile(join(source, 'draft', 'manifest.json'), '{}')
+
+  assert.deepEqual(seedPackedPlugins(source, target), ['page-terminal'])
+  assert.equal(await readFile(join(target, 'page-terminal', 'node_modules', 'node-pty', 'index.js'), 'utf8'), 'pty')
+  assert.equal(await readFile(join(target, 'draft', 'manifest.json')).then(() => 'copied', () => 'absent'), 'absent')
+
+  await writeFile(join(target, 'page-terminal', 'web.js'), 'user pack')
+  assert.deepEqual(seedPackedPlugins(source, target), [])
+  assert.equal(await readFile(join(target, 'page-terminal', 'web.js'), 'utf8'), 'user pack')
 })
 
 test('adoptPackedUserData inherits leftover pack-host data without overwriting userData', async () => {

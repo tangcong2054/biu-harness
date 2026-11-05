@@ -8,7 +8,7 @@ import { Context } from 'cordis'
 import { runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import type { CatalogEntry } from '@biu/host-hub'
 import { PluginStoreService, defaultPluginDir, defaultStatePath } from './index.ts'
-import { hashInstalledPluginCode, hubPluginIsLive } from './store.ts'
+import { hashInstalledPluginCode, hubPluginIsLive, packedBuiltinIds } from './store.ts'
 
 function stubHub(ctx: Context) {
   const adopted: string[] = []
@@ -43,6 +43,60 @@ test('a plugin that is still mounting can serve its web bundle', () => {
   assert.equal(hubPluginIsLive({ enabled: false, state: 'pending' }), true)
   assert.equal(hubPluginIsLive({ enabled: false, state: 'off' }), false)
   assert.equal(hubPluginIsLive({ enabled: false, state: 'failed' }), false)
+})
+
+test('registering binds packed builtins as installed and running', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-bind-builtin-'))
+  const packages: string[] = []
+  const installed: string[] = []
+  const loads = new Set<string>()
+  try {
+    const ctx = new Context()
+    ;(ctx as unknown as { get(name: string): unknown }).get = (name: string) =>
+      name === 'account'
+        ? {
+            recordPluginPackage: async (_account: string, input: { id: string }) => {
+              packages.push(input.id)
+            },
+            installPluginForAccount: async (_account: string, _workspace: string, id: string) => {
+              installed.push(id)
+            },
+            setPluginLoad: async (_account: string, _workspace: string, id: string, on: boolean) => {
+              if (on) loads.add(id)
+              else loads.delete(id)
+            },
+            canAccessPlugin: async () => true,
+          }
+        : undefined
+    const pluginDir = join(dir, '.plugin')
+    await mkdir(join(pluginDir, 'page-terminal'), { recursive: true })
+    await mkdir(join(pluginDir, 'arena-rogue'), { recursive: true })
+    await writeFile(join(pluginDir, 'page-terminal', 'manifest.json'), JSON.stringify({ id: 'page-terminal', builtin: true }))
+    await writeFile(join(pluginDir, 'page-terminal', 'web.js'), 'export {}')
+    await writeFile(join(pluginDir, 'arena-rogue', 'manifest.json'), JSON.stringify({ id: 'arena-rogue' }))
+    await writeFile(join(pluginDir, 'arena-rogue', 'web.js'), 'export {}')
+    const store = new PluginStoreService(ctx, pluginDir, join(dir, 'store.json'), join(dir, '.plugin-dev')).open()
+    assert.deepEqual(await store.bindPackedBuiltins('acc_ada', 'ws_home'), ['page-terminal'])
+    assert.deepEqual(packages, ['page-terminal'])
+    assert.deepEqual(installed, ['page-terminal'])
+    assert.deepEqual([...loads], ['page-terminal'])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('packed builtin ids are the bundles desktop should start', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-builtin-ids-'))
+  await mkdir(join(dir, 'page-terminal'), { recursive: true })
+  await mkdir(join(dir, 'arena-rogue'), { recursive: true })
+  await mkdir(join(dir, 'notes'), { recursive: true })
+  await writeFile(join(dir, 'page-terminal', 'manifest.json'), JSON.stringify({ id: 'page-terminal', builtin: true }))
+  await writeFile(join(dir, 'page-terminal', 'web.js'), 'export {}')
+  await writeFile(join(dir, 'arena-rogue', 'manifest.json'), JSON.stringify({ id: 'arena-rogue', builtin: false }))
+  await writeFile(join(dir, 'arena-rogue', 'web.js'), 'export {}')
+  await writeFile(join(dir, 'notes', 'manifest.json'), JSON.stringify({ id: 'notes', builtin: true }))
+  assert.deepEqual(packedBuiltinIds(dir), ['page-terminal'])
+  await rm(dir, { recursive: true, force: true })
 })
 
 test('builtin sandboxes stay in the plugin list without draft permission', async () => {

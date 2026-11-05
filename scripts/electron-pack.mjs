@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { execFileSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
-import { dirname, join, relative, resolve } from 'node:path'
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, symlinkSync, unlinkSync, writeFileSync, readFileSync } from 'node:fs'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { compileMain } from './electron-launch.mjs'
 
@@ -40,12 +40,42 @@ function copyDir(from, to, skip = new Set()) {
   }
 }
 
+function isBuiltinPluginSource(dir) {
+  const manifestPath = join(dir, 'manifest.json')
+  if (!existsSync(manifestPath)) return false
+  try {
+    return JSON.parse(readFileSync(manifestPath, 'utf8')).builtin === true
+  } catch {
+    return false
+  }
+}
+
+/** 桌面包只带 manifest.builtin 的系统插件。其余 .plugin-dev 留在仓库，避免和商店同名插件抢掉安装按钮。 */
+export function copyBuiltinPluginSources(source, dest) {
+  if (!existsSync(source)) return []
+  mkdirSync(dest, { recursive: true })
+  const copied = []
+  for (const name of readdirSync(source)) {
+    const from = join(source, name)
+    if (!isBuiltinPluginSource(from)) continue
+    cpSync(from, join(dest, name), {
+      recursive: true,
+      filter: (file) => !relative(from, file).split(/[\\/]/).includes('node_modules'),
+    })
+    copied.push(name)
+  }
+  return copied
+}
+
 function stageBuiltinPluginSources() {
-  const source = join(root, '.plugin-dev')
-  if (!existsSync(source)) return
-  cpSync(source, join(hostDir, '.plugin-dev'), {
-    recursive: true,
-    filter: (path) => !relative(source, path).split(/[\\/]/).includes('node_modules'),
+  copyBuiltinPluginSources(join(root, '.plugin-dev'), join(hostDir, '.plugin-dev'))
+}
+
+function stageBuiltinPluginBundles() {
+  const tsx = join(root, 'node_modules', 'tsx', 'dist', 'cli.mjs')
+  execFileSync(process.execPath, [tsx, join(root, 'scripts', 'stage-builtin-bundles.ts'), join(root, '.plugin-dev'), join(hostDir, '.plugin')], {
+    cwd: root,
+    stdio: 'inherit',
   })
 }
 
@@ -87,7 +117,7 @@ function configuredHostEntries() {
   })
 }
 
-async function compilePackagedHost() {
+export async function compilePackagedHost() {
   const { build } = await import('esbuild')
   const entries = configuredHostEntries()
   const modules = entries.map(
@@ -113,6 +143,10 @@ async function compilePackagedHost() {
     target: 'node24',
     sourcemap: false,
     legalComments: 'none',
+    // mysql2 等 CJS 会 require("buffer")。打成 ESM 后没有 require，宿主会在启动时直接退出，窗口只剩底色。
+    banner: {
+      js: "import { createRequire as createBiuRequire } from 'node:module'\nconst require = createBiuRequire(import.meta.url)\n",
+    },
     external: HOST_RUNTIME_PACKAGES.flatMap((name) => [name, `${name}/*`]),
     logLevel: 'info',
   })
@@ -130,6 +164,29 @@ export function npmQueryInvocation(
   }
   // Windows 不能由 execFileSync 直接执行 npm.cmd（EINVAL）；fallback 必须走 shell。
   return { command: 'npm', args, shell: platform === 'win32' }
+}
+
+/** npm 的 .bin 是指向仓库的绝对链接，codesign 会拒签。改成包内相对链接。 */
+export function retargetPackagedSymlinks(dir, sourceRoot) {
+  const walk = (current) => {
+    for (const name of readdirSync(current)) {
+      const path = join(current, name)
+      const stat = lstatSync(path)
+      if (stat.isSymbolicLink()) {
+        const target = readlinkSync(path)
+        if (!isAbsolute(target)) continue
+        const fromSource = relative(sourceRoot, target)
+        unlinkSync(path)
+        const relocated = join(dir, fromSource)
+        if (fromSource && !fromSource.startsWith('..') && !isAbsolute(fromSource) && existsSync(relocated)) {
+          symlinkSync(relative(dirname(path), relocated), path)
+        }
+        continue
+      }
+      if (stat.isDirectory()) walk(path)
+    }
+  }
+  walk(dir)
 }
 
 function stageHostNodeModules() {
@@ -153,6 +210,7 @@ function stageHostNodeModules() {
     cpSync(join(root, location), join(hostDir, location), { recursive: true })
     copied.push(location)
   }
+  retargetPackagedSymlinks(hostDir, root)
 }
 
 /** asar/app 只装壳。host 单独放 pack-host，避免 extraResources 的 package.json 把壳里的同名文件排除掉。 */
@@ -189,6 +247,7 @@ export async function stagePackHost() {
   }
   cpSync(join(root, 'dist'), join(hostDir, 'dist'), { recursive: true })
   stageBuiltinPluginSources()
+  stageBuiltinPluginBundles()
   await compilePackagedHost()
   stageHostNodeModules()
 }

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, watch, writeFileSync, type FSWatcher } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, watch, writeFileSync, type FSWatcher } from 'node:fs'
 import { readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { dirname, join, resolve, sep } from 'node:path'
@@ -97,6 +97,25 @@ async function copyPackedMedia(sandbox: string, dest: string) {
 }
 
 /** 已安装插件代码短版本：host.js 与 web.js 按文件名顺序一起 SHA-1，取前 12 位。 */
+/** 桌面安装包里已经打好、启动时要直接挂上的系统插件。 */
+export function packedBuiltinIds(pluginDir: string) {
+  if (!existsSync(pluginDir)) return []
+  const ids: string[] = []
+  for (const name of readdirSync(pluginDir)) {
+    if (!/^[a-z][a-z0-9-]{1,40}$/.test(name)) continue
+    const dir = join(pluginDir, name)
+    if (!existsSync(join(dir, 'manifest.json'))) continue
+    if (!existsSync(join(dir, 'host.js')) && !existsSync(join(dir, 'web.js'))) continue
+    try {
+      const raw = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8')) as { id?: unknown; builtin?: unknown }
+      if (raw.builtin === true && String(raw.id ?? '') === name) ids.push(name)
+    } catch {
+      /* 坏清单不自动启动 */
+    }
+  }
+  return ids.sort()
+}
+
 export async function hashInstalledPluginCode(dir: string): Promise<string | undefined> {
   const hash = createHash('sha1')
   let any = false
@@ -1108,7 +1127,43 @@ export class PluginStoreService extends Service {
     this.invalidateList()
   }
 
+  /** 把已经打好的系统插件装进这个账号的当前空间，并记成正在运行。 */
+  async bindPackedBuiltins(accountId: string, workspaceId: string) {
+    const account = accountId.trim()
+    const workspace = workspaceId.trim()
+    if (!account || !workspace) return []
+    const records = this.accountStore()
+    if (!records?.recordPluginPackage || !records.installPluginForAccount || !records.setPluginLoad) return []
+    const bound: string[] = []
+    for (const id of packedBuiltinIds(this.pluginDir)) {
+      const dir = this.pluginPath(id)
+      const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8')) as Record<string, unknown>
+      const codeVersion = (await hashInstalledPluginCode(dir)) ?? 'builtin'
+      await records.recordPluginPackage(account, {
+        id,
+        version: codeVersion,
+        packageHash: codeVersion,
+        packagePath: dir,
+        sourceKind: 'builtin',
+        trustState: 'approved',
+        tenantMode: 'assigned',
+        hasWeb: existsSync(join(dir, 'web.js')),
+        hasHost: existsSync(join(dir, 'host.js')),
+        manifest,
+      })
+      await records.installPluginForAccount(account, workspace, id, codeVersion)
+      await records.setPluginLoad(account, workspace, id, true)
+      bound.push(id)
+    }
+    return bound
+  }
+
   async restore() {
+    if (process.env.BIU_AUTOSTART_BUILTINS === '1') {
+      for (const id of packedBuiltinIds(this.pluginDir)) {
+        if (!this.isEnabled(id)) this.setEnabled(id, true)
+      }
+    }
     const ids = [...new Set([...(await this.accountStore()?.loadedPluginIds?.() ?? []), ...this.state.enabled])]
     for (const id of ids) {
       const hit = await this.findPluginDir(id)

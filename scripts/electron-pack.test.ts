@@ -1,10 +1,56 @@
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
+import { existsSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
-import { npmQueryInvocation } from './electron-pack.mjs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { copyBuiltinPluginSources, npmQueryInvocation, retargetPackagedSymlinks } from './electron-pack.mjs'
 
 const root = resolve(import.meta.dirname, '..')
+
+test('packaged npm bins become relative symlinks', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'biu-pack-link-'))
+  try {
+    const source = join(dir, 'repo')
+    const packed = join(dir, 'pack-host')
+    mkdirSync(join(source, 'node_modules', 'npm', 'node_modules', 'which', 'bin'), { recursive: true })
+    mkdirSync(join(packed, 'node_modules', 'npm', 'node_modules', 'which', 'bin'), { recursive: true })
+    mkdirSync(join(packed, 'node_modules', 'npm', 'node_modules', '.bin'), { recursive: true })
+    writeFileSync(join(source, 'node_modules', 'npm', 'node_modules', 'which', 'bin', 'which.js'), '')
+    writeFileSync(join(packed, 'node_modules', 'npm', 'node_modules', 'which', 'bin', 'which.js'), '')
+    const link = join(packed, 'node_modules', 'npm', 'node_modules', '.bin', 'node-which')
+    symlinkSync(join(source, 'node_modules', 'npm', 'node_modules', 'which', 'bin', 'which.js'), link)
+    retargetPackagedSymlinks(packed, source)
+    assert.equal(readlinkSync(link), '../which/bin/which.js')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('desktop pack copies only builtin plugin sources', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'biu-pack-plugins-'))
+  try {
+    const source = join(dir, 'plugin-dev')
+    const dest = join(dir, 'staged')
+    const writePlugin = (id, manifest, extra = {}) => {
+      mkdirSync(join(source, id, 'node_modules', 'left-behind'), { recursive: true })
+      writeFileSync(join(source, id, 'manifest.json'), JSON.stringify(manifest))
+      writeFileSync(join(source, id, 'host.js'), 'export {}')
+      writeFileSync(join(source, id, 'node_modules', 'left-behind', 'index.js'), '')
+      for (const [name, body] of Object.entries(extra)) writeFileSync(join(source, id, name), body)
+    }
+    writePlugin('page-terminal', { id: 'page-terminal', builtin: true })
+    writePlugin('arena-rogue', { id: 'arena-rogue', builtin: false })
+    mkdirSync(join(source, 'cdb-slowlog'), { recursive: true })
+    assert.deepEqual(copyBuiltinPluginSources(source, dest), ['page-terminal'])
+    assert.equal(existsSync(join(dest, 'page-terminal', 'host.js')), true)
+    assert.equal(existsSync(join(dest, 'page-terminal', 'node_modules')), false)
+    assert.equal(existsSync(join(dest, 'arena-rogue')), false)
+    assert.equal(existsSync(join(dest, 'cdb-slowlog')), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 test('npm query runs through node instead of npm.cmd on Windows', () => {
   const cli = String.raw`C:\Program Files\nodejs\node_modules\npm\bin\npm-cli.js`
@@ -44,6 +90,7 @@ test('desktop pack publishes dmg/exe via GitHub Release and ad-hoc macOS signing
   assert.match(source, /HOST_RUNTIME_PACKAGES/)
   assert.match(source, /cpSync\(join\(root, 'dist'\), join\(hostDir, 'dist'\)/)
   assert.match(source, /stageBuiltinPluginSources/)
+  assert.match(source, /stageBuiltinPluginBundles/)
   assert.match(source, /join\(hostDir, '\.plugin-dev'\)/)
   assert.match(source, /includes\('node_modules'\)/)
   assert.doesNotMatch(source, /join\(appDir, 'dist'\)/)
@@ -51,6 +98,7 @@ test('desktop pack publishes dmg/exe via GitHub Release and ad-hoc macOS signing
   assert.doesNotMatch(source, /copyDir\(join\(root, 'node_modules'/)
   assert.doesNotMatch(source, /cpSync\(join\(root, 'node_modules', '@biu'\)/)
   assert.match(source, /compilePackagedHost/)
+  assert.match(source, /createBiuRequire/)
   assert.match(source, /target: 'node24'/)
   assert.doesNotMatch(source, /copyDir\(join\(root, 'packages'/)
   assert.match(yml, /beforeBuild: scripts\/electron-builder-before-build\.cjs/)
@@ -61,6 +109,7 @@ test('desktop pack publishes dmg/exe via GitHub Release and ad-hoc macOS signing
     '@modelcontextprotocol/sdk',
     'cordis',
     'esbuild',
+    'npm',
     'ws',
     'yaml',
   ])
@@ -91,9 +140,13 @@ test('desktop pack publishes dmg/exe via GitHub Release and ad-hoc macOS signing
   assert.match(main, /'ipc'/)
   assert.match(main, /await win\.loadURL\(hostUrl\)/)
   assert.match(main, /seedPluginSandboxes/)
+  assert.match(main, /seedPackedPlugins/)
+  assert.match(main, /BIU_AUTOSTART_BUILTINS: '1'/)
   assert.match(main, /adoptPackedUserData/)
   assert.match(main, /BIU_PLUGIN_DEV_DIR: pluginDevDir/)
   assert.match(main, /BIU_PLUGIN_DIR: pluginDir/)
+  assert.match(main, /BIU_PLUGIN_REGISTRY: 'https:\/\/tanontang\.devcloud\.woa\.com\/api\/plugin-registry\/v1'/)
+  assert.match(main, /BIU_REMOTE_ORIGIN: 'https:\/\/tanontang\.devcloud\.woa\.com'/)
   assert.doesNotMatch(main, /await win\.loadFile/)
   assert.doesNotMatch(main, /node_modules', 'tsx/)
 

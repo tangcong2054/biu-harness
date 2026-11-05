@@ -2,7 +2,7 @@ import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rm
 import { readFile, writeFile } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { dirname, extname, join, resolve } from 'node:path'
+import { delimiter, dirname, extname, join, resolve } from 'node:path'
 import type { Plugin as EsbuildPlugin } from 'esbuild'
 import { declaredStoreShell, parseStoreShell, requireDeclaredShell, type StoreShell } from '../shell.ts'
 
@@ -297,6 +297,34 @@ export function withPluginPackLock<T>(fn: () => Promise<T>): Promise<T> {
   return run
 }
 
+function fileExists(path: string) {
+  return Boolean(path) && existsSync(path)
+}
+
+/** 桌面版由访达启动时 PATH 里没有 npm。优先用宿主自带的 npm-cli，再用 PATH 和常见安装位置。 */
+export function resolveNpmLaunch(env: NodeJS.ProcessEnv = process.env, execPath = process.execPath, cwd = process.cwd()) {
+  const bundled = join(cwd, 'node_modules', 'npm', 'bin', 'npm-cli.js')
+  if (fileExists(bundled)) return { command: execPath, args: [bundled] }
+  const pathValue = env.PATH || env.Path || ''
+  const names = process.platform === 'win32' ? ['npm.cmd', 'npm.exe', 'npm'] : ['npm']
+  for (const dir of pathValue.split(delimiter)) {
+    if (!dir) continue
+    for (const name of names) {
+      const hit = join(dir, name)
+      if (fileExists(hit)) return { command: hit, args: [] as string[] }
+    }
+  }
+  const home = env.HOME || env.USERPROFILE || ''
+  for (const candidate of [
+    '/opt/homebrew/bin/npm',
+    '/usr/local/bin/npm',
+    join(home, 'AppData', 'Roaming', 'npm', 'npm.cmd'),
+  ]) {
+    if (fileExists(candidate)) return { command: candidate, args: [] as string[] }
+  }
+  return { command: process.platform === 'win32' ? 'npm.cmd' : 'npm', args: [] as string[] }
+}
+
 /** 沙箱自己的 npm 依赖：pack 时装进 .plugin-dev/<id>/node_modules，再打进 bundle。不走宿主 package.json。 */
 export async function ensureSandboxNpm(sandbox: string) {
   const pkgFile = join(sandbox, 'package.json')
@@ -314,15 +342,20 @@ export async function ensureSandboxNpm(sandbox: string) {
     existsSync(join(sandbox, 'node_modules', name, 'package.json')) &&
     (!NATIVE_PLUGIN_DEPENDENCIES.has(name) || nativeModuleReady(sandbox, name))
   if (names.every(dependencyReady)) return
+  const launch = resolveNpmLaunch()
   const options = {
     cwd: sandbox,
     encoding: 'utf8' as const,
     stdio: ['ignore', 'pipe', 'pipe'] as const,
-    env: { ...process.env, npm_config_update_notifier: 'false' },
-    shell: process.platform === 'win32',
+    env: {
+      ...process.env,
+      npm_config_update_notifier: 'false',
+      ...(launch.args.length ? { ELECTRON_RUN_AS_NODE: '1' } : {}),
+    },
+    shell: process.platform === 'win32' && launch.args.length === 0,
   }
   const runNpm = (args: string[], timeout: number) =>
-    execFileAsync('npm', args, { ...options, timeout })
+    execFileAsync(launch.command, [...launch.args, ...args], { ...options, timeout })
   try {
     await runNpm(
       ['install', '--omit=dev', '--no-audit', '--no-fund', '--ignore-scripts', '--no-package-lock'],
@@ -398,7 +431,11 @@ function prunePluginRuntime(dir: string) {
 }
 
 /** 原生 external 由插件自己携带；不再要求桌面宿主提供。 */
-export function copyPluginRuntimeDependencies(sandbox: string, dest: string) {
+export function copyPluginRuntimeDependencies(
+  sandbox: string,
+  dest: string,
+  options?: { allPrebuilds?: boolean },
+) {
   const external = pluginExternalDependencies(sandbox)
   const destModules = join(dest, 'node_modules')
   rmSync(destModules, { recursive: true, force: true })
@@ -412,7 +449,7 @@ export function copyPluginRuntimeDependencies(sandbox: string, dest: string) {
     rmSync(join(pty, name), { recursive: true, force: true })
   }
   const prebuilds = join(pty, 'prebuilds')
-  if (existsSync(prebuilds)) {
+  if (existsSync(prebuilds) && !options?.allPrebuilds) {
     const keep = `${process.platform}-${process.arch}`
     for (const name of readdirSync(prebuilds)) {
       if (name !== keep) rmSync(join(prebuilds, name), { recursive: true, force: true })
@@ -425,6 +462,27 @@ export function copyPluginRuntimeDependencies(sandbox: string, dest: string) {
   const builtHelper = join(pty, 'build', 'Release', 'spawn-helper')
   if (process.platform !== 'win32' && existsSync(builtHelper)) chmodSync(builtHelper, 0o755)
   return external
+}
+
+/** 把沙箱打成可直接挂载的 .plugin 目录。不改沙箱里的 manifest。 */
+export async function packSandboxDir(sandbox: string, dest: string, options?: { allPrebuilds?: boolean }) {
+  if (!existsSync(join(sandbox, 'manifest.json'))) throw new Error(`sandbox not found: ${sandbox}`)
+  const raw = JSON.parse(readFileSync(join(sandbox, 'manifest.json'), 'utf8')) as Record<string, unknown>
+  const createdAt = listingCreatedAt(raw.createdAt) || Date.now()
+  const manifest = parseStoreManifest({ ...raw, createdAt })
+  const hostEntry = findEntry(sandbox, HOST_ENTRIES)
+  const webEntry = findEntry(sandbox, WEB_ENTRIES)
+  if (!hostEntry && !webEntry) throw new Error('sandbox needs host/index.ts or web/index.tsx')
+  requireDeclaredShell(raw.shell, Boolean(webEntry), 'pack', Boolean(manifest.headless))
+  rmSync(dest, { recursive: true, force: true })
+  mkdirSync(dest, { recursive: true })
+  await writeFile(join(dest, 'manifest.json'), `${JSON.stringify({ ...raw, id: manifest.id, createdAt: manifest.createdAt }, null, 2)}\n`)
+  if (hostEntry) await writeFile(join(dest, 'host.js'), await bundleStoreEntry(hostEntry, 'host'))
+  if (webEntry) await writeFile(join(dest, 'web.js'), await bundleStoreEntry(webEntry, 'web'))
+  copyPluginRuntimeDependencies(sandbox, dest, options)
+  const readme = join(sandbox, 'README.md')
+  if (existsSync(readme)) await writeFile(join(dest, 'README.md'), readFileSync(readme))
+  return manifest.id
 }
 
 /** 沙箱入口打包：相对 import + 沙箱 npm（react / @biu/* 除外）。 */

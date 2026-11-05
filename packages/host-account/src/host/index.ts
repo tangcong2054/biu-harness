@@ -1032,6 +1032,18 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
     }
   })
 
+  async function bindDesktopBuiltins(accountId: string, workspaceId: string) {
+    if (!accountId || !workspaceId || account.usesMysqlAccounts()) return
+    try {
+      const plugins = ctx.get('pluginStore') as {
+        bindPackedBuiltins?: (accountId: string, workspaceId: string) => Promise<unknown>
+      }
+      await plugins.bindPackedBuiltins?.(accountId, workspaceId)
+    } catch {
+      /* 插件服务还没起来时，注册和登录本身仍然成功。 */
+    }
+  }
+
   ctx.http.route('POST', '/api/account/register', async (route) => {
     try {
       if (isOperationsRuntime()) throw new CollabError('运营端不开放自助注册', 403)
@@ -1069,6 +1081,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
       }
       const created = account.store.register('', Date.now(), password, email)
       const workspaceId = account.store.enter(created.id)
+      await bindDesktopBuiltins(created.id, workspaceId)
       const session = account.store.openSession(created.id, String(route.req.headers['user-agent'] ?? '浏览器').slice(0, 120))
       rememberLogin(route, session.token)
       ctx.http.broadcast('database', { ts: Date.now() })
@@ -1121,6 +1134,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
         throw new CollabError('没有平台运营权限', 403)
       }
       const workspaceId = account.store.enter(found.id)
+      await bindDesktopBuiltins(found.id, workspaceId)
       rememberLogin(route, found.token)
       ctx.http.broadcast('database', { ts: Date.now() })
       route.send(200, {
