@@ -21,6 +21,10 @@ export const CLIENT_INFO = { name: 'biu', version: '0.1.0' } as const
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.BIU_MCP_TIMEOUT ?? 30000)
 
+function timeoutOf(config: McpServerConfig) {
+  return config.timeoutMs && config.timeoutMs > 0 ? config.timeoutMs : DEFAULT_TIMEOUT_MS
+}
+
 function buildTransport(config: McpServerConfig): Transport {
   if (config.transport === 'stdio') {
     return new StdioClientTransport({
@@ -52,24 +56,26 @@ export class McpConnection {
   private client: Client
   private transport: Transport
   private stderr = ''
+  private timeoutMs: number
 
-  private constructor(id: string, client: Client, transport: Transport) {
+  private constructor(id: string, client: Client, transport: Transport, timeoutMs: number) {
     this.id = id
     this.client = client
     this.transport = transport
+    this.timeoutMs = timeoutMs
   }
 
   static async open(config: McpServerConfig) {
     const client = new Client(CLIENT_INFO, { capabilities: {} })
     const transport = buildTransport(config)
-    const connection = new McpConnection(config.id, client, transport)
+    const connection = new McpConnection(config.id, client, transport, timeoutOf(config))
     if (transport instanceof StdioClientTransport) {
       transport.stderr?.on('data', (chunk: Buffer) => {
         // 只留尾部，够定位启动失败原因，不至于把日志灌爆。
         connection.stderr = `${connection.stderr}${chunk.toString('utf8')}`.slice(-4000)
       })
     }
-    await client.connect(transport, { timeout: DEFAULT_TIMEOUT_MS })
+    await client.connect(transport, { timeout: connection.timeoutMs })
     return connection
   }
 
@@ -97,7 +103,7 @@ export class McpConnection {
   }
 
   async listTools(): Promise<McpToolInfo[]> {
-    const listed = await this.client.listTools(undefined, { timeout: DEFAULT_TIMEOUT_MS })
+    const listed = await this.client.listTools(undefined, { timeout: this.timeoutMs })
     return (listed.tools ?? []).map((tool) => ({
       name: tool.name,
       description: String(tool.description ?? ''),
@@ -107,7 +113,7 @@ export class McpConnection {
   }
 
   async callTool(name: string, args: Record<string, unknown>) {
-    return this.client.callTool({ name, arguments: args }, undefined, { timeout: DEFAULT_TIMEOUT_MS })
+    return this.client.callTool({ name, arguments: args }, undefined, { timeout: this.timeoutMs })
   }
 
   async close() {

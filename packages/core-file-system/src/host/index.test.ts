@@ -2394,9 +2394,15 @@ test('builtin MCP echo is shared and read-only in every workspace without record
     schema: { labelField: 'title', fields: { ...REQUIRED_RECORD_FIELDS, title: { type: 'string' }, builtin: { type: 'boolean' } } },
     list: () => [
       { id: 'echo', title: 'echo', builtin: true },
-      { id: 'other', title: 'other', builtin: false },
+      { id: 'tapd', title: 'TAPD官方MCP', builtin: true },
+      { id: 'km', title: 'km', builtin: false },
     ],
-    get: (id) => id === 'echo' ? { id, title: 'echo', builtin: true } : null,
+    get: (id) => {
+      if (id === 'echo') return { id, title: 'echo', builtin: true }
+      if (id === 'tapd') return { id, title: 'TAPD官方MCP', builtin: true }
+      if (id === 'km') return { id, title: 'km', builtin: false }
+      return null
+    },
   })
   const dir = mkdtempSync(join(tmpdir(), 'biu-db-shared-mcp-'))
   const collab = new CollabStore(openAndMigrateBiu(join(dir, 'biu.sqlite')))
@@ -2414,14 +2420,17 @@ test('builtin MCP echo is shared and read-only in every workspace without record
     for (const [id, workspace] of [[ada.id, first.id], [bob.id, second.id]]) {
       const run = <T>(fn: () => T) => runWithAccount(id, () => runWithRequestWorkspace(workspace, fn))
       const rows = await run(() => db.list('/mcp'))
-      assert.deepEqual(rows.items.map((row) => row.id), ['echo'])
-      assert.equal(rows.items[0]?.shareScope, '共享')
-      assert.equal(rows.items[0]?.shareRole, '阅读')
-      assert.deepEqual((await run(() => db.list('/mcp', { $scope: 'shared' }))).items.map((row) => row.id), ['echo'])
-      assert.equal((await run(() => db.list('/mcp', { $scope: 'workspace' }))).items.length, 0)
-      const read = await run(() => db.read('/mcp/echo'))
-      assert.equal(read.kind === 'record' && read.value.id, 'echo')
+      assert.deepEqual(rows.items.map((row) => row.id).sort(), ['echo', 'km', 'tapd'])
+      assert.equal(rows.items.find((row) => row.id === 'echo')?.shareScope, '共享')
+      assert.equal(rows.items.find((row) => row.id === 'echo')?.shareRole, '阅读')
+      assert.equal(rows.items.find((row) => row.id === 'tapd')?.shareScope, '共享')
+      assert.equal(rows.items.find((row) => row.id === 'km')?.shareScope, '空间')
+      assert.deepEqual((await run(() => db.list('/mcp', { $scope: 'shared' }))).items.map((row) => row.id).sort(), ['echo', 'tapd'])
+      assert.deepEqual((await run(() => db.list('/mcp', { $scope: 'workspace' }))).items.map((row) => row.id), ['km'])
+      const read = await run(() => db.read('/mcp/tapd'))
+      assert.equal(read.kind === 'record' && read.value.id, 'tapd')
       await assert.rejects(() => run(() => db.update('/mcp/echo', { title: 'changed' })), /INSUFFICIENT_PERMISSION/)
+      await assert.rejects(() => run(() => db.update('/mcp/tapd', { title: 'changed' })), /INSUFFICIENT_PERMISSION/)
     }
   } finally {
     if (previous === undefined) delete process.env.BIU_ONLINE

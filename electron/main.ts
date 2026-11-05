@@ -728,6 +728,7 @@ async function startHost() {
       BIU_PLUGIN_DIR: pluginDir,
       BIU_PLUGIN_DEV_DIR: pluginDevDir,
       BIU_AUTOSTART_BUILTINS: '1',
+      BIU_SYSTEM_MCP: '1',
       BIU_PLUGIN_STATE: process.env.BIU_PLUGIN_STATE || join(pluginDir, 'store.json'),
     },
   })

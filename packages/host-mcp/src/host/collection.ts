@@ -10,7 +10,7 @@ function asRecord(
 ): DbRecord {
   return {
     id: row.id,
-    title: row.id,
+    title: row.title || row.id,
     transport: row.transport,
     status: row.status,
     enabled: row.enabled,
@@ -121,7 +121,7 @@ export function mcpCollection(mcp: McpService): CollectionSpec {
         `title 就是${location()}中的 key，改它等于重命名。远端服务器把 transport 改成 http 或 sse 并填 url。` +
         'env 一项一个 KEY=VALUE，headers 一项一个 Name: Value。工具选择改「仅允许 / 禁用」两列，或在详情清单里勾。' +
         '本表动作只留启用 / 停用（改 enabled 并连上或断开）和删除。挂载用新建行或 mcp_add_stdio，清单用 mcp_list。' +
-        'status=error 时看 error 列，stdio 服务器那里会带上子进程 stderr。builtin 的 echo 行只用于自检，不能改。',
+        'status=error 时看 error 列，stdio 服务器那里会带上子进程 stderr。内置行（echo 和桌面系统 MCP）不能改、不能删。',
       order: 40,
       icon: 'link',
     },

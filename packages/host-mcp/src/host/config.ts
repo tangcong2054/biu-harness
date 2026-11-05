@@ -23,6 +23,10 @@ export type McpServerConfig = {
   headers: Record<string, string>
   enabled: boolean
   tools: McpToolFilter
+  /** 表格上的名字。缺省用 id。 */
+  title?: string
+  /** 单台服务器的握手和调用超时，毫秒。缺省用 BIU_MCP_TIMEOUT 或 30 秒。 */
+  timeoutMs?: number
 }
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
@@ -96,7 +100,14 @@ export function normalizeServerConfig(id: string, value: unknown): McpServerConf
     // 只有显式 false / disabled:true 才算关；缺省是开，跟外部配置文件的直觉一致。
     enabled: raw.enabled === undefined ? raw.disabled !== true : raw.enabled !== false,
     tools: normalizeToolFilter(raw.tools),
+    title: String(raw.title ?? '').trim() || undefined,
+    timeoutMs: positiveTimeout(raw.timeoutMs ?? raw.timeout),
   }
+}
+
+function positiveTimeout(value: unknown) {
+  const timeout = Number(value)
+  return Number.isFinite(timeout) && timeout > 0 ? timeout : undefined
 }
 
 /** 还不能连的草稿：stdio 缺命令，远端缺地址。空串表示配置已齐。 */

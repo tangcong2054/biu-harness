@@ -1155,6 +1155,7 @@ export class DatabaseService extends Service implements Database {
         if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) {
           return action === 'resource:read' || action === 'resource:list'
         }
+        if (this.mcpConfigVisible(collection, row as { id?: unknown; builtin?: unknown })) return true
         if (collection === '/plugins' && actor.type === 'account' && 'pluginPath' in row &&
           (action === 'resource:read' || action === 'resource:list') &&
           this.installedPluginVisible(String(row.id ?? ''), actor.accountId, actor.workspaceId)) return true
@@ -1191,6 +1192,7 @@ export class DatabaseService extends Service implements Database {
       if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) {
         return action === 'resource:read' || action === 'resource:list'
       }
+      if (this.mcpConfigVisible(collection, row as { id?: unknown; builtin?: unknown })) return true
       const target = this.scopeTarget(collection, String(row.id ?? ''), row)
       if (!this.inWorkspace(membership, target.collection, target.id)) return false
       if (!membership.strict || !store?.grantMap || !workspaceId) return true
@@ -1237,6 +1239,7 @@ export class DatabaseService extends Service implements Database {
     const reading = action === 'resource:read' || action === 'resource:list'
     if (collection === '/plugin-catalog' || collection === '/plugin-reviews' || isOperationsMetadata(collection)) return reading
     if (this.builtinShared(collection, row)) return reading
+    if (this.mcpConfigVisible(collection, row)) return true
     if (collection === '/plugins' && reading && 'pluginPath' in row &&
       this.installedPluginVisible(String(row.id ?? ''), mode.accountId, mode.workspaceId)) return true
     const role = this.mysqlRoleOf(collection, row)
@@ -1469,10 +1472,19 @@ export class DatabaseService extends Service implements Database {
     return record?.builtin === true || isRegisteredBuiltinPlugin(id)
   }
 
-  /** 内置 echo 无需记录归属；与内置插件一样供各工作区只读自检。 */
+  /** 内置插件和内置 MCP 无需记录归属，各工作区只读可见。 */
   private builtinShared(collection: string, record: { id?: unknown; builtin?: unknown }) {
-    return (collection === '/plugins' && record.builtin === true)
-      || (collection === '/mcp' && record.id === 'echo' && record.builtin === true)
+    return ((collection === '/plugins' || collection === '/mcp') && record.builtin === true)
+  }
+
+  /**
+   * 工作区 MCP 配置文件里的服务器没有单独的归属行。
+   * 不补这一步时，表格会把它当成无主的私人记录藏起来，Agent 的 mcp_servers 仍能看到。
+   */
+  private mcpConfigVisible(collection: string, row: { id?: unknown; builtin?: unknown }) {
+    if (collection !== '/mcp' || row.builtin === true) return false
+    if (this.mysqlAccount()?.usesMysqlAccounts?.()) return false
+    return !this.recordOwner(collection, String(row.id ?? ''))
   }
 
   private assertLiveRecord(
@@ -1490,9 +1502,12 @@ export class DatabaseService extends Service implements Database {
       return Promise.reject(new Error('permission denied: INSUFFICIENT_PERMISSION'))
     }
     if (this.builtinPlugin(spec, id, record as { builtin?: unknown } | undefined)
-      || (spec.path === '/mcp' && id === 'echo' && (record as { builtin?: unknown } | undefined)?.builtin === true)) {
+      || this.builtinShared(spec.path, { id, ...(record as { builtin?: unknown } | undefined) })) {
       if (action === 'resource:read' || action === 'resource:list') return Promise.resolve()
       return Promise.reject(new Error('permission denied: INSUFFICIENT_PERMISSION'))
+    }
+    if (this.mcpConfigVisible(spec.path, { id, ...(record as { builtin?: unknown } | undefined) })) {
+      return Promise.resolve()
     }
     if (spec.path === '/plugins' && (action === 'resource:read' || action === 'resource:list')) {
       const mode = this.mysqlUserMode()
@@ -2123,6 +2138,10 @@ export class DatabaseService extends Service implements Database {
         shared.push(row)
         continue
       }
+      if (this.mcpConfigVisible(collection, row as { id?: unknown; builtin?: unknown })) {
+        workspace.push(row)
+        continue
+      }
       if (collection === '/plugins' && actor.type === 'account' && 'pluginPath' in row &&
         this.installedPluginVisible(String(row.id ?? ''), actor.accountId, actor.workspaceId)) {
         personal.push(row)
@@ -2688,12 +2707,12 @@ export class DatabaseService extends Service implements Database {
   private ownershipOf(collection: string, id: string): 'personal' | 'workspace' | 'shared' {
     const store = this.collabStore()
     const workspaceId = store?.activeWorkspaceId?.() ?? ''
-    if (!store?.collectionOwnership || !workspaceId) return 'personal'
+    if (!store?.collectionOwnership || !workspaceId) return collection === '/mcp' ? 'workspace' : 'personal'
     const key = `${workspaceId}\t${collection}`
     if (!this.ownershipCache || this.ownershipCache.key !== key) {
       this.ownershipCache = { key, map: store.collectionOwnership(workspaceId, collection) }
     }
-    return this.ownershipCache.map.get(id) ?? 'personal'
+    return this.ownershipCache.map.get(id) ?? (collection === '/mcp' ? 'workspace' : 'personal')
   }
 
   private recordOwner(collection: string, id: string) {

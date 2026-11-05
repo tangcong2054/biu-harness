@@ -15,6 +15,7 @@ import {
   type McpServerConfig,
   type McpToolFilter,
 } from './config.ts'
+import { systemMcpConfigs, systemMcpIds } from './system-servers.ts'
 
 export type McpStatus = 'idle' | 'connecting' | 'ready' | 'error'
 
@@ -27,6 +28,7 @@ export type McpServerRow = {
   cwd: string
   enabled: boolean
   builtin: boolean
+  title: string
   status: McpStatus
   error: string
   serverName: string
@@ -59,6 +61,10 @@ type ServerState = {
   builtin: boolean
   generation?: number
   opening?: Promise<void>
+}
+
+function inProcessBuiltin(state: ServerState) {
+  return state.builtin && state.config.command === 'builtin:echo'
 }
 
 function echoState(): ServerState {
@@ -152,16 +158,22 @@ export class McpService extends Service {
       this.stamps.set(key, stamp)
       if (cached) return cached
       const fallback = new Map<string, ServerState>([['echo', echoState()]])
+      for (const config of systemMcpConfigs()) {
+        fallback.set(config.id, {
+          config, status: 'idle', error: '', tools: [], connectedAt: 0, builtin: true,
+        })
+      }
       this.scopes.set(key, fallback)
       return fallback
     }
     // 读成功：清掉错误标记并按文件重建（之前读失败的占位、或文件被外部改过）。
     this.loadErrors.delete(key)
     this.stamps.set(key, stamp)
+    const reserved = new Set(['echo', ...systemMcpIds()])
     const servers = new Map<string, ServerState>([['echo', echoState()]])
     this.scopes.set(key, servers)
     for (const config of configs) {
-      if (config.id === 'echo') continue
+      if (reserved.has(config.id)) continue
       const prev = cached?.get(config.id)
       // 配置没变的沿用原连接，避免外部改动别的服务器时把正在跑的子进程一起重启。
       if (prev && !prev.builtin && JSON.stringify(prev.config) === JSON.stringify(config)) {
@@ -170,6 +182,16 @@ export class McpService extends Service {
       }
       servers.set(config.id, {
         config, status: 'idle', error: '', tools: [], connectedAt: 0, builtin: false,
+      })
+    }
+    for (const config of systemMcpConfigs()) {
+      const prev = cached?.get(config.id)
+      if (prev?.builtin && JSON.stringify(prev.config) === JSON.stringify(config)) {
+        servers.set(config.id, prev)
+        continue
+      }
+      servers.set(config.id, {
+        config, status: 'idle', error: '', tools: [], connectedAt: 0, builtin: true,
       })
     }
     // 被外部删掉或改掉的服务器：关掉旧连接，别留下孤儿子进程。
@@ -182,7 +204,8 @@ export class McpService extends Service {
     }
     // 每个工作区首次访问时独立连接；不把其他工作区的 MCP 清单/连接带过来。
     for (const state of servers.values()) {
-      if (!state.builtin && !state.connection && state.status !== 'connecting' && state.config.enabled && !incompleteReason(state.config)) {
+      const holdSystem = process.env.BIU_SYSTEM_MCP_CONNECT === '0' && state.builtin
+      if (!holdSystem && !inProcessBuiltin(state) && !state.connection && state.status !== 'connecting' && state.config.enabled && !incompleteReason(state.config)) {
         state.opening = this.connectInScope(key, state)
         void state.opening.catch(() => undefined)
       }
@@ -240,7 +263,7 @@ export class McpService extends Service {
     if (isOnlineRuntime() || this.ctx.get('account')) return
     const servers = this.servers
     await Promise.all([...servers.values()]
-      .filter((state) => !state.builtin && state.config.enabled && !incompleteReason(state.config))
+      .filter((state) => !inProcessBuiltin(state) && state.config.enabled && !incompleteReason(state.config))
       .map((state) => state.opening?.catch(() => undefined)))
   }
 
@@ -281,7 +304,7 @@ export class McpService extends Service {
 
   async connect(id: string) {
     const state = this.require(id)
-    if (state.builtin) return this.row(state)
+    if (inProcessBuiltin(state)) return this.row(state)
     const missing = incompleteReason(state.config)
     if (missing) {
       state.status = 'error'
@@ -298,7 +321,7 @@ export class McpService extends Service {
 
   async disconnect(id: string) {
     const state = this.require(id)
-    if (state.builtin) throw new Error('cannot disconnect built-in echo server')
+    if (state.builtin) throw new Error('cannot disconnect built-in server')
     state.generation = (state.generation ?? 0) + 1
     await state.connection?.close()
     state.connection = undefined
@@ -313,7 +336,7 @@ export class McpService extends Service {
   async upsert(raw: Record<string, unknown> & { id: string }) {
     const config = normalizeServerConfig(raw.id, raw)
     if (!config) throw new Error(`invalid mcp server config: ${raw.id}`)
-    if (config.id === 'echo') throw new Error('echo is reserved for the built-in server')
+    if (config.id === 'echo' || systemMcpIds().has(config.id)) throw new Error('built-in server id is reserved')
     this.assertWritable()
     const existing = this.servers.get(config.id)
     if (existing) await this.disconnect(config.id)
@@ -332,7 +355,7 @@ export class McpService extends Service {
 
   async setEnabled(id: string, enabled: boolean) {
     const state = this.require(id)
-    if (state.builtin) throw new Error('built-in echo server is always enabled')
+    if (state.builtin) throw new Error('built-in server is always enabled')
     this.assertWritable()
     state.config = { ...state.config, enabled }
     this.persist()
@@ -348,7 +371,7 @@ export class McpService extends Service {
   /** 改 id：迁移配置并按需重连。表格里改「服务器」列走这条。 */
   async rename(id: string, nextId: string) {
     const state = this.require(id)
-    if (state.builtin) throw new Error('cannot rename the built-in echo server')
+    if (state.builtin) throw new Error('cannot rename the built-in server')
     this.assertWritable()
     const wanted = String(nextId ?? '').trim()
     if (wanted === id) return this.row(state)
@@ -381,7 +404,7 @@ export class McpService extends Service {
    */
   async patchConfig(id: string, patch: Partial<McpServerConfig>) {
     const state = this.require(id)
-    if (state.builtin) throw new Error('cannot edit the built-in echo server')
+    if (state.builtin) throw new Error('cannot edit the built-in server')
     this.assertWritable()
     const before = state.config
     const merged = normalizeServerConfig(id, { ...before, ...patch, id })
@@ -403,7 +426,7 @@ export class McpService extends Service {
   /** 工具选择：只改配置，读时过滤立即生效，不需要重连。 */
   setToolFilter(id: string, filter: unknown) {
     const state = this.require(id)
-    if (state.builtin) throw new Error('cannot filter the built-in echo server')
+    if (state.builtin) throw new Error('cannot filter the built-in server')
     this.assertWritable()
     state.config = { ...state.config, tools: normalizeToolFilter(filter) }
     this.persist()
@@ -421,7 +444,7 @@ export class McpService extends Service {
     const unique = [...new Set(ids.map((id) => String(id ?? '').trim()).filter(Boolean))]
     const states = unique.map((id) => {
       const state = this.require(id)
-      if (state.builtin) throw new Error('cannot remove built-in echo server')
+      if (state.builtin) throw new Error('cannot remove built-in server')
       return state
     })
     this.assertWritable()
@@ -439,7 +462,7 @@ export class McpService extends Service {
   /** 重新拉取工具清单（server 端热更新了工具时用）。 */
   async refresh(id: string) {
     const state = this.require(id)
-    if (state.builtin) return this.row(state)
+    if (inProcessBuiltin(state)) return this.row(state)
     if (!state.connection) return this.connect(id)
     state.tools = await state.connection.listTools()
     this.changed()
@@ -515,6 +538,7 @@ export class McpService extends Service {
       cwd: state.config.cwd,
       enabled: state.builtin ? true : state.config.enabled,
       builtin: state.builtin,
+      title: state.config.title || state.config.id,
       status: state.status,
       error: state.error || missing,
       serverName: info?.name ?? '',
@@ -539,7 +563,7 @@ export class McpService extends Service {
 
   async call(serverId: string, name: string, args: Record<string, unknown>) {
     const state = this.require(serverId)
-    if (state.builtin) {
+    if (inProcessBuiltin(state)) {
       if (name !== 'mcp_echo') throw new Error(`unknown mcp tool: ${name}`)
       return { text: String(args.text ?? '') }
     }

@@ -20,6 +20,8 @@ afterEach(() => {
   delete process.env.BIU_MCP_CONFIG
   delete process.env.BIU_ONLINE
   delete process.env.BIU_HOME
+  delete process.env.BIU_SYSTEM_MCP
+  delete process.env.BIU_SYSTEM_MCP_CONNECT
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -53,6 +55,31 @@ test('mcp_remove refuses built-in echo and exposes add/remove tools', async () =
   }
   await assert.rejects(() => ctx.tools.invoke('mcp_remove', { id: 'echo' }), /cannot remove built-in/)
   assert.deepEqual(ctx.mcp.serverIds(), ['echo'])
+})
+
+test('desktop system mcp servers are built in and stay out of the config file', async () => {
+  process.env.BIU_SYSTEM_MCP = '1'
+  process.env.BIU_SYSTEM_MCP_CONNECT = '0'
+  const ctx = await boot()
+  const ids = ['CDB_CLS_MCP_SERVER', 'cloud-dba-ai-cdb-mcpserver', 'echo', 'gongfeng', 'iWiki', 'tapd']
+  assert.deepEqual(ctx.mcp.serverIds(), [...ids].sort((a, b) => a.localeCompare(b)))
+  const tapd = ctx.mcp.listServers().find((row) => row.id === 'tapd')
+  assert.equal(tapd?.builtin, true)
+  assert.equal(tapd?.title, 'TAPD官方MCP')
+  assert.equal(tapd?.url, 'https://tapd.mcp.woa.com')
+  assert.equal(tapd?.transport, 'http')
+  const cls = ctx.mcp.configOf('CDB_CLS_MCP_SERVER')
+  assert.equal(cls.transport, 'sse')
+  assert.equal(cls.headers['x-request-from'], 'router')
+  assert.match(cls.headers.Authorization, /^Bearer \S+$/)
+  assert.equal(ctx.mcp.configOf('gongfeng').timeoutMs, 60_000)
+  assert.equal(ctx.mcp.configOf('cloud-dba-ai-cdb-mcpserver').timeoutMs, 60_000)
+  ctx.mcp.draft()
+  const saved = readFileSync(process.env.BIU_MCP_CONFIG!, 'utf8')
+  assert.match(saved, /new-server/)
+  assert.doesNotMatch(saved, /tapd|gongfeng|iWiki|cloud-dba|CDB_CLS|Bearer /)
+  await assert.rejects(() => ctx.mcp.remove('iWiki'), /cannot remove built-in/)
+  await assert.rejects(() => ctx.mcp.upsert({ id: 'tapd', url: 'https://example.com' }), /reserved/)
 })
 
 test('mcp_servers reports the built-in row as ready', async () => {

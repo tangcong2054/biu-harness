@@ -142,6 +142,7 @@ test('desktop pack publishes dmg/exe via GitHub Release and ad-hoc macOS signing
   assert.match(main, /seedPluginSandboxes/)
   assert.match(main, /seedPackedPlugins/)
   assert.match(main, /BIU_AUTOSTART_BUILTINS: '1'/)
+  assert.match(main, /BIU_SYSTEM_MCP: '1'/)
   assert.match(main, /adoptPackedUserData/)
   assert.match(main, /BIU_PLUGIN_DEV_DIR: pluginDevDir/)
   assert.match(main, /BIU_PLUGIN_DIR: pluginDir/)
