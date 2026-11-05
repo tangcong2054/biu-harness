@@ -507,6 +507,7 @@ export class PluginStoreService extends Service {
     const staging = join(this.pluginDir, `.packing-${manifest.id}`)
     await rm(staging, { recursive: true, force: true })
     mkdirSync(staging, { recursive: true })
+    let publishedReadme = ''
     try {
       await writeFile(join(staging, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
       if (hostEntry) await writeFile(join(staging, 'host.js'), await bundleStoreEntry(hostEntry, 'host'))
@@ -514,6 +515,7 @@ export class PluginStoreService extends Service {
       copyPluginRuntimeDependencies(sandbox, staging)
       let readme = await this.readDiskReadme(id)
       if (!readme.trim()) readme = `# ${manifest.name}\n\n${manifest.blurb.trim()}\n`
+      publishedReadme = readme
       const packed = copyReferencedEditorAssets({
         body: readme,
         assetsDir: assetsRootPath(),
@@ -527,6 +529,8 @@ export class PluginStoreService extends Service {
       await rm(staging, { recursive: true, force: true })
       throw error
     }
+    // 安装目录里的 README 已经换成沙箱这份。介绍表里若还留着第一次读到的旧正文，db_content 不会跟着变。
+    await this.publishReadme(manifest.id, publishedReadme)
     const codeVersion = (await hashInstalledPluginCode(dest)) ?? 'empty'
     const accountId = currentAccountId()
     const workspaceId = this.currentWorkspaceId()
@@ -1032,6 +1036,27 @@ export class PluginStoreService extends Service {
       return cloud?.editorContentMode === 'mysql' && cloud.editorContentRepository ? cloud : null
     } catch {
       return null
+    }
+  }
+
+  /** 把这次打包用的 README 写进介绍表。内容相同则不写，避免把版本号空加一次。不回写磁盘，打包文件保持原样。 */
+  private async publishReadme(id: string, markdown: string) {
+    const text = String(markdown ?? '')
+    const cloud = this.cloudReadme()
+    if (cloud) {
+      await cloud.ensureProductMigrations?.()
+      const current = await cloud.editorContentRepository!.read('/plugins', id)
+      if (current.body !== text) await cloud.editorContentRepository!.write('/plugins', id, text)
+      return
+    }
+    const sqlitePath = this.contentSqlitePath()
+    mkdirSync(dirname(sqlitePath), { recursive: true })
+    const db = openAndMigrateBiu(sqlitePath)
+    try {
+      if (readEditorContent(db, '/plugins', id) === text) return
+      writeEditorContent(db, '/plugins', id, text)
+    } finally {
+      db.close()
     }
   }
 

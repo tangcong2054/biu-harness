@@ -88,6 +88,28 @@ test('empty table reads packed README when sandbox is missing', async () => {
   }
 })
 
+test('pack publishes a changed sandbox README into editor content', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-readme-pack-'))
+  try {
+    const sandbox = join(dir, '.plugin-dev', 'demo')
+    await writeManifest(sandbox, 'demo', '# next\n')
+    await mkdir(join(sandbox, 'host'), { recursive: true })
+    await writeFile(join(sandbox, 'host', 'index.ts'), "export const name = 'demo'\nexport function apply() { return true }\n")
+    mkdirSync(join(dir, DATA_DIR_NAME), { recursive: true })
+    const db = openAndMigrateBiu(sqlitePath(dir))
+    writeEditorContent(db, '/plugins', 'demo', '# old\n')
+    db.close()
+    const store = storeFor(dir)
+    await store.pack('demo')
+    assert.equal(bodyInDb(dir, 'demo'), '# next\n')
+    assert.equal(await store.readReadme('demo'), '# next\n')
+    assert.equal(await readFile(join(sandbox, 'README.md'), 'utf8'), '# next\n')
+    assert.equal(await readFile(join(dir, '.plugin', 'demo', 'README.md'), 'utf8'), '# next\n')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('non-empty table wins over different disk files', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'plugin-readme-table-'))
   try {
@@ -189,6 +211,13 @@ test('MySQL: plugin intro reads and writes the MySQL editor content, never the l
     assert.deepEqual(writes, ['demo', 'edited'])
     assert.equal(await readFile(join(dir, '.plugin-dev', 'edited', 'README.md'), 'utf8'), '# second\n')
     // 本地 biu.sqlite 不会被创建或写入。
+    assert.equal((await import('node:fs')).existsSync(sqlitePath(dir)), false)
+    const sandbox = join(dir, '.plugin-dev', 'demo')
+    await mkdir(join(sandbox, 'host'), { recursive: true })
+    await writeFile(join(sandbox, 'host', 'index.ts'), "export const name = 'demo'\nexport function apply() { return true }\n")
+    await writeFile(join(sandbox, 'README.md'), '# packed next\n')
+    await store.pack('demo')
+    assert.equal(rows.get('demo')?.body, '# packed next\n')
     assert.equal((await import('node:fs')).existsSync(sqlitePath(dir)), false)
   } finally {
     await rm(dir, { recursive: true, force: true })
