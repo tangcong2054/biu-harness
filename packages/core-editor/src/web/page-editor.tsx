@@ -12,7 +12,7 @@ import { pageEditorExtensions } from './kit.ts'
 import { imageUploadFailureText, onImageUploadFailure, setEditorResourcePath } from './page-image.ts'
 import { PageBlockHandle } from './page-block-handle.tsx'
 import { editorHostIsLive } from './editor-live.ts'
-import { FOCUS_RECORD_CONTENT, FOCUS_RECORD_TITLE, handleContentTitleNav, shouldLeaveContentForTitle, focusRecordTitleNear, isDocStartSelection } from './title-content-nav.ts'
+import { FOCUS_RECORD_CONTENT, FOCUS_RECORD_TITLE, handleContentTitleNav, shouldLeaveContentForTitle, focusRecordTitleNear, isDocStartSelection, keyFromPluginField } from './title-content-nav.ts'
 import { tryContentJump, contentJumpForRecord } from './content-jump.ts'
 import { CONTENT_JUMP_EVENT } from '@biu/type-file-system'
 import { bindEditorTextHost, getPick } from '@biu/core-pick/web'
@@ -342,6 +342,7 @@ export function PageEditor({ record, value, writable, onChange, path, status = '
           'data-testid': 'page-editor',
         },
         handleKeyDown: (view, event) => {
+          if (keyFromPluginField(event)) return true
           if (isFindHotkey(event)) {
             event.preventDefault()
             setFindOpen(true)
@@ -583,6 +584,7 @@ export function PageEditor({ record, value, writable, onChange, path, status = '
   }
 
   const onEditorHotkey = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (keyFromPluginField(event.nativeEvent)) return
     if (event.key === ' ' && event.target === event.currentTarget) {
       event.preventDefault()
       event.stopPropagation()

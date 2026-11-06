@@ -118,6 +118,25 @@ test('Backspace in the middle of a paragraph does not jump to the title', () => 
   host.remove()
 })
 
+test('ArrowUp from a plugin field does not jump to title even at doc start', () => {
+  const { editor, host } = makeEditor('hello')
+  editor.chain().focus().setTextSelection(Selection.atStart(editor.state.doc)).run()
+  const block = document.createElement('div')
+  block.className = 'page-block'
+  const input = document.createElement('input')
+  block.appendChild(input)
+  host.appendChild(block)
+  input.focus()
+  const before = editor.getHTML()
+  const event = new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true })
+  input.dispatchEvent(event)
+  assert.equal(editor.getHTML(), before)
+  assert.equal(document.activeElement, input)
+  editor.destroy()
+  host.remove()
+  block.remove()
+})
+
 test('Enter at the start of TipTap stays in the document', () => {
   const { editor, host } = makeEditor('hello')
   editor.chain().focus().setTextSelection(Selection.atStart(editor.state.doc)).run()

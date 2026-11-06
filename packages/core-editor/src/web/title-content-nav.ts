@@ -24,7 +24,15 @@ export function shouldLeaveContentForTitle(
   return isDocStartSelection(from, empty, docStart)
 }
 
+/** 这次按键发生在插件块内部（输入框、按钮等）。外层编辑器不能借这一击改正文或跳标题。 */
+export function keyFromPluginField(event: { target: EventTarget | null }) {
+  const raw = event.target
+  const target = raw instanceof Element ? raw : raw instanceof Node ? raw.parentElement : null
+  return Boolean(target?.closest('.page-block, [data-page-block-capture]'))
+}
+
 export function handleContentTitleNav(view: EditorView, event: KeyboardEvent) {
+  if (keyFromPluginField(event)) return true
   if (event.isComposing) return false
   const sel = view.state.selection
   const start = Selection.atStart(view.state.doc).from
