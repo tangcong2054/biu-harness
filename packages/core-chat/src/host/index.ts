@@ -139,6 +139,12 @@ export type { ChatMessage }
 
 export type { AgentToolMode }
 
+type ReplayMode = 'lean-replay' | 'native-replay'
+
+function isReplayMode(value: unknown): value is ReplayMode {
+  return value === 'lean-replay' || value === 'native-replay'
+}
+
 const DEFAULT_PROVIDER: ChatProvider = 'deepseek'
 /** 当前选中入口 id；内置三家与 preset id 对齐，自定义入口为 custom-*。 */
 type EndpointId = string
@@ -172,6 +178,7 @@ interface ChatConfig {
   model: string
   systemPrompt: string
   agentMode: AgentToolMode
+  replayMode: ReplayMode
   /** 极简模式下常驻额外工具（不含 minimal 底座与 live 调度工具） */
   extraTools: string[]
   /** 当前模型的思考开关；能思考的模型默认 enabled（对齐上游）。 */
@@ -281,6 +288,7 @@ function defaults(): ChatConfig {
       (provider === 'openai' ? 'gpt-4o-mini' : provider === 'anthropic' ? 'claude-3-5-sonnet-20241022' : 'deepseek-v4-flash'),
     systemPrompt: '你是控制台里的助手。需要时调用当前已注册的 tools；插件卸载后对应 tool 会消失。回答简洁。',
     agentMode: 'standard',
+    replayMode: 'native-replay',
     extraTools: [],
     thinking: 'enabled',
     reasoningEffort: 'high',
@@ -323,6 +331,7 @@ export function persistedChatConfig(config: ChatConfig, online = isOnlineRuntime
     model: config.model,
     systemPrompt: config.systemPrompt,
     agentMode: config.agentMode,
+    replayMode: config.replayMode,
     extraTools: config.extraTools,
     thinking: config.thinking,
     reasoningEffort: config.reasoningEffort,
@@ -551,6 +560,7 @@ function mergePersisted(base: ChatConfig, saved: Partial<ChatConfig> | null): Ch
     model: !process.env.CHAT_MODEL && typeof saved.model === 'string' && saved.model.trim() ? saved.model.trim() : base.model,
     systemPrompt: typeof saved.systemPrompt === 'string' ? saved.systemPrompt : base.systemPrompt,
     agentMode: parseAgentMode(saved.agentMode, base.agentMode),
+    replayMode: isReplayMode(saved.replayMode) ? saved.replayMode : base.replayMode,
     extraTools: Array.isArray(saved.extraTools)
       ? [...new Set(saved.extraTools.map((name) => String(name).trim()).filter(Boolean))]
       : base.extraTools,
@@ -687,6 +697,7 @@ export class ChatService extends Service {
       model: this.config.model,
       systemPrompt: this.config.systemPrompt,
       agentMode: this.config.agentMode,
+      replayMode: this.config.replayMode,
       thinking: this.config.thinking,
       reasoningEffort: this.config.reasoningEffort,
       contextWindow: this.config.contextWindow,
@@ -744,6 +755,7 @@ export class ChatService extends Service {
       model: this.config.model,
       systemPrompt: this.config.systemPrompt,
       agentMode: this.config.agentMode,
+      replayMode: this.config.replayMode,
       extraTools: [...this.config.extraTools],
     }
     if (!sessionId) return { defaults: defaultsView, config: undefined as SessionConfig | undefined, effective: defaultsView }
@@ -768,6 +780,7 @@ export class ChatService extends Service {
       systemPrompt:
         typeof config?.systemPrompt === 'string' ? config.systemPrompt : defaultsView.systemPrompt,
       agentMode: config?.agentMode ?? defaultsView.agentMode,
+      replayMode: defaultsView.replayMode,
       extraTools: config?.extraTools ? [...config.extraTools] : [...defaultsView.extraTools],
       ...(config?.title ? { title: config.title } : {}),
     }
@@ -854,6 +867,7 @@ export class ChatService extends Service {
       endpointId,
       apiKey: key,
       model: effective.model,
+      replayMode: effective.replayMode,
       ...(endpoint ? { baseUrl: effectiveBaseUrl(this.config, endpoint) } : {}),
       contextWindowTokens: contextWindowTokenCount(mode.context),
       outputReserveTokens: provider === 'anthropic' ? 4_096 : 16_384,
@@ -962,6 +976,7 @@ export class ChatService extends Service {
       baseUrl: string
       systemPrompt: string
       agentMode: AgentToolMode
+      replayMode: ReplayMode
       extraTools: string[]
       thinking: ThinkingMode
       reasoningEffort: ReasoningEffort
@@ -982,7 +997,11 @@ export class ChatService extends Service {
     }>,
     opts?: { persist?: boolean },
   ) {
+    if (next.replayMode !== undefined && !isReplayMode(next.replayMode)) {
+      throw new Error('replayMode must be lean-replay or native-replay')
+    }
     const beforeKey = prefKey(this.config.endpointId, this.config.model)
+    if (isReplayMode(next.replayMode)) this.config.replayMode = next.replayMode
     rememberModelPrefs(this.config)
     if (typeof next.endpointId === 'string' && next.endpointId.trim()) {
       const id = next.endpointId.trim()
@@ -1643,6 +1662,7 @@ export function apply(ctx: Context) {
       baseUrl: string
       systemPrompt: string
       agentMode: AgentToolMode
+      replayMode: ReplayMode
       extraTools: string[]
       setApiKey: Partial<Record<string, string | null>>
       setBaseUrl: Partial<Record<string, string | null>>
@@ -1652,9 +1672,13 @@ export function apply(ctx: Context) {
       removeCustomEndpoint: string
       removeCustomModel: string
     }>
+    if (payload?.replayMode !== undefined && !isReplayMode(payload.replayMode)) {
+      route.send(400, { error: 'replayMode must be lean-replay or native-replay' })
+      return
+    }
     const includesSecret =
-      typeof payload.apiKey === 'string' ||
-      Boolean(payload.setApiKey && Object.values(payload.setApiKey).some((value) => typeof value === 'string' && value.length > 0))
+      typeof payload?.apiKey === 'string' ||
+      Boolean(payload?.setApiKey && Object.values(payload.setApiKey).some((value) => typeof value === 'string' && value.length > 0))
     if (isOnlineRuntime() && includesSecret) {
       route.send(403, { error: 'AI API Token 只能保存在运行 Agent 的设备上' })
       return

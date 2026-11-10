@@ -44,7 +44,10 @@ interface ProviderView {
   hint: string
 }
 
+type ReplayMode = 'lean-replay' | 'native-replay'
+
 interface ChatPublicConfig {
+  replayMode?: ReplayMode
   endpointId?: string
   provider: ChatProvider
   model: string
@@ -85,6 +88,10 @@ export function ChatConfig(props?: { onClose?: () => void }) {
   const [modelCatalog, setModelCatalog] = useState<ModelDef[]>([])
   const [providers, setProviders] = useState<Record<string, ProviderView> | null>(null)
   const [acceptsApiKeys, setAcceptsApiKeys] = useState(true)
+  const [savedReplayMode, setSavedReplayMode] = useState<ReplayMode>('native-replay')
+  const [replayModeDraft, setReplayModeDraft] = useState<ReplayMode | null>(null)
+  const replayMode = replayModeDraft ?? savedReplayMode
+  const replayChanged = replayMode !== savedReplayMode
 
   const [keyDraft, setKeyDraft] = useState('')
   const [urlDraft, setUrlDraft] = useState('')
@@ -248,6 +255,7 @@ export function ChatConfig(props?: { onClose?: () => void }) {
     setModelCatalog(cats)
     if (data.providers) setProviders(data.providers)
     setAcceptsApiKeys(data.acceptsApiKeys !== false)
+    setSavedReplayMode(data.replayMode === 'lean-replay' ? 'lean-replay' : 'native-replay')
 
     const eid = preferActive || data.endpointId || data.provider || 'deepseek'
     setDefaultEndpointId(data.endpointId || data.provider || eid)
@@ -287,7 +295,7 @@ export function ChatConfig(props?: { onClose?: () => void }) {
     setError('')
     setStatus('')
     try {
-      const body: Record<string, unknown> = {}
+      const body: Record<string, unknown> = replayChanged ? { replayMode } : {}
       const nextModel = opts?.model ?? (isDefaultProvider ? defaultModel : activeModels[0]?.model)
       if (opts?.makeDefault || isDefaultProvider) {
         body.endpointId = activeId
@@ -306,6 +314,7 @@ export function ChatConfig(props?: { onClose?: () => void }) {
         !body.endpointId &&
         !body.setApiKey &&
         !body.setBaseUrl &&
+        !body.replayMode &&
         !opts?.makeDefault
       ) {
         // 仅切换默认模型（当前已是默认入口）
@@ -328,7 +337,37 @@ export function ChatConfig(props?: { onClose?: () => void }) {
         return
       }
       applyPublic((await res.json()) as ChatPublicConfig, activeId)
+      if (body.replayMode) setReplayModeDraft((draft) => draft === body.replayMode ? null : draft)
       setStatus(opts?.makeDefault ? '已设为默认并保存' : '已保存')
+    } catch (err) {
+      setError(`保存失败：${String(err)}`)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function saveReplayMode() {
+    if (saving || !replayChanged) return
+    setSaving(true)
+    setError('')
+    setStatus('')
+    try {
+      const res = await fetch('/api/chat/config', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replayMode }),
+      })
+      if (!res.ok) {
+        setError(`保存失败：HTTP ${res.status}`)
+        return
+      }
+      const data = (await res.json()) as ChatPublicConfig
+      setSavedReplayMode(data.replayMode === 'lean-replay' ? 'lean-replay' : 'native-replay')
+      setReplayModeDraft((draft) => draft === replayMode ? null : draft)
+      window.dispatchEvent(new CustomEvent('biu:chat-config-changed'))
+      setStatus('回放策略已保存，下一回合生效')
+    } catch (err) {
+      setError(`保存失败：${String(err)}`)
     } finally {
       setSaving(false)
     }
@@ -993,6 +1032,31 @@ export function ChatConfig(props?: { onClose?: () => void }) {
               </div>
 
               <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 py-3">
+                <section className="flex flex-col gap-2 rounded-lg border border-(--dsw-border) p-3">
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-[11px] font-semibold text-(--dsw-label-3)">回放策略</span>
+                    <select
+                      className={inputCls}
+                      value={replayMode}
+                      disabled={saving}
+                      onChange={(e) => setReplayModeDraft(e.target.value as ReplayMode)}
+                    >
+                      <option value="lean-replay">lean-replay · 精简回放</option>
+                      <option value="native-replay">native-replay · 原生回放（默认）</option>
+                    </select>
+                  </label>
+                  <p className="text-[11px] leading-5 text-(--dsw-label-3)">
+                    当前模型配置的默认策略，保存后下一回合生效。旧会话缺失原生状态时，使用原生回放可能需要新建会话。
+                  </p>
+                  <button
+                    type="button"
+                    className="self-end rounded-lg border border-(--dsw-border) px-3 py-[6px] text-[12px] text-(--dsw-label) hover:bg-(--dsw-hover) disabled:opacity-50"
+                    disabled={saving || !replayChanged}
+                    onClick={() => void saveReplayMode()}
+                  >
+                    保存回放策略
+                  </button>
+                </section>
                 {acceptsApiKeys ? <label className="flex flex-col gap-1.5">
                   <span className="flex items-center justify-between text-[11px] font-semibold text-(--dsw-label-3)">
                     <span>API Key</span>
