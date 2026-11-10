@@ -125,7 +125,7 @@ export const AUTO_COMPACT_PROMPT = `你是 Agent 会话压缩器。请把此前�
 function withoutPrimarySystem(messages: LlmMessage[]): LlmMessage[] {
   const output = [...messages]
   if (output[0]?.role === 'system') output.shift()
-  return output.map((message) => {
+  return output.map(({ replay: _replay, replayRef: _replayRef, replayMissing: _replayMissing, ...message }) => {
     if (!Array.isArray(message.content)) return message
     return {
       ...message,

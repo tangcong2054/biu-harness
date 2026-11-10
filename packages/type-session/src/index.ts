@@ -31,7 +31,7 @@ export type UserMessageImage = {
 /** 写入 append 的正文（不含 seq/ts）；与 SessionEvent 判别联合一一对应。 */
 export type SessionEventBody =
   | { type: 'session/open'; version: number }
-  | { type: 'turn/start'; turn: number }
+  | { type: 'turn/start'; turn: number; replayMode?: 'lean-replay' | 'native-replay' }
   | { type: 'turn/end'; turn: number; reason: string }
   | { type: 'step/start'; turn: number; step: number }
   | { type: 'step/end'; turn: number; step: number }
@@ -42,6 +42,8 @@ export type SessionEventBody =
       type: 'assistant/message'
       text: string
       tool_calls?: Array<{ id: string; name: string; arguments: string }>
+      /** 宿主私有原生回放引用；事件中不能保存回放正文。 */
+      replayRef?: string
       usage?: {
         inputTokens: number
         outputTokens: number
