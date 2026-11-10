@@ -264,11 +264,15 @@ class UiActionsWebClient {
   }
 }
 
+/**
+ * Agent 通道的浏览器半边：只负责 WS 连接和执行 Host 下发的命令。
+ * 注册表由 ui-actions-registry（web 内核表）常驻提供，这里不能自己创建，
+ * 否则关掉通道时会把业务插件依赖的 uiActions 服务一起卸掉。
+ */
 export const name = 'ui-actions-web'
-export const inject = [] as const
+export const inject = ['uiActions'] as const
 
 export function apply(ctx: Context) {
-  const service = new UiActionsService(ctx)
-  const client = new UiActionsWebClient(service)
+  const client = new UiActionsWebClient(ctx.uiActions)
   ctx.effect(() => client.start(), 'ui-actions.websocket')
 }

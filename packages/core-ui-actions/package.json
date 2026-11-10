@@ -8,6 +8,7 @@
   "exports": {
     "./protocol": "./src/protocol.ts",
     "./host": "./src/host/index.ts",
+    "./registry": "./src/web/registry-plugin.ts",
     "./web": "./src/web/index.ts"
   },
   "dependencies": {

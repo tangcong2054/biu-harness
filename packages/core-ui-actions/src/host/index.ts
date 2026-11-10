@@ -77,6 +77,7 @@ export class UiActionsHostService extends Service {
   readonly observability = new UiActionsObservability()
   private readonly clients = new Map<string, Client>()
   private readonly bySocket = new Map<WebSocket, string>()
+  private readonly sockets = new Set<WebSocket>()
   private readonly socketTenant = new WeakMap<WebSocket, { accountId: string; workspaceId: string }>()
   private readonly pending = new Map<string, Pending>()
   private readonly inspectCache = new Map<string, unknown>()
@@ -94,6 +95,7 @@ export class UiActionsHostService extends Service {
         socket.close(1008, 'unauthorized')
         return
       }
+      this.sockets.add(socket)
       // 账号服务在 MySQL 控制面下是异步的；租户解析完之前收到的消息按顺序排队。
       const ready = this.resolveTenant(request, url.searchParams.get('workspaceId') ?? '')
         .catch(() => ({ accountId: '', workspaceId: '' }))
@@ -276,6 +278,7 @@ export class UiActionsHostService extends Service {
   }
 
   private onClose(socket: WebSocket) {
+    this.sockets.delete(socket)
     const clientId = this.bySocket.get(socket)
     if (!clientId) return
     this.bySocket.delete(socket)
@@ -435,15 +438,55 @@ export class UiActionsHostService extends Service {
   listClients() {
     return [...this.clients.values()].map(({ socket: _socket, ...client }) => client)
   }
+
+  /**
+   * 通道插件卸载时调用：进行中的命令立即失败（不等超时），并断开已连接的浏览器。
+   * ws 的 WebSocketServer.close() 不会关掉已建立的连接，这里必须自己关。
+   */
+  shutdown() {
+    for (const [requestId, item] of this.pending) {
+      this.pending.delete(requestId)
+      clearTimeout(item.timer)
+      item.cleanupAbort?.()
+      this.observability.record({
+        ...item.observed,
+        event: 'failed',
+        durationMs: Date.now() - item.startedAt,
+        outcome: 'channel_closed',
+      })
+      item.reject(new Error('UI Actions Agent 通道已关闭'))
+    }
+    const sockets = new Set(this.sockets)
+    for (const client of this.clients.values()) sockets.add(client.socket)
+    this.sockets.clear()
+    this.clients.clear()
+    this.bySocket.clear()
+    this.inspectCache.clear()
+    for (const socket of sockets) {
+      try {
+        socket.close(1001, 'ui-actions channel disabled')
+      } catch {
+        /* 已断开 */
+      }
+    }
+  }
 }
 
+/**
+ * Agent 通道（Host 半边）：ui_inspect / ui_action / ui_wait 工具、系统提示片段、bootstrap、WS 与审批。
+ * 可在插件树里运行时开关；关掉后 Agent 看不到 ui_* 工具，业务插件的注册表不受影响。
+ */
 export const name = 'ui-actions'
 export const inject = ['http', 'tools', 'systemPrompt', 'approvals']
 
 export function apply(ctx: Context) {
   const service = new UiActionsHostService(ctx)
   service.start()
-  ctx.effect(() => () => service.observability.dispose(), 'ui-actions.observability')
+  // 先 shutdown（会记录 channel_closed），再 flush 观测日志；放在同一个 effect 里保证顺序。
+  ctx.effect(() => () => {
+    service.shutdown()
+    return service.observability.dispose()
+  }, 'ui-actions.shutdown')
   ctx.http.route('GET', '/api/ui-actions/bootstrap', (route) => {
     const result = service.bootstrap(route.req)
     if (!result) {

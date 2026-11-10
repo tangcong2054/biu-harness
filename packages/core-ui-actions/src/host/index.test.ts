@@ -189,6 +189,69 @@ test('host tools discover and execute actions through the active browser RPC', a
   }
 })
 
+test('disabling the agent channel removes ui_* tools, fails pending commands and drops browsers', async () => {
+  const port = await freePort()
+  const publicDir = await mkdtemp(join(tmpdir(), 'biu-ui-actions-toggle-'))
+  const previousLogDir = process.env.BIU_UI_ACTION_LOG_DIR
+  process.env.BIU_UI_ACTION_LOG_DIR = join(publicDir, 'logs')
+  const ctx = new Context()
+  const httpFiber = await ctx.plugin(http, { port, host: '127.0.0.1', publicDir, sharePort: 0 })
+  const toolsFiber = await ctx.plugin(tools)
+  const promptFiber = await ctx.plugin(systemPrompt)
+  const approvalsFiber = await ctx.plugin(approvals)
+  let uiFiber = await ctx.plugin(uiActions)
+  const uiTools = () => ctx.tools.names().filter((name) => name.startsWith('ui_')).sort()
+  try {
+    assert.deepEqual(uiTools(), ['ui_action', 'ui_inspect', 'ui_wait'])
+    const { token } = await fetch(`http://127.0.0.1:${port}/api/ui-actions/bootstrap`).then((res) => res.json()) as {
+      token: string
+    }
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/ws/ui-actions?uiToken=${token}`)
+    await new Promise<void>((resolve, reject) => {
+      socket.once('open', () => resolve())
+      socket.once('error', reject)
+    })
+    const closed = new Promise<number>((resolve) => socket.once('close', (code) => resolve(code)))
+    let received = 0
+    socket.on('message', () => { received += 1 })
+    socket.send(JSON.stringify({
+      type: 'hello',
+      clientId: 'browser-toggle',
+      route: '/',
+      focused: true,
+      registryVersion: 1,
+      protocolVersion: UI_ACTIONS_PROTOCOL_VERSION,
+      targetCount: 1,
+    }))
+    await eventually(() => ctx.uiActionsHost.listClients().length === 1)
+    // 浏览器故意不回包：命令会一直挂着，直到通道被关掉
+    const hanging = ctx.tools.invoke('ui_inspect', {})
+    hanging.catch(() => {})
+    await eventually(() => received === 1)
+    const started = Date.now()
+    await uiFiber.dispose()
+    await assert.rejects(() => hanging, /通道已关闭/)
+    assert.ok(Date.now() - started < 5000, 'pending command should fail immediately, not wait for timeout')
+    assert.equal(await closed, 1001)
+    assert.deepEqual(uiTools(), [])
+    const gone = await fetch(`http://127.0.0.1:${port}/api/ui-actions/bootstrap`)
+    assert.notEqual(gone.status, 200)
+
+    uiFiber = await ctx.plugin(uiActions)
+    assert.deepEqual(uiTools(), ['ui_action', 'ui_inspect', 'ui_wait'])
+    const again = await fetch(`http://127.0.0.1:${port}/api/ui-actions/bootstrap`)
+    assert.equal(again.status, 200)
+  } finally {
+    await uiFiber.dispose()
+    await approvalsFiber.dispose()
+    await promptFiber.dispose()
+    await toolsFiber.dispose()
+    await httpFiber.dispose()
+    if (previousLogDir === undefined) delete process.env.BIU_UI_ACTION_LOG_DIR
+    else process.env.BIU_UI_ACTION_LOG_DIR = previousLogDir
+  }
+})
+
 test('ui tools fail clearly without a connected browser', async () => {
   const ctx = new Context()
   const registered: Array<{ name: string; execute: Function }> = []

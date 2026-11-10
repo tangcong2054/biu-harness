@@ -13,6 +13,8 @@ const rootDir = findRepoRoot()
 export function pluginCatalogLayer(item: CordisPluginEntry): CatalogEntry['layer'] {
   if (item.layer === 'web') return 'web'
   if (item.layer === 'core') return 'core'
+  // 显式声明 capability 时以声明为准：包名带 core- 前缀（如 @biu/core-ui-actions/host）也能做成可开关能力插件。
+  if (item.layer === 'capability') return 'capability'
   const pkg = item.package ?? ''
   if (item.id.startsWith('core-') || /(^|\/)core-/.test(pkg)) return 'core'
   return 'capability'

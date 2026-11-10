@@ -2,7 +2,7 @@ import { test } from 'vitest'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { resolveCatalog } from './resolve-catalog.ts'
+import { pluginCatalogLayer, resolveCatalog } from './resolve-catalog.ts'
 import { findRepoRoot, pluginWebSpecifier } from '@biu/host-plugin-loader'
 
 test('resolveCatalog loads only packages declared in cordis.plugins.json', async () => {
@@ -22,4 +22,17 @@ test('resolveCatalog loads only packages declared in cordis.plugins.json', async
       assert.equal(entry?.togglable, false)
     }
   }
+})
+
+test('explicit capability layer wins over core- package prefix', () => {
+  assert.equal(pluginCatalogLayer({ id: 'x', package: '@biu/core-ui-actions/host', layer: 'capability' }), 'capability')
+  assert.equal(pluginCatalogLayer({ id: 'x', package: '@biu/core-ui-actions/host' }), 'core')
+  assert.equal(pluginCatalogLayer({ id: 'core-x', package: '@biu/cap-x/host' }), 'core')
+})
+
+test('ui-actions agent channel is a togglable capability', async () => {
+  const entry = (await resolveCatalog()).find((row) => row.id === 'ui-actions-agent')
+  assert.ok(entry, 'ui-actions-agent missing from catalog')
+  assert.equal(entry.layer, 'capability')
+  assert.equal(entry.togglable, true)
 })

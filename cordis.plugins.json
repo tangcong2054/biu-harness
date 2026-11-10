@@ -37,17 +37,18 @@
     { "id": "plugin-tree", "package": "@biu/web-plugin-tree", "togglable": false, "enabled": true },
     { "id": "event-log", "package": "@biu/web-event-log", "togglable": false, "enabled": true },
     { "id": "routes-panel", "package": "@biu/web-routes-panel", "togglable": false, "enabled": true },
+    { "id": "ui-actions-registry", "package": "@biu/core-ui-actions/registry", "togglable": false, "enabled": true },
     { "id": "ui-hub", "package": "@biu/web-ui-hub", "togglable": false, "enabled": true }
   ],
   "plugins": [
     {
-      "id": "core-ui-actions",
-      "name": "Core-UI Actions",
-      "layer": "core",
-      "blurb": "Agent 与当前 Biu 浏览器之间的语义 UI 操作协议。动作按需 inspect，不把全部插件能力注入上下文。",
+      "id": "ui-actions-agent",
+      "name": "UI Actions · Agent 通道",
+      "layer": "capability",
+      "blurb": "让 Agent 通过 ui_inspect / ui_action / ui_wait 操作当前 Biu 页面。关掉后 Agent 看不到 ui_* 工具，插件照常渲染；动作注册表常驻在 web 内核（ui-actions-registry）。",
       "package": "@biu/core-ui-actions/host",
       "web": "@biu/core-ui-actions/web",
-      "togglable": false,
+      "togglable": true,
       "enabled": true
     },
     {
