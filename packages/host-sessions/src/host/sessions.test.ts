@@ -1,18 +1,223 @@
-import { mkdtemp, realpath } from 'node:fs/promises'
+import { mkdtemp, realpath, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { mkdtempSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { DatabaseSync } from 'node:sqlite'
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
 import { Context, Service } from 'cordis'
-import { openAndMigrateBiu, runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
+import { openAndMigrateBiu, runWithAccount, runWithRequestWorkspace, runWithWorkspace } from '@biu/host-plugin-loader/data-dir'
 import { CollabStore } from '@biu/host-account/store'
 import * as sessionStore from '@biu/host-session-store'
+import { ensureSqliteSessionStore } from '../../../host-session-store/src/host/sqlite-session-store.ts'
 import * as sessions from './index.ts'
-import { SESSION_FORMAT_VERSION, deriveMessages, applyContextBudget, estimateRequestTokens, estimateTokens, fitMessagesToTokenBudget, statInputComposition } from './index.ts'
+import { SESSION_FORMAT_VERSION, deriveMessages, applyContextBudget, estimateMessageTokens, estimateRequestTokens, estimateTokens, fitMessagesToTokenBudget, statInputComposition } from './index.ts'
 import type { SessionEvent } from './index.ts'
-import type { LlmMessage } from '@biu/host-llm'
+import type { LlmMessage, NativeReplay } from '@biu/host-llm'
+import { runWithSession } from './session-scope.ts'
 import { projectNodes } from '../../../web-session-view/src/web/session-project.ts'
+
+const nativeReplayFixture = (): NativeReplay => ({
+  version: 1, complete: true, routeKey: 'test-route', protocol: 'anthropic',
+  blocks: [
+    { type: 'thinking', thinking: 'private thought', signature: 'opaque-signature' },
+    { type: 'redacted_thinking', data: 'opaque-redacted-data' },
+    { type: 'text', text: 'visible' },
+  ],
+})
+
+async function withReplayHome(fn: (home: string) => Promise<void>) {
+  const home = await mkdtemp(join(tmpdir(), 'biu-private-replay-'))
+  const previousHome = process.env.BIU_HOME
+  const previousOnline = process.env.BIU_ONLINE
+  process.env.BIU_HOME = home
+  process.env.BIU_ONLINE = '0'
+  try {
+    await fn(home)
+  } finally {
+    if (previousHome === undefined) delete process.env.BIU_HOME
+    else process.env.BIU_HOME = previousHome
+    if (previousOnline === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previousOnline
+    await rm(home, { recursive: true, force: true })
+  }
+}
+
+async function replayContext(path?: string) {
+  const ctx = new Context()
+  if (path) {
+    const store = await ensureSqliteSessionStore(path)
+    new sessionStore.SessionStoreService(ctx, store)
+    ctx.effect(() => () => store.close())
+  } else {
+    await ctx.plugin(sessionStore, { driver: 'memory', path: join(process.env.BIU_HOME!, 'unused-session.sqlite') })
+  }
+  await ctx.plugin(sessions)
+  return ctx
+}
+
+test('private replay survives service reopen, keeps private permissions and never enters events', async () => {
+  await withReplayHome(async (home) => {
+    const path = join(home, 'sessions.sqlite')
+    const ctx = await replayContext(path)
+    const record = await ctx.sessions.create('replay-persisted')
+    const payload = nativeReplayFixture()
+    const ref = await ctx.sessions.saveReplay(record.id, payload)
+    assert.match(ref, /^[0-9a-f-]{36}$/)
+    await ctx.sessions.append(record.id, { type: 'assistant/message', text: 'visible', replayRef: ref })
+    assert.equal(JSON.stringify(await ctx.sessionStore.load(record.id)).includes('opaque-signature'), false)
+    const projected = await ctx.sessions.deriveMessages(record.id)
+    assert.equal(projected[0]?.replayRef, ref)
+    assert.equal(projected[0]?.replay, undefined)
+    assert.equal((await stat(join(home, '.biu/private-replay'))).mode & 0o777, 0o700)
+    assert.equal((await stat(join(home, '.biu/private-replay/replays.sqlite'))).mode & 0o777, 0o600)
+    const closedStore = ctx.sessionStore
+    await ctx.fiber.dispose()
+    await assert.rejects(() => closedStore.load(record.id), { code: 'ERR_INVALID_STATE' })
+    const reopened = await replayContext(path)
+    assert.deepEqual(await reopened.sessions.loadReplay(record.id, ref), payload)
+    await reopened.fiber.dispose()
+  })
+})
+
+test('private replay refuses cross-session, account, workspace, runtime and missing scopes', async () => {
+  await withReplayHome(async (home) => {
+    const ctx = await replayContext()
+    await ctx.sessions.create('first')
+    await ctx.sessions.create('second')
+    const as = <T,>(account: string, workspace: string, fn: () => T) =>
+      runWithAccount(account, () => runWithRequestWorkspace(workspace, fn))
+    const ref = await as('alice', 'workspace-a', () => ctx.sessions.saveReplay('first', nativeReplayFixture()))
+    assert.deepEqual(await as('alice', 'workspace-a', () => ctx.sessions.loadReplay('first', ref)), nativeReplayFixture())
+    await assert.rejects(as('alice', 'workspace-a', () => ctx.sessions.loadReplay('second', ref)), /请新建会话/)
+    await assert.rejects(as('bob', 'workspace-a', () => ctx.sessions.loadReplay('first', ref)), /请新建会话/)
+    await assert.rejects(as('alice', 'workspace-b', () => ctx.sessions.loadReplay('first', ref)), /请新建会话/)
+    await assert.rejects(runWithWorkspace({ id: 'other-root', root: home }, () =>
+      as('alice', 'workspace-a', () => ctx.sessions.loadReplay('first', ref))), /请新建会话/)
+    await assert.rejects(runWithSession('second', () =>
+      as('alice', 'workspace-a', () => ctx.sessions.loadReplay('first', ref))), /请新建会话/)
+    await assert.rejects(ctx.sessions.loadReplay('first', '../../replays.sqlite'), /请新建会话/)
+    await assert.rejects(ctx.sessions.loadReplay('first', randomUUID()), /请新建会话/)
+    await assert.rejects(ctx.sessions.saveReplay('missing', nativeReplayFixture()), /请新建会话/)
+    process.env.BIU_ONLINE = '1'
+    await assert.rejects(ctx.sessions.saveReplay('first', nativeReplayFixture()), /请新建会话/)
+    await assert.rejects(as('alice', 'workspace-a', () => ctx.sessions.loadReplay('first', ref)), /请新建会话/)
+    const onlineRef = await runWithWorkspace({ id: 'task-a', root: join(home, 'task-a') }, () =>
+      as('alice', 'workspace-a', () => ctx.sessions.saveReplay('first', nativeReplayFixture())))
+    const underOtherRoot = <T,>(fn: () => T) => runWithWorkspace({ id: 'task-b', root: join(home, 'task-b') }, fn)
+    assert.deepEqual(await underOtherRoot(() =>
+      as('alice', 'workspace-a', () => ctx.sessions.loadReplay('first', onlineRef))), nativeReplayFixture())
+    await assert.rejects(underOtherRoot(() =>
+      as('bob', 'workspace-a', () => ctx.sessions.loadReplay('first', onlineRef))), /请新建会话/)
+    await assert.rejects(underOtherRoot(() =>
+      as('alice', 'workspace-b', () => ctx.sessions.loadReplay('first', onlineRef))), /请新建会话/)
+    process.env.BIU_ONLINE = '0'
+    const inWorkspace = ctx.sessions.inWorkspaceAsync.bind(ctx.sessions)
+    ctx.sessions.inWorkspaceAsync = async () => false
+    await assert.rejects(ctx.sessions.saveReplay('first', nativeReplayFixture()), /请新建会话/)
+    ctx.sessions.inWorkspaceAsync = inWorkspace
+    await ctx.fiber.dispose()
+  })
+})
+
+test('private replay rejects static exposure and missing loads do not create a database', async () => {
+  await withReplayHome(async (home) => {
+    const ctx = await replayContext()
+    await ctx.sessions.create('private-only')
+    await assert.rejects(ctx.sessions.loadReplay('private-only', randomUUID()), /请新建会话/)
+    await assert.rejects(stat(join(home, '.biu/private-replay')), { code: 'ENOENT' })
+    const previousPublic = process.env.BIU_PUBLIC_DIR
+    process.env.BIU_PUBLIC_DIR = home
+    try {
+      await assert.rejects(ctx.sessions.saveReplay('private-only', nativeReplayFixture()), /静态文件服务/)
+    } finally {
+      if (previousPublic === undefined) delete process.env.BIU_PUBLIC_DIR
+      else process.env.BIU_PUBLIC_DIR = previousPublic
+    }
+    await assert.rejects(stat(join(home, '.biu/private-replay')), { code: 'ENOENT' })
+    await ctx.fiber.dispose()
+  })
+})
+
+test('private replay validates version, completeness, serialized bytes and corrupted persisted JSON', async () => {
+  await withReplayHome(async (home) => {
+    const ctx = await replayContext()
+    await ctx.sessions.create('validate')
+    for (const payload of [
+      { ...nativeReplayFixture(), version: 2 },
+      { ...nativeReplayFixture(), complete: false },
+      { ...nativeReplayFixture(), protocol: 'unknown' },
+      { ...nativeReplayFixture(), blocks: {} },
+    ]) {
+      await assert.rejects(ctx.sessions.saveReplay('validate', payload as unknown as NativeReplay), /请新建会话/)
+    }
+    await assert.rejects(ctx.sessions.saveReplay('validate', {
+      version: 1, complete: true, routeKey: 'route', protocol: 'openai-compat', reasoningContent: '中'.repeat(750_000),
+    }), /2 MiB/)
+    const ref = await ctx.sessions.saveReplay('validate', nativeReplayFixture())
+    const db = new DatabaseSync(join(home, '.biu/private-replay/replays.sqlite'))
+    try {
+      for (const payload of ['{invalid', JSON.stringify({ ...nativeReplayFixture(), version: 2 }), 'x'.repeat(2 * 1024 * 1024 + 1)]) {
+        db.prepare('UPDATE replays SET payload = ? WHERE ref = ?').run(payload, ref)
+        await assert.rejects(ctx.sessions.loadReplay('validate', ref), /请新建会话/)
+      }
+    } finally {
+      db.close()
+    }
+    await ctx.fiber.dispose()
+  })
+})
+
+test('fork drops private refs; deletion removes replay rows', async () => {
+  await withReplayHome(async (home) => {
+    const ctx = await replayContext()
+    await ctx.sessions.create('parent')
+    await ctx.sessions.create('other')
+    const ref = await ctx.sessions.saveReplay('parent', nativeReplayFixture())
+    const otherRef = await ctx.sessions.saveReplay('other', nativeReplayFixture())
+    await ctx.sessions.append('parent', { type: 'assistant/message', text: 'visible', replayRef: ref })
+    const fork = await ctx.sessions.fork('parent', 'child')
+    const assistant = fork.events.find(event => event.type === 'assistant/message')
+    assert.equal(assistant?.type, 'assistant/message')
+    if (assistant?.type !== 'assistant/message') throw new Error('missing assistant')
+    assert.equal(assistant.replayRef, undefined)
+    assert.deepEqual(deriveMessages(fork.events)[0], { role: 'assistant', content: 'visible' })
+    await assert.rejects(ctx.sessions.loadReplay('child', ref), /请新建会话/)
+    assert.deepEqual(await ctx.sessions.loadReplay('parent', ref), nativeReplayFixture())
+    assert.equal(await ctx.sessions.delete('parent'), true)
+    const db = new DatabaseSync(join(home, '.biu/private-replay/replays.sqlite'))
+    try {
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM replays WHERE session_id = ?').get('parent')?.count, 0)
+    } finally {
+      db.close()
+    }
+    await ctx.sessions.create('parent')
+    await assert.rejects(ctx.sessions.loadReplay('parent', ref), /请新建会话/)
+    assert.deepEqual(await ctx.sessions.loadReplay('other', otherRef), nativeReplayFixture())
+    await ctx.fiber.dispose()
+  })
+})
+
+test('compact projection drops private refs and replay budget preserves whole opaque blocks', () => {
+  const events: SessionEvent[] = [
+    { type: 'assistant/message', text: 'before', replayRef: randomUUID(), seq: 0, ts: 1 },
+    { type: 'tool/call', id: 'compact', name: 'session_compact', arguments: '{"text":"summary"}', seq: 1, ts: 2 },
+    { type: 'assistant/message', text: 'after', seq: 2, ts: 3 },
+  ]
+  assert.equal(deriveMessages(events).some(message => message.replayRef), false)
+  const replay = nativeReplayFixture()
+  const snapshot = JSON.stringify(replay)
+  const lean: LlmMessage = { role: 'assistant', content: 'visible' }
+  const native: LlmMessage = { ...lean, replay }
+  assert.equal(estimateMessageTokens(native) - estimateMessageTokens(lean), Buffer.byteLength(snapshot, 'utf8'))
+  assert.equal(estimateMessageTokens({ ...lean, replayRef: randomUUID() }), estimateMessageTokens(lean))
+  assert.ok(estimateMessageTokens({ ...lean, tool_calls: [{ id: 'tool', type: 'function', function: {
+    name: 'large', arguments: 'x'.repeat(4000),
+  } }] }) > estimateMessageTokens(lean) + 1000)
+  fitMessagesToTokenBudget([{ role: 'user', content: 'hi' }, native], 1)
+  assert.equal(JSON.stringify(replay), snapshot)
+})
 
 test('creating a session stamps createdBy through the database service', async () => {
   const ctx = new Context()

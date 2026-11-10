@@ -1,8 +1,11 @@
 import { Service, type Context } from 'cordis'
-import { basename, isAbsolute, resolve } from 'node:path'
+import { basename, isAbsolute, join, relative, resolve } from 'node:path'
 import { realpath, stat } from 'node:fs/promises'
+import { chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { DatabaseSync } from 'node:sqlite'
 import { platform } from 'node:os'
-import { assistantContentForApi, type LlmMessage } from '@biu/host-llm'
+import { assistantContentForApi, type LlmMessage, type NativeReplay } from '@biu/host-llm'
 import type { AgentSendOptions, AgentHandle, AgentTurn } from '@biu/host-agents'
 import {
   SESSION_FORMAT_VERSION,
@@ -31,7 +34,86 @@ import { rebuildHealedEvents } from './session-heal.ts'
 import { sessionsCollection } from './sessions-collection.ts'
 import type { AuthorizationService } from '@biu/host-account/authorization'
 import { mysqlRecordVisible, type ScopePolicy, type ScopeSource } from '@biu/host-account/record-scope'
-import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
+import { currentAccountId, currentRequestWorkspaceId, currentWorkspace, dataHome, isOnlineRuntime } from '@biu/host-plugin-loader/data-dir'
+import { currentSessionId } from './session-scope.ts'
+
+const REPLAY_MAX_BYTES = 2 * 1024 * 1024
+const REPLAY_REF = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const REPLAY_UNAVAILABLE = '原生回放数据缺失或不属于当前账号、工作区或会话，请新建会话后重试。'
+
+function validateReplay(value: unknown): asserts value is NativeReplay {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('原生回放数据格式无效，请新建会话。')
+  const replay = value as Record<string, unknown>
+  if (replay.version !== 1 || replay.complete !== true) throw new Error('原生回放版本不支持或数据不完整，请新建会话。')
+  if (typeof replay.routeKey !== 'string' || !replay.routeKey || replay.routeKey.length > 4096
+    || (replay.protocol !== 'openai-compat' && replay.protocol !== 'anthropic')
+    || (replay.reasoningContent !== undefined && typeof replay.reasoningContent !== 'string')
+    || (replay.blocks !== undefined && !Array.isArray(replay.blocks))) {
+    throw new Error('原生回放数据格式无效，请新建会话。')
+  }
+}
+
+function serializeReplay(replay: NativeReplay): string {
+  validateReplay(replay)
+  let encoded: string
+  try {
+    encoded = JSON.stringify(replay)
+  } catch {
+    throw new Error('原生回放数据无法序列化，请新建会话。')
+  }
+  if (Buffer.byteLength(encoded, 'utf8') > REPLAY_MAX_BYTES) throw new Error('原生回放数据超过 2 MiB 限制，请新建会话。')
+  validateReplay(JSON.parse(encoded))
+  return encoded
+}
+
+function privateReplayHome() {
+  return resolve(process.env.BIU_HOME || (isOnlineRuntime() ? process.cwd() : dataHome()))
+}
+
+function privateReplayPath(ctx: Context) {
+  const home = privateReplayHome()
+  const canonical = (path: string): string => existsSync(path)
+    ? realpathSync(path)
+    : join(canonical(resolve(path, '..')), basename(path))
+  const path = join(canonical(home), '.biu', 'private-replay', 'replays.sqlite')
+  let publicDir: string | undefined
+  try {
+    publicDir = (ctx.get('http') as { config?: { publicDir?: string } } | undefined)?.config?.publicDir
+  } catch {}
+  for (const root of [publicDir, process.env.BIU_PUBLIC_DIR, join(process.cwd(), 'dist'), join(process.cwd(), 'public')]) {
+    if (!root) continue
+    const rel = relative(canonical(resolve(root)), path)
+    if (!rel || (!/^\.\.(?:[/\\]|$)/.test(rel) && !isAbsolute(rel))) {
+      throw new Error('原生回放目录不能位于静态文件服务范围内，请调整 BIU_HOME 后新建会话。')
+    }
+  }
+  return path
+}
+
+function openReplayDatabase(ctx: Context, create: boolean): DatabaseSync | undefined {
+  const path = privateReplayPath(ctx)
+  if (!create && !existsSync(path)) return undefined
+  const parent = resolve(path, '..')
+  const data = resolve(parent, '..')
+  if (create) mkdirSync(data, { recursive: true, mode: 0o700 })
+  if (!lstatSync(data).isDirectory() || lstatSync(data).isSymbolicLink()) throw new Error('原生回放目录不安全，请新建会话。')
+  if (create) mkdirSync(parent, { recursive: true, mode: 0o700 })
+  if (!lstatSync(parent).isDirectory() || lstatSync(parent).isSymbolicLink()) throw new Error('原生回放目录不安全，请新建会话。')
+  chmodSync(parent, 0o700)
+  const fd = openSync(path, constants.O_RDWR | constants.O_NOFOLLOW | (create ? constants.O_CREAT : 0), 0o600)
+  closeSync(fd)
+  if (!lstatSync(path).isFile() || lstatSync(path).nlink !== 1) throw new Error('原生回放文件不安全，请新建会话。')
+  chmodSync(path, 0o600)
+  const db = new DatabaseSync(path)
+  try {
+    db.exec('PRAGMA busy_timeout = 5000; PRAGMA secure_delete = ON; PRAGMA journal_mode = DELETE;')
+    if (create) db.exec('CREATE TABLE IF NOT EXISTS replays (scope TEXT NOT NULL, account_id TEXT NOT NULL, session_id TEXT NOT NULL, ref TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (scope, account_id, session_id, ref))')
+    return db
+  } catch (error) {
+    db.close()
+    throw error
+  }
+}
 
 export type { SessionEvent, SessionEventBody, SessionProject, SessionRecord, SessionMascot, SessionConfig }
 export { SESSION_FORMAT_VERSION, normalizeSessionConfig, mergeSessionConfig }
@@ -111,6 +193,7 @@ export function deriveMessages(events: SessionEvent[]): LlmMessage[] {
       messages.push({
         role: 'assistant',
         content: assistantContentForApi(event.text, hasToolCalls),
+        ...(event.replayRef ? { replayRef: event.replayRef } : {}),
         ...(hasToolCalls
           ? {
               tool_calls: event.tool_calls!.map((call) => ({
@@ -266,16 +349,20 @@ export function estimateTokens(text: string): number {
 }
 
 export function estimateMessageTokens(m: LlmMessage): number {
+  const tools = (m.tool_calls ?? []).reduce((sum, call) => sum + 6
+    + estimateTokens(call.function.name) + estimateTokens(call.function.arguments), 0)
+  // 原生签名、加密块按 UTF-8 字节保守计费；不能为预算截断或改写 opaque 数据。
+  const replay = m.replay ? Buffer.byteLength(JSON.stringify(m.replay), 'utf8') : 0
   if (Array.isArray(m.content)) {
     let n = 0
     for (const part of m.content) {
       if (part.type === 'text') n += estimateTokens(part.text)
       else n += 1200
     }
-    return n + (typeof m.tool_calls?.length === 'number' ? m.tool_calls.length * 6 : 0) + 4
+    return n + tools + replay + 4
   }
   const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '')
-  return estimateTokens(content) + (typeof m.tool_calls?.length === 'number' ? m.tool_calls.length * 6 : 0) + 4
+  return estimateTokens(content) + tools + replay + 4
 }
 
 export function estimateToolSchemaTokens(tools: unknown[]): number {
@@ -597,6 +684,63 @@ export class SessionsService extends Service {
     return record
   }
 
+  private async replayScope(sessionId: string, checkSession = true) {
+    const scopedSession = checkSession ? currentSessionId() : undefined
+    const accountId = currentAccountId()
+    const workspace = currentWorkspace()
+    const workspaceId = currentRequestWorkspaceId() || this.collabStore()?.activeWorkspaceId() || workspace?.id || ''
+    if (!sessionId || (scopedSession && scopedSession !== sessionId)
+      || (isOnlineRuntime() && (!accountId || !workspaceId))
+      || !(await this.inWorkspaceAsync(sessionId))
+      || !(await this.ctx.sessionStore.load(sessionId))) {
+      throw new Error(REPLAY_UNAVAILABLE)
+    }
+    const scopeParts = isOnlineRuntime()
+      ? ['online', privateReplayHome(), workspaceId]
+      : ['offline', resolve(dataHome()), workspace?.id || '', workspaceId]
+    const scope = createHash('sha256').update(JSON.stringify(scopeParts)).digest('hex')
+    return { scope, accountId }
+  }
+
+  async saveReplay(sessionId: string, replay: NativeReplay): Promise<string> {
+    const { scope, accountId } = await this.replayScope(sessionId)
+    const encoded = serializeReplay(replay)
+    const ref = randomUUID()
+    const db = openReplayDatabase(this.ctx, true)!
+    try {
+      db.prepare('INSERT INTO replays (scope, account_id, session_id, ref, payload) VALUES (?, ?, ?, ?, ?)')
+        .run(scope, accountId, sessionId, ref, encoded)
+      return ref
+    } finally {
+      db.close()
+    }
+  }
+
+  async loadReplay(sessionId: string, ref: string): Promise<NativeReplay> {
+    if (typeof ref !== 'string' || !REPLAY_REF.test(ref)) throw new Error(REPLAY_UNAVAILABLE)
+    const { scope, accountId } = await this.replayScope(sessionId)
+    const db = openReplayDatabase(this.ctx, false)
+    if (!db) throw new Error(REPLAY_UNAVAILABLE)
+    try {
+      const row = db.prepare('SELECT payload FROM replays WHERE scope = ? AND account_id = ? AND session_id = ? AND ref = ?')
+        .get(scope, accountId, sessionId, ref) as { payload: string } | undefined
+      if (!row) throw new Error(REPLAY_UNAVAILABLE)
+      if (typeof row.payload !== 'string' || Buffer.byteLength(row.payload, 'utf8') > REPLAY_MAX_BYTES) {
+        throw new Error('原生回放数据超过 2 MiB 限制或已损坏，请新建会话。')
+      }
+      let replay: unknown
+      try {
+        replay = JSON.parse(row.payload)
+      } catch {
+        throw new Error('原生回放数据已损坏，请新建会话。')
+      }
+      validateReplay(replay)
+      return replay
+    } finally {
+      db.close()
+    }
+  }
+
   /**
    * 对外派工：向指定 session 的 agent 发送一条消息并启动回合。
    * 遵循封装原则——外部只依赖 Session，不直接操控 Agent。
@@ -752,7 +896,11 @@ export class SessionsService extends Service {
     const record: SessionRecord = {
       id: childId,
       version: source.version,
-      events: forkEvents.map((event) => ({ ...event })),
+      events: forkEvents.map((event) => {
+        if (event.type !== 'assistant/message' || !event.replayRef) return { ...event }
+        const { replayRef: _ref, ...body } = event
+        return body
+      }),
       ...(source.project ? { project: { ...source.project } } : {}),
       mascot,
       config: normalizeSessionConfig({
@@ -969,6 +1117,15 @@ export class SessionsService extends Service {
   }
 
   async delete(id: string) {
+    if (existsSync(privateReplayPath(this.ctx)) && await this.ctx.sessionStore.load(id)) {
+      const { scope } = await this.replayScope(id, false)
+      const db = openReplayDatabase(this.ctx, false)
+      try {
+        db?.prepare('DELETE FROM replays WHERE scope = ? AND session_id = ?').run(scope, id)
+      } finally {
+        db?.close()
+      }
+    }
     this.clearPersistTimer(id)
     this.cache.delete(id)
     return this.ctx.sessionStore.delete(id)

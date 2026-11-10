@@ -58,7 +58,20 @@ export class AgentLoop implements AgentRunner {
       contextWindowTokens: 200_000,
       outputReserveTokens: 16_384,
     },
-  ) {}
+  ) {
+    this.config = { ...config }
+  }
+
+  private async replayMessages(): Promise<LlmMessage[]> {
+    const messages = await liftToolImages(this.ctx.sessions.deriveMessages(this.sessionId), this.sessionId)
+    return Promise.all(messages.map(async ({ replayRef, replayMissing, replay: _replay, ...message }) => {
+      if (this.config.replayMode !== 'native-replay') return message
+      if (replayMissing) throw new Error('此会话缺失原生回放状态，请新建会话或清除上下文后重试。')
+      if (!replayRef) return message
+      const replay = await this.ctx.sessions.loadReplay(this.sessionId, replayRef)
+      return { ...message, replay }
+    }))
+  }
 
   private async autoCompact(messages: LlmMessage[], policy: ContextPolicy): Promise<boolean> {
     const request = buildAutoCompactMessages(messages, policy.hardMessageTokens)
@@ -72,6 +85,7 @@ export class AgentLoop implements AgentRunner {
       const reply = await this.llm.chat(request.messages, [], this.signal, {
         maxOutputTokens: policy.compactMaxOutputTokens,
         thinking: 'disabled',
+        replayMode: 'lean-replay',
         estimatedTotalTokens: projectedRequestTokens(
           request.messages,
           [],
@@ -194,7 +208,9 @@ export class AgentLoop implements AgentRunner {
     // turn/start 是唯一可靠的回合边界。
     const record = await session.get(this.sessionId)
     const turn = record ? record.events.filter((event) => event.type === 'turn/start').length + 1 : 1
-    await session.append(this.sessionId, { type: 'turn/start', turn })
+    await session.append(this.sessionId, {
+      type: 'turn/start', turn, replayMode: this.config.replayMode ?? 'lean-replay',
+    })
 
     let req: PreStepReq = { sessionId: this.sessionId, messages: claimed }
     req = this.ctx.waterfall('agent/pre-step', req, () => req)
@@ -330,7 +346,6 @@ export class AgentLoop implements AgentRunner {
         throw new Error('cancelled')
       }
 
-      let rawMessages = await liftToolImages(session.deriveMessages(this.sessionId), this.sessionId)
       let inputComp = session.statInputComposition(this.sessionId)
       let contextWindowTokens: number | undefined
       const attachUsage = (usage?: LlmUsage) =>
@@ -338,8 +353,10 @@ export class AgentLoop implements AgentRunner {
           ? { ...usage, histPct: inputComp.histPct, ...(contextWindowTokens ? { contextWindowTokens } : {}) }
           : undefined
       let reply: AssistantReply
+      let replayRef: string | undefined
       try {
         if (this.signal.aborted) throw new Error('cancelled')
+        let rawMessages = await this.replayMessages()
         const tools = this.ctx.tools.schemas()
         const policy = resolveContextPolicy(this.config, tools)
         contextWindowTokens = policy.contextWindowTokens
@@ -353,7 +370,7 @@ export class AgentLoop implements AgentRunner {
         ) {
           const compacted = await this.autoCompact(rawMessages, policy)
           if (compacted) {
-            rawMessages = await liftToolImages(session.deriveMessages(this.sessionId), this.sessionId)
+            rawMessages = await this.replayMessages()
             inputComp = session.statInputComposition(this.sessionId)
           }
         }
@@ -380,6 +397,7 @@ export class AgentLoop implements AgentRunner {
         const requestMessages = withReminder(fitted.messages, reminder)
 
         reply = await this.llm.chat(requestMessages, tools, this.signal, {
+          replayMode: this.config.replayMode ?? 'lean-replay',
           estimatedTotalTokens: projectedRequestTokens(
             requestMessages,
             tools,
@@ -397,6 +415,9 @@ export class AgentLoop implements AgentRunner {
         })
         await flushChunks()
         await flushTools()
+        this.throwIfAborted()
+        if (reply.replay) replayRef = await session.saveReplay(this.sessionId, reply.replay)
+        this.throwIfAborted()
       } catch (error) {
         await flushChunks()
         await flushTools()
@@ -424,7 +445,8 @@ export class AgentLoop implements AgentRunner {
         const usage = attachUsage(reply.usage)
         await session.append(this.sessionId, {
           type: 'assistant/message',
-          text: final,
+          text: replayRef ? (reply.content ?? '') : final,
+          ...(replayRef ? { replayRef } : {}),
           ...(usage ? { usage } : {}),
         })
         await session.append(this.sessionId, { type: 'step/end', turn, step })
@@ -448,6 +470,7 @@ export class AgentLoop implements AgentRunner {
         type: 'assistant/message',
         text: reply.content ?? '',
         tool_calls: reply.toolCalls,
+        ...(replayRef ? { replayRef } : {}),
         ...(usage ? { usage } : {}),
       })
 

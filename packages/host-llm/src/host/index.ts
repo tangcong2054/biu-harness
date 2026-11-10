@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import { Service, type Context } from 'cordis'
 import {
   isTencentTokenPlan,
@@ -26,6 +28,8 @@ export interface LlmConfig {
   /** DeepSeek V4 / Claude 扩展思考：显式开关，避免上游默认开思考把页面卡死。 */
   thinking?: 'enabled' | 'disabled'
   reasoningEffort?: 'high' | 'max'
+  /** 默认精简回放；原生回放只允许相同供应商、模型和实际入口。 */
+  replayMode?: 'lean-replay' | 'native-replay'
   /** Agent 本地上下文管理使用；不会原样发送给上游。 */
   contextWindowTokens?: number
   /** 为正常回答 / thinking 预留的窗口空间。 */
@@ -310,11 +314,34 @@ export type LlmContentPart =
 
 export type LlmMessageContent = string | LlmContentPart[] | null
 
+export type NativeReplayBlock = (
+  | { type: 'text'; text: string }
+  | { type: 'thinking'; thinking: string; signature: string }
+  | { type: 'redacted_thinking'; data: string }
+  | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+) & Record<string, unknown>
+
+/** 仅供宿主私有存储；完整块及签名不可进入公共事件或直接展开为请求字段。 */
+export interface NativeReplay {
+  version: 1
+  complete: true
+  routeKey: string
+  protocol: 'openai-compat' | 'anthropic'
+  reasoningContent?: string
+  reasoningField?: 'reasoning_content' | 'reasoning'
+  blocks?: NativeReplayBlock[]
+}
+
 export interface LlmMessage {
   role: string
   content?: LlmMessageContent
   tool_calls?: Array<{ id: string; type: string; function: { name: string; arguments: string } }>
   tool_call_id?: string
+  replay?: NativeReplay
+  /** 私有存储引用，绝不发送给上游。 */
+  replayRef?: string
+  /** 分叉或私有状态不可用时显式标记；原生回放不得静默降级。 */
+  replayMissing?: boolean
 }
 
 /** 若消息 content 含图片块则返回 true（用于触发视觉模型路由）。 */
@@ -435,6 +462,7 @@ export interface LlmUsage {
 export interface AssistantReply {
   content: string | null
   toolCalls: ToolCall[]
+  replay?: NativeReplay
   usage?: LlmUsage
   /** 供应商请求 id：响应头或流里的 request_id，排查问题时提供给供应商。 */
   requestId?: string
@@ -453,6 +481,8 @@ export interface ChatOptions {
   maxOutputTokens?: number
   /** 单次覆盖思考模式；自动 compact 默认关闭思考，减少延迟和 Token。 */
   thinking?: 'enabled' | 'disabled'
+  /** 单次覆盖回放策略；摘要等内部请求使用精简回放，不发送原始思考。 */
+  replayMode?: 'lean-replay' | 'native-replay'
   /** 调用前估算的输入 + 最大输出 Token，供供应商 TPM adapter 预留额度。 */
   estimatedTotalTokens?: number
 }
@@ -495,123 +525,248 @@ export function formatUsage(usage: LlmUsage | undefined): string {
   return parts.join(' · ')
 }
 
+export function nativeReplayRouteKey(config: LlmConfig, model = config.model, endpoint?: string): string {
+  const protocol = config.provider === 'anthropic' ? 'anthropic' : 'openai-compat'
+  const url = endpoint ?? (protocol === 'anthropic'
+    ? resolveAnthropicMessagesUrl(config.baseUrl)
+    : resolveChatCompletionsUrl(config.baseUrl, config.provider))
+  return createHash('sha256')
+    .update(JSON.stringify([config.provider, protocol, model, url, config.endpointId ?? '']))
+    .digest('hex')
+}
+
+function replayError(detail: string): Error {
+  return new Error(`原生回放无法继续工具历史：${detail}。请新建会话或清除上下文后重试；不会自动重跑工具。`)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function validReplayBlock(value: unknown): value is NativeReplayBlock {
+  if (!isRecord(value)) return false
+  switch (value.type) {
+    case 'text': return typeof value.text === 'string'
+    case 'thinking': return typeof value.thinking === 'string' && typeof value.signature === 'string' && !!value.signature
+    case 'redacted_thinking': return typeof value.data === 'string' && !!value.data
+    case 'tool_use': return typeof value.id === 'string' && !!value.id && typeof value.name === 'string' && !!value.name && isRecord(value.input)
+    default: return false
+  }
+}
+
+function replayForMessage(
+  message: LlmMessage,
+  config: LlmConfig,
+  routeKey: string,
+  protocol: NativeReplay['protocol'],
+): NativeReplay | undefined {
+  if (message.role !== 'assistant' || config.replayMode !== 'native-replay') return undefined
+  if (message.replayMissing) throw replayError('分叉或恢复后原始响应状态不可用')
+  const replay = message.replay
+  const hasTools = !!message.tool_calls?.length
+  const fail = (detail: string) => {
+    if (hasTools || replay || message.replayRef) throw replayError(detail)
+    return undefined
+  }
+  if (!replay || replay.version !== 1 || replay.complete !== true) return fail('缺少完整的原始响应状态')
+  if (replay.routeKey !== routeKey || replay.protocol !== protocol) return fail('供应商、模型或入口已改变')
+  if (protocol === 'openai-compat') {
+    if ((replay.reasoningContent !== undefined || replay.reasoningField !== undefined)
+      && (typeof replay.reasoningContent !== 'string'
+        || !['reasoning_content', 'reasoning'].includes(replay.reasoningField ?? ''))) {
+      return fail('原始 reasoning 字段不完整')
+    }
+  } else {
+    if (!Array.isArray(replay.blocks) || !replay.blocks.every(validReplayBlock)) return fail('原始内容块或思考签名不完整')
+    const nativeTools = replay.blocks.filter((block) => block.type === 'tool_use')
+    const expected = message.tool_calls ?? []
+    if (nativeTools.length !== expected.length || nativeTools.some((block, index) => {
+      const call = expected[index]!
+      return block.id !== call.id || block.name !== call.function.name
+        || !isDeepStrictEqual(block.input, parseToolJson(call.function.arguments))
+    })) return fail('工具调用与原始内容块不一致')
+    if (replay.blocks.filter((block) => block.type === 'text').map((block) => block.text).join('')
+      !== textFromContent(message.content)) return fail('正文与原始内容块不一致')
+  }
+  return replay
+}
+
+function openAiMessages(messages: LlmMessage[], config: LlmConfig, routeKey: string): Record<string, unknown>[] {
+  return messages.map((message) => {
+    const replay = replayForMessage(message, config, routeKey, 'openai-compat')
+    return {
+      role: message.role,
+      ...(message.content !== undefined ? { content: message.content } : {}),
+      ...(message.tool_calls ? { tool_calls: message.tool_calls.map((call) => ({
+        id: call.id, type: call.type,
+        function: { name: call.function.name, arguments: call.function.arguments },
+      })) } : {}),
+      ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}),
+      ...(replay?.reasoningField ? { [replay.reasoningField]: replay.reasoningContent } : {}),
+    }
+  })
+}
+
+function anthropicMessages(messages: LlmMessage[], config: LlmConfig, routeKey: string): Record<string, unknown>[] {
+  return messages.filter((message) => message.role !== 'system').map((message) => {
+    const replay = replayForMessage(message, config, routeKey, 'anthropic')
+    if (replay?.blocks) return { role: 'assistant', content: replay.blocks }
+    if (message.tool_call_id) return { role: 'user', content: toAnthropicContent(message.content, message.tool_call_id) }
+    const content = toAnthropicContent(message.content)
+    if (!message.tool_calls?.length) return { role: message.role, content }
+    return {
+      role: message.role,
+      content: [
+        ...(Array.isArray(content) ? content : content ? [{ type: 'text', text: content }] : []),
+        ...message.tool_calls.map((call) => ({
+          type: 'tool_use', id: call.id, name: call.function.name, input: parseToolJson(call.function.arguments),
+        })),
+      ],
+    }
+  })
+}
+
 interface StreamToolAcc {
   id: string
   name: string
   arguments: string
 }
 
-/** 解析 OpenAI/DeepSeek chat.completions SSE；`[DONE]` 结束。不引入 eventsource-parser。 */
-export async function consumeChatCompletionSse(
-  stream: ReadableStream<Uint8Array>,
-  options: {
-    onDelta?: (text: string) => void | Promise<void>
-    onReasoningDelta?: (text: string) => void | Promise<void>
-    onToolDelta?: (call: { id: string; name: string; arguments: string }) => void | Promise<void>
-    signal?: AbortSignal
-    /** 响应头里已拿到的请求 id；流里的 request_id 只在它缺失时补上。 */
-    requestId?: string
-  } = {},
-): Promise<AssistantReply> {
+interface SseOptions {
+  onDelta?: (text: string) => void | Promise<void>
+  onReasoningDelta?: (text: string) => void | Promise<void>
+  onToolDelta?: (call: ToolCall) => void | Promise<void>
+  signal?: AbortSignal
+  requestId?: string
+  routeKey?: string
+}
+
+async function* ssePayloads(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncGenerator<string> {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
+  const onAbort = () => { void reader.cancel().catch(() => undefined) }
+  signal?.addEventListener('abort', onAbort, { once: true })
+  try {
+    while (true) {
+      if (signal?.aborted) throw new Error('cancelled')
+      const { done, value } = await reader.read()
+      if (signal?.aborted) throw new Error('cancelled')
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true })
+      if (done && buffer) buffer += '\n'
+      const lines = buffer.split(/\r?\n/)
+      buffer = lines.pop() ?? ''
+      for (const line of lines) {
+        if (signal?.aborted) throw new Error('cancelled')
+        const payload = sseDataLine(line)
+        if (payload) yield payload
+      }
+      if (done) break
+    }
+  } finally {
+    signal?.removeEventListener('abort', onAbort)
+    void reader.cancel().catch(() => undefined)
+    reader.releaseLock()
+  }
+}
+
+/** 解析 OpenAI/DeepSeek chat.completions SSE；`[DONE]` 结束。不引入 eventsource-parser。 */
+export async function consumeChatCompletionSse(
+  stream: ReadableStream<Uint8Array>,
+  options: SseOptions = {},
+): Promise<AssistantReply> {
   let content = ''
+  let reasoningContent = ''
+  let reasoningField: NativeReplay['reasoningField']
   let usage: LlmUsage | undefined
   let requestId = options.requestId
   let responseId: string | undefined
   const tools = new Map<number, StreamToolAcc>()
   let sawDone = false
+  let captureComplete = true
 
-  const onAbort = () => {
-    void reader.cancel().catch(() => undefined)
-  }
-  options.signal?.addEventListener('abort', onAbort, { once: true })
-
-  try {
-    while (true) {
-      if (options.signal?.aborted) throw new Error('cancelled')
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split(/\r?\n/)
-      buffer = lines.pop() ?? ''
-      for (const line of lines) {
-        const payload = sseDataLine(line)
-        if (payload === undefined) continue
-        if (payload === '[DONE]') {
-          sawDone = true
-          break
-        }
-        let chunk: {
-          choices?: Array<{
-            delta?: {
-              content?: string | null
-              reasoning_content?: string | null
-              reasoning?: string | null
-              tool_calls?: Array<{
-                index?: number
-                id?: string
-                function?: { name?: string; arguments?: string }
-              }>
-            }
-          }>
-          usage?: unknown
-          error?: { message?: string }
-          id?: unknown
-          request_id?: unknown
-        }
-        try {
-          chunk = JSON.parse(payload) as typeof chunk
-        } catch {
-          continue
-        }
-        requestId ??= idString(chunk.request_id)
-        responseId ??= idString(chunk.id)
-        if (chunk.error?.message) throw new Error(chunk.error.message)
-        const delta = chunk.choices?.[0]?.delta
-        const reasoning = delta?.reasoning_content ?? delta?.reasoning
-        if (typeof reasoning === 'string' && reasoning.length) {
-          await options.onReasoningDelta?.(reasoning)
-        }
-        const text = delta?.content
-        if (typeof text === 'string' && text.length) {
-          content += text
-          await options.onDelta?.(text)
-        }
-        for (const call of delta?.tool_calls ?? []) {
-          const index = typeof call.index === 'number' ? call.index : 0
-          const acc = tools.get(index) ?? { id: '', name: '', arguments: '' }
-          if (call.id) acc.id = call.id
-          if (call.function?.name) acc.name = call.function.name
-          if (typeof call.function?.arguments === 'string') acc.arguments += call.function.arguments
-          tools.set(index, acc)
-          if (acc.id && acc.name) await options.onToolDelta?.({ id: acc.id, name: acc.name, arguments: acc.arguments })
-        }
-        const nextUsage = parseProviderUsage(chunk.usage)
-        if (nextUsage) usage = nextUsage
-      }
-      if (sawDone) break
+  for await (const payload of ssePayloads(stream, options.signal)) {
+    if (payload.trim() === '[DONE]') {
+      sawDone = true
+      break
     }
-  } finally {
-    options.signal?.removeEventListener('abort', onAbort)
-    reader.releaseLock()
+    let chunk: {
+      choices?: Array<{
+        delta?: {
+          content?: string | null
+          reasoning_content?: string | null
+          reasoning?: string | null
+          tool_calls?: Array<{
+            index?: number
+            id?: string
+            function?: { name?: string; arguments?: string }
+          }>
+        }
+      }>
+      usage?: unknown
+      error?: { message?: string }
+      id?: unknown
+      request_id?: unknown
+    }
+    try {
+      chunk = JSON.parse(payload) as typeof chunk
+    } catch {
+      throw new Error('LLM 流包含无效 JSON，响应不完整，请重试。')
+    }
+    if (!chunk || typeof chunk !== 'object') throw new Error('LLM 流响应格式无效。')
+    requestId ??= idString(chunk.request_id)
+    responseId ??= idString(chunk.id)
+    if (chunk.error) throw new Error(chunk.error.message || 'LLM 流返回错误。')
+    const delta = chunk.choices?.[0]?.delta
+    const field = typeof delta?.reasoning_content === 'string' ? 'reasoning_content'
+      : typeof delta?.reasoning === 'string' ? 'reasoning' : undefined
+    if (field) {
+      if (reasoningField && reasoningField !== field) captureComplete = false
+      if (typeof delta?.reasoning_content === 'string' && typeof delta.reasoning === 'string') captureComplete = false
+      reasoningField = field
+      reasoningContent += delta![field]!
+    }
+    const reasoning = delta?.reasoning_content ?? delta?.reasoning
+    if (typeof reasoning === 'string' && reasoning.length) await options.onReasoningDelta?.(reasoning)
+    const text = delta?.content
+    if (typeof text === 'string' && text.length) {
+      content += text
+      await options.onDelta?.(text)
+    }
+    for (const call of delta?.tool_calls ?? []) {
+      const index = typeof call.index === 'number' ? call.index : 0
+      if (!Number.isInteger(index) || index < 0) throw new Error('LLM 工具调用索引无效。')
+      const acc = tools.get(index) ?? { id: '', name: '', arguments: '' }
+      if (call.id) acc.id = call.id
+      if (call.function?.name) acc.name = call.function.name
+      if (typeof call.function?.arguments === 'string') acc.arguments += call.function.arguments
+      tools.set(index, acc)
+      if (acc.id && acc.name) await options.onToolDelta?.({ ...acc })
+    }
+    const nextUsage = parseProviderUsage(chunk.usage)
+    if (nextUsage) usage = nextUsage
   }
-
   if (options.signal?.aborted) throw new Error('cancelled')
+  if (!sawDone) throw new Error('LLM 流提前结束，响应不完整，请重试。')
 
-  const toolCalls: ToolCall[] = [...tools.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([, call]) => ({
-      id: call.id || `call_${Math.random().toString(36).slice(2, 10)}`,
-      name: call.name,
-      arguments: call.arguments || '{}',
-    }))
-    .filter((call) => call.name)
-
+  const toolCalls = [...tools.entries()].sort((a, b) => a[0] - b[0]).map(([, call]) => {
+    if (!call.id || !call.name) throw new Error('LLM 工具调用不完整，请重试。')
+    const args = call.arguments || '{}'
+    try {
+      if (!isRecord(JSON.parse(args))) throw new Error('invalid input')
+    } catch {
+      throw new Error('LLM 工具参数不完整，请重试。')
+    }
+    return { ...call, arguments: args }
+  })
+  if (!captureComplete && toolCalls.length) throw replayError('上游混用了不同 reasoning 字段，无法完整捕获')
   return {
     content: content || null,
     toolCalls,
+    ...(options.routeKey && captureComplete ? { replay: {
+      version: 1 as const, complete: true as const, routeKey: options.routeKey, protocol: 'openai-compat' as const,
+      ...(reasoningField ? { reasoningContent, reasoningField } : {}),
+    } } : {}),
     ...(usage ? { usage } : {}),
     ...(requestId ? { requestId } : {}),
     ...(responseId ? { responseId } : {}),
@@ -640,9 +795,15 @@ export class OpenAiCompatLlm implements LlmClient {
       this.config.provider === 'deepseek' && hasImage
         ? DEEPSEEK_VISION_MODEL
         : this.config.model
+    const config = {
+      ...this.config, model,
+      thinking: options?.thinking ?? this.config.thinking,
+      replayMode: options?.replayMode ?? this.config.replayMode ?? 'lean-replay',
+    }
+    const routeKey = nativeReplayRouteKey(config, model, url)
     const body: Record<string, unknown> = {
       model,
-      messages: payload,
+      messages: openAiMessages(payload, config, routeKey),
       stream: true,
       stream_options: { include_usage: true },
     }
@@ -673,6 +834,7 @@ export class OpenAiCompatLlm implements LlmClient {
     }
     if (!res.body) throw new Error('llm stream missing body')
     return consumeChatCompletionSse(res.body, {
+      routeKey,
       onDelta: options?.onDelta,
       onReasoningDelta: options?.onReasoningDelta,
       onToolDelta: options?.onToolDelta,
@@ -699,6 +861,12 @@ export class AnthropicLlm implements LlmClient {
     options?: ChatOptions,
   ): Promise<AssistantReply> {
     const endpoint = resolveAnthropicMessagesUrl(this.config.baseUrl)
+    const config = {
+      ...this.config,
+      thinking: options?.thinking ?? this.config.thinking,
+      replayMode: options?.replayMode ?? this.config.replayMode ?? 'lean-replay',
+    }
+    const routeKey = nativeReplayRouteKey(config, config.model, endpoint)
     const system = messages
       .filter((m) => m.role === 'system')
       .map((m) => m.content ?? '')
@@ -708,23 +876,7 @@ export class AnthropicLlm implements LlmClient {
       model: this.config.model,
       max_tokens: Math.floor(options?.maxOutputTokens || 4096),
       ...(system ? { system } : {}),
-      messages: messages
-        .filter((m) => m.role !== 'system')
-        .map((m) => ({
-          role: m.role === 'tool' ? 'user' : m.role,
-          ...(m.content && !m.tool_call_id && !m.tool_calls?.length ? { content: toAnthropicContent(m.content) } : {}),
-          ...(m.tool_call_id ? { content: toAnthropicContent(m.content, m.tool_call_id) } : {}),
-          ...(m.tool_calls?.length
-            ? {
-                content: m.tool_calls.map((call) => ({
-                  type: 'tool_use' as const,
-                  id: call.id,
-                  name: call.function.name,
-                  input: parseToolJson(call.function.arguments),
-                })),
-              }
-            : {}),
-        })),
+      messages: anthropicMessages(messages, config, routeKey),
       stream: true,
     }
     if (tools.length) {
@@ -759,6 +911,7 @@ export class AnthropicLlm implements LlmClient {
     }
     if (!res.body) throw new Error('llm stream missing body')
     return consumeMessagesSse(res.body, {
+      routeKey,
       onDelta: options?.onDelta,
       onReasoningDelta: options?.onReasoningDelta,
       onToolDelta: options?.onToolDelta,
@@ -778,113 +931,138 @@ function parseToolJson(text: string): unknown {
 }
 
 /** 解析 Anthropic Messages SSE：text（text_delta）+ 工具参数（input_json_delta）累积。 */
-async function consumeMessagesSse(
+export async function consumeMessagesSse(
   stream: ReadableStream<Uint8Array>,
-  options: {
-    onDelta?: (text: string) => void | Promise<void>
-    onReasoningDelta?: (text: string) => void | Promise<void>
-    onToolDelta?: (call: { id: string; name: string; arguments: string }) => void | Promise<void>
-    signal?: AbortSignal
-    requestId?: string
-  } = {},
+  options: SseOptions = {},
 ): Promise<AssistantReply> {
-  const reader = stream.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
   let content = ''
   let usage: LlmUsage | undefined
   const requestId = options.requestId
   let responseId: string | undefined
-  const toolBlocks: Array<{ id?: string; name?: string; input: string }> = []
+  const blocks = new Map<number, { block: Record<string, unknown>; input: string; stopped: boolean }>()
+  let sawStart = false
   let sawStop = false
+  let captureComplete = true
 
-  const onAbort = () => void reader.cancel().catch(() => undefined)
-  options.signal?.addEventListener('abort', onAbort, { once: true })
-
-  try {
-    while (true) {
-      if (options.signal?.aborted) throw new Error('cancelled')
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split(/\r?\n/)
-      buffer = lines.pop() ?? ''
-      for (const line of lines) {
-        if (!line.startsWith('data:')) continue
-        const payloadLine = line.slice(5).trim()
-        if (!payloadLine) continue
-        let evt: Record<string, unknown>
-        try {
-          evt = JSON.parse(payloadLine) as Record<string, unknown>
-        } catch {
-          continue
-        }
-        switch (evt.type) {
-          case 'message_start': {
-            const message = evt.message as { usage?: unknown; id?: unknown } | undefined
-            responseId ??= idString(message?.id)
-            const nextUsage = parseProviderUsage(message?.usage)
-            if (nextUsage) usage = nextUsage
-            break
-          }
-          case 'message_delta': {
-            const nextUsage = parseProviderUsage(evt.usage)
-            if (nextUsage) usage = nextUsage
-            break
-          }
-          case 'content_block_start': {
-            const block = evt.content_block as { type?: string; id?: string; name?: string } | undefined
-            if (block?.type === 'tool_use') {
-              toolBlocks.push({ id: block.id, name: block.name, input: '' })
-              if (block.id && block.name) {
-                await options.onToolDelta?.({ id: block.id, name: block.name, arguments: '' })
-              }
-            }
-            break
-          }
-          case 'content_block_delta': {
-            const delta = evt.delta as { type?: string; text?: string; partial_json?: string; thinking?: string } | undefined
-            if (delta?.type === 'text_delta' && typeof delta.text === 'string' && delta.text.length) {
-              content += delta.text
-              await options.onDelta?.(delta.text)
-            } else if (delta?.type === 'thinking_delta' && typeof delta.thinking === 'string' && delta.thinking.length) {
-              await options.onReasoningDelta?.(delta.thinking)
-            } else if (delta?.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
-              const last = toolBlocks[toolBlocks.length - 1]
-              if (last) {
-                last.input += delta.partial_json
-                if (last.id && last.name) {
-                  await options.onToolDelta?.({ id: last.id, name: last.name, arguments: last.input })
-                }
-              }
-            }
-            break
-          }
-          case 'message_stop':
-            sawStop = true
-            break
-        }
-      }
-      if (sawStop) break
+  for await (const payload of ssePayloads(stream, options.signal)) {
+    let evt: Record<string, unknown>
+    try {
+      evt = JSON.parse(payload) as Record<string, unknown>
+    } catch {
+      throw new Error('Anthropic 流包含无效 JSON，响应不完整，请重试。')
     }
-  } finally {
-    options.signal?.removeEventListener('abort', onAbort)
-    reader.releaseLock()
+    if (!isRecord(evt)) throw new Error('Anthropic 流响应格式无效。')
+    switch (evt.type) {
+      case 'error': {
+        const error = isRecord(evt.error) ? evt.error : {}
+        throw new Error(typeof error.message === 'string' ? error.message : 'Anthropic 流返回错误。')
+      }
+      case 'message_start': {
+        if (sawStart) throw new Error('Anthropic 流包含重复消息。')
+        sawStart = true
+        const message = isRecord(evt.message) ? evt.message : {}
+        if (Array.isArray(message.content) && message.content.length) captureComplete = false
+        responseId ??= idString(message.id)
+        const nextUsage = parseProviderUsage(message.usage)
+        if (nextUsage) usage = nextUsage
+        break
+      }
+      case 'message_delta': {
+        const raw = isRecord(evt.usage) ? evt.usage : {}
+        const nextUsage = parseProviderUsage({
+          ...raw,
+          input_tokens: raw.input_tokens ?? usage?.inputTokens,
+          output_tokens: raw.output_tokens ?? usage?.outputTokens,
+          cache_read_input_tokens: raw.cache_read_input_tokens ?? usage?.cacheReadTokens,
+        })
+        if (nextUsage) usage = nextUsage
+        break
+      }
+      case 'content_block_start': {
+        if (typeof evt.index !== 'number' || !Number.isInteger(evt.index) || evt.index < 0
+          || blocks.has(evt.index) || !isRecord(evt.content_block)) throw new Error('Anthropic 内容块索引或起始状态无效。')
+        const block = { ...evt.content_block }
+        blocks.set(evt.index, { block, input: '', stopped: false })
+        if (block.type === 'text' && typeof block.text === 'string' && block.text) {
+          content += block.text
+          await options.onDelta?.(block.text)
+        } else if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking) {
+          await options.onReasoningDelta?.(block.thinking)
+        } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+          await options.onToolDelta?.({ id: block.id, name: block.name, arguments: '' })
+        }
+        break
+      }
+      case 'content_block_delta': {
+        const delta = isRecord(evt.delta) ? evt.delta : {}
+        const acc = typeof evt.index === 'number' ? blocks.get(evt.index) : undefined
+        if (!acc) captureComplete = false
+        if (acc?.stopped) throw new Error('Anthropic 已结束的内容块仍包含增量。')
+        const block = acc?.block
+        if (delta.type === 'text_delta' && typeof delta.text === 'string') {
+          if (block && block.type !== 'text') throw new Error('Anthropic 文本增量与内容块不一致。')
+          if (block) block.text = String(block.text ?? '') + delta.text
+          content += delta.text
+          if (delta.text) await options.onDelta?.(delta.text)
+        } else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+          if (block && block.type !== 'thinking') throw new Error('Anthropic 思考增量与内容块不一致。')
+          if (block) block.thinking = String(block.thinking ?? '') + delta.thinking
+          if (delta.thinking) await options.onReasoningDelta?.(delta.thinking)
+        } else if (delta.type === 'signature_delta' && typeof delta.signature === 'string') {
+          if (block?.type !== 'thinking') throw new Error('Anthropic 思考签名缺少对应内容块。')
+          block.signature = String(block.signature ?? '') + delta.signature
+        } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
+          if (!acc || block?.type !== 'tool_use') throw new Error('Anthropic 工具增量缺少对应内容块。')
+          acc.input += delta.partial_json
+          if (typeof block.id === 'string' && typeof block.name === 'string') {
+            await options.onToolDelta?.({ id: block.id, name: block.name, arguments: acc.input })
+          }
+        } else if (delta.type === 'citations_delta' && isRecord(delta.citation) && block?.type === 'text') {
+          block.citations = [...(Array.isArray(block.citations) ? block.citations : []), delta.citation]
+        } else {
+          captureComplete = false
+        }
+        break
+      }
+      case 'content_block_stop': {
+        const acc = typeof evt.index === 'number' ? blocks.get(evt.index) : undefined
+        if (!acc || acc.stopped) throw new Error('Anthropic 内容块结束状态无效。')
+        if (acc.block.type === 'tool_use' && acc.input) {
+          try {
+            acc.block.input = JSON.parse(acc.input)
+          } catch {
+            throw new Error('Anthropic 工具参数不完整，请重试。')
+          }
+        }
+        if (!validReplayBlock(acc.block)) throw new Error('Anthropic 内容块或思考签名不完整，请新建会话或清除上下文后重试。')
+        acc.stopped = true
+        break
+      }
+      case 'message_stop': sawStop = true; break
+      case 'ping': break
+      default: captureComplete = false
+    }
+    if (sawStop) break
   }
-
   if (options.signal?.aborted) throw new Error('cancelled')
-
-  const toolCalls: ToolCall[] = toolBlocks
-    .filter((block) => block.name)
-    .map((block) => ({
-      id: block.id || `call_${Math.random().toString(36).slice(2, 10)}`,
-      name: block.name ?? '',
-      arguments: block.input.trim() || '{}',
-    }))
-
+  if (!sawStop || [...blocks.values()].some((acc) => !acc.stopped)) {
+    throw new Error('Anthropic 流提前结束，响应不完整，请重试。')
+  }
+  const ordered = [...blocks.entries()].sort((a, b) => a[0] - b[0])
+  captureComplete &&= sawStart && ordered.every(([index], position) => index === position)
+  const nativeBlocks = ordered.map(([, acc]) => acc.block as NativeReplayBlock)
+  const toolCalls: ToolCall[] = nativeBlocks
+    .filter((block) => block.type === 'tool_use')
+    .map((block) => ({ id: block.id, name: block.name, arguments: JSON.stringify(block.input) }))
+  if (!captureComplete && toolCalls.length) throw replayError('Anthropic 流缺少完整原始内容块')
+  if (captureComplete) content = nativeBlocks.filter((block) => block.type === 'text').map((block) => block.text).join('')
   return {
     content: content || null,
     toolCalls,
+    ...(options.routeKey && captureComplete ? { replay: {
+      version: 1 as const, complete: true as const, routeKey: options.routeKey,
+      protocol: 'anthropic' as const, blocks: nativeBlocks,
+    } } : {}),
     ...(usage ? { usage } : {}),
     ...(requestId ? { requestId } : {}),
     ...(responseId ? { responseId } : {}),
@@ -942,6 +1120,7 @@ export class LlmService extends Service {
               onToolDelta: options?.onToolDelta,
               maxOutputTokens,
               thinking: options?.thinking,
+              replayMode: options?.replayMode,
               estimatedTotalTokens,
             })
             reservation?.finish(reply.usage)
