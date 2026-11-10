@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react'
+import { useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
 import {
   DndContext,
   DragOverlay,
@@ -45,6 +45,52 @@ const WITHIN = [
 ]
 
 type SortFieldOption = { value: string; label: string; icon?: ReactNode }
+
+const MENU_GAP = 8
+
+function clipHost(el: HTMLElement): HTMLElement | null {
+  let node = el.parentElement
+  while (node && node !== document.body && node !== document.documentElement) {
+    if (getComputedStyle(node).overflowX !== 'visible') return node
+    node = node.parentElement
+  }
+  return null
+}
+
+function useKeepInPane(ref: RefObject<HTMLDivElement | null>) {
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const host = clipHost(el)
+    const fit = () => {
+      el.style.right = ''
+      el.style.width = ''
+      el.style.minWidth = ''
+      const box = host?.getBoundingClientRect()
+      const left = Math.max(box?.left ?? 0, 0) + MENU_GAP
+      const right = Math.min(box?.right ?? window.innerWidth, window.innerWidth) - MENU_GAP
+      const room = right - left
+      if (room <= 0) return
+      if (el.getBoundingClientRect().width > room) {
+        el.style.width = `${room}px`
+        el.style.minWidth = '0'
+      }
+      const rect = el.getBoundingClientRect()
+      let dx = 0
+      if (rect.right > right) dx = right - rect.right
+      if (rect.left + dx < left) dx = left - rect.left
+      if (dx) el.style.right = `${-dx}px`
+    }
+    fit()
+    window.addEventListener('resize', fit)
+    const observer = typeof ResizeObserver === 'undefined' || !host ? null : new ResizeObserver(fit)
+    observer?.observe(host!)
+    return () => {
+      window.removeEventListener('resize', fit)
+      observer?.disconnect()
+    }
+  }, [ref])
+}
 
 function SortRuleFields({
   rule,
@@ -138,9 +184,11 @@ export function SortQueryMenu({
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }))
   const active = sorts.find((item) => item.id === activeId)
   const activeKind = fields.find((item) => item.key === active?.field)?.kind ?? 'string'
+  const menuRef = useRef<HTMLDivElement>(null)
+  useKeepInPane(menuRef)
 
   return (
-    <div className="fsdb-query-menu" role="menu">
+    <div ref={menuRef} className="fsdb-query-menu" role="menu">
       <div className="tasks-sort-head">排序</div>
       {sorts.length ? (
         <DndContext
@@ -217,8 +265,10 @@ export function FilterQueryMenu({
   valueOptions: (field: QueryField) => Array<{ value: string; label: string }>
   onChange: (next: FilterGroup) => void
 }) {
+  const menuRef = useRef<HTMLDivElement>(null)
+  useKeepInPane(menuRef)
   return (
-    <div className="fsdb-query-menu is-filter" role="menu">
+    <div ref={menuRef} className="fsdb-query-menu is-filter" role="menu">
       <div className="tasks-sort-head">筛选</div>
       <FilterGroupEditor
         group={tree}
