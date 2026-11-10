@@ -122,6 +122,14 @@ export function ChatConfig(props?: { onClose?: () => void }) {
   )
   const isDefaultProvider = defaultEndpointId === activeId
   const configured = active?.configured ?? providers?.[activeId]?.configured ?? false
+  const defaultSummary = useMemo(() => {
+    const ep = endpoints.find((e) => e.id === defaultEndpointId)
+    const endpointLabel = isOfficial(defaultEndpointId)
+      ? OFFICIAL_META[defaultEndpointId].label
+      : ep?.label || defaultEndpointId
+    const def = modelCatalog.find((m) => m.endpointId === defaultEndpointId && m.model === defaultModel)
+    return { endpointLabel, modelLabel: def?.label || defaultModel, model: defaultModel }
+  }, [endpoints, modelCatalog, defaultEndpointId, defaultModel])
 
   const officialList = useMemo(() => {
     return OFFICIAL_IDS.map((id) => {
@@ -374,6 +382,12 @@ export function ChatConfig(props?: { onClose?: () => void }) {
   }
 
   async function pickDefaultModel(m: ModelDef) {
+    const prevEndpoint = defaultEndpointId
+    const prevModel = defaultModel
+    const rollback = () => {
+      setDefaultEndpointId(prevEndpoint)
+      setDefaultModel(prevModel)
+    }
     setDefaultModel(m.model)
     setSaving(true)
     setError('')
@@ -392,11 +406,15 @@ export function ChatConfig(props?: { onClose?: () => void }) {
         body: JSON.stringify(body),
       })
       if (!res.ok) {
+        rollback()
         setError(`保存失败：HTTP ${res.status}`)
         return
       }
       applyPublic((await res.json()) as ChatPublicConfig, activeId)
       setStatus(`默认模型：${m.label}`)
+    } catch (err) {
+      rollback()
+      setError(`保存失败：${String(err)}`)
     } finally {
       setSaving(false)
     }
@@ -659,7 +677,21 @@ export function ChatConfig(props?: { onClose?: () => void }) {
       onClick={asDialog ? (e) => e.stopPropagation() : undefined}
     >
       <div className="biu-float-head">
-        <h2 className="biu-float-title">模型配置</h2>
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <h2 className="biu-float-title shrink-0">模型配置</h2>
+          {endpoints.length && defaultSummary.model ? (
+            <span
+              className="inline-flex min-w-0 items-center gap-1 truncate rounded-md bg-(--dsw-business-soft) px-2 py-0.5 text-[11px] text-(--dsw-business)"
+              data-testid="default-model-summary"
+              title={`当前默认：${defaultSummary.endpointLabel} · ${defaultSummary.modelLabel}（${defaultSummary.model}）`}
+            >
+              <span className="shrink-0 opacity-70">当前默认</span>
+              <span className="truncate font-medium">
+                {defaultSummary.endpointLabel} · {defaultSummary.modelLabel}
+              </span>
+            </span>
+          ) : null}
+        </div>
         {asDialog ? (
           <button
             type="button"
@@ -1137,7 +1169,11 @@ export function ChatConfig(props?: { onClose?: () => void }) {
                       模型
                       <span className="ml-1 font-normal">· {activeModels.length}</span>
                     </span>
-                    <span className="text-[10px] text-(--dsw-label-3)">点击设为默认</span>
+                    <span className="min-w-0 truncate text-[10px] text-(--dsw-label-3)">
+                      {isDefaultProvider && defaultSummary.model
+                        ? `默认：${defaultSummary.modelLabel} · 点击切换`
+                        : '点击设为默认'}
+                    </span>
                   </div>
 
                   {activeModels.length ? (
@@ -1163,6 +1199,9 @@ export function ChatConfig(props?: { onClose?: () => void }) {
                                   {m.note ? ` · ${m.note}` : ''}
                                 </span>
                               </span>
+                              {selected && m.builtin === false ? (
+                                <span className="shrink-0 rounded-sm px-1.5 py-0.5 text-[10px] font-semibold">默认</span>
+                              ) : null}
                               {m.builtin === false ? (
                                 <span
                                   role="button"
