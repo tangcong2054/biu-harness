@@ -378,7 +378,11 @@ function DeckFrame({
     return () => window.removeEventListener('message', onMessage)
   }, [kind, source])
 
-  const stamped = kind === 'html' ? stampHtmlSource(injectDeckBridge(html), `deck-${index}`, name) : ''
+  /* React 19 只比 dangerouslySetInnerHTML 的对象引用，不稳定就会每次重渲染都重设 innerHTML，冲掉选区。 */
+  const slideHtml = useMemo(
+    () => ({ __html: kind === 'html' ? stampHtmlSource(injectDeckBridge(html), `deck-${index}`, name) : '' }),
+    [kind, html, index],
+  )
   const fill = {
     position: 'absolute' as const,
     inset: 0,
@@ -420,7 +424,7 @@ function DeckFrame({
     <div
       data-testid="html-deck-slide"
       style={{ ...fill, overflow: 'auto', background: 'transparent' }}
-      dangerouslySetInnerHTML={{ __html: stamped }}
+      dangerouslySetInnerHTML={slideHtml}
     />
   )
 }
@@ -963,6 +967,13 @@ const HTML_DIRECT_SAMPLE = HTML_EDITORIAL_SAMPLE
 
 const HTML_FILL_CSS = `.html-direct-fill-inner{height:100%;min-height:100%}.html-direct-fill-inner>:first-child{height:100%!important;min-height:100%;box-sizing:border-box}`
 
+/**
+ * 页面块外层被 ProseMirror 设成 draggable="true"，Chromium 会把它映射成可继承的 user-select:none，
+ * mousedown 时再临时摘掉 draggable 已经晚了，块内文字根本起不了选区，这里显式改回 text。
+ * 整块选中（NodeSelection）时 Tiptap 用 .ProseMirror-hideselection 把 ::selection 设成透明，也一并恢复高亮。
+ */
+const HTML_SELECT_CSS = `.html-direct-content{-webkit-user-select:text;user-select:text}.ProseMirror-hideselection .html-direct-content::selection,.ProseMirror-hideselection .html-direct-content *::selection{background:Highlight;color:HighlightText}`
+
 function HtmlDirectCard({ data, update, writable }: BlockProps) {
   const ro = !writable
   const html = String(data.html ?? '')
@@ -978,8 +989,9 @@ function HtmlDirectCard({ data, update, writable }: BlockProps) {
   const deck = useHtmlDeck(hostRef, 'html', html, { width, height, deck: deckOn })
   useHtmlBlockActions('html', html, writable, update, deck.start)
   const selectionBubble = useDirectHtmlSelection(hostRef)
-  const stamped = useMemo(
-    () => stampHtmlSource(html, htmlBlockKey(hostRef.current?.closest('[data-page-block]') ?? null, html), name),
+  /* 必须是稳定的 { __html } 对象：React 19 按引用比较，悬停、选区气泡等任何重渲染都会重设 innerHTML，把正在拖的选区冲掉。 */
+  const innerHtml = useMemo(
+    () => ({ __html: stampHtmlSource(html, htmlBlockKey(hostRef.current?.closest('[data-page-block]') ?? null, html), name) }),
     [html],
   )
 
@@ -1000,6 +1012,7 @@ function HtmlDirectCard({ data, update, writable }: BlockProps) {
       onPointerLeave={() => setHover(false)}
     >
       {fill ? <style>{HTML_FILL_CSS}</style> : null}
+      <style>{HTML_SELECT_CSS}</style>
       {(hover || editing) && (
         <FloatBar
           editing={editing}
@@ -1016,13 +1029,14 @@ function HtmlDirectCard({ data, update, writable }: BlockProps) {
         <SourceEditor html={html} onChange={(v) => update({ html: v })} />
       ) : (
         <div
-          className={fill ? 'html-direct-fill-inner' : undefined}
-          style={{ overflowX: sized ? undefined : 'auto', height: fill ? '100%' : undefined }}
+          data-testid="page-html-direct-content"
+          className={fill ? 'html-direct-content html-direct-fill-inner' : 'html-direct-content'}
+          style={{ overflowX: sized ? undefined : 'auto', height: fill ? '100%' : undefined, userSelect: 'text', WebkitUserSelect: 'text' }}
           onMouseDown={(event) => {
             event.stopPropagation()
             suspendAncestorDrag(event.currentTarget)
           }}
-          dangerouslySetInnerHTML={{ __html: stamped }}
+          dangerouslySetInnerHTML={innerHtml}
         />
       )}
       {ro || editing ? null : <SizeGrip reveal={hover} boxRef={hostRef} onSize={(next) => update(next)} />}

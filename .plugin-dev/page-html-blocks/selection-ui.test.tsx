@@ -49,6 +49,11 @@ test('static HTML selection can be attached with Ctrl+L and keeps block dragging
     </div>,
   )
   const copy = container.querySelector('[data-testid="copy"]')!
+  const content = container.querySelector<HTMLElement>('[data-testid="page-html-direct-content"]')!
+  // Chromium 把祖先 draggable="true" 映射成可继承的 user-select:none，预览区必须显式改回 text。
+  assert.equal(content.style.userSelect, 'text')
+  assert.match(container.innerHTML, /\.html-direct-content\{-webkit-user-select:text;user-select:text\}/)
+  assert.match(container.innerHTML, /\.ProseMirror-hideselection \.html-direct-content \*::selection\{background:Highlight/)
   fireEvent.mouseDown(copy)
   assert.equal(container.firstElementChild?.getAttribute('draggable'), 'false')
 
