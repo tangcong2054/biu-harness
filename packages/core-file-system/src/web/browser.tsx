@@ -506,6 +506,10 @@ function rememberListCache(path: string, snap: ListCacheSnap) {
 }
 
 const EMPTY_FILTERS: Record<string, string> = {}
+/** 未拖过列宽时，标题列按表格容器宽度自适应的上限：容器宽 × 比例，夹在 [MIN, MAX]。 */
+const PIN_COL_RATIO = 0.5
+const PIN_COL_MIN_PX = 160
+const PIN_COL_MAX_PX = 420
 /** 与选区拖选同一阈值：位移超过这个距离只当拖，不当点击。 */
 const CELL_POP_DRAG_PX = 6
 const CELL_POP_IGNORE =
@@ -1639,6 +1643,21 @@ export function CollectionBrowser({
       wrap.removeEventListener('scroll', onScroll)
       ro.disconnect()
     }
+  }, [tableWrap])
+
+  useLayoutEffect(() => {
+    if (!tableWrap) return
+    const wrap = tableWrap
+    const fit = () => {
+      const width = wrap.clientWidth
+      if (!width) return
+      const px = Math.round(Math.min(PIN_COL_MAX_PX, Math.max(PIN_COL_MIN_PX, width * PIN_COL_RATIO)))
+      wrap.style.setProperty('--fsdb-pin-max', `${px}px`)
+    }
+    fit()
+    const ro = new ResizeObserver(fit)
+    ro.observe(wrap)
+    return () => ro.disconnect()
   }, [tableWrap])
 
   useLayoutEffect(() => {
