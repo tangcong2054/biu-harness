@@ -206,6 +206,46 @@ test('cached package can be installed in two workspaces without rewriting shared
   }
 })
 
+test('a packed builtin is approved as a system package when installed', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plugin-builtin-install-'))
+  const previous = process.env.BIU_ONLINE
+  process.env.BIU_ONLINE = '1'
+  try {
+    const ctx = new Context()
+    stubHub(ctx)
+    const recorded: Array<Record<string, unknown>> = []
+    const assignments: string[] = []
+    const loads: string[] = []
+    let approved = false
+    ;(ctx as unknown as { get(name: string): unknown }).get = (name: string) =>
+      name === 'account' ? { store: {
+        isMember: (accountId: string) => accountId === 'ada',
+        recordPluginPackage: (_accountId: string, input: Record<string, unknown>) => {
+          recorded.push(input)
+          approved = input.trustState === 'approved'
+        },
+        isApprovedPluginPackage: () => approved,
+        installPluginForAccount: (accountId: string, workspaceId: string, id: string) => assignments.push(`${accountId}/${workspaceId}/${id}`),
+        setPluginLoad: (accountId: string, workspaceId: string, id: string) => loads.push(`${accountId}/${workspaceId}/${id}`),
+      } } : undefined
+    const store = new PluginStoreService(ctx, join(dir, '.plugin'), join(dir, 'store.json'), join(dir, '.plugin-dev')).open()
+    await mkdir(join(dir, '.plugin', 'cdb-meta'), { recursive: true })
+    await writeFile(join(dir, '.plugin', 'cdb-meta', 'manifest.json'), JSON.stringify({ id: 'cdb-meta', name: 'CDB 实例元数据', builtin: true, headless: true }))
+    await writeFile(join(dir, '.plugin', 'cdb-meta', 'host.js'), 'export const name = "cdb-meta"\n')
+    await writeFile(join(dir, '.plugin', 'cdb-meta', 'web.js'), 'export const name = "cdb-meta"\n')
+    const installed = await runWithAccount('ada', () => runWithRequestWorkspace('ws', () => store.installCached('cdb-meta')))
+    assert.equal(installed.id, 'cdb-meta')
+    assert.equal(recorded[0]?.sourceKind, 'builtin')
+    assert.equal(recorded[0]?.trustState, 'approved')
+    assert.deepEqual(assignments, ['ada/ws/cdb-meta'])
+    assert.deepEqual(loads, ['ada/ws/cdb-meta'])
+  } finally {
+    if (previous === undefined) delete process.env.BIU_ONLINE
+    else process.env.BIU_ONLINE = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('online members can pack without instance install permission', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'plugin-pack-member-'))
   const previous = process.env.BIU_ONLINE

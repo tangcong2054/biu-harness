@@ -559,7 +559,7 @@ export class PluginStoreService extends Service {
       version: codeVersion,
       packageHash: codeVersion,
       packagePath: dest,
-      sourceKind: 'sandbox',
+      sourceKind: manifest.builtin === true ? 'builtin' : 'sandbox',
       trustState: 'approved',
       tenantMode: 'assigned',
       hasWeb: Boolean(webEntry),
@@ -914,9 +914,25 @@ export class PluginStoreService extends Service {
     if (!existsSync(join(dir, 'manifest.json'))) throw new Error(`plugin is not packed: ${id}`)
     const codeVersion = await hashInstalledPluginCode(dir)
     if (!codeVersion) throw new Error(`plugin bundle has no code: ${id}`)
+    const manifest = await readManifest(dir)
     const account = this.accountStore()
     const accountId = currentAccountId()
     const workspaceId = this.currentWorkspaceId()
+    // 系统插件随安装包发布，不走商店审批。点安装时补上批准记录，否则会报 package is not approved。
+    if (manifest.builtin === true) {
+      await account?.recordPluginPackage?.(accountId, {
+        id,
+        version: codeVersion,
+        packageHash: codeVersion,
+        packagePath: dir,
+        sourceKind: 'builtin',
+        trustState: 'approved',
+        tenantMode: 'assigned',
+        hasWeb: existsSync(join(dir, 'web.js')),
+        hasHost: existsSync(join(dir, 'host.js')),
+        manifest,
+      })
+    }
     if (accountId || isOnlineRuntime()) {
       const member = accountId && workspaceId && (
         account?.isMemberAsync
@@ -928,6 +944,7 @@ export class PluginStoreService extends Service {
         throw new Error(`plugin package is not approved: ${id}@${codeVersion}`)
       }
       await account.installPluginForAccount(accountId, workspaceId, id, codeVersion)
+      if (manifest.builtin === true) await account.setPluginLoad?.(accountId, workspaceId, id, true)
     }
     this.invalidateList()
     return { id, codeVersion }
