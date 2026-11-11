@@ -176,7 +176,10 @@ export class ToolsService extends Service {
     const mode = policy?.mode ?? this.mode
     if (mode === 'standard') return true
     if (this.originOf(name) === 'store') return false
-    if (mode === 'file') return (FILE_TOOL_NAMES as readonly string[]).includes(name)
+    if (mode === 'file') {
+      return (FILE_TOOL_NAMES as readonly string[]).includes(name)
+        || (name === 'session_file_read' && Boolean(policy?.extras.has(name)))
+    }
     if ((MINIMAL_TOOL_NAMES as readonly string[]).includes(name)) return true
     if ((policy?.extras ?? new Set()).has(name)) return true
     if ([...(policy?.extras ?? [])].some((item) => this.resolveName(item) === name)) return true

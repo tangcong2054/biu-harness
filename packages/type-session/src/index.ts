@@ -26,6 +26,29 @@ export type UserMessageImage = {
   name: string
   mime: string
   url: string
+  id?: string
+  size?: number
+}
+
+export type UserMessageFile = {
+  id: string
+  name: string
+  mime: string
+  url: string
+  size: number
+}
+
+export function parseSessionArtifactUrl(url: string, sessionId?: string): { sessionId: string; id: string } | undefined {
+  const match = /^\/api\/sessions\/([^/]+)\/artifacts\/([a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}(?:\.[a-z0-9]{1,10})?)$/.exec(url)
+  if (!match || url !== `/api/sessions/${match[1]}/artifacts/${match[2]}`) return undefined
+  try {
+    const owner = decodeURIComponent(match[1]!)
+    if (!owner || /[/\\\x00]/.test(owner) || owner === '.' || owner === '..') return undefined
+    if (encodeURIComponent(owner) !== match[1] || (sessionId !== undefined && owner !== sessionId)) return undefined
+    return { sessionId: owner, id: match[2]! }
+  } catch {
+    return undefined
+  }
 }
 
 /** 写入 append 的正文（不含 seq/ts）；与 SessionEvent 判别联合一一对应。 */
@@ -37,7 +60,7 @@ export type SessionEventBody =
   | { type: 'step/end'; turn: number; step: number }
   | { type: 'system/prompt'; text: string }
   | { type: 'system/compact'; text: string }
-  | { type: 'user/message'; text: string; kind: InboxKind; sender?: MessageSender; images?: UserMessageImage[] }
+  | { type: 'user/message'; text: string; kind: InboxKind; sender?: MessageSender; images?: UserMessageImage[]; files?: UserMessageFile[]; clientMessageId?: string }
   | {
       type: 'assistant/message'
       text: string

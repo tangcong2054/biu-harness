@@ -749,15 +749,11 @@ export async function consumeChatCompletionSse(
   if (options.signal?.aborted) throw new Error('cancelled')
   if (!sawDone) throw new Error('LLM 流提前结束，响应不完整，请重试。')
 
+  // 流已完整结束（见 [DONE] 校验）；参数 JSON 是否合法属于模型输出问题，
+  // 原样交给 agent loop，由它回报工具错误让模型自行修正，而不是终止整个回合。
   const toolCalls = [...tools.entries()].sort((a, b) => a[0] - b[0]).map(([, call]) => {
     if (!call.id || !call.name) throw new Error('LLM 工具调用不完整，请重试。')
-    const args = call.arguments || '{}'
-    try {
-      if (!isRecord(JSON.parse(args))) throw new Error('invalid input')
-    } catch {
-      throw new Error('LLM 工具参数不完整，请重试。')
-    }
-    return { ...call, arguments: args }
+    return { ...call, arguments: call.arguments || '{}' }
   })
   if (!captureComplete && toolCalls.length) throw replayError('上游混用了不同 reasoning 字段，无法完整捕获')
   return {

@@ -1,10 +1,11 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent } from 'react'
-import { ArrowUpIcon, ChevronDownIcon, FlagIcon, PauseIcon, PencilSquareIcon, PlayIcon, PlusIcon, XMarkIcon } from '@heroicons/react/16/solid'
+import { ArrowUpIcon, ChevronDownIcon, FlagIcon, PauseIcon, PaperClipIcon, PencilSquareIcon, PlayIcon, PlusIcon, XMarkIcon } from '@heroicons/react/16/solid'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { EditorContent, useEditor } from '@tiptap/react'
 import Placeholder from '@tiptap/extension-placeholder'
 import type { SlotProps } from '@biu/web-slots'
-import { bindSessionView, type SessionViewService } from '@biu/web-session-view'
+import { bindSessionView, formatAttachmentSize, type SessionViewService } from '@biu/web-session-view'
+import { addDraftFiles, removeDraftFile, uploadDraftFiles, useAttachmentDrafts } from './attachment-draft.ts'
 import { pickKey, textPickFromPlain, usePickState, type PickService } from '@biu/core-pick/web'
 import { HeadlessDismiss } from '@biu/public-ui'
 import { composerDocExtensions } from './composer-kit.ts'
@@ -23,7 +24,7 @@ import { ComposerModelMenu } from './composer-model-menu.tsx'
 import type { ContextWindow, ModelCapabilities, ModelModeValues, ReasoningEffort, SpeedMode, ThinkingMode } from '../host/model-catalog.ts'
 import { EFFORT_KNOB, THINKING_KNOB } from '../host/model-catalog.ts'
 import { ImageThumbs } from './image-thumbs.tsx'
-import { collectClipboardImages, collectImageFiles } from './clipboard-images.ts'
+import { collectClipboardImages } from './clipboard-images.ts'
 import { revealOverlayThread, isComposerFocusPending } from '@biu/web-app-shell/chat-overlay'
 import { shouldNavigateToSession } from './composer-nav.ts'
 import { currentTurnTodos, TodoPanel } from './todo-panel.tsx'
@@ -111,24 +112,6 @@ function clearDraft(sessionId: string) {
   }
 }
 
-const MAX_PENDING_IMAGES = 6
-
-type PendingImage = { id: string; name: string; mime: string; previewUrl: string; file: File }
-
-function readFileDataUrl(file: File): Promise<{ name: string; mime: string; url: string }> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onerror = () => reject(new Error('read image failed'))
-    reader.onload = () => {
-      resolve({
-        name: file.name || 'image.png',
-        mime: file.type || 'image/png',
-        url: String(reader.result ?? ''),
-      })
-    }
-    reader.readAsDataURL(file)
-  })
-}
 type ChatProvider = 'deepseek' | 'openai' | 'anthropic'
 
 type ModelOption = {
@@ -215,7 +198,8 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
   const [contextWindow, setContextWindow] = useState<ContextWindow>('200k')
   const [speed, setSpeed] = useState<SpeedMode>('slow')
   const [modelCaps, setModelCaps] = useState<ModelCapabilities>({ knobs: [THINKING_KNOB, EFFORT_KNOB] })
-  const [pendingImages, setPendingImages] = useState<PendingImage[]>([])
+  const { getDraft: getAttachmentDraft, claimDraft: claimAttachmentDraft, notify: notifyAttachments } = useAttachmentDrafts()
+  const fileInputRef = useRef<HTMLInputElement>(null)
   /** 全部目录模型（含未配置的），用于下拉只展示已配置入口，但当前选中可能来自任一。 */
   const [allModels, setAllModels] = useState<ModelOption[]>([])
   /** 各入口是否已配置 token（key = endpointId）。 */
@@ -226,6 +210,9 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
   const pending = useSessionView((state) => state.pending)
   const inbox = useSessionView((state) => state.inbox)
   const sessionId = useSessionView((state) => state.sessionId)
+  const attachmentDraft = getAttachmentDraft(sessionId)
+  const pendingFiles = attachmentDraft.files
+  const sending = attachmentDraft.sending
   const goal = useSessionView((state) => state.sessions.find((item) => item.id === state.sessionId)?.goal)
   const events = useSessionView((state) => state.events)
   const todos = useMemo(() => currentTurnTodos(events), [events])
@@ -410,7 +397,7 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
     value: string,
     tools: string[] = picked,
     picks = pickRefs.length,
-    imageCount = pendingImages.length,
+    imageCount = pendingFiles.length,
   ) {
     const next = Boolean(value.trim()) || tools.length > 0 || picks > 0 || imageCount > 0
     if (debounceRef.current != null) clearTimeout(debounceRef.current)
@@ -444,33 +431,29 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
     }
   }
 
-  const addImageFiles = useCallback((files: File[]) => {
-    const next = collectImageFiles(files)
-    if (!next.length) return
-    setPendingImages((prev) => {
-      const room = MAX_PENDING_IMAGES - prev.length
-      const take = next.slice(0, Math.max(0, room)).map((file) => ({
-        id: `${Date.now()}-${file.name}-${file.size}-${Math.random().toString(36).slice(2, 8)}`,
-        name: file.name || 'image.png',
-        mime: file.type || 'image/png',
-        previewUrl: URL.createObjectURL(file),
-        file,
-      }))
-      return take.length ? [...prev, ...take] : prev
-    })
-  }, [])
+  const addFiles = useCallback((files: File[]) => {
+    const draft = getAttachmentDraft(sessionView.get().sessionId)
+    if (!files.length || draft.sending) return
+    try {
+      addDraftFiles(draft, files)
+      draft.error = undefined
+    } catch (error) {
+      draft.error = error instanceof Error ? error.message : String(error)
+    }
+    notifyAttachments()
+  }, [getAttachmentDraft, notifyAttachments, sessionView])
 
   const live = useRef({
     slash,
     filtered,
     pick,
     pickRefs,
-    pendingImages,
+    pendingFiles,
     picked,
     catalog,
     route: location.pathname,
   })
-  live.current = { slash, filtered, pick, pickRefs, pendingImages, picked, catalog, route: location.pathname }
+  live.current = { slash, filtered, pick, pickRefs, pendingFiles, picked, catalog, route: location.pathname }
   const pickToolRef = useRef<(name: string) => void>(() => {})
   const activeIndexRef = useRef(0)
   activeIndexRef.current = activeIndex
@@ -493,7 +476,7 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
         const images = collectClipboardImages(event.clipboardData)
         if (images.length) {
           event.preventDefault()
-          addImageFiles(images)
+          addFiles(images)
           return true
         }
         const raw = event.clipboardData?.getData('text/plain') ?? ''
@@ -550,7 +533,7 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
         }
         if (
           (event.key === 'Backspace' || event.key === 'Delete') &&
-          live.current.pendingImages.length
+          live.current.pendingFiles.length
         ) {
           const doc = _view.state.doc
           const plain = doc.textBetween(0, doc.content.size, '\n', '')
@@ -560,11 +543,12 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
           })
           if (!plain.trim() && !chips) {
             event.preventDefault()
-            setPendingImages((prev) => {
-              const last = prev[prev.length - 1]
-              if (last) URL.revokeObjectURL(last.previewUrl)
-              return prev.slice(0, -1)
-            })
+            const draft = getAttachmentDraft(sessionView.get().sessionId)
+            const last = draft.files.at(-1)
+            if (last && !draft.sending) {
+              removeDraftFile(draft, last.id)
+              notifyAttachments()
+            }
             return true
           }
         }
@@ -573,7 +557,7 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
     },
     onUpdate: ({ editor: ed }) => {
       const packed = serializeComposer(ed)
-      scheduleCanSubmit(packed.plain, live.current.picked, packed.refs.length, live.current.pendingImages.length)
+      scheduleCanSubmit(packed.plain, live.current.picked, packed.refs.length, live.current.pendingFiles.length)
       const el = ed.view.dom
       const form = formRef.current
       const wraps = form ? editorWrapsInCompactRow(form, el) : el.scrollHeight > COMPOSER_LINE_PX + 4
@@ -582,7 +566,7 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
           packed.plain.includes('\n') ||
           packed.refs.length > 0 ||
           live.current.picked.length > 0 ||
-          live.current.pendingImages.length > 0,
+          live.current.pendingFiles.length > 0,
       )
       schedulePersistDraft(packed.text)
       const caret = editorCaretPlain(ed)
@@ -611,6 +595,10 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
     },
     [],
   )
+
+  useEffect(() => {
+    editor?.setEditable(!sending)
+  }, [editor, sending])
 
   useEffect(() => {
     if (!editor) return
@@ -642,10 +630,10 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
         editor.chain().focus().insertContent(`${prefix}${draft.text}`).run()
       }
       const packed = serializeComposer(editor)
-      scheduleCanSubmit(packed.plain, picked, packed.refs.length, pendingImages.length)
+      scheduleCanSubmit(packed.plain, picked, packed.refs.length, pendingFiles.length)
       if (draft?.send) queueMicrotask(() => formRef.current?.requestSubmit())
     })
-  }, [pickRefs, editor, picked.length, pendingImages.length])
+  }, [pickRefs, editor, picked.length, pendingFiles.length])
 
   function clearInput() {
     if (debounceRef.current != null) {
@@ -658,19 +646,15 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
     setCanSubmit(false)
     setSlash(null)
     setPicked([])
-    setPendingImages((prev) => {
-      for (const item of prev) URL.revokeObjectURL(item.previewUrl)
-      return []
-    })
     pickKeysRef.current = new Set()
     setExpanded(false)
   }
 
   function onDrop(event: DragEvent<HTMLFormElement>) {
-    const images = collectImageFiles(event.dataTransfer?.files)
-    if (!images.length) return
+    const files = Array.from(event.dataTransfer?.files ?? [])
+    if (!files.length && !Array.from(event.dataTransfer?.types ?? []).includes('Files')) return
     event.preventDefault()
-    addImageFiles(images)
+    addFiles(files)
   }
 
   const openSlashMenu = useCallback(() => {
@@ -790,7 +774,7 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
     const packedEditor = serializeComposer(editor)
     const content = packedEditor.plain.trim()
     // 空回车 + 队列有 wake：abort 当前回合并立刻 claim
-    if (!content && !picked.length && !packedEditor.refs.length && !pendingImages.length) {
+    if (!content && !picked.length && !packedEditor.refs.length && !pendingFiles.length) {
       if (inbox.some((item) => item.kind === 'wake')) {
         try {
           await sessionView.flushInbox()
@@ -800,29 +784,56 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
       }
       return
     }
+    const draft = attachmentDraft
+    if (draft.sending || sessionView.get().sessionId !== sessionId) return
+    draft.sending = true
+    draft.error = undefined
+    editor?.setEditable(false)
+    notifyAttachments()
     const tools = [...picked]
-    const fallback = tools.length ? `请使用工具：${tools.join(', ')}` : pendingImages.length ? '（图片）' : ''
+    const fallback = tools.length ? `请使用工具：${tools.join(', ')}` : pendingFiles.length ? '（附件）' : ''
     const text = packedEditor.text || fallback
-    const packed = await Promise.all(pendingImages.map((item) => readFileDataUrl(item.file)))
-    clearInput()
-    pick?.clear()
-    revealOverlayThread()
+    let targetSessionId = sessionId
+    flushDraftTimer()
+    if (targetSessionId) writeDraft(targetSessionId, packedEditor.text)
     try {
-      await sessionView.send(
-        text,
-        'wake',
-        tools,
-        packed.filter((item) => item.url.startsWith('data:image/')),
-      )
-      revealOverlayThread()
-      const id = sessionView.get().sessionId
-      if (id) {
-        clearDraft(id)
-        flushDraftTimer()
+      if (!targetSessionId) {
+        targetSessionId = await sessionView.ensureSession()
+        claimAttachmentDraft(draft, targetSessionId)
+        writeDraft(targetSessionId, packedEditor.text)
+        if (sessionView.get().sessionId === targetSessionId) {
+          editor?.commands.setContent(jsonFromDraft(packedEditor.text))
+          editor?.setEditable(false)
+          pick?.claimSession(targetSessionId)
+        }
       }
-      if (id && shouldNavigateToSession(location.pathname, id)) navigate(`/s/${id}`)
-    } catch {
-      /* error 已写入 sessionView */
+      const files = await uploadDraftFiles(draft, targetSessionId, sessionView, notifyAttachments)
+      const key = JSON.stringify([targetSessionId, text, tools, files.map((file) => file.id)])
+      if (draft.retry?.key !== key) draft.retry = { key, clientMessageId: crypto.randomUUID() }
+      draft.progress = '发送中'
+      notifyAttachments()
+      revealOverlayThread()
+      await sessionView.send(text, 'wake', tools, [], files, {
+        sessionId: targetSessionId,
+        clientMessageId: draft.retry.clientMessageId,
+      })
+      for (const item of [...draft.files]) removeDraftFile(draft, item.id)
+      draft.retry = undefined
+      clearDraft(targetSessionId)
+      if (sessionView.get().sessionId === targetSessionId) {
+        clearInput()
+        pick?.clear()
+        flushDraftTimer()
+        revealOverlayThread()
+        if (shouldNavigateToSession(live.current.route, targetSessionId)) navigate(`/s/${targetSessionId}`)
+      }
+    } catch (error) {
+      draft.error = error instanceof Error ? error.message : String(error)
+    } finally {
+      draft.sending = false
+      draft.progress = undefined
+      if (sessionView.get().sessionId === targetSessionId) editor?.setEditable(true)
+      notifyAttachments()
     }
   }
 
@@ -890,15 +901,17 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
                   <button
                     type="button"
                     className="composer-inbox-btn"
-                    title="编辑"
+                    title={item.images?.length || item.files?.length ? '含附件消息暂不支持编辑' : sending ? '发送中暂不支持编辑' : '编辑'}
                     aria-label="编辑排队消息"
+                    disabled={sending || Boolean(item.images?.length || item.files?.length)}
                     onClick={() => {
+                      if (attachmentDraft.sending || item.images?.length || item.files?.length) return
                       void (async () => {
                         const ok = await sessionView.dropInboxItem(item.id)
-                        if (!ok || !editor) return
+                        if (!ok || !editor || attachmentDraft.sending) return
                         editor.commands.setContent(jsonFromDraft(item.text))
                         editor.commands.focus('end')
-                        scheduleCanSubmit(item.text, picked, pickRefs.length, pendingImages.length)
+                        scheduleCanSubmit(item.text, picked, pickRefs.length, pendingFiles.length)
                       })()
                     }}
                   >
@@ -922,7 +935,7 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
 
       <form
         ref={formRef}
-        className={`composer-pill${expanded ? ' is-expanded' : ''}${pickRefs.length || picked.length || pendingImages.length ? ' has-chips' : ''}`}
+        className={`composer-pill${expanded ? ' is-expanded' : ''}${pickRefs.length || picked.length || pendingFiles.length ? ' has-chips' : ''}`}
         onSubmit={onSubmit}
         onDragOver={(event) => {
           if ([...(event.dataTransfer?.types ?? [])].includes('Files')) event.preventDefault()
@@ -977,22 +990,36 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
         </div>
       ) : null}
 
-      {pendingImages.length ? (
-        <ImageThumbs
-          images={pendingImages.map((item) => ({
-            name: item.name,
-            mime: item.mime,
-            url: item.previewUrl,
-          }))}
-          onRemove={(index) => {
-            setPendingImages((prev) => {
-              const hit = prev[index]
-              if (hit) URL.revokeObjectURL(hit.previewUrl)
-              return prev.filter((_, i) => i !== index)
-            })
-          }}
-        />
+      {pendingFiles.length ? (
+        <div className="composer-attachments">
+          <ImageThumbs images={pendingFiles.flatMap((item) => {
+            const mime = item.uploaded?.mime ?? item.file.type
+            const url = item.uploaded?.url ?? item.previewUrl
+            return mime.startsWith('image/') && url ? [{ name: item.file.name, mime, url }] : []
+          })} />
+          <div className="chat-attachment-list" aria-label="待发送附件">
+            {pendingFiles.map((item) => (
+              <div className="chat-attachment-link" key={item.id}>
+                <span className="chat-attachment-name" title={item.file.name}>{item.file.name}</span>
+                <span className="chat-attachment-size">{formatAttachmentSize(item.file.size)}</span>
+                <button type="button" className="composer-attachment-remove" disabled={sending}
+                  aria-label={`移除 ${item.file.name}`} onClick={() => {
+                    removeDraftFile(attachmentDraft, item.id)
+                    attachmentDraft.error = undefined
+                    notifyAttachments()
+                  }}><XMarkIcon className="size-3.5" aria-hidden /></button>
+              </div>
+            ))}
+          </div>
+        </div>
       ) : null}
+      {attachmentDraft.progress ? <div className="composer-attachment-status" role="status">{attachmentDraft.progress}</div> : null}
+      {attachmentDraft.error ? <div className="composer-attachment-error" role="alert">{attachmentDraft.error}；草稿已保留，可重新发送。</div> : null}
+      <input ref={fileInputRef} type="file" multiple hidden aria-label="选择附件" disabled={sending}
+        onChange={(event) => {
+          addFiles(Array.from(event.currentTarget.files ?? []))
+          event.currentTarget.value = ''
+        }} />
 
       <div className="composer-pill-row">
         <button
@@ -1010,6 +1037,10 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
         </div>
 
         <div className="composer-pill-right">
+          <button type="button" className="composer-attachment-add" title="添加附件（最多 6 个，每个 20 MiB）"
+            aria-label="添加附件" disabled={sending} onClick={() => fileInputRef.current?.click()}>
+            <PaperClipIcon className="size-4" aria-hidden />
+          </button>
           <div className="composer-model">
             <button
               type="button"
@@ -1063,7 +1094,7 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
           <button
             type="submit"
             className="composer-send"
-            disabled={!canSubmit}
+            disabled={!canSubmit || sending}
             aria-label={pending ? 'Queue' : 'Send'}
             title={pending ? (inbox.some((item) => item.kind === 'wake') ? '注入排队' : '加入排队') : '发送'}
           >

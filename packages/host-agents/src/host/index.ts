@@ -1,7 +1,7 @@
 import { Service, type Context } from 'cordis'
 import type { LlmConfig } from '@biu/host-llm'
 import type { AgentTurn, ClaimedInput } from '@biu/type-agent-loop'
-import type { MessageSender, LiveUiContext, SessionGoal } from '@biu/type-session'
+import { parseSessionArtifactUrl, type MessageSender, type LiveUiContext, type SessionGoal, type UserMessageImage, type UserMessageFile } from '@biu/type-session'
 import { currentSessionId } from '@biu/host-sessions/scope'
 import {
   continuationPrompt,
@@ -20,7 +20,9 @@ export interface AgentSendOptions {
   wait?: boolean
   /** 消息来源：Live 派工时传入 { type: 'session', sessionId } */
   sender?: MessageSender
-  images?: Array<{ name: string; mime: string; url: string }>
+  images?: UserMessageImage[]
+  files?: UserMessageFile[]
+  clientMessageId?: string
   liveContext?: LiveUiContext
 }
 
@@ -38,11 +40,15 @@ export type InboxRow = {
   id: string
   kind: 'wake' | 'inject'
   text: string
+  images?: UserMessageImage[]
+  files?: UserMessageFile[]
+  clientMessageId?: string
 }
 
 interface LiveAgent {
   handle: AgentHandle
   inbox: ClaimedInput[]
+  pendingClientMessageIds: Set<string>
   running?: Promise<void>
   abort: AbortController
   /** 上一回合还在收尾时又 resume / 入队：结束后立刻再 kick，避免 wake 停在 inbox 没人领 */
@@ -87,7 +93,12 @@ export class AgentsService extends Service {
     if (!live) return []
     return live.inbox.map((item) => {
       if (!item.id) item.id = nextInboxId()
-      return { id: item.id, kind: item.kind, text: item.text }
+      return {
+        id: item.id, kind: item.kind, text: item.text,
+        ...(item.images?.length ? { images: item.images } : {}),
+        ...(item.files?.length ? { files: item.files } : {}),
+        ...(item.clientMessageId ? { clientMessageId: item.clientMessageId } : {}),
+      }
     })
   }
 
@@ -97,7 +108,8 @@ export class AgentsService extends Service {
     if (!live || !itemId) return false
     const index = live.inbox.findIndex((item) => (item.id ?? '') === itemId)
     if (index < 0) return false
-    live.inbox.splice(index, 1)
+    const [removed] = live.inbox.splice(index, 1)
+    if (removed?.clientMessageId) live.pendingClientMessageIds.delete(removed.clientMessageId)
     this.emitInbox(sessionId)
     return true
   }
@@ -109,8 +121,8 @@ export class AgentsService extends Service {
     const item = live.inbox.find((row) => (row.id ?? '') === itemId)
     if (!item) return false
     const trimmed = text.trim()
-    if (!trimmed && !item.images?.length) return false
-    item.text = trimmed || item.text
+    if (!trimmed && !item.images?.length && !item.files?.length) return false
+    item.text = trimmed
     this.emitInbox(sessionId)
     return true
   }
@@ -127,8 +139,17 @@ export class AgentsService extends Service {
 
     const live: LiveAgent = {
       inbox: [],
+      pendingClientMessageIds: new Set(),
       abort: new AbortController(),
       handle: {} as AgentHandle,
+    }
+    const reserveClientMessageId = (clientMessageId: string | undefined) => {
+      if (!clientMessageId) return true
+      if (live.pendingClientMessageIds.has(clientMessageId)
+        || live.inbox.some((item) => item.clientMessageId === clientMessageId)
+        || this.ctx.sessions.peek(id)?.events.some((event) => event.type === 'user/message' && event.clientMessageId === clientMessageId)) return false
+      live.pendingClientMessageIds.add(clientMessageId)
+      return true
     }
 
     const kick = async (): Promise<AgentTurn> => {
@@ -147,6 +168,10 @@ export class AgentsService extends Service {
         } catch (error) {
           if (/cancelled|AbortError|aborted/i.test(String(error))) break
           throw error
+        } finally {
+          for (const item of claimed) {
+            if (item.clientMessageId) live.pendingClientMessageIds.delete(item.clientMessageId)
+          }
         }
         if (live.abort.signal.aborted) break
       }
@@ -197,25 +222,42 @@ export class AgentsService extends Service {
       sessionId: id,
       send: async (text: string, opts?: AgentSendOptions) => {
         const trimmed = text.trim()
-        const images = sanitizeImages(opts?.images)
-        if (!trimmed && !images?.length) return { text: '请先输入内容。', steps: [] }
+        const images = sanitizeImages(opts?.images, id)
+        const files = sanitizeFiles(opts?.files, id)
+        if (!trimmed && !images?.length && !files?.length) return { text: '请先输入内容。', steps: [] }
+        const clientMessageId = sanitizeClientMessageId(opts?.clientMessageId)
+        const extraTools = sanitizeExtraTools(opts?.extraTools)
+        if (!reserveClientMessageId(clientMessageId)) return { text: '', steps: [] }
         const slash = parseGoalSlash(trimmed)
         if (slash) {
-          const control = await this.applyGoalSlash(id, slash)
-          if (control !== 'run') {
-            await this.ctx.sessions.append(id, { type: 'user/message', text: trimmed, kind: 'wake' })
-            await this.ctx.sessions.append(id, { type: 'assistant/message', text: control })
-            return { text: control, steps: [] }
+          try {
+            const control = await this.applyGoalSlash(id, slash)
+            if (control !== 'run') {
+              await this.ctx.sessions.append(id, {
+                type: 'user/message', text: trimmed, kind: 'wake',
+                ...(opts?.sender ? { sender: opts.sender } : {}),
+                ...(images ? { images } : {}),
+                ...(files ? { files } : {}),
+                ...(clientMessageId ? { clientMessageId } : {}),
+              })
+              await this.ctx.sessions.append(id, { type: 'assistant/message', text: control })
+              if (clientMessageId) live.pendingClientMessageIds.delete(clientMessageId)
+              return { text: control, steps: [] }
+            }
+          } catch (error) {
+            if (clientMessageId) live.pendingClientMessageIds.delete(clientMessageId)
+            throw error
           }
         }
-        const extraTools = sanitizeExtraTools(opts?.extraTools)
         const wait = opts?.wait !== false
         const entry = {
-          text: trimmed || '（图片）',
+          text: trimmed,
           id: nextInboxId(),
           ...(extraTools.length ? { extraTools } : {}),
           ...(opts?.sender ? { sender: opts.sender } : {}),
           ...(images ? { images } : {}),
+          ...(files ? { files } : {}),
+          ...(clientMessageId ? { clientMessageId } : {}),
           ...(opts?.liveContext ? { liveContext: opts.liveContext } : {}),
         }
 
@@ -240,16 +282,21 @@ export class AgentsService extends Service {
       },
       inject: (text: string, opts?: AgentSendOptions) => {
         const trimmed = text.trim()
-        const images = sanitizeImages(opts?.images)
-        if (!trimmed && !images?.length) return
+        const images = sanitizeImages(opts?.images, id)
+        const files = sanitizeFiles(opts?.files, id)
+        if (!trimmed && !images?.length && !files?.length) return
+        const clientMessageId = sanitizeClientMessageId(opts?.clientMessageId)
         const extraTools = sanitizeExtraTools(opts?.extraTools)
+        if (!reserveClientMessageId(clientMessageId)) return
         live.inbox.push({
           kind: 'inject',
-          text: trimmed || '（图片）',
+          text: trimmed,
           id: nextInboxId(),
           ...(extraTools.length ? { extraTools } : {}),
           ...(opts?.sender ? { sender: opts.sender } : {}),
           ...(images ? { images } : {}),
+          ...(files ? { files } : {}),
+          ...(clientMessageId ? { clientMessageId } : {}),
           ...(opts?.liveContext ? { liveContext: opts.liveContext } : {}),
         })
         this.emitInbox(id)
@@ -379,20 +426,44 @@ export class AgentsService extends Service {
   }
 }
 
-function sanitizeImages(raw: AgentSendOptions['images']): ClaimedInput['images'] {
+function sanitizeImages(raw: AgentSendOptions['images'], sessionId: string): ClaimedInput['images'] {
   if (!Array.isArray(raw) || !raw.length) return undefined
   const out: NonNullable<ClaimedInput['images']> = []
   for (const item of raw) {
     if (!item || typeof item !== 'object') continue
     const mime = String(item.mime ?? '')
     const url = String(item.url ?? '')
-    const name = String(item.name ?? 'image.png').slice(0, 80)
-    if (!/^image\/(png|jpe?g|gif|webp)$/i.test(mime)) continue
-    if (!url.startsWith('data:image/') || url.length > 8 * 1024 * 1024) continue
-    out.push({ name: name || 'image.png', mime, url })
+    const name = String(item.name ?? 'image.png').slice(0, 255)
+    const ref = parseSessionArtifactUrl(url, sessionId)
+    if (ref) {
+      if (!/^image\/[a-z0-9.+-]+$/i.test(mime) || (item.id !== undefined && item.id !== ref.id)) continue
+    } else if (!/^image\/(png|jpe?g|gif|webp)$/i.test(mime)
+      || !url.startsWith('data:image/') || url.length > 8 * 1024 * 1024) continue
+    out.push({
+      name: name || 'image.png', mime, url,
+      ...(ref ? { id: ref.id } : {}),
+      ...(typeof item.size === 'number' && Number.isSafeInteger(item.size) && item.size >= 0 ? { size: item.size } : {}),
+    })
     if (out.length >= 6) break
   }
   return out.length ? out : undefined
+}
+
+function sanitizeFiles(raw: AgentSendOptions['files'], sessionId: string): ClaimedInput['files'] {
+  if (!Array.isArray(raw)) return undefined
+  const out: UserMessageFile[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || typeof item.url !== 'string') continue
+    const ref = parseSessionArtifactUrl(item.url, sessionId)
+    if (!ref || item.id !== ref.id || typeof item.name !== 'string' || typeof item.mime !== 'string') continue
+    if (/^image\//i.test(item.mime) || !Number.isSafeInteger(item.size) || item.size < 0) continue
+    out.push({ id: ref.id, name: item.name.slice(0, 255), mime: item.mime, url: item.url, size: item.size })
+  }
+  return out.length ? out : undefined
+}
+
+function sanitizeClientMessageId(value: unknown): string | undefined {
+  return typeof value === 'string' && value ? value : undefined
 }
 
 function sanitizeExtraTools(names: string[] | undefined): string[] {

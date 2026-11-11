@@ -21,7 +21,10 @@ import {
   findEvent,
 } from '@biu/host-sessions/trajectory'
 import { deriveMessages, estimateRequestTokens, estimateToolSchemaTokens, estimateTokens, liftToolImages } from '@biu/host-sessions'
-import { persistPastedImages, readArtifactFile, withPastedImagePicks } from '@biu/host-sessions/artifacts'
+import { validArtifactSession } from '@biu/host-sessions/artifacts'
+import { AttachmentError, MAX_MESSAGE_ATTACHMENTS, discardSessionFiles, persistLegacyMessageImages, resolveSessionFiles, validateLegacyMessageImages } from '@biu/host-sessions/attachments'
+import type { UserMessageFile } from '@biu/type-session'
+import { canWriteSessionFiles, registerSessionFileRoutes, sendAttachmentError } from './session-files.ts'
 import { collectLiveDispatchedTasks } from '@biu/host-live-sessions/usage'
 import { loadLiveDispatchTasks, registerChatInspectorRoutes } from './inspector.ts'
 import { forwardCloud } from '@biu/host-account/mirror'
@@ -1398,7 +1401,7 @@ type ForkCutoff = { untilSeq?: number; untilTurn?: number }
  * 分叉会话。桌面端打开的是云端会话时 `forward` 会转发到 Online：
  * 先在线上 fork 拿到子会话 id，本机再用同一 id、同一截点复制。
  * - 截点必须一起转发，否则云端整段复制、本机按回复截断，两边子会话内容不一致；
- * - 转发前先在本机校验截点，避免云端已经建好子会话、本机却截不出来留下孤儿。
+ * - 转发前先在本机校验截点和复制范围内的附件，避免云端建好子会话后本机复制失败留下孤儿。
  */
 export async function forkSessionWithCloud(
   deps: {
@@ -1413,7 +1416,7 @@ export async function forkSessionWithCloud(
   body: unknown,
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   const options = forkOptionsFromBody(body)
-  if (options) await deps.sessions.checkForkCutoff?.(sourceId, options)
+  await deps.sessions.checkForkCutoff?.(sourceId, options)
   const forwarded = await deps.forward(`/api/sessions/${sourceId}/fork`, options ? { body: options } : {})
   let childId: string | undefined
   if (forwarded) {
@@ -2034,19 +2037,7 @@ export function apply(ctx: Context) {
     }
     route.send(200, { turns: result as Record<string, TurnStat> })
   })
-  ctx.http.route('GET', '/api/sessions/:id/artifacts/:name', async (route) => {
-    const record = await visibleSession(route.params.id)
-    if (!record) return route.send(404, { error: 'unknown session' })
-    const file = await readArtifactFile(route.params.id, route.params.name)
-    if (!file) return route.send(404, { error: 'unknown artifact' })
-    if (route.res.headersSent) return
-    route.res.writeHead(200, {
-      'content-type': file.mime,
-      'cache-control': 'private, max-age=3600',
-      'content-length': file.data.byteLength,
-    })
-    route.res.end(file.data)
-  })
+  registerSessionFileRoutes(ctx, visibleSession)
   ctx.http.route('GET', '/api/sessions/:id/events/:seq', async (route) => {
     const record = await visibleSession(route.params.id)
     if (!record) return route.send(404, { error: 'unknown session' })
@@ -2183,9 +2174,30 @@ export function apply(ctx: Context) {
       wait?: boolean
       extraTools?: string[]
       images?: Array<{ name?: string; mime?: string; url?: string }>
+      files?: string[]
+      clientMessageId?: string
       liveContext?: unknown
     }
-    if (!(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
+    if (!payload || typeof payload !== 'object' || (payload.text !== undefined && typeof payload.text !== 'string')) {
+      return route.send(400, { error: '无效的消息' })
+    }
+    if (!validArtifactSession(route.params.id) || !(await visibleSession(route.params.id))) return route.send(404, { error: 'unknown session' })
+    let attachments: UserMessageFile[] = []
+    try {
+      if (payload.files !== undefined || payload.images !== undefined) {
+        if (!(await canWriteSessionFiles(ctx, route.params.id))) return route.send(403, { error: '没有会话附件写入权限' })
+        if ((Array.isArray(payload.files) ? payload.files.length : 0) + (Array.isArray(payload.images) ? payload.images.length : 0) > MAX_MESSAGE_ATTACHMENTS) {
+          throw new AttachmentError('每条消息最多 6 个附件')
+        }
+        attachments = await resolveSessionFiles(route.params.id, payload.files)
+        validateLegacyMessageImages(payload.images)
+      }
+      if (payload.clientMessageId !== undefined && (typeof payload.clientMessageId !== 'string' || !/^[\w-]{1,128}$/.test(payload.clientMessageId))) {
+        throw new AttachmentError('无效的消息标识')
+      }
+    } catch (error) {
+      return sendAttachmentError(route, error)
+    }
     if (isOnlineRuntime() && (await executionLeases(ctx)?.has(route.params.id))) {
       return route.send(409, { error: '这个会话正在桌面设备上运行' })
     }
@@ -2197,48 +2209,56 @@ export function apply(ctx: Context) {
         return route.send(409, { error: error instanceof Error ? error.message : String(error) })
       }
     }
-    const agent = await ctx.agents.create(route.params.id)
+    let legacyFiles: UserMessageFile[] = []
+    let agent: Awaited<ReturnType<typeof ctx.agents.create>>
+    try {
+      agent = await ctx.agents.create(route.params.id)
+      legacyFiles = await persistLegacyMessageImages(route.params.id, payload.images)
+      attachments.push(...legacyFiles)
+    } catch (error) {
+      if (shouldExecute) await finishCloudExecution(route.params.id)
+      return sendAttachmentError(route, error)
+    }
+    const rollbackUnusedLegacyFiles = async () => {
+      if (!legacyFiles.length) return
+      const record = await ctx.sessions.get(route.params.id)
+      if (!record) return
+      const referenced = new Set<string>()
+      for (const item of [...record.events.filter((event) => event.type === 'user/message'), ...ctx.agents.listInbox(route.params.id)]) {
+        for (const file of [...(item.images ?? []), ...(item.files ?? [])]) {
+          referenced.add(file.url)
+        }
+      }
+      await discardSessionFiles(route.params.id, legacyFiles.filter((file) => !referenced.has(file.url)).map((file) => file.id))
+    }
     // re-sync in-memory LLM without rewriting disk
     chat.patch({}, { persist: false })
     const extraTools = Array.isArray(payload.extraTools)
       ? [...new Set(payload.extraTools.map((name) => String(name).trim()).filter(Boolean))]
       : []
-    const images = Array.isArray(payload.images)
-      ? payload.images
-          .map((img) => ({
-            name: String(img.name ?? '').trim(),
-            mime: String(img.mime ?? '').trim(),
-            url: String(img.url ?? '').trim(),
-          }))
-          .filter((img) => img.name && img.mime && img.url)
-      : []
-    // 粘贴/拖入的图片只有 data URL，agent 工具（db_asset from=）拿不到；落到会话 artifacts 并附 kind=file pick。
-    let text = payload.text ?? ''
-    if (images.length) {
-      try {
-        text = withPastedImagePicks(text, await persistPastedImages(route.params.id, images))
-      } catch {
-        if (shouldExecute) void finishCloudExecution(route.params.id)
-        return route.send(400, { error: '粘贴的图片未能保存到本地，请重试' })
-      }
-    }
+    const images = attachments.filter((file) => file.mime.startsWith('image/'))
+    const files = attachments.filter((file) => !file.mime.startsWith('image/'))
+    if (attachments.length && !extraTools.includes('session_file_read')) extraTools.push('session_file_read')
+    const text = payload.text?.trim() || (files.length ? '（附件）' : images.length ? '（图片）' : '')
     const liveContext = sanitizeLiveUiContext(payload.liveContext)
     const sendOpts = {
       ...(extraTools.length ? { extraTools } : {}),
       // 默认不等待整回合：聊天要靠 WS 推 chunk。显式 wait:true 才阻塞 HTTP。
       wait: payload.wait === true,
       ...(images.length ? { images } : {}),
+      ...(files.length ? { files } : {}),
+      ...(payload.clientMessageId ? { clientMessageId: payload.clientMessageId } : {}),
       ...(liveContext ? { liveContext } : {}),
     }
-    if (payload.kind === 'inject') {
-      agent.inject(text, sendOpts)
-      return route.send(200, {
-        sessionId: agent.sessionId,
-        queued: true,
-        inbox: ctx.agents.listInbox(agent.sessionId),
-      })
-    }
     try {
+      if (payload.kind === 'inject') {
+        agent.inject(text, sendOpts)
+        return route.send(200, {
+          sessionId: agent.sessionId,
+          queued: true,
+          inbox: ctx.agents.listInbox(agent.sessionId),
+        })
+      }
       const turn = await agent.send(text, sendOpts)
       route.send(200, {
         sessionId: agent.sessionId,
@@ -2247,9 +2267,10 @@ export function apply(ctx: Context) {
         queued: Boolean(sendOpts.wait === false || ctx.agents.isBusy(agent.sessionId)),
         inbox: ctx.agents.listInbox(agent.sessionId),
       })
-    } catch (error) {
-      void finishCloudExecution(route.params.id)
-      route.send(500, { error: String(error) })
+    } catch {
+      if (shouldExecute) await finishCloudExecution(route.params.id)
+      await rollbackUnusedLegacyFiles()
+      route.send(500, { error: '消息提交失败，请重试' })
     }
   })
   ctx.http.route('GET', '/api/sessions/:id/inbox', async (route) => {

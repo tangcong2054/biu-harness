@@ -70,13 +70,76 @@ function compile(pattern: string) {
   return { keys, regexp }
 }
 
-function readBody(req: IncomingMessage): Promise<Buffer> {
+const DEFAULT_BODY_LIMIT_BYTES = 32 * 1024 * 1024
+
+class RequestBodyError extends Error {
+  constructor(public status: 400 | 413, message: string) {
+    super(message)
+    this.name = 'RequestBodyError'
+  }
+}
+
+function bodyLimitBytes(limit = DEFAULT_BODY_LIMIT_BYTES) {
+  if (!Number.isSafeInteger(limit) || limit <= 0) throw new RangeError('bodyLimitBytes must be a positive safe integer')
+  return limit
+}
+
+function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
-    req.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
-    req.on('end', () => resolve(Buffer.concat(chunks)))
-    req.on('error', reject)
+    let size = 0
+    let settled = false
+    const fail = (error: RequestBodyError) => {
+      if (settled) return
+      settled = true
+      chunks.length = 0
+      req.pause()
+      reject(error)
+    }
+    req.on('data', (chunk: Buffer | string) => {
+      if (settled) return
+      const length = typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length
+      if (length > limit - size) {
+        fail(new RequestBodyError(413, 'request body too large'))
+        return
+      }
+      size += length
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    })
+    req.once('end', () => {
+      if (settled) return
+      settled = true
+      resolve(Buffer.concat(chunks, size))
+      chunks.length = 0
+    })
+    req.once('error', () => fail(new RequestBodyError(400, 'invalid request body')))
+    req.once('aborted', () => fail(new RequestBodyError(400, 'invalid request body')))
+    req.once('close', () => {
+      if (!req.complete) fail(new RequestBodyError(400, 'invalid request body'))
+    })
+    const declaredLength = req.headers['content-length']
+    if (declaredLength && /^\d+$/.test(declaredLength) && Number(declaredLength) > limit) {
+      fail(new RequestBodyError(413, 'request body too large'))
+    } else if (req.aborted || req.destroyed) {
+      fail(new RequestBodyError(400, 'invalid request body'))
+    }
   })
+}
+
+function closeRejectedRequest(req: IncomingMessage, res: ServerResponse, status: number) {
+  if (status < 400 || req.complete || req.readableEnded) return
+  req.pause()
+  res.shouldKeepAlive = false
+  res.setHeader('connection', 'close')
+  const socket = req.socket
+  const cleanup = () => res.off('finish', close)
+  const close = () => {
+    res.off('close', cleanup)
+    req.pause()
+    socket.destroySoon()
+  }
+  res.once('finish', close)
+  res.once('close', cleanup)
 }
 
 function parseJson(raw: Buffer): unknown {
@@ -84,7 +147,7 @@ function parseJson(raw: Buffer): unknown {
   try {
     return JSON.parse(raw.toString('utf8'))
   } catch {
-    throw new Error('invalid json')
+    throw new RequestBodyError(400, 'invalid json')
   }
 }
 
@@ -92,6 +155,8 @@ export type HttpListenConfig = {
   port?: number
   host?: string
   publicDir?: string
+  /** json()/bytes() 的最大正文总字节数，默认 32 MiB；不限制原始 req 流。 */
+  bodyLimitBytes?: number
   /** 请求端口被占用时回退到系统分配端口。 */
   fallbackPort?: boolean
   /** LAN listener that only serves share pages. 0 = off. */
@@ -143,6 +208,7 @@ function resolveListenConfig(config?: HttpListenConfig) {
     port,
     host: config?.host ?? process.env.HTTP_HOST ?? '0.0.0.0',
     publicDir: config?.publicDir ?? defaultPublicDir(),
+    bodyLimitBytes: bodyLimitBytes(config?.bodyLimitBytes),
     fallbackPort: config?.fallbackPort ?? process.env.BIU_PORT_FALLBACK === '1',
     sharePort: Number.isFinite(sharePortRaw) ? sharePortRaw : 0,
     shareHost: config?.shareHost ?? process.env.SHARE_HOST ?? '0.0.0.0',
@@ -166,9 +232,12 @@ export class HttpService extends Service {
   private server: Server | null = null
   /** 同一 HTTP server 上只能有一条 upgrade 路由；多挂几个 `ws.Server({ server })` 会互相 abort 握手。 */
   private wsServers = new Map<string, WebSocketServer>()
+  private readonly bodyLimit: number
 
-  constructor(ctx: Context, public config: { port: number; host: string; publicDir: string; fallbackPort: boolean; sharePort: number; shareHost: string }) {
+  constructor(ctx: Context, public config: { port: number; host: string; publicDir: string; fallbackPort: boolean; sharePort: number; shareHost: string; bodyLimitBytes?: number }) {
+    const limit = bodyLimitBytes(config.bodyLimitBytes)
     super(ctx, 'http')
+    this.bodyLimit = limit
     ctx.effect(() => {
       const server = createServer((req, res) => {
         void this.dispatch(req, res, false)
@@ -525,8 +594,20 @@ export class HttpService extends Service {
         params[key] = decodeURIComponent(result?.[i + 1] ?? '')
       })
       let rawBody: Promise<Buffer> | null = null
+      let bodyError: RequestBodyError | null = null
+      const rejectBody = (error: unknown): never => {
+        if (error instanceof RequestBodyError && !bodyError) {
+          bodyError = error
+          if (!res.headersSent && !res.writableEnded) {
+            closeRejectedRequest(req, res, error.status)
+            res.writeHead(error.status, { 'content-type': 'application/json; charset=utf-8', ...corsHeaders })
+            res.end(JSON.stringify({ error: error.message }))
+          }
+        }
+        throw error
+      }
       const body = () => {
-        if (!rawBody) rawBody = readBody(req)
+        if (!rawBody) rawBody = readBody(req, this.bodyLimit).catch(rejectBody)
         return rawBody
       }
       const context: RouteContext = {
@@ -534,9 +615,17 @@ export class HttpService extends Service {
         res,
         params,
         query: url.searchParams,
-        json: async <T = unknown>() => parseJson(await body()) as T,
+        json: async <T = unknown>() => {
+          try {
+            return parseJson(await body()) as T
+          } catch (error) {
+            return rejectBody(error)
+          }
+        },
         bytes: () => body(),
         send: (status, body) => {
+          if (bodyError || res.writableEnded) return
+          closeRejectedRequest(req, res, status)
           res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...corsHeaders })
           res.end(JSON.stringify(body))
         },
@@ -653,8 +742,8 @@ export class HttpService extends Service {
         await runWithAccount(accountId, () => runWithRequestWorkspace(requestedWorkspace, () => match.handler(context)))
         })
       } catch (error) {
-        this.ctx.logger('http').error(error)
-        if (!res.headersSent) context.send(500, { error: String(error) })
+        if (!(error instanceof RequestBodyError)) this.ctx.logger('http').error(error)
+        if (!res.headersSent) context.send(500, { error: 'internal server error' })
       }
       const ms = Date.now() - started
       if (ms >= 8 || url.pathname.startsWith('/api/db')) {

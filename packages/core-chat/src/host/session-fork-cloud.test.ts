@@ -115,6 +115,82 @@ test('cloud failures are surfaced and nothing is created locally', async () => {
   assert.equal((await ctx.sessions.listSummaries()).length, before)
 })
 
+test.each(['files', 'images'] as const)('missing %s stop cloud and local fork with or without a cutoff', async (field) => {
+  const { ctx, source } = await bootWithThreeTurns()
+  try {
+    const id = '11111111-1111-4111-8111-111111111111.png'
+    await ctx.sessions.append(source.id, { type: 'turn/start', turn: 4 })
+    await ctx.sessions.append(source.id, {
+      type: 'user/message', text: 'missing attachment', kind: 'wake',
+      [field]: [{ id, name: 'missing.png', mime: 'image/png', size: 12, url: `/api/sessions/${source.id}/artifacts/${id}` }],
+    })
+    const reply = await ctx.sessions.append(source.id, { type: 'assistant/message', text: 'reply 4' })
+    await ctx.sessions.append(source.id, { type: 'turn/end', turn: 4, reason: 'complete' })
+    const sourceBefore = JSON.stringify((await ctx.sessions.require(source.id)).events)
+    const before = (await ctx.sessions.listSummaries()).length
+    let forwardCalls = 0
+    let forkCalls = 0
+    for (const body of [undefined, null, { untilSeq: reply.seq }, { untilTurn: 4 }]) {
+      await assert.rejects(() => forkSessionWithCloud({
+        sessions: {
+          checkForkCutoff: ctx.sessions.checkForkCutoff.bind(ctx.sessions),
+          fork: async (...args) => {
+            forkCalls += 1
+            return ctx.sessions.fork(...args)
+          },
+        },
+        forward: async () => {
+          forwardCalls += 1
+          return { status: 201, body: { id: 'missing-attachment-child' } }
+        },
+      }, source.id, body), /附件/)
+      assert.equal(forwardCalls, 0)
+      assert.equal(forkCalls, 0)
+    }
+    assert.equal((await ctx.sessions.listSummaries()).length, before)
+    assert.equal(JSON.stringify((await ctx.sessions.require(source.id)).events), sourceBefore)
+  } finally {
+    await ctx.fiber.dispose()
+  }
+})
+
+test.each(['files', 'images'] as const)('missing %s after the cutoff do not block cloud fork', async (field) => {
+  const { ctx, source, replies } = await bootWithThreeTurns()
+  try {
+    const id = '11111111-1111-4111-8111-111111111111.png'
+    await ctx.sessions.append(source.id, {
+      type: 'user/message', text: 'later missing attachment', kind: 'wake',
+      [field]: [{ id, name: 'missing.png', mime: 'image/png', size: 12, url: `/api/sessions/${source.id}/artifacts/${id}` }],
+    })
+    let forwardCalls = 0
+    const childId = `${source.id}-child`
+    const result = await forkSessionWithCloud({
+      sessions: ctx.sessions,
+      forward: async () => {
+        forwardCalls += 1
+        return { status: 201, body: { id: childId } }
+      },
+    }, source.id, { untilSeq: replies[1] })
+    assert.equal(result.status, 201)
+    assert.equal(forwardCalls, 1)
+    const child = await ctx.sessions.require(childId)
+    assert.deepEqual(child.events.filter((event) => event.type === 'turn/end').map((event) => event.turn), [1, 2])
+    assert.equal(child.events.some((event) => event.type === 'user/message' && event.text === 'later missing attachment'), false)
+  } finally {
+    await ctx.fiber.dispose()
+  }
+})
+
+test('legacy session stubs without cutoff preflight remain supported', async () => {
+  const calls: string[] = []
+  const result = await forkSessionWithCloud({
+    sessions: { fork: async () => { calls.push('fork'); return { id: 'stub-child', version: 1 } } },
+    forward: async () => { calls.push('forward'); return null },
+  }, 'stub-source', undefined)
+  assert.equal(result.status, 201)
+  assert.deepEqual(calls, ['forward', 'fork'])
+})
+
 test('local (non-cloud) fork keeps upstream behaviour: cutoff applied, fresh id', async () => {
   const { ctx, source, replies } = await bootWithThreeTurns()
   const result = await forkSessionWithCloud(

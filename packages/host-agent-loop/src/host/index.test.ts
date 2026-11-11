@@ -35,6 +35,57 @@ async function spine() {
   return { ctx, sessionId: session.id }
 }
 
+test('loop persists original attachment fields and gives the model only a derived file-reading hint', async () => {
+  const { ctx, sessionId } = await spine()
+  const id = '33333333-3333-4333-8333-333333333333.txt'
+  const files = [{ id, name: 'notes.txt', mime: 'text/plain', size: 3,
+    url: `/api/sessions/${sessionId}/artifacts/${id}` }]
+  let modelMessages: LlmMessage[] = []
+  const llm: LlmClient = { async chat(messages) {
+    modelMessages = messages
+    return { content: 'ok', toolCalls: [] }
+  } }
+  const loop = new AgentLoop(ctx, llm, sessionId, new AbortController().signal)
+  await loop.run([{ kind: 'wake', text: 'read this', files, clientMessageId: 'client-file' }])
+  const event = (await ctx.sessions.require(sessionId)).events.find((item) => item.type === 'user/message')
+  assert.equal(event?.text, 'read this')
+  assert.equal(event?.clientMessageId, 'client-file')
+  assert.deepEqual(event?.files, files)
+  const user = modelMessages.find((message) => message.role === 'user')
+  assert.equal(typeof user?.content, 'string')
+  assert.match(user?.content as string, /session_file_read/)
+  assert.ok((user?.content as string).includes(id))
+})
+
+test('minimal and file turns expose session_file_read only for same-session current or historical attachments', async () => {
+  for (const mode of ['minimal', 'file'] as const) {
+    const { ctx, sessionId } = await spine()
+    ctx.provide('chat', { resolveEffective: () => ({ effective: { agentMode: mode, extraTools: [] } }) })
+    for (const name of ['session_file_read', 'unrelated_fs_read']) {
+      ctx.tools.register({ name, description: name, parameters: { type: 'object', properties: {} }, execute: () => 'ok' })
+    }
+    const seen: string[][] = []
+    const llm: LlmClient = { async chat(_messages, offered) {
+      seen.push((offered ?? []).map((tool) => tool.function.name))
+      return { content: 'ok', toolCalls: [] }
+    } }
+    const loop = () => new AgentLoop(ctx, llm, sessionId, new AbortController().signal)
+    await loop().run([{ kind: 'wake', text: 'no attachments' }])
+    assert.equal(seen.at(-1)?.includes('session_file_read'), false)
+    const id = '33333333-3333-4333-8333-333333333333'
+    const file = { id, name: 'README', mime: 'text/plain', size: 3, url: `/api/sessions/other/artifacts/${id}` }
+    await loop().run([{ kind: 'wake', text: 'invalid attachment', files: [{ ...file }] }])
+    assert.equal(seen.at(-1)?.includes('session_file_read'), false, `${mode}: cross-session attachment`)
+    file.url = `/api/sessions/${sessionId}/artifacts/${id}`
+    await loop().run([{ kind: 'wake', text: 'current attachment', files: [{ ...file }] }])
+    assert.equal(seen.at(-1)?.includes('session_file_read'), true, `${mode}: current attachment`)
+    await loop().run([{ kind: 'wake', text: 'read the earlier attachment' }])
+    assert.equal(seen.at(-1)?.includes('session_file_read'), true, `${mode}: historical attachment`)
+    assert.equal(seen.flat().includes('unrelated_fs_read'), false)
+    await ctx.fiber.dispose()
+  }
+})
+
 test('online agent turn pins account and workspace to its session, including background runs', async () => {
   const { ctx, sessionId } = await spine()
   const previous = process.env.BIU_ONLINE

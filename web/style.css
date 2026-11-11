@@ -10566,3 +10566,72 @@ html:not(.dark) .tasks-viewdd-menu .tasks-viewdd-check svg {
   .site .site-compare-card,
   .site .site-usecase-card { transition: none; }
 }
+
+.composer-attachments {
+  padding: 8px 12px 0;
+}
+.chat-attachment-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 6px;
+}
+.chat-attachment-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 6px 9px;
+  border: 1px solid var(--dsw-border);
+  border-radius: 8px;
+  background: var(--dsw-bubble);
+  color: var(--dsw-label);
+  font-size: 12px;
+  text-decoration: none;
+}
+a.chat-attachment-link:hover {
+  background: var(--dsw-hover);
+}
+.chat-attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-attachment-size {
+  flex-shrink: 0;
+  color: var(--dsw-label-3);
+}
+.composer-attachment-remove,
+.composer-attachment-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border: 0;
+  background: transparent;
+  color: var(--dsw-icon-active);
+  cursor: pointer;
+}
+.composer-attachment-add {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+}
+.composer-attachment-add:hover {
+  background: var(--dsw-hover);
+}
+.composer-attachment-remove:disabled,
+.composer-attachment-add:disabled {
+  opacity: .5;
+  cursor: default;
+}
+.composer-attachment-status,
+.composer-attachment-error {
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--dsw-label-3);
+}
+.composer-attachment-error {
+  color: #c05040;
+}

@@ -240,6 +240,56 @@ for (const mode of ['lean-replay', 'native-replay'] as const) {
   })
 }
 
+test('model-generated invalid tool JSON is reported back instead of ending the native turn', async () => {
+  const { ctx, sessionId } = await spine()
+  const received: unknown[] = []
+  ctx.tools.register({ name: 'job_collect', description: 'test', parameters: { type: 'object' }, execute: (args) => {
+    received.push(args)
+    return 'collected'
+  } })
+  const bodies: Array<{ messages: Array<Record<string, unknown>> }> = []
+  vi.stubGlobal('fetch', vi.fn(async (_url, init: RequestInit) => {
+    bodies.push(JSON.parse(String(init.body)))
+    const delta = bodies.length === 1
+      ? { reasoning_content: 'collect', tool_calls: [{ index: 0, id: 'bad', function: { name: 'job_collect', arguments: '{"id": 31830dc7}' } }] }
+      : bodies.length === 2
+        ? { reasoning_content: 'fix quotes', tool_calls: [{ index: 0, id: 'good', function: { name: 'job_collect', arguments: '{"id": "31830dc7"}' } }] }
+        : { content: 'done' }
+    return new Response(`data: ${JSON.stringify({ choices: [{ delta }] })}\n\ndata: [DONE]\n\n`, {
+      headers: { 'content-type': 'text/event-stream' },
+    })
+  }))
+  const settings: LlmConfig = { ...config('native-replay'), model: 'deepseek-v4-flash', baseUrl: 'https://replay-fixture.test/v1' }
+  const result = await new AgentLoop(ctx, new LlmService(ctx).forConfig(settings), sessionId,
+    new AbortController().signal, settings).run([{ kind: 'wake', text: 'collect job' }])
+  assert.equal(result.text, 'done')
+  assert.deepEqual(received, [{ id: '31830dc7' }])
+  const events = (await ctx.sessions.require(sessionId)).events
+  const bad = events.find((event) => event.type === 'tool/result' && event.id === 'bad')
+  assert.equal(bad?.type === 'tool/result' && bad.ok, false)
+  assert.match(bad?.type === 'tool/result' ? bad.detail : '', /不是合法的 JSON[\s\S]*未执行[\s\S]*31830dc7/)
+  const secondRequestTool = bodies[1]!.messages.find((message) => message.role === 'tool')
+  assert.match(String(secondRequestTool?.content), /未执行/)
+  const firstAssistant = bodies[1]!.messages.find((message) => message.role === 'assistant')
+  assert.equal(firstAssistant?.reasoning_content, 'collect')
+  assert.equal(events.at(-1)?.type === 'turn/end' && events.at(-1)?.reason, 'complete')
+})
+
+test('invalid tool arguments never reach tool execution or approval for non-object JSON', async () => {
+  const { ctx, sessionId, calls } = await spine()
+  const replies = ['[1]', 'null', '"x"', '{"a":'].map((args, index) => ({
+    content: null, toolCalls: [{ id: `c${index}`, name: 'replay_test', arguments: args }],
+  }))
+  const llm: LlmClient = { async chat() { return replies.shift() ?? { content: 'done', toolCalls: [] } } }
+  const result = await new AgentLoop(ctx, llm, sessionId, new AbortController().signal, config('lean-replay'))
+    .run([{ kind: 'wake', text: 'go' }])
+  assert.equal(result.text, 'done')
+  assert.equal(calls(), 0)
+  const failed = (await ctx.sessions.require(sessionId)).events
+    .filter((event) => event.type === 'tool/result' && !event.ok)
+  assert.equal(failed.length, 4)
+})
+
 test('compaction never sends native blocks, signatures or private references to the summary model', () => {
   const messages: LlmMessage[] = [
     { role: 'system', content: 'system' },

@@ -1,4 +1,4 @@
-import type { InboxKind, MessageSender, LiveUiContext, SessionConfig } from '@biu/type-session'
+import type { InboxKind, MessageSender, LiveUiContext, SessionConfig, UserMessageImage, UserMessageFile } from '@biu/type-session'
 
 export interface AgentTurn {
   text: string
@@ -11,7 +11,9 @@ export interface ClaimedInput {
   id?: string
   extraTools?: string[]
   sender?: MessageSender
-  images?: Array<{ name: string; mime: string; url: string }>
+  images?: UserMessageImage[]
+  files?: UserMessageFile[]
+  clientMessageId?: string
   /** 发送时的界面快照，写入本回合 system/prompt。 */
   liveContext?: LiveUiContext
 }

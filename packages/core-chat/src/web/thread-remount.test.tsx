@@ -141,6 +141,24 @@ describe('scroll-back remount contract', () => {
   })
 })
 
+describe('message attachment links', () => {
+  it('renders canonical downloads with escaped names and rejects cross-session and unsafe links', () => {
+    const id = '12345678-1234-4234-8234-123456789abc.txt'
+    const file = { id, name: '<img src=x onerror=alert(1)>.txt', mime: 'text/plain', size: 3, url: `/api/sessions/s1/artifacts/${id}` }
+    const node: ChatNode = { id: 'u-1', kind: 'user', text: 'files', files: [
+      file,
+      { ...file, id: id.replace('abc', 'abd'), name: 'unsafe.txt', url: 'javascript:alert(1)' },
+      { ...file, id: id.replace('abc', 'abe'), name: 'other-session.txt', url: file.url.replace('/s1/', '/s2/') },
+    ] }
+    const { container, getByRole } = render(<ChatNodeList nodes={[node]} sessionId="s1" onInspect={vi.fn()} onFork={vi.fn()} />)
+    const link = getByRole('link', { name: /onerror/ })
+    expect(link.getAttribute('href')).toBe(file.url)
+    expect(link.getAttribute('download')).toBe(file.name)
+    expect(container.querySelectorAll('.chat-attachment-list a')).toHaveLength(1)
+    expect(container.querySelectorAll('.chat-attachment-list img')).toHaveLength(0)
+  })
+})
+
 describe('markdown cache helpers', () => {
   it('parse once then getCached hits', () => {
     const text = 'cache **hit** check'

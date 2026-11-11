@@ -2,11 +2,13 @@ import { readFile, stat } from 'node:fs/promises'
 import { basename, isAbsolute, resolve } from 'node:path'
 import { assetsRootPath, hashedAssetRel, isHashedAssetName } from '@biu/host-plugin-loader/data-dir'
 import type { LlmContentPart, LlmMessage } from '@biu/host-llm'
+import { parseSessionArtifactUrl } from '@biu/type-session'
 import { artifactMime, isImagePath, readArtifactFile } from './artifacts.ts'
 
-/** 与用户贴图同一档：单次最多 6 张、单张 8MB。svg 视觉模型普遍不认。 */
+/** 工具产图单次最多 6 张、单张 8MB。svg 视觉模型普遍不认。 */
 export const MAX_TOOL_IMAGES = 6
 export const MAX_TOOL_IMAGE_BYTES = 8 * 1024 * 1024
+export const MAX_USER_IMAGE_BYTES = 20 * 1024 * 1024
 
 const VISION_MIME = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp'])
 
@@ -21,9 +23,9 @@ function isVisionMime(mime: string) {
   return VISION_MIME.has(base)
 }
 
-function dataUrl(mime: string, data: Buffer) {
+function dataUrl(mime: string, data: Buffer, maxBytes = MAX_TOOL_IMAGE_BYTES) {
   const base = mime === 'image/jpg' ? 'image/jpeg' : mime.split(';')[0]!.trim()
-  if (!isVisionMime(base) || data.length === 0 || data.length > MAX_TOOL_IMAGE_BYTES) return null
+  if (!isVisionMime(base) || data.length === 0 || data.length > maxBytes) return null
   return `data:${base};base64,${data.toString('base64')}`
 }
 
@@ -148,10 +150,34 @@ export async function liftToolImages(
   sessionId: string,
   options?: { baseDir?: string },
 ): Promise<LlmMessage[]> {
-  if (!sessionId) return messages
   const out: LlmMessage[] = []
   for (const message of messages) {
-    if (message.role !== 'tool' || typeof message.content !== 'string' || !message.content) {
+    if (message.role === 'user' && Array.isArray(message.content)) {
+      const content: LlmContentPart[] = []
+      for (const part of message.content) {
+        if (part.type !== 'image_url' || part.image_url.url.startsWith('data:image/')) {
+          content.push(part)
+          continue
+        }
+        const ref = sessionId ? parseSessionArtifactUrl(part.image_url.url, sessionId) : undefined
+        if (!ref) {
+          content.push({ type: 'text', text: '[图片附件不可用：仅允许当前会话的规范附件引用。]' })
+          continue
+        }
+        try {
+          const file = await readArtifactFile(sessionId, ref.id, options?.baseDir)
+          const url = file ? dataUrl(file.mime, file.data, MAX_USER_IMAGE_BYTES) : null
+          content.push(url
+            ? { ...part, image_url: { ...part.image_url, url } }
+            : { type: 'text', text: `[图片附件不可用：${ref.id} 文件缺失、格式不支持或超过 20MiB。]` })
+        } catch {
+          content.push({ type: 'text', text: `[图片附件不可用：${ref.id} 读取失败。]` })
+        }
+      }
+      out.push({ ...message, content })
+      continue
+    }
+    if (!sessionId || message.role !== 'tool' || typeof message.content !== 'string' || !message.content) {
       out.push(message)
       continue
     }

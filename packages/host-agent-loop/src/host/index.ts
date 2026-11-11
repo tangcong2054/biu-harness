@@ -3,7 +3,7 @@ import type { AssistantReply, ChatOptions, LlmClient, LlmConfig, LlmMessage, Llm
 import { runWithSession } from '@biu/host-sessions/scope'
 import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime, runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import { estimateTokens, fitMessagesToTokenBudget, liftToolImages } from '@biu/host-sessions'
-import { TODO_TOOL_NAME } from '@biu/type-session'
+import { parseSessionArtifactUrl, TODO_TOOL_NAME } from '@biu/type-session'
 import { runWithToolPolicy, runWithToolProgress, type AgentToolMode } from '@biu/host-tools'
 import {
   buildAutoCompactMessages,
@@ -190,6 +190,14 @@ export class AgentLoop implements AgentRunner {
       extras = extras.filter((name) => this.ctx.tools.originOf(name) !== 'store')
     }
     if (mode === 'file') extras = []
+    const hasAttachments = (item: Pick<ClaimedInput, 'files' | 'images'>) =>
+      [...(item.files ?? []), ...(item.images ?? [])].some((file) => {
+        const ref = typeof file?.url === 'string' ? parseSessionArtifactUrl(file.url, this.sessionId) : undefined
+        return ref && (file.id === undefined || file.id === ref.id)
+      })
+    const history = this.ctx.sessions.peek(this.sessionId)?.events ?? []
+    if ((claimed.some(hasAttachments) || history.some((event) => event.type === 'user/message' && hasAttachments(event)))
+      && !extras.includes('session_file_read')) extras.push('session_file_read')
     return runWithSession(this.sessionId, () =>
       runWithToolPolicy({ mode, extras }, () => this.runInSession(claimed)),
     )
@@ -236,6 +244,8 @@ export class AgentLoop implements AgentRunner {
         kind: item.kind,
         ...(item.sender ? { sender: item.sender } : {}),
         ...(item.images?.length ? { images: item.images } : {}),
+        ...(item.files?.length ? { files: item.files } : {}),
+        ...(item.clientMessageId ? { clientMessageId: item.clientMessageId } : {}),
       })
     }
 
@@ -475,13 +485,9 @@ export class AgentLoop implements AgentRunner {
       })
 
       const prepared = reply.toolCalls.map((call) => {
-        let args: Record<string, unknown> = {}
-        try {
-          args = JSON.parse(call.arguments || '{}') as Record<string, unknown>
-        } catch {
-          args = {}
-        }
-        return { call, args, mode: this.ctx.tools.executionMode(call.name, args) }
+        const parsed = parseToolArguments(call.arguments)
+        if (!parsed.ok) return { call, args: {}, mode: 'parallel' as const, invalid: parsed.error }
+        return { call, args: parsed.args, mode: this.ctx.tools.executionMode(call.name, parsed.args) }
       })
 
       // 先把整批调用都推给前端，这样并行工具会同时显示为“运行中”。
@@ -499,7 +505,16 @@ export class AgentLoop implements AgentRunner {
         return next
       }
 
-      const executeCall = async (call: ReplyToolCall, args: Record<string, unknown>): Promise<ToolOutcome> => {
+      const executeCall = async (
+        call: ReplyToolCall,
+        args: Record<string, unknown>,
+        invalid?: string,
+      ): Promise<ToolOutcome> => {
+        if (invalid) {
+          const detail = invalidToolArgumentsMessage(call.arguments, invalid)
+          await enqueueAppend({ type: 'tool/result', id: call.id, name: call.name, ok: false, detail })
+          return { name: call.name, ok: false, detail, cancelled: this.signal.aborted }
+        }
         let detail = ''
         let ok = true
         try {
@@ -547,7 +562,7 @@ export class AgentLoop implements AgentRunner {
         const batch = parallel
         parallel = []
         await recordOutcomes(
-          await mapConcurrent(batch, toolConcurrency(), ({ call, args }) => executeCall(call, args)),
+          await mapConcurrent(batch, toolConcurrency(), ({ call, args, invalid }) => executeCall(call, args, invalid)),
         )
       }
 
@@ -557,7 +572,7 @@ export class AgentLoop implements AgentRunner {
           continue
         }
         await flushParallel()
-        await recordOutcomes([await executeCall(item.call, item.args)])
+        await recordOutcomes([await executeCall(item.call, item.args, item.invalid)])
       }
       await flushParallel()
       await enqueueAppend({ type: 'step/end', turn, step })
@@ -601,6 +616,34 @@ export class AgentLoopService extends Service {
 
 function isCancelError(error: unknown) {
   return /cancelled|AbortError|aborted/i.test(String(error))
+}
+
+const INVALID_ARGS_PREVIEW_CHARS = 500
+
+/** 解析模型给出的工具参数；必须是 JSON 对象。空串按 `{}` 处理（无参工具）。 */
+export function parseToolArguments(
+  raw: string | undefined,
+): { ok: true; args: Record<string, unknown> } | { ok: false; error: string } {
+  const text = raw?.trim() ? raw : '{}'
+  let value: unknown
+  try {
+    value = JSON.parse(text)
+  } catch (error) {
+    return { ok: false, error: `不是合法的 JSON：${error instanceof Error ? error.message : String(error)}` }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { ok: false, error: `必须是 JSON 对象，实际为 ${Array.isArray(value) ? 'array' : value === null ? 'null' : typeof value}` }
+  }
+  return { ok: true, args: value as Record<string, unknown> }
+}
+
+/** 回给模型的工具错误：说明原因并附上原始参数，便于模型下一步自行修正。 */
+export function invalidToolArgumentsMessage(raw: string | undefined, reason: string): string {
+  const text = raw ?? ''
+  const preview = text.length > INVALID_ARGS_PREVIEW_CHARS
+    ? `${text.slice(0, INVALID_ARGS_PREVIEW_CHARS)}…[共 ${text.length} 字符]`
+    : text
+  return `工具参数${reason}。本次调用未执行。请检查参数格式（例如字符串值需要加引号）后重新调用。原始参数：${preview}`
 }
 
 function stringify(value: unknown) {

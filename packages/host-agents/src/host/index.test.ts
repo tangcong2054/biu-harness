@@ -45,6 +45,103 @@ test('inject waits for the next wake and is logged first', async () => {
   assert.equal(users[0] && 'kind' in users[0] ? users[0].kind : '', 'inject')
 })
 
+test('attachment-only sends and injects preserve files, image references and client ids through inbox and events', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  await ctx.plugin(tools)
+  await ctx.plugin(systemPrompt)
+  await ctx.plugin(llm)
+  await ctx.plugin(agentLoop)
+  await ctx.plugin(agents)
+  const agent = await ctx.agents.create()
+  const fileId = '11111111-1111-4111-8111-111111111111'
+  const imageId = '22222222-2222-4222-8222-222222222222.png'
+  const files = [{ id: fileId, name: 'README', mime: 'text/plain', size: 4,
+    url: `/api/sessions/${agent.sessionId}/artifacts/${fileId}` }]
+  const images = [{ id: imageId, name: 'large.png', mime: 'image/png', size: 20 * 1024 * 1024,
+    url: `/api/sessions/${agent.sessionId}/artifacts/${imageId}` }]
+  agent.inject('', { files, clientMessageId: 'injected-client' })
+  const inbox = ctx.agents.listInbox(agent.sessionId)
+  assert.equal(inbox.length, 1)
+  assert.deepEqual(inbox[0]?.files, files)
+  assert.equal(inbox[0]?.clientMessageId, 'injected-client')
+  assert.equal(ctx.agents.patchInbox(agent.sessionId, inbox[0]!.id, ''), true)
+  await agent.send('', { images, files, clientMessageId: 'sent-client' })
+  const users = (await ctx.sessions.require(agent.sessionId)).events.filter((item) => item.type === 'user/message')
+  assert.equal(users.length, 2)
+  assert.equal(users[0]?.clientMessageId, 'injected-client')
+  assert.deepEqual(users[0]?.files, files)
+  assert.deepEqual(users[1]?.images, images)
+  assert.deepEqual(users[1]?.files, files)
+  assert.equal(users[1]?.clientMessageId, 'sent-client')
+  assert.deepEqual(users.map((item) => item.text), ['', ''])
+  agent.inject('', { images: [{ ...images[0]!, url: `/api/sessions/other/artifacts/${imageId}` }] })
+  agent.inject('', { files: [{ ...files[0]!, url: `/api/sessions/other/artifacts/${fileId}` }] })
+  agent.inject('', { files: [{ ...files[0]!, id: '../private.txt' }] })
+  assert.deepEqual(ctx.agents.listInbox(agent.sessionId), [])
+  const svgId = '44444444-4444-4444-8444-444444444444.svg'
+  const svg = { id: svgId, name: 'vector.svg', mime: 'image/svg+xml', size: 20,
+    url: `/api/sessions/${agent.sessionId}/artifacts/${svgId}` }
+  agent.inject('', { images: [svg] })
+  assert.deepEqual(ctx.agents.listInbox(agent.sessionId)[0]?.images, [svg])
+})
+
+test('client message ids deduplicate queued, claimed and persisted retries but not equal text with distinct ids', async () => {
+  const ctx = new Context()
+  await ctx.plugin(sessionStore, { driver: 'memory' })
+  await ctx.plugin(sessions)
+  await ctx.plugin(tools)
+  await ctx.plugin(systemPrompt)
+  await ctx.plugin(llm)
+  await ctx.plugin(agentLoop)
+  await ctx.plugin(agents)
+  const agent = await ctx.agents.create()
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  let runs = 0
+  const originalCreate = ctx.agentLoop.create.bind(ctx.agentLoop)
+  ctx.agentLoop.create = ((config, sessionId, signal) => {
+    const runner = originalCreate(config, sessionId, signal)
+    return { async run(claimed) {
+      runs += 1
+      await gate
+      return runner.run(claimed)
+    } }
+  }) as typeof ctx.agentLoop.create
+  const initial = agent.send('same text', { clientMessageId: 'one' })
+  assert.deepEqual(await agent.send('same text', { clientMessageId: 'one', wait: false }), { text: '', steps: [] })
+  agent.inject('same text', { clientMessageId: 'one' })
+  assert.deepEqual(ctx.agents.listInbox(agent.sessionId), [])
+  agent.inject('same text', { clientMessageId: 'two' })
+  agent.inject('same text', { clientMessageId: 'two' })
+  await agent.send('same text', { clientMessageId: 'three', wait: false })
+  await agent.send('changed retry text', { clientMessageId: 'three', wait: false })
+  assert.equal(ctx.agents.listInbox(agent.sessionId).length, 2)
+  release()
+  await initial
+  const users = (await ctx.sessions.require(agent.sessionId)).events.filter((item) => item.type === 'user/message')
+  assert.deepEqual(users.map((item) => item.clientMessageId), ['one', 'two', 'three'])
+  assert.equal(users.every((item) => item.text === 'same text'), true)
+  assert.equal(runs, 2)
+  agent.dispose()
+  const recreated = await ctx.agents.create(agent.sessionId)
+  await recreated.send('same text', { clientMessageId: 'one' })
+  recreated.inject('same text', { clientMessageId: 'two' })
+  assert.equal(runs, 2)
+  assert.deepEqual(ctx.agents.listInbox(agent.sessionId), [])
+  await recreated.send('same text', { clientMessageId: 'four' })
+  assert.equal(runs, 3)
+  recreated.inject('retry dropped', { clientMessageId: 'dropped' })
+  assert.equal(ctx.agents.dropInbox(agent.sessionId, ctx.agents.listInbox(agent.sessionId)[0]!.id), true)
+  recreated.inject('retry dropped', { clientMessageId: 'dropped' })
+  assert.equal(ctx.agents.listInbox(agent.sessionId).length, 1)
+  const other = await ctx.agents.create()
+  await other.send('same text', { clientMessageId: 'one' })
+  assert.equal(runs, 4)
+  await ctx.fiber.dispose()
+})
+
 test('send wait:false returns immediately; isBusy clears when done', async () => {
   const ctx = new Context()
   await ctx.plugin(sessionStore, { driver: 'memory' })

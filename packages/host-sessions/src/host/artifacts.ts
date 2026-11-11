@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, writeFile, access, readdir, stat } from 'node:fs/promises'
+import { copyFile, mkdir, writeFile, access, readdir, stat, lstat, open, realpath } from 'node:fs/promises'
 import { basename, extname, isAbsolute, join, resolve, relative } from 'node:path'
 import { constants } from 'node:fs'
 import { DATA_DIR_NAME, LEGACY_DATA_DIR_NAME, dataDir, dataHome } from '@biu/host-plugin-loader/data-dir'
@@ -22,8 +22,32 @@ export type PastedImage = {
 const PATH_CANDIDATE =
   /(?:^|[\s"'=`(,\[{])((?:\/|\.\/|\.\.\/)?[^\s"'`)\]},;]+?\.(?:png|jpe?g|gif|webp|svg))\b/gi
 
+export const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+export const MAX_MESSAGE_ATTACHMENTS = 6
+
+export function validArtifactSession(sessionId: string) {
+  return /^[\w-][\w.-]{0,127}$/.test(sessionId) && !sessionId.includes('..')
+}
+
 export function artifactsDir(sessionId: string, baseDir = dataHome()) {
+  if (!validArtifactSession(sessionId)) throw new Error('invalid session id')
   return join(dataDir(baseDir), 'artifacts', sessionId)
+}
+
+export async function safeArtifactDirectory(sessionId: string, baseDir = dataHome(), create = false) {
+  const dir = artifactsDir(sessionId, baseDir)
+  const root = dirnameOfArtifact(dir)
+  for (const path of [root, dir]) {
+    if (create) await mkdir(path, { recursive: true, mode: 0o700 })
+    const info = await lstat(path)
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('invalid artifact directory')
+  }
+  if (await realpath(dir) !== join(await realpath(root), sessionId)) throw new Error('invalid artifact directory')
+  return dir
+}
+
+function dirnameOfArtifact(dir: string) {
+  return resolve(dir, '..')
 }
 
 export function artifactMime(name: string) {
@@ -127,7 +151,7 @@ export async function ingestSessionImages(options: {
   baseDir?: string
 }): Promise<ArtifactMeta[]> {
   const { sessionId, candidates, workspaceRoot } = options
-  const baseDir = options.baseDir ?? process.cwd()
+  const baseDir = options.baseDir ?? dataHome()
   if (!sessionId || candidates.length === 0) return []
 
   const root = resolve(workspaceRoot)
@@ -163,8 +187,8 @@ export async function ingestSessionImages(options: {
 }
 
 /** 解析并校验 artifact 文件路径；非法或穿越返回 null。 */
-export function resolveArtifactFile(sessionId: string, name: string, baseDir = process.cwd()) {
-  if (!sessionId || !name) return null
+export function resolveArtifactFile(sessionId: string, name: string, baseDir = dataHome()) {
+  if (!validArtifactSession(sessionId) || !name || name.length > 255) return null
   if (name.includes('/') || name.includes('\\') || name.includes('..')) return null
   if (!/^[\w.\-]+$/.test(name)) return null
   const dir = artifactsDir(sessionId, baseDir)
@@ -254,13 +278,39 @@ export function withPastedImagePicks(text: string, images: Array<{ name: string;
 }
 
 
-export async function readArtifactFile(sessionId: string, name: string, baseDir = process.cwd()) {
+export async function openArtifactFile(sessionId: string, name: string, baseDir = dataHome()) {
   const full = resolveArtifactFile(sessionId, name, baseDir)
   if (!full) return null
   try {
-    const data = await readFile(full)
-    return { path: full, data, mime: artifactMime(name) }
+    await safeArtifactDirectory(sessionId, baseDir)
+    const handle = await open(full, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    try {
+      const info = await handle.stat()
+      if (!info.isFile() || info.size > MAX_ATTACHMENT_BYTES) throw new Error('invalid artifact file')
+      return { handle, path: full, size: info.size, mime: artifactMime(name) }
+    } catch (error) {
+      await handle.close()
+      throw error
+    }
   } catch {
     return null
+  }
+}
+
+export async function readArtifactFile(sessionId: string, name: string, baseDir = dataHome()) {
+  const file = await openArtifactFile(sessionId, name, baseDir)
+  if (!file) return null
+  try {
+    const buffer = Buffer.alloc(file.size + 1)
+    let size = 0
+    while (size < buffer.length) {
+      const { bytesRead } = await file.handle.read(buffer, size, buffer.length - size, size)
+      if (!bytesRead) break
+      size += bytesRead
+    }
+    if (size !== file.size) return null
+    return { path: file.path, data: buffer.subarray(0, size), mime: file.mime }
+  } finally {
+    await file.handle.close()
   }
 }

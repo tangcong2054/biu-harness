@@ -133,15 +133,28 @@ test('OpenAI captures ordinary replies without inventing an empty reasoning fiel
   assert.equal('reasoningField' in reply.replay!, false)
 })
 
-test('OpenAI rejects unfinished streams, provider errors and incomplete tool arguments', async () => {
+test('OpenAI rejects unfinished streams, provider errors and truncated tool streams', async () => {
   for (const chunks of [
     ['data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'],
     ['data: {"error":{"message":"upstream-error"}}\n\n', 'data: [DONE]\n\n'],
     ['data: invalid-json\n\n', 'data: [DONE]\n\n'],
-    ['data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"tool","arguments":"{"}}]}}]}\n\n', 'data: [DONE]\n\n'],
+    ['data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"tool","arguments":"{"}}]}}]}\n\n'],
   ]) {
     await assert.rejects(() => consumeChatCompletionSse(sseBody(chunks), { routeKey: 'route-test' }))
   }
+})
+
+test('OpenAI passes model-generated invalid tool JSON through a complete stream for the loop to report', async () => {
+  const raw = '{"id": 31830dc7}'
+  const reply = await consumeChatCompletionSse(sseBody([
+    `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: 'collect job', tool_calls: [
+      { index: 0, id: 'c', function: { name: 'job_collect', arguments: raw } },
+    ] } }] })}\n\n`,
+    'data: [DONE]\n\n',
+  ]), { routeKey: 'route-test' })
+  assert.deepEqual(reply.toolCalls, [{ id: 'c', name: 'job_collect', arguments: raw }])
+  assert.equal(reply.replay?.complete, true)
+  assert.equal(reply.replay?.reasoningContent, 'collect job')
 })
 
 test('OpenAI cannot publish native replay after aborting a partial reasoning stream', async () => {

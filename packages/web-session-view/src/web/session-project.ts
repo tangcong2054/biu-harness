@@ -1,4 +1,4 @@
-import { mergeContentEditFiles } from '@biu/type-session'
+import { mergeContentEditFiles, type UserMessageFile, type UserMessageImage } from '@biu/type-session'
 
 /** 与 host SessionEvent 对齐的瘦客户端类型（只投影 UI 需要的字段）。 */
 export type SessionEvent = {
@@ -16,7 +16,9 @@ export type SessionEvent = {
       text: string
       kind?: string
       sender?: { type: 'user' } | { type: 'session'; sessionId: string }
-      images?: Array<{ name: string; mime: string; url: string }>
+      images?: UserMessageImage[]
+      files?: UserMessageFile[]
+      clientMessageId?: string
     }
   | {
       type: 'assistant/message'
@@ -124,7 +126,9 @@ export type ChatNode =
       text: string
       kindTag?: string
       ts?: number
-      images?: Array<{ name: string; mime: string; url: string }>
+      images?: UserMessageImage[]
+      files?: UserMessageFile[]
+      clientMessageId?: string
       /** 缺省 / user = 真人；session = Live 等其它会话派工 */
       sender?: { type: 'user' } | { type: 'session'; sessionId: string }
     }
@@ -393,6 +397,8 @@ export function projectNodes(events: SessionEvent[]): ChatNode[] {
         ts: event.ts,
         ...(event.sender ? { sender: event.sender } : {}),
         ...(event.images?.length ? { images: event.images } : {}),
+        ...(event.files?.length ? { files: event.files } : {}),
+        ...(event.clientMessageId ? { clientMessageId: event.clientMessageId } : {}),
       })
     } else if (event.type === 'assistant/chunk') {
       const r = ensureReply(event.seq)

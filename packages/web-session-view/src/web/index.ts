@@ -1,6 +1,8 @@
 import { useSyncExternalStore } from 'react'
 import { Service, type Context } from 'cordis'
-import { mergeInspectorBind, mergeContentEditFiles, type SessionInspectorBind, type SessionGoal } from '@biu/type-session'
+import { mergeInspectorBind, mergeContentEditFiles, type SessionInspectorBind, type SessionGoal, type UserMessageFile, type UserMessageImage } from '@biu/type-session'
+import { attachmentUrl, validateMessageFiles } from './attachments.ts'
+export { attachmentUrl, validateMessageFiles, formatAttachmentSize, MAX_MESSAGE_FILES, MAX_MESSAGE_FILE_BYTES } from './attachments.ts'
 import { captureLiveUiContext } from './live-ui-context.ts'
 import {
   compactSessionEvents,
@@ -139,6 +141,9 @@ export type InboxQueueItem = {
   id: string
   kind: 'wake' | 'inject'
   text: string
+  images?: UserMessageImage[]
+  files?: UserMessageFile[]
+  clientMessageId?: string
 }
 
 /** 打开会话与上翻分页分批拉取，避免长会话一次渲染数千条事件和附件。 */
@@ -575,12 +580,18 @@ export class SessionViewService extends Service {
     }
     this.flushChunkFrame()
     const base = this.value.sessionId === sessionId ? this.value.events : []
-    const withoutOptimistic =
-      event.type === 'user/message'
-        ? base.filter(
-            (item) => !(item.type === 'user/message' && item.seq < 0 && item.text === event.text),
-          )
-        : base
+    let optimisticIndex = -1
+    if (event.type === 'user/message' && event.seq >= 0 && !base.some((item) => item.seq === event.seq)) {
+      optimisticIndex = base.findIndex((item) => {
+        if (item.type !== 'user/message' || item.seq >= 0) return false
+        if (event.clientMessageId) return item.clientMessageId === event.clientMessageId
+        return item.text === event.text &&
+          JSON.stringify(item.sender ?? { type: 'user' }) === JSON.stringify(event.sender ?? { type: 'user' }) &&
+          JSON.stringify(item.images ?? []) === JSON.stringify(event.images ?? []) &&
+          JSON.stringify(item.files ?? []) === JSON.stringify(event.files ?? [])
+      })
+    }
+    const withoutOptimistic = optimisticIndex < 0 ? base : base.filter((_, index) => index !== optimisticIndex)
     const events = upsertEvent(withoutOptimistic, event)
     this.replace({
       sessionId,
@@ -887,9 +898,48 @@ export class SessionViewService extends Service {
     return body.id
   }
 
-  async ensureSession() {
+  private creatingSession?: Promise<string>
+
+  async ensureSession(): Promise<string> {
     if (this.value.sessionId) return this.value.sessionId
-    return this.newSession()
+    if (this.creatingSession) return this.creatingSession
+    const generation = this.loadGen
+    this.creatingSession = (async () => {
+      const res = await fetch('/api/sessions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const body = (await res.json()) as { id?: string; error?: string }
+      if (!res.ok || !body.id) throw new Error(body.error || '无法创建 session')
+      if (this.value.sessionId || this.loadGen !== generation) throw new Error('会话已切换，请重新发送')
+      markSidebarMascotFresh(body.id)
+      await this.load(body.id, { view: 'chat' })
+      void this.refreshSessions({ refresh: true })
+      return body.id
+    })()
+    try {
+      return await this.creatingSession
+    } finally {
+      this.creatingSession = undefined
+    }
+  }
+
+  async uploadFile(file: File, targetSessionId?: string): Promise<UserMessageFile> {
+    validateMessageFiles([file])
+    const sessionId = targetSessionId ?? this.value.sessionId ?? await this.ensureSession()
+    if (this.value.sessionId !== sessionId) throw new Error('会话已切换，请返回原会话重试')
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/files/${encodeURIComponent(file.name || 'attachment')}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: file,
+    })
+    const body = await res.json().catch(() => ({})) as Partial<UserMessageFile> & { error?: string }
+    if (!res.ok) throw new Error(body.error || `上传失败：${res.status}`)
+    if (typeof body.id !== 'string' || typeof body.url !== 'string' || typeof body.name !== 'string' || typeof body.mime !== 'string' || !Number.isSafeInteger(body.size) || body.size! < 0 || !attachmentUrl(body as UserMessageFile, sessionId)) {
+      throw new Error('服务器返回了无效的附件引用')
+    }
+    return body as UserMessageFile
   }
 
   private pendingInspector(): Pick<SessionViewState, 'sessionInspector' | 'inspectorReady'> {
@@ -1540,56 +1590,45 @@ export class SessionViewService extends Service {
     text: string,
     kind: 'wake' | 'inject' = 'wake',
     extraTools: string[] = [],
-    images: Array<{ name: string; mime: string; url: string }> = [],
+    images: UserMessageImage[] = [],
+    attachments: UserMessageFile[] = [],
+    options: { sessionId?: string; clientMessageId?: string } = {},
   ) {
     const content = text.trim()
-    const pics = images.filter((item) => item?.url?.startsWith('data:image/')).slice(0, 6)
-    if (!content && !pics.length) return
-    const sessionId = await this.ensureSession()
+    const legacyImages = images.filter((item) => item?.url?.startsWith('data:image/'))
+    validateMessageFiles(attachments, legacyImages.length)
+    if (!content && !legacyImages.length && !attachments.length) return
+    const sessionId = options.sessionId ?? this.value.sessionId ?? await this.ensureSession()
+    if (this.value.sessionId !== sessionId) throw new Error('会话已切换，请返回原会话重试')
+    if (attachments.some((file) => !attachmentUrl(file, sessionId))) throw new Error('附件不属于当前会话或引用无效')
+    const clientMessageId = options.clientMessageId ?? crypto.randomUUID()
+    const pics = [...legacyImages, ...attachments.filter((file) => file.mime.startsWith('image/'))]
+    const files = attachments.filter((file) => !file.mime.startsWith('image/'))
+    const messageText = content || (files.length ? '（附件）' : '（图片）')
     const tools = [...new Set(extraTools.map((name) => name.trim()).filter(Boolean))]
     const liveContext = captureLiveUiContext(this)
     const busy = this.value.pending || this.value.agentStatus === 'running'
     const hasWake = this.value.inbox.some((item) => item.kind === 'wake')
-    // 忙碌且已有 wake：再发 → inject；否则 wake。
-    // 空闲 wake 也必须 wait:false：否则 POST 会卡到整段生成完（背长文会空等七八秒，
-    // 轨迹里也没有 assistant/chunk），HTTP/1 还可能堵住同域 WS。
     const effectiveKind: 'wake' | 'inject' =
       kind === 'inject' || (kind === 'wake' && busy && hasWake) ? 'inject' : 'wake'
-    const imagePayload = pics.length ? { images: pics } : {}
-    const body: Record<string, unknown> =
-      effectiveKind === 'inject'
-        ? { text: content || '（图片）', kind: 'inject', ...(tools.length ? { extraTools: tools } : {}), ...(liveContext ? { liveContext } : {}), ...imagePayload }
-        : {
-            text: content || '（图片）',
-            wait: false,
-            ...(tools.length ? { extraTools: tools } : {}),
-            ...(liveContext ? { liveContext } : {}),
-            ...imagePayload,
-          }
-
-    if (busy) this.enqueueLocalInbox(effectiveKind, content || '（图片）')
-
-    if (effectiveKind === 'inject') {
-      const res = await fetch(`/api/sessions/${sessionId}/messages`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      const data = (await res.json()) as { error?: string; inbox?: InboxQueueItem[] }
-      if (!res.ok) {
-        this.replace({ error: data.error || `注入失败：${res.status}` })
-        throw new Error(data.error || `注入失败：${res.status}`)
-      }
-      if (Array.isArray(data.inbox)) this.setInbox(data.inbox, sessionId)
-      return
+    const body = {
+      text: messageText,
+      clientMessageId,
+      ...(effectiveKind === 'inject' ? { kind: 'inject' } : { wait: false }),
+      ...(tools.length ? { extraTools: tools } : {}),
+      ...(liveContext ? { liveContext } : {}),
+      ...(legacyImages.length ? { images: legacyImages } : {}),
+      ...(attachments.length ? { files: attachments.map((file) => file.id) } : {}),
     }
-
-    this.markBusyHold()
-    this.setAgentStatus('running', undefined, sessionId)
+    const localInboxId = busy ? this.enqueueLocalInbox(effectiveKind, messageText, pics, files, clientMessageId) : undefined
+    if (effectiveKind === 'wake') {
+      this.markBusyHold()
+      this.setAgentStatus('running', undefined, sessionId)
+      if (!busy) this.paintOutgoingUser(sessionId, messageText, pics, files, clientMessageId)
+    }
     this.replace({ error: undefined })
-    if (!busy) this.paintOutgoingUser(sessionId, content || '（图片）', pics)
     try {
-      const res = await fetch(`/api/sessions/${sessionId}/messages`, {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
@@ -1598,55 +1637,75 @@ export class SessionViewService extends Service {
         error?: string
         sessionId?: string
         text?: string
-        queued?: boolean
         inbox?: InboxQueueItem[]
       }
       if (!res.ok) throw new Error(data.error || `发送失败：${res.status}`)
       if (Array.isArray(data.inbox)) this.setInbox(data.inbox, data.sessionId ?? sessionId)
-      // wait:false：HTTP 立刻返回，token / 状态走 WS。不要 GET 整页，会和首包 chunk 抢，看起来像先卡再整段弹出。
-      if (typeof data.text === 'string' && data.text.startsWith('模型调用失败：')) {
+      if (this.value.sessionId === sessionId && typeof data.text === 'string' && data.text.startsWith('模型调用失败：')) {
         this.replace({ error: data.text })
       }
     } catch (error) {
-      try {
-        await this.load(sessionId, { view: this.value.view, wait: true })
-      } catch {
-        /* 加载失败时仍展示下方 error */
+      const events = this.value.sessionId === sessionId ? this.value.events : this.cache.get(sessionId)?.events ?? []
+      if (events.some((item) => item.type === 'user/message' && item.seq >= 0 && item.clientMessageId === clientMessageId)) return
+      const withoutOutgoing = events.filter((item) => !(item.type === 'user/message' && item.seq < 0 && item.clientMessageId === clientMessageId))
+      if (this.value.sessionId === sessionId) {
+        if (!busy && effectiveKind === 'wake') this.setAgentStatus('idle', undefined, sessionId)
+        this.replace({
+          events: withoutOutgoing,
+          nodes: this.buildNodes(withoutOutgoing),
+          inbox: this.value.inbox.filter((item) => item.id !== localInboxId),
+          error: String(error),
+        })
+        this.stashCurrent()
+      } else {
+        const cached = this.cache.get(sessionId)
+        if (cached) this.putCache(sessionId, { ...cached, events: withoutOutgoing, nodes: this.buildNodes(withoutOutgoing, cached.dispatchedUsageByTurn) })
       }
-      this.setAgentStatus('idle', undefined, sessionId)
-      this.replace({ error: String(error) })
       throw error
     }
-    // 成功后不要在 finally 里强行 idle：agent 仍在跑，状态交给 WS agent/status
   }
 
-  private enqueueLocalInbox(kind: 'wake' | 'inject', text: string) {
-    const item = {
+  private enqueueLocalInbox(
+    kind: 'wake' | 'inject',
+    text: string,
+    images: UserMessageImage[],
+    files: UserMessageFile[],
+    clientMessageId: string,
+  ) {
+    const item: InboxQueueItem = {
       id: `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
       kind,
       text,
+      clientMessageId,
+      ...(images.length ? { images } : {}),
+      ...(files.length ? { files } : {}),
     }
     this.replace({ inbox: [...this.value.inbox, item] })
+    return item.id
   }
+
+  private outgoingSeq = 0
 
   private paintOutgoingUser(
     sessionId: string,
     text: string,
-    images: Array<{ name: string; mime: string; url: string }>,
+    images: UserMessageImage[],
+    files: UserMessageFile[],
+    clientMessageId: string,
   ) {
     if (this.value.sessionId !== sessionId) return
     if (this.holdPreviousThread) return
-    const exists = this.value.events.some(
-      (item) => item.type === 'user/message' && item.text === text && item.ts > Date.now() - 8000,
-    )
-    if (exists) return
+    if (this.value.events.some((item) => item.type === 'user/message' && item.clientMessageId === clientMessageId)) return
+    this.outgoingSeq = Math.min(-Date.now(), this.outgoingSeq - 1)
     this.ingest(sessionId, {
       type: 'user/message',
       text,
       kind: 'wake',
-      seq: -Date.now(),
+      seq: this.outgoingSeq,
       ts: Date.now(),
+      clientMessageId,
       ...(images.length ? { images } : {}),
+      ...(files.length ? { files } : {}),
     })
   }
 

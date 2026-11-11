@@ -19,7 +19,7 @@ import {
 import { ImageThumbs } from './image-thumbs.tsx'
 import { ForkGlyph } from './fork-glyph.tsx'
 import { bindSessionView, type SessionListItem, type SessionViewService } from '@biu/web-session-view'
-import { nodeIdFromOutlineEvent } from '@biu/web-session-view'
+import { attachmentUrl, formatAttachmentSize, nodeIdFromOutlineEvent } from '@biu/web-session-view'
 import {
   formatTokens,
   type ChatNode,
@@ -683,7 +683,20 @@ function NodeView({
             ) : null}
             <UserBubbleEditor text={node.text} />
           </div>
-          {node.images?.length ? <ImageThumbs images={node.images} /> : null}
+          {node.images?.length ? <ImageThumbs images={node.images.filter((image) => image.id ? Boolean(attachmentUrl({ id: image.id, url: image.url }, sessionId)) : image.url.startsWith('data:image/'))} /> : null}
+          {node.files?.length ? (
+            <div className="chat-attachment-list" aria-label="消息附件">
+              {node.files.map((file) => {
+                const url = attachmentUrl(file, sessionId)
+                return url ? (
+                  <a key={file.id} className="chat-attachment-link" href={url} download={file.name}>
+                    <span className="chat-attachment-name">{file.name}</span>
+                    <span className="chat-attachment-size">{formatAttachmentSize(file.size)}</span>
+                  </a>
+                ) : <span key={file.id} className="chat-attachment-link">{file.name}（附件不可用）</span>
+              })}
+            </div>
+          ) : null}
         </div>
         <UserTurnBar
           user={node}

@@ -9,6 +9,7 @@
     ".": "./src/host/index.ts",
     "./scope": "./src/host/session-scope.ts",
     "./artifacts": "./src/host/artifacts.ts",
+    "./attachments": "./src/host/attachments.ts",
     "./window": "./src/host/session-window.ts",
     "./trajectory": "./src/host/trajectory-index.ts",
     "./mascot": "./src/host/session-mascot.ts"
