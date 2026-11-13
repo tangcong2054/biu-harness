@@ -90,26 +90,23 @@ function seed(ctx: Context) {
   })
 }
 
-test('云端只列出当前工作区可见的技能', async () => {
+test('桌面端技能包跨空间可见，Agent 也能读到', async () => {
   const ctx = await boot({ visible: new Set(['mine']) })
   const { mine, other } = await seed(ctx)
   const listed = runWithAccount('acc_test', () => ctx.skills.list())
-  assert.deepEqual(listed.map((item) => item.id), [mine.id])
-  assert.equal(runWithAccount('acc_test', () => ctx.skills.summaries().length), 1)
+  assert.deepEqual(listed.map((item) => item.id).sort(), [mine.id, other.id].sort())
+  assert.equal(runWithAccount('acc_test', () => ctx.skills.summaries().length), 2)
   assert.doesNotThrow(() => runWithAccount('acc_test', () => ctx.skills.read(mine.id)))
-  // 别的工作区的技能：读不到
-  assert.throws(() => runWithAccount('acc_test', () => ctx.skills.read(other.id)), /unknown skill/)
-  assert.equal(ctx.skills.recordOrNull(other.id), null)
-  assert.deepEqual(ctx.skills.filesOf(other.id), [])
-  assert.throws(() => ctx.skills.fileText(other.id, 'SKILL.md'), /unknown skill/)
+  assert.doesNotThrow(() => runWithAccount('acc_test', () => ctx.skills.read(other.id)))
+  assert.equal(ctx.skills.recordOrNull(other.id)?.id, other.id)
 })
 
-test('promptSection 不泄露别的工作区的技能', async () => {
+test('promptSection 列出本机全部技能包', async () => {
   const ctx = await boot({ visible: new Set(['mine']) })
   await seed(ctx)
   const prompt = runWithAccount('acc_test', () => ctx.skills.promptSection())
   assert.match(prompt, /mine/)
-  assert.doesNotMatch(prompt, /other/)
+  assert.match(prompt, /other/)
 })
 
 test('没有账号服务时（本地 / 桌面）保持全部可见', async () => {
@@ -119,12 +116,11 @@ test('没有账号服务时（本地 / 桌面）保持全部可见', async () =>
   assert.deepEqual(listed.map((item) => item.id).sort(), [mine.id, other.id].sort())
 })
 
-test('云端但拿不到工作区时 fail-closed', async () => {
+test('桌面端没有工作区时仍可导入，技能留在本机目录', async () => {
   const ctx = await boot({ workspaceId: '', visible: new Set(['mine']) })
-  // 有账号但没有工作区：认领失败，导入回滚，不留下无归属技能。
-  await assert.rejects(() => seed(ctx), /没有可用工作区/)
-  assert.deepEqual(runWithAccount('acc_test', () => ctx.skills.list()), [])
-  assert.equal(ctx.skills.recordOrNull('mine'), null)
+  const { mine } = await seed(ctx)
+  assert.equal(mine.id, 'mine')
+  assert.deepEqual(runWithAccount('acc_test', () => ctx.skills.list()).map((item) => item.id).sort(), ['mine', 'other'])
 })
 
 test('BIU_SKILL_DEFAULT_WORKSPACE 可兜底', async () => {
@@ -132,5 +128,64 @@ test('BIU_SKILL_DEFAULT_WORKSPACE 可兜底', async () => {
   const ctx = await boot({ workspaceId: '', visible: new Set(['mine']) })
   await seed(ctx)
   const listed = runWithAccount('acc_test', () => ctx.skills.list())
-  assert.deepEqual(listed.map((item) => item.id), ['mine'])
+  assert.deepEqual(listed.map((item) => item.id).sort(), ['mine', 'other'])
+})
+
+test('MySQL：只列出当前工作区认领的技能', async () => {
+  dir = mkdtempSync(join(tmpdir(), 'biu-skills-scope-mysql-'))
+  process.env.BIU_SKILL_ROOT = join(dir, 'skill')
+  process.env.BIU_SKILLS_DIR = join(dir, 'legacy-skills')
+  const owned = new Set<string>()
+
+  class FakeAccount extends Service {
+    usesMysqlAccounts() {
+      return true
+    }
+    mysql = {
+      async membership() {
+        return { role: 'member', memberKind: 'member' }
+      },
+      async ownedRecordIds() {
+        return [...owned]
+      },
+      async ownerWorkspaceIds(_collection: string, recordId: string) {
+        if (recordId === 'other') return ['ws_other']
+        return owned.has(recordId) ? ['ws_a'] : []
+      },
+      async claimRecord(input: { recordId: string }) {
+        owned.add(input.recordId)
+      },
+    }
+    store = { activeWorkspaceId: () => 'ws_a', claim: () => ({ ok: true }) }
+    constructor(ctx: Context) {
+      super(ctx, 'account')
+    }
+  }
+
+  const ctx = new Context()
+  new FakeDatabase(ctx)
+  new FakeHttp(ctx)
+  new FakeAccount(ctx)
+  await ctx.plugin(tools)
+  await ctx.plugin(systemPrompt)
+  await ctx.plugin(skills)
+  const { runWithRequestWorkspace } = await import('@biu/host-plugin-loader/data-dir')
+  await runWithAccount('acc_test', () => runWithRequestWorkspace('ws_a', async () => {
+    await ctx.skills.import({
+      name: 'mine',
+      description: '本工作区的技能',
+      files: [{ path: 'SKILL.md', content: '---\nname: mine\ndescription: 本工作区的技能\n---\n正文' }],
+    })
+    await assert.rejects(
+      ctx.skills.import({
+        name: 'other',
+        description: '别的工作区的技能',
+        files: [{ path: 'SKILL.md', content: '---\nname: other\ndescription: 别的工作区的技能\n---\n正文' }],
+      }),
+      /另一个空间/,
+    )
+    await ctx.skills.ensureOwned()
+    assert.deepEqual(ctx.skills.list().map((item) => item.id), ['mine'])
+    assert.equal(ctx.skills.recordOrNull('other'), null)
+  }))
 })

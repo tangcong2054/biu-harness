@@ -118,7 +118,7 @@ export class SkillsService extends Service {
 
   /**
    * 把技能认领到当前工作区。
-   * 文件只落在运行目录的磁盘上；Online 没有 record_owners 时，列表会把它当成私有记录藏起来。
+   * 线上 MySQL：id 跨空间独占。桌面 SQLite：技能是本机安装包，别的空间已经占用时不报错、不回滚。
    */
   private async claimOwnership(id: string) {
     const actorId = currentAccountId()
@@ -131,7 +131,10 @@ export class SkillsService extends Service {
       return
     }
     const workspaceId = this.workspaceId()
-    if (!workspaceId) throw new Error('没有可用工作区，无法认领 Skill')
+    if (!workspaceId) {
+      if (mysql?.claimRecord) throw new Error('没有可用工作区，无法认领 Skill')
+      return
+    }
     if (mysql?.claimRecord) {
       const owners = await mysql.ownerWorkspaceIds('/skills', id)
       if (owners.some((owner) => owner !== workspaceId)) {
@@ -149,42 +152,27 @@ export class SkillsService extends Service {
       this.rememberOwned(workspaceId, id)
       return
     }
-    account!.store!.claim!(actorId, workspaceId, '/skills', id)
+    try {
+      account!.store!.claim!(actorId, workspaceId, '/skills', id)
+    } catch (error) {
+      const message = String(error instanceof Error ? error.message : error)
+      if (/另一个空间|已经有归属/.test(message)) return
+      throw error
+    }
   }
 
   /**
-   * 云端：返回当前工作区可见的技能 id；`null` 表示不做过滤（本地 / 桌面模式）。
-   * 技能目录是全局单份，只有这一层把「可见性」约束到工作区，
-   * 否则 Agent 的 promptSection / skill_list / skill_read 会读到别的空间技能。
+   * 线上 MySQL：只返回当前工作区认领的技能。
+   * 桌面 / 本机：技能是机器级安装包，目录全局一份，所有空间都能用；`null` 表示不过滤。
    */
-  private visibleIds(skills = this.store.list()): Set<string> | null {
+  private visibleIds(): Set<string> | null {
     try {
       const account = this.account()
-      const authorization = account?.authorization
+      if (!account?.usesMysqlAccounts?.()) return null
       const workspaceId = this.workspaceId()
       const accountId = currentAccountId()
-      if (account?.usesMysqlAccounts?.()) {
-        if (!workspaceId || !accountId) return new Set()
-        return this.ownedByWorkspace.get(workspaceId) ?? new Set()
-      }
-      // 没有账号服务（本地 / 桌面）：沿用旧行为，全部可见。
-      if (!authorization?.authorize) return null
-      // 云端但拿不到工作区/账号：fail-closed，一条都不给。
       if (!workspaceId || !accountId) return new Set()
-      const actor =
-        authorization.currentActor?.() ?? ({ type: 'account', accountId, workspaceId } as const)
-      if (actor && actor.workspaceId && actor.workspaceId !== workspaceId) return new Set()
-      const ids = new Set<string>()
-      for (const skill of skills) {
-        const decision = authorization.authorize(actor, 'resource:read', {
-          type: 'record',
-          workspaceId,
-          collection: '/skills',
-          recordId: skill.id,
-        })
-        if (decision?.allowed) ids.add(skill.id)
-      }
-      return ids
+      return this.ownedByWorkspace.get(workspaceId) ?? new Set()
     } catch {
       // 授权服务异常时宁可不给，也不要把全部技能暴露出去。
       return new Set()
@@ -278,7 +266,7 @@ export class SkillsService extends Service {
 
   list(): SkillRecord[] {
     const all = this.store.list()
-    const ids = this.visibleIds(all)
+    const ids = this.visibleIds()
     return ids ? all.filter((item) => ids.has(item.id)) : all
   }
 
@@ -371,7 +359,7 @@ export class SkillsService extends Service {
 
   async import(input: SkillImportInput) {
     assertNotReserved(input.id)
-    const created = this.store.import(input)
+    const { record: created, reused } = this.store.commitImport(input)
     if (isBuiltinSkillId(created.id)) {
       this.store.remove(created.id)
       assertNotReserved(created.id)
@@ -379,7 +367,7 @@ export class SkillsService extends Service {
     try {
       await this.claimOwnership(created.id)
     } catch (error) {
-      this.store.remove(created.id)
+      if (!reused) this.store.remove(created.id)
       throw error
     }
     this.changed()

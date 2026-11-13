@@ -1135,6 +1135,7 @@ export class DatabaseService extends Service implements Database {
     const authorization = this.authorization()
     const actor = authorization?.currentActor()
     const keep = <R extends T>(row: R, sqliteAllows: () => boolean) => {
+      if (this.deviceSkillVisible(collection, action)) return true
       // 已按账号·空间安装的插件包跨空间复用：记录归属在别的空间也要可见，不能被 MySQL 归属否决。
       if (collection === '/plugins' && actor?.type === 'account' && 'pluginPath' in row &&
         (action === 'resource:read' || action === 'resource:list') &&
@@ -1155,6 +1156,7 @@ export class DatabaseService extends Service implements Database {
         if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) {
           return action === 'resource:read' || action === 'resource:list'
         }
+        if (this.deviceSkillVisible(collection, action)) return true
         if (collection === '/plugins' && actor.type === 'account' && 'pluginPath' in row &&
           (action === 'resource:read' || action === 'resource:list') &&
           this.installedPluginVisible(String(row.id ?? ''), actor.accountId, actor.workspaceId)) return true
@@ -1475,6 +1477,16 @@ export class DatabaseService extends Service implements Database {
       || (collection === '/mcp' && record.id === 'echo' && record.builtin === true)
   }
 
+  /**
+   * 桌面端技能是本机安装包：磁盘上只有一份，列表/阅读不按工作区归属过滤。
+   * 线上 MySQL 仍按空间认领隔离。
+   */
+  private deviceSkillVisible(collection: string, action: PermissionAction) {
+    if (collection !== '/skills') return false
+    if (action !== 'resource:read' && action !== 'resource:list') return false
+    return this.mysqlAccount()?.usesMysqlAccounts?.() !== true
+  }
+
   private assertLiveRecord(
     spec: CollectionSpec,
     id: string,
@@ -1494,6 +1506,7 @@ export class DatabaseService extends Service implements Database {
       if (action === 'resource:read' || action === 'resource:list') return Promise.resolve()
       return Promise.reject(new Error('permission denied: INSUFFICIENT_PERMISSION'))
     }
+    if (this.deviceSkillVisible(spec.path, action)) return Promise.resolve()
     if (spec.path === '/plugins' && (action === 'resource:read' || action === 'resource:list')) {
       const mode = this.mysqlUserMode()
       const actor = mode
@@ -2121,6 +2134,10 @@ export class DatabaseService extends Service implements Database {
     for (const row of rows) {
       if (this.builtinShared(collection, row as { id?: unknown; builtin?: unknown })) {
         shared.push(row)
+        continue
+      }
+      if (this.deviceSkillVisible(collection, 'resource:read')) {
+        workspace.push(row)
         continue
       }
       if (collection === '/plugins' && actor.type === 'account' && 'pluginPath' in row &&

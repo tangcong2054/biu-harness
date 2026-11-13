@@ -345,6 +345,29 @@ test('import writes extra files under the skill id directory', () => {
   assert.match(store.readFile(record.id, 'scripts/render.mjs').text, /export const render/)
 })
 
+test('reimporting the same skill id updates the pack instead of failing', () => {
+  const store = new SkillsStore()
+  const first = store.import({
+    files: [
+      { path: 'abc/SKILL.md', content: '---\nname: ABC\ndescription: 旧说明\n---\n\n旧正文' },
+      { path: 'abc/old.md', content: '旧附件' },
+    ],
+  })
+  const again = store.import({
+    files: [
+      { path: 'abc/SKILL.md', content: '---\nname: ABC\ndescription: 新说明\n---\n\n新正文' },
+      { path: 'abc/new.md', content: '新附件' },
+    ],
+  })
+  assert.equal(first.id, 'abc')
+  assert.equal(again.id, 'abc')
+  assert.equal(store.list().length, 1)
+  assert.equal(again.description, '新说明')
+  assert.equal(again.notes, '新正文')
+  assert.equal(again.enabled, true)
+  assert.deepEqual(store.listFiles('abc'), ['new.md'])
+})
+
 test('skills only exposes enable/disable; files are read and written through the workspace path', async () => {
   const { ctx } = await boot()
   const spec = (ctx.database as FakeDatabase).specs.find((item) => item.path === '/skills')!
