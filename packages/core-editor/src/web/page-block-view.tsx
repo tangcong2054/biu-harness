@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type RefObject } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import { createPortal } from 'react-dom'
 import type { NodeViewProps } from '@tiptap/react'
 import { NodeViewWrapper } from '@tiptap/react'
@@ -137,7 +137,7 @@ function samePageBlockProps(prev: NodeViewProps, next: NodeViewProps) {
   )
 }
 
-export const PageBlockView = memo(function PageBlockView({ node, updateAttributes, editor, getPos }: NodeViewProps) {
+export const PageBlockView = memo(function PageBlockView({ node, updateAttributes, editor }: NodeViewProps) {
   usePageEditorVersion()
   const kind = String(node.attrs.kind ?? 'card')
   const plugin = String(node.attrs.plugin ?? '').trim()
@@ -257,22 +257,6 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
     }
   }, [cloneFrom, file])
 
-  const onMouseDown = (event: MouseEvent) => {
-    if (!editor.isEditable || editor.isDestroyed) return
-    const target = event.target instanceof Element
-      ? event.target
-      : event.target instanceof Node
-        ? event.target.parentElement
-        : null
-    if (target?.closest('textarea, input, select, button, a, [data-biu-select]')) return
-    // Pick overlay resolves the inner html node. A node selection here becomes
-    // a markdown fence pick on pointerup and hides that node.
-    if (document.documentElement.classList.contains('pick-mode')) return
-    const pos = getPos()
-    if (typeof pos !== 'number') return
-    editor.chain().setNodeSelection(pos).run()
-  }
-
   return (
     <NodeViewWrapper
       ref={hostRef}
@@ -288,7 +272,6 @@ export const PageBlockView = memo(function PageBlockView({ node, updateAttribute
       data-biu-label={pickLabel}
       contentEditable={false}
       data-testid={`page-block-${kind}`}
-      onMouseDown={onMouseDown}
     >
       {View && presentation ? <PagePresentationInlineActions controls={presentation} /> : null}
       {cloneFrom ? (
