@@ -94,6 +94,8 @@ import { currentSessionId } from '@biu/host-sessions/scope'
 import { databaseRevealForTool, normalizeCollectionPath, splitResourcePath } from '../paths.ts'
 import { matchListFilterRecord, normalizeSorts, sortRecordsBy } from '../query-logic.ts'
 import { AgentDbCompact } from './agent-payload.ts'
+import type { AccountService } from '@biu/host-account'
+import { parseSharingAction, parseSharingUpdate, RECORD_SHARING_ACTIONS, RECORD_SHARING_SCHEMA, type PublicLinkPatch } from './record-sharing.ts'
 
 const agentDbCompact = new AgentDbCompact()
 
@@ -915,6 +917,22 @@ export class DatabaseService extends Service implements Database {
     if (path === '/') throw new Error('collection path cannot be /')
     if (splitPath(path).length !== 1) throw new Error(`collection path must be one segment: ${path}`)
     let entry = { ...spec, path }
+    if (!isSystemCollection(path) && !isIndexCollection(path)) {
+      if (spec.actions?.some((action) => RECORD_SHARING_ACTIONS.some((builtin) => builtin.id === action.id))) {
+        throw new Error('sharing action ids are reserved')
+      }
+      entry = {
+        ...entry,
+        schema: { ...entry.schema, sharing: RECORD_SHARING_SCHEMA },
+        actions: [
+          ...(entry.actions ?? []),
+          ...RECORD_SHARING_ACTIONS.map((action) => ({
+            ...action,
+            run: (id: string, _record: DbRecord, args?: Record<string, unknown>) => this.runRecordSharingAction(path, id, action.id, args),
+          })),
+        ],
+      }
+    }
     return this.ctx.effect(() => {
       if (this.collections.has(entry.id)) throw new Error(`collection already registered: ${entry.id}`)
       if ([...this.collections.values()].some((item) => item.path === path && item.id !== entry.id)) {
@@ -2961,16 +2979,112 @@ export class DatabaseService extends Service implements Database {
     return { kind: 'record' as const, path: `${spec.path}/${record.id}`, schema: await this.schemaForCurrent(spec), value: withoutContent(spec, this.withBanner(spec, this.decorateRecord(spec, record))) }
   }
 
-  async update(path: string, content: unknown) {
+  private sharingAccount() {
+    return this.ctx.get('account') as AccountService | undefined
+  }
+
+  private sharingWorkspace(account: AccountService | undefined) {
+    return currentRequestWorkspaceId() || (!account?.usesMysqlAccounts() ? account?.store.activeWorkspaceId() : '') || ''
+  }
+
+  private requireSharingActor() {
+    const account = this.sharingAccount()
+    const workspaceId = this.sharingWorkspace(account)
+    if (!account || !currentAccountId() || !workspaceId) throw new Error('permission denied: UNAUTHENTICATED')
+    if (!account.usesMysqlAccounts() && account.authorization?.currentActor()?.workspaceId !== workspaceId) {
+      throw new Error('permission denied: WORKSPACE_MISMATCH')
+    }
+  }
+
+  private async forwardSharing(path: string, endpoint: string, body: Record<string, unknown>) {
+    this.requireSharingActor()
+    if (isOnlineRuntime()) return null
+    const account = this.sharingAccount()
+    const workspaceId = this.sharingWorkspace(account)
+    if (!workspaceId || account?.workspaceLocation(workspaceId) !== 'cloud') return null
+    const target = splitResourcePath(path)
+    if (!target?.recordId) throw new Error('sharing requires a record path')
+    const forwarded = await forwardCloud(this.ctx, target.collection, target.recordId, endpoint, { body })
+    if (!forwarded) throw new Error('permission denied: 请先登录云端账号')
+    if (forwarded.status >= 300) {
+      const failure = forwarded.body as { error?: string; code?: string } | null
+      throw Object.assign(new Error(failure?.error || `cloud sharing failed: ${forwarded.status}`), { code: failure?.code, status: forwarded.status })
+    }
+    return forwarded.body as { kind: 'record'; path: string; value: DbRecord; result?: unknown }
+  }
+
+  private publicLinkState(share: ShareRecord | null) {
+    return share ? { enabled: true, ...share, url: publicShareUrl(undefined, share.token) } : { enabled: false }
+  }
+
+  async setRecordPublicLink(path: string, patch: PublicLinkPatch, options: { implicitEnable?: boolean; viewId?: string } = {}) {
+    this.requireSharingActor()
+    const target = splitResourcePath(path)
+    if (!target?.recordId || isSystemCollection(target.collection) || isIndexCollection(target.collection)) {
+      throw new Error('sharing is only available for data records')
+    }
+    await this.requirePath(path, 'resource:share')
+    if (patch.enabled === false) {
+      this.shares.revokeRecord(target.collection, target.recordId)
+      await this.shares.flush()
+      this.invalidateCaches()
+      return null
+    }
+    if (!options.implicitEnable && patch.enabled !== true && !this.shares.findRecord(target.collection, target.recordId)) {
+      throw new Error('public link is disabled; set enabled:true to create it')
+    }
+    const share = this.shares.upsert({
+      kind: 'record', collection: target.collection, recordId: target.recordId, viewId: options.viewId,
+      password: patch.password, sharePlugins: patch.sharePlugins, allowCopy: patch.allowCopy,
+    })
+    await this.shares.flush()
+    this.invalidateCaches()
+    return share
+  }
+
+  private async runRecordSharingAction(collection: string, recordId: string, actionId: string, input?: Record<string, unknown>) {
+    const args = parseSharingAction(actionId, input)
+    const account = this.sharingAccount()
+    const workspaceId = this.sharingWorkspace(account)
+    const actorId = currentAccountId()
+    const collaborative = Boolean(account && workspaceId && (account.usesMysqlAccounts() || account.workspaceLocation(workspaceId) === 'cloud'))
+    if (actionId === 'sharing_get') {
+      const access = collaborative ? await account!.recordAccessDetails(actorId, workspaceId, collection, recordId) : null
+      return { sharing: { publicLink: this.publicLinkState(this.shares.findRecord(collection, recordId)), collaborationAvailable: collaborative, access } }
+    }
+    if (!account || !collaborative) throw new Error('本机空间不支持邀请协作者，请切换到云端空间')
+    const target = { actorId, workspaceId, collection, recordId }
+    const access = actionId === 'sharing_invite'
+      ? await account.inviteRecordCollaborator({ ...target, email: args.email!, role: args.role!, collaboratorKind: args.collaboratorKind })
+      : await account.revokeRecordCollaborator({ ...target, subjectType: 'account', subjectId: args.accountId! })
+    this.invalidateCaches()
+    return { sharing: { access } }
+  }
+
+  async update(path: string, content: unknown): Promise<{ kind: 'record'; path: string; value: DbRecord; result?: unknown }> {
+    const raw = parseContent(content)
+    const sharing = 'sharing' in raw ? parseSharingUpdate(raw) : null
+    if (sharing) {
+      const forwarded = await this.forwardSharing(path, '/api/db/update', { path, content: raw })
+      if (forwarded) return forwarded
+    }
     await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length !== 2) throw new Error(`cannot update: ${normalizeCollectionPath(path)}`)
     const spec = this.collection(`/${parts[0]}`)
     if (!spec) throw new Error(`unknown collection: /${parts[0]}`)
     const schema = schemaFor(spec)
-    const raw = parseContent(content)
     const current = await spec.get(parts[1]!)
     if (!current) throw new Error(`unknown record: ${spec.path}/${parts[1]}`)
+    if (sharing) {
+      const share = await this.setRecordPublicLink(path, sharing)
+      return {
+        kind: 'record' as const,
+        path: `${spec.path}/${current.id}`,
+        value: withoutContent(spec, this.withBanner(spec, this.decorateRecord(spec, current))),
+        result: { sharing: { publicLink: this.publicLinkState(share) } },
+      }
+    }
     await this.assertLiveRecord(spec, current.id, 'resource:update', current)
     const bannerPatch = takeBannerPatch(raw)
     if ('facet' in raw && schema.fields.facet) {
@@ -3377,6 +3491,11 @@ export class DatabaseService extends Service implements Database {
   }
 
   async action(path: string, actionId: string, args?: Record<string, unknown>) {
+    if (RECORD_SHARING_ACTIONS.some((action) => action.id === actionId)) {
+      parseSharingAction(actionId, args)
+      const forwarded = await this.forwardSharing(path, '/api/db/action', { path, action: actionId, args })
+      if (forwarded) return forwarded
+    }
     await this.prepareMetadata()
     const parts = splitPath(path)
     if (parts.length !== 2) throw new Error(`cannot action: ${normalizeCollectionPath(path)}`)
@@ -3410,6 +3529,10 @@ export class DatabaseService extends Service implements Database {
     }
     if (!matchActionWhen(record, action.when)) throw new Error(`action not available: ${actionId}`)
     const result = await action.run(parts[1]!, record, args)
+    if (RECORD_SHARING_ACTIONS.some((builtin) => builtin.id === actionId)) {
+      if (actionId !== 'sharing_get') this.bump()
+      return { kind: 'record' as const, path: `${spec.path}/${record.id}`, value: withoutContent(spec, record), result }
+    }
     const after = spec.path === '/plugins' ? await this.pluginOwnership(parts[1]!) : null
     if (after && actionId === 'sandbox' && !after.here && !after.elsewhere) {
       await this.attachWorkspaceRecord(spec.path, parts[1]!, { ownership: 'personal', accessMode: 'private' })
@@ -4237,7 +4360,7 @@ export function apply(ctx: Context) {
   })
   ctx.tools.register({
     name: 'db_update',
-    description: '按表结构 schema 的可写字段更新一条已有记录，路径为 /<表>/<id>。成功只返回 {ok, path}，不回整行。合集 facet：可同时贴多个。一个合集用扁平 values，如 {tags:["facet-2"],values:{导演:"查泽雷"}}；多个合集必须按合集分子对象，如 {tags:["facet-2","awards"],values:{"facet-2":{导演:"查泽雷"},awards:{oscar:true}}}。省略 tags 则改当前已贴合集的属性（合并，不撕掉别的合集）。改合集定义用 db_update /facets/<id> content.fields。新建用 db_create，正文用 db_content。',
+    description: '按表结构 schema 的可写字段更新一条已有记录，路径为 /<表>/<id>。通常返回 {ok, path}，不回整行。公开分享用 content:{sharing:{publicLink:{enabled:true}}}，可设置 password、sharePlugins、allowCopy，关闭用 enabled:false；必须单独更新，不与普通字段混写，参数见 db_stat schema.sharing，结果带 result.sharing（含链接）。shareScope/shareRole 仍只读。邀请和查看协作者用 db_action sharing_invite/sharing_get/sharing_revoke。合集 facet：可同时贴多个。一个合集用扁平 values，如 {tags:["facet-2"],values:{导演:"查泽雷"}}；多个合集必须按合集分子对象，如 {tags:["facet-2","awards"],values:{"facet-2":{导演:"查泽雷"},awards:{oscar:true}}}。省略 tags 则改当前已贴合集的属性（合并，不撕掉别的合集）。改合集定义用 db_update /facets/<id> content.fields。新建用 db_create，正文用 db_content。',
     parameters: {
       type: 'object',
       properties: {
@@ -4321,7 +4444,7 @@ export function apply(ctx: Context) {
   ctx.tools.register({
     name: 'db_action',
     description:
-      '对一条记录执行该表登记的动作。路径为 /<表>/<id>，action 为动作 id（见 db_stat 的 schema.actions）。成功返回 {ok, path}，有返回值时带 result，不回整行。需要参数时放在 args。任务派工/汇报、会话压缩/进度、插件创建/打包一律走这里。',
+      '对一条记录执行该表登记的动作。路径为 /<表>/<id>，action 为动作 id（见 db_stat 的 schema.actions）。成功返回 {ok, path}，有返回值时带 result，不回整行。需要参数时放在 args。共享管理：sharing_get 查看链接和直接协作者；sharing_invite 用 args:{email,role?,collaboratorKind?} 邀请已注册账号，默认 viewer/external，空间内部成员须指定 collaboratorKind:internal；sharing_revoke 用 args:{accountId} 撤销直接授权，不撤销继承权限。公开链接开关用 db_update content.sharing。任务派工/汇报、会话压缩/进度、插件创建/打包一律走这里。',
     parameters: {
       type: 'object',
       properties: {
@@ -5106,14 +5229,18 @@ export function apply(ctx: Context) {
         route.send(401, { error: '请先登录云端账号' })
         return
       }
-      await db.requirePath(kind === 'record' ? `${collection}/${recordId}` : collection, 'resource:share')
-      if (kind === 'view' && !publicViewShareAllowed(collection, String(body.viewId ?? ''), body.enabled === false)) {
+      if (kind === 'record') {
+        const share = await db.setRecordPublicLink(`${collection}/${recordId}`, body, { implicitEnable: true, viewId: body.viewId })
+        route.send(200, { share: share ? { ...share, url: publicShareUrl(route.req, share.token) } : null })
+        return
+      }
+      await db.requirePath(collection, 'resource:share')
+      if (!publicViewShareAllowed(collection, String(body.viewId ?? ''), body.enabled === false)) {
         route.send(403, { code: 'VIEW_SHARE_DENIED', error: '只有视图的创建者可以开启或关闭它的公开链接' })
         return
       }
       if (body.enabled === false) {
-        if (kind === 'record') shares.revokeRecord(collection, recordId)
-        else shares.revokeTarget(kind, collection, body.viewId ?? '', body.recordId ?? '')
+        shares.revokeTarget(kind, collection, body.viewId ?? '', body.recordId ?? '')
         await shares.flush()
         route.send(200, { share: null })
         return

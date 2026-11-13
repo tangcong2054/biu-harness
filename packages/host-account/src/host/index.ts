@@ -160,6 +160,56 @@ export class AccountService extends Service {
     throw new CollabError(`MySQL 账号控制面尚未迁移此方法：${method}`, 501)
   }
 
+  private requireRecordCollaboration(actorId: string, workspaceId: string) {
+    if (!actorId) throw new CollabError('请先登录', 401)
+    if (!workspaceId) throw new CollabError('没有工作区', 400)
+    if (!this.usesMysqlAccounts()) {
+      if (this.workspaceLocation(workspaceId) !== 'cloud') {
+        throw new CollabError('本机空间仅供当前本地账号使用，不提供成员、分享或权限功能', 404)
+      }
+      if (this.store.activeWorkspaceId() !== workspaceId) throw new CollabError('工作区不匹配', 403)
+    }
+  }
+
+  async recordAccessDetails(actorId: string, workspaceId: string, collection: string, recordId: string, afterChange = false) {
+    this.requireRecordCollaboration(actorId, workspaceId)
+    try {
+      const raw = this.usesMysqlAccounts()
+        ? await this.mysql!.recordAccess(actorId, workspaceId, collection, recordId)
+        : this.store.recordAccess(actorId, collection, recordId)
+      return toRecordAccessDetails(raw as Record<string, unknown>)
+    } catch (error) {
+      if (afterChange && ((error as { code?: string })?.code === 'ACCESS_DETAILS_DENIED' || (error instanceof CollabError && error.status === 403))) {
+        return { ok: true as const, access: null }
+      }
+      throw error
+    }
+  }
+
+  async inviteRecordCollaborator(input: {
+    actorId: string; workspaceId: string; collection: string; recordId: string;
+    email: string; role: ResourceRole; collaboratorKind?: 'internal' | 'external'
+  }) {
+    this.requireRecordCollaboration(input.actorId, input.workspaceId)
+    if (this.usesMysqlAccounts()) {
+      const target = await this.mysql!.shareRecordWithEmail({ ...input, collaboratorKind: input.collaboratorKind ?? 'external', now: Date.now() })
+      if (!target) throw new CollabError('没有这个邮箱，对方需要先注册', 404)
+    } else {
+      this.store.shareWithEmail(input.actorId, input.collection, input.recordId, input.email, input.role, input.collaboratorKind ?? 'external')
+    }
+    return this.recordAccessDetails(input.actorId, input.workspaceId, input.collection, input.recordId, true)
+  }
+
+  async revokeRecordCollaborator(input: {
+    actorId: string; workspaceId: string; collection: string; recordId: string;
+    subjectType: 'account' | 'group' | 'member_view'; subjectId: string
+  }) {
+    this.requireRecordCollaboration(input.actorId, input.workspaceId)
+    if (this.usesMysqlAccounts()) await this.mysql!.revokeRecordGrant(input)
+    else this.store.revokeRecordGrant(input.actorId, input.collection, input.recordId, input.subjectType, input.subjectId)
+    return this.recordAccessDetails(input.actorId, input.workspaceId, input.collection, input.recordId, true)
+  }
+
   async resolveMcpCredential(token: string) {
     if (this.usesMysqlAccounts()) {
       return this.mysql!.resolveMcpCredential(controlPlaneTokenHash(token))
@@ -2152,7 +2202,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
           subjectType = 'group'
           subjectId = String(body.groupId)
         } else {
-          const target = await account.mysql!.shareRecordWithEmail({
+          route.send(200, await account.inviteRecordCollaborator({
             actorId: me.id,
             workspaceId,
             collection,
@@ -2160,15 +2210,7 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
             email: String(body.email ?? ''),
             role,
             collaboratorKind,
-            now: Date.now(),
-          })
-          if (!target) throw new CollabError('没有这个邮箱，对方需要先注册', 404)
-          route.send(200, await recordAccessAfterChange(
-            me.id,
-            workspaceId,
-            collection,
-            String(body.recordId ?? ''),
-          ))
+          }))
           return
         }
         await account.mysql!.grantRecord({
@@ -2220,7 +2262,13 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
       }
       if (body.memberViewId) account.store.grantMemberView(me.id, collection, recordId, String(body.memberViewId), role)
       else if (body.groupId) account.store.grantGroup(me.id, collection, recordId, String(body.groupId), role)
-      else account.store.shareWithEmail(me.id, collection, recordId, String(body.email ?? ''), role, kind)
+      else {
+        route.send(200, await account.inviteRecordCollaborator({
+          actorId: me.id, workspaceId: activeWorkspace!, collection, recordId,
+          email: String(body.email ?? ''), role, collaboratorKind: kind,
+        }))
+        return
+      }
       route.send(200, localRecordAccessAfterChange(me.id, collection, recordId))
     } catch (error) {
       fail(route, error)
@@ -2257,20 +2305,14 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
           ), String(body.viewId)))
           return
         }
-        await account.mysql!.revokeRecordGrant({
+        route.send(200, await account.revokeRecordCollaborator({
           actorId: me.id,
           workspaceId,
           collection,
           recordId: String(body.recordId ?? ''),
           subjectType,
           subjectId: String(body.subjectId ?? ''),
-        })
-        route.send(200, await recordAccessAfterChange(
-          me.id,
-          workspaceId,
-          collection,
-          String(body.recordId ?? ''),
-        ))
+        }))
         return
       }
       const me = actor(route)
@@ -2297,14 +2339,14 @@ export function apply(ctx: Context, config: AccountConfig = {}) {
         ), viewId))
         return
       }
-      account.store.revokeRecordGrant(
-        me.id,
-        String(body.collection ?? ''),
-        String(body.recordId ?? ''),
+      route.send(200, await account.revokeRecordCollaborator({
+        actorId: me.id,
+        workspaceId: activeWorkspace!,
+        collection: String(body.collection ?? ''),
+        recordId: String(body.recordId ?? ''),
         subjectType,
-        String(body.subjectId ?? ''),
-      )
-      route.send(200, localRecordAccessAfterChange(me.id, String(body.collection ?? ''), String(body.recordId ?? '')))
+        subjectId: String(body.subjectId ?? ''),
+      }))
     } catch (error) {
       fail(route, error)
     }

@@ -665,6 +665,8 @@ export type CollectionSchema = {
   /** 指向本表另一条记录 id 的字段。有则表格可按树展示；不写则按 parentId / parent 或数据里的父子引用推断。 */
   parentField?: string
   actions?: CollectionActionInfo[]
+  /** 平台共享配置的更新协议，不作为业务字段或表格列。 */
+  sharing?: { description: string; parameters: Record<string, unknown> }
   /** 记录权限，来自登记时的 records。list/get 始终有；update/create/delete 缺省为 false。 */
   records?: CollectionRecordCaps
 }

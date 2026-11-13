@@ -9,6 +9,7 @@ import * as http from '@biu/host-http'
 import * as account from '@biu/host-account'
 import * as tools from '@biu/host-tools'
 import { apply as applyFileSystem } from './index.ts'
+import { runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 
 const dirs: string[] = []
 
@@ -53,6 +54,10 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
     }
     if (url === '/api/account/workspaces') {
       res.end(JSON.stringify({ workspaces: [{ id: 'cloud-ws', name: '云端空间', role: 'owner' }] }))
+      return
+    }
+    if (url === '/api/db/action' || (url === '/api/db/update' && (body.content as { sharing?: unknown } | undefined)?.sharing)) {
+      res.end(JSON.stringify({ kind: 'record', path: '/pages/p1', value: { id: 'p1' }, result: { sharing: { publicLink: { enabled: true, url: '/share/test-link' } } } }))
       return
     }
     if (url === '/api/db/create' || url === '/api/db/update') {
@@ -131,7 +136,7 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ email: 'ada@example.com', password: 'secret1' }),
-    }).then((res) => res.json())) as { token: string; workspaceId: string }
+    }).then((res) => res.json())) as { id: string; token: string; workspaceId: string }
     const auth = {
       authorization: `Bearer ${registered.token}`,
       'content-type': 'application/json',
@@ -148,6 +153,18 @@ test('desktop cloud writes send the workspace header and forward bulk delete, re
       body: JSON.stringify({ workspaceId: 'cloud-ws' }),
     })).status, 200)
     const headers = { ...auth, 'x-biu-workspace-id': 'cloud-ws' }
+
+    captured.length = 0
+    const shared = await runWithAccount(registered.id, () => runWithRequestWorkspace('cloud-ws', () =>
+      ctx.tools.invoke('db_update', { path: '/pages/p1', content: { sharing: { publicLink: { enabled: true } } } }),
+    ))
+    assert.deepEqual(shared, { ok: true, path: '/pages/p1', result: { sharing: { publicLink: { enabled: true, url: '/share/test-link' } } } })
+    assert.equal(captured.some((item) => item.url === '/api/db/update' && item.workspaceId === 'cloud-ws'), true)
+    const invited = await runWithAccount(registered.id, () => runWithRequestWorkspace('cloud-ws', () =>
+      ctx.tools.invoke('db_action', { path: '/pages/p1', action: 'sharing_invite', args: { email: 'bob@example.test' } }),
+    ))
+    assert.equal((invited as { ok: boolean }).ok, true)
+    assert.equal(captured.some((item) => item.url === '/api/db/action' && item.workspaceId === 'cloud-ws' && item.body.action === 'sharing_invite'), true)
 
     captured.length = 0
     const created = await fetch(`${origin}/api/db/create`, {

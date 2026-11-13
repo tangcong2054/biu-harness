@@ -27,6 +27,7 @@ export class AgentDbCompact {
     if (schema.parentField) out.parentField = schema.parentField
     if (Object.keys(fields).length) out.fields = fields
     if (actions.length) out.actions = actions
+    if (schema.sharing) out.sharing = schema.sharing
     return out
   }
 
