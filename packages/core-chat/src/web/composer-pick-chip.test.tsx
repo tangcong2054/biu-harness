@@ -47,6 +47,36 @@ test('plainToInlineContent keeps line breaks and skips empty text nodes', () => 
   ])
 })
 
+test('composer preserves plugin selection source and location metadata', () => {
+  const editor = new Editor({ extensions: composerDocExtensions() as never })
+  try {
+    insertPickChips(editor, [{
+      kind: 'text',
+      id: 'plugin-selection',
+      label: '主实例',
+      route: '/pages/meta',
+      path: '/pages/meta',
+      title: '实例元数据',
+      selection: '主实例',
+      plugin: 'cdb-meta',
+      block_id: 'meta-1',
+      block_kind: 'cdb-meta',
+      element_id: 'cdb-meta:0/1',
+      location: '实例架构 / 主节点',
+      field: '角色',
+    }])
+    const ref = serializeComposer(editor).refs[0]
+    assert.equal(ref?.plugin, 'cdb-meta')
+    assert.equal(ref?.block_id, 'meta-1')
+    assert.equal(ref?.block_kind, 'cdb-meta')
+    assert.equal(ref?.element_id, 'cdb-meta:0/1')
+    assert.equal(ref?.location, '实例架构 / 主节点')
+    assert.equal(ref?.field, '角色')
+  } finally {
+    editor.destroy()
+  }
+})
+
 test('expanding a chip replaces it with editable original text', () => {
   const editor = new Editor({ extensions: composerDocExtensions() as never })
   try {

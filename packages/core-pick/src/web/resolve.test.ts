@@ -90,6 +90,32 @@ test('formatPicks keeps page title for the agent', () => {
   assert.equal(chipLabel(parsed.refs[0]!), '爱乐之城 (1)')
 })
 
+test('formatPicks keeps ordinary plugin selection location for the agent', () => {
+  const text = formatPicks([
+    {
+      kind: 'text',
+      id: 'plugin-text-1',
+      label: '252488077',
+      route: '/pages/tasks',
+      path: '/pages/tasks',
+      plugin: 'cdb-tasks',
+      block_id: 'block-1',
+      block_kind: 'cdb-tasks',
+      element_id: 'cdb-tasks:0/2/1',
+      location: '任务详情 / 表格第2行，第1列（任务 ID）',
+      field: '任务 ID',
+      selection: '252488077',
+    },
+  ])
+  const parsed = parsePicks(text).refs[0]
+  assert.equal(parsed?.plugin, 'cdb-tasks')
+  assert.equal(parsed?.block_id, 'block-1')
+  assert.equal(parsed?.block_kind, 'cdb-tasks')
+  assert.equal(parsed?.element_id, 'cdb-tasks:0/2/1')
+  assert.equal(parsed?.location, '任务详情 / 表格第2行，第1列（任务 ID）')
+  assert.equal(parsed?.field, '任务 ID')
+})
+
 test('text pick without source lines shows character count', () => {
   const ref = textPickFromPlain('/s/abc', 'hello world this is a pasted blob')
   assert.ok(ref)

@@ -7,6 +7,7 @@ import { PickOverlay } from './overlay.tsx'
 export { PickService, getPick, usePickState } from './service.ts'
 export { formatPicks, formatPick, parsePicks, splitPickStream, dedupePicks, chipLabel, chipCaption, pickKey, pickPreview, pickIdFromText, textPickFromSelection, textPickFromPlain, pickDomAttrs, pickChipAttrs, pickRefFromAttrs, withPickLocus, withHostSource, lineSpanLabel, chipSpanLabel, pickFullText, type PickRef } from './types.ts'
 export { bindEditorTextHost, editorHostFromNode } from './editor-host.ts'
+export { installPluginTextSelection, isPluginTextSelectionHotkey, pluginTextSelectionPick } from './plugin-text-selection.ts'
 export { PickChip, PickChipLabel, PickKindGlyph, pickKindIcon, pickKindTone, canonicalPickKind, copyPlainText } from './chip.tsx'
 export { resolvePickFromNode, resolvePickAtPoint, resolvePicksInRect, visiblePickBox, pickSurfaceFromNode, pickSurfaceAtPoint, serializeHtmlPickElement } from './resolve.ts'
 
