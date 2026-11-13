@@ -21,6 +21,12 @@ export type PickRef = {
   insert?: number
   /** 登记这块 UI 的插件 id，改呈现/卡片时对着它 sandbox。 */
   plugin?: string
+  /** 普通 DOM 插件选区所在的页面块和内部元素。 */
+  block_id?: string
+  block_kind?: string
+  element_id?: string
+  /** 面向 Agent 的可读位置，如「任务详情 / 表格第 2 行，第 3 列」。 */
+  location?: string
   /** HTML 块内被点中的节点 outerHTML（已去掉 pick 戳），text 仍是整块围栏。 */
   element?: string
   /** 表格单元格 / 详情属性：db_update 的字段名。 */
@@ -53,6 +59,10 @@ export function dedupePicks(refs: PickRef[]): PickRef[] {
       route: ref.route || prev.route,
       ...(ref.action || prev.action ? { action: ref.action || prev.action } : {}),
       ...(ref.plugin || prev.plugin ? { plugin: ref.plugin || prev.plugin } : {}),
+      ...(ref.block_id || prev.block_id ? { block_id: ref.block_id || prev.block_id } : {}),
+      ...(ref.block_kind || prev.block_kind ? { block_kind: ref.block_kind || prev.block_kind } : {}),
+      ...(ref.element_id || prev.element_id ? { element_id: ref.element_id || prev.element_id } : {}),
+      ...(ref.location || prev.location ? { location: ref.location || prev.location } : {}),
       ...(ref.field || prev.field ? { field: ref.field || prev.field } : {}),
       ...locusFields(ref.start_line != null ? ref : prev),
       ...sourceFields(ref.path ? ref : prev),
@@ -76,6 +86,10 @@ function pickPayload(ref: PickRef) {
   if (ref.kind !== 'text' && ref.label) data.label = ref.label
   if (ref.path) data.path = ref.path
   if (ref.plugin) data.plugin = ref.plugin
+  if (ref.block_id) data.block_id = ref.block_id
+  if (ref.block_kind) data.block_kind = ref.block_kind
+  if (ref.element_id) data.element_id = ref.element_id
+  if (ref.location) data.location = ref.location
   if (ref.start_line != null) data.start_line = ref.start_line
   if (ref.end_line != null) data.end_line = ref.end_line
   if (ref.text) data.text = ref.text
@@ -125,6 +139,10 @@ function parsePickAttrs(raw: string): PickRef | null {
     route: attrs.route?.trim() || '',
     ...(attrs.title?.trim() ? { title: attrs.title.trim() } : {}),
     ...(attrs.plugin?.trim() ? { plugin: attrs.plugin.trim() } : {}),
+    ...(attrs.block_id?.trim() ? { block_id: attrs.block_id.trim() } : {}),
+    ...(attrs.block_kind?.trim() ? { block_kind: attrs.block_kind.trim() } : {}),
+    ...(attrs.element_id?.trim() ? { element_id: attrs.element_id.trim() } : {}),
+    ...(attrs.location?.trim() ? { location: attrs.location.trim() } : {}),
     ...(attrs.field?.trim() ? { field: attrs.field.trim() } : {}),
     ...sourceFields({ path: attrs.path?.trim() }),
     ...locusFields({
@@ -322,6 +340,10 @@ export function pickChipAttrs(ref: PickRef) {
     action: ref.action ?? null,
     path: ref.path ?? null,
     plugin: ref.plugin ?? null,
+    block_id: ref.block_id ?? null,
+    block_kind: ref.block_kind ?? null,
+    element_id: ref.element_id ?? null,
+    location: ref.location ?? null,
     title: ref.title ?? null,
     start_line: ref.start_line ?? null,
     end_line: ref.end_line ?? null,
@@ -352,6 +374,10 @@ export function pickRefFromAttrs(attrs: Record<string, unknown>): PickRef | null
     ...(action ? { action } : {}),
     ...sourceFields({ path, title: String(attrs.title ?? '').trim() }),
     ...(String(attrs.plugin ?? '').trim() ? { plugin: String(attrs.plugin).trim() } : {}),
+    ...(String(attrs.block_id ?? '').trim() ? { block_id: String(attrs.block_id).trim() } : {}),
+    ...(String(attrs.block_kind ?? '').trim() ? { block_kind: String(attrs.block_kind).trim() } : {}),
+    ...(String(attrs.element_id ?? '').trim() ? { element_id: String(attrs.element_id).trim() } : {}),
+    ...(String(attrs.location ?? '').trim() ? { location: String(attrs.location).trim() } : {}),
     ...(String(attrs.field ?? '').trim() ? { field: String(attrs.field).trim() } : {}),
     ...locusFields({
       start_line: Number.isInteger(start) && start >= 1 ? start : undefined,

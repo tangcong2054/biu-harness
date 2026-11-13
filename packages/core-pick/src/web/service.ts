@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from 'react'
 import { Service, type Context } from 'cordis'
 import { pickKey, dedupePicks, type PickRef } from './types.ts'
+import { installPluginTextSelection } from './plugin-text-selection.ts'
 
 export type PickHover = { top: number; left: number; width: number; height: number }
 export type PickDraft = { text: string; send?: boolean }
@@ -65,9 +66,14 @@ export class PickService extends Service {
         }
       }
       window.addEventListener('storage', onStorage)
+      const disposePluginTextSelection = installPluginTextSelection(
+        (refs) => this.attach(refs),
+        () => this.route(),
+      )
       return () => {
         window.removeEventListener('biu:overlay-closed', onClosed)
         window.removeEventListener('storage', onStorage)
+        disposePluginTextSelection()
         this.channel?.close()
         this.channel = null
         if (boundPick === this) boundPick = undefined

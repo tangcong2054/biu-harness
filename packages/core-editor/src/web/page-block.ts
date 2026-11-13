@@ -81,7 +81,8 @@ export const pageBlock = Node.create({
   group: 'block',
   atom: true,
   selectable: true,
-  draggable: true,
+  // 页面块内容用于交互和选择文字；排序只允许走左侧专用拖拽把手。
+  draggable: false,
 
   addAttributes() {
     return {

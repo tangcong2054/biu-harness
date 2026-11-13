@@ -84,6 +84,23 @@ test('import 自动把技能认领到当前工作区', async () => {
   }
 })
 
+test('桌面端技能已被另一空间占用时导入复用，不回滚', async () => {
+  const { ctx, cleanup } = await boot()
+  try {
+    const account = ctx.get('account') as { store: { claim: (...args: string[]) => unknown } }
+    account.store.claim = () => { throw new Error('这条记录已经属于另一个空间') }
+    const created = await runWithAccount('acc_test', () => ctx.skills.import({
+      name: 'shared-pack',
+      description: '云端已经有了',
+      files: [{ path: 'SKILL.md', content: '---\nname: shared-pack\ndescription: 云端已经有了\n---\n正文' }],
+    }))
+    assert.equal(created.id, 'shared-pack')
+    assert.equal(ctx.skills.recordOrNull('shared-pack')?.id, 'shared-pack')
+  } finally {
+    cleanup()
+  }
+})
+
 test('认领失败时目录导入报错并清理未归属技能', async () => {
   const { ctx, cleanup } = await boot()
   try {

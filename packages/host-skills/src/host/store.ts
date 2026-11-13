@@ -35,8 +35,8 @@ export type SkillImportInput = {
 }
 
 const ID_PATTERN = /^[a-z][a-z0-9-]{1,63}$/
-const MAX_FILES = 500
-const MAX_TOTAL_CHARS = 5_000_000
+const MAX_FILES = 2000
+const MAX_TOTAL_CHARS = 20_000_000
 const SKIP_DIR = new Set(['node_modules', '.git', '__pycache__'])
 export const LEGACY_MIGRATED = '.biu-migrated'
 
@@ -441,22 +441,50 @@ export class SkillsStore {
     return created
   }
 
+  /**
+   * 按 SKILL.md 的稳定 id 写入。本机已有同名技能时覆盖元数据，并在包里带了附加文件时整包替换。
+   * 桌面端技能是机器级安装包，连上云端后同一个 id 应复用，而不是报 already exists。
+   */
   import(input: SkillImportInput) {
+    return this.commitImport(input).record
+  }
+
+  commitImport(input: SkillImportInput): { record: SkillRecord; reused: boolean } {
     const packed = packSkillImport(input.files ?? [])
     const description = String(input.description || packed.parsed.meta.description || '').trim()
-    return this.create({
-      id: trySkillId(String(input.id ?? '')) || trySkillId(packed.parsed.meta.name || '') || undefined,
-      name: input.name || packed.parsed.meta.name,
-      description,
-      source: input.source || packed.parsed.meta.source,
-      tags: input.tags,
-      emoji: input.emoji,
-      enabled: input.enabled,
-      notes: packed.notes,
-      files: packed.files,
-      // frontmatter 里带了 description 就不算草稿，即使调用方没在记录字段里给。
-      draft: input.draft ?? !description,
-    })
+    const name = String(input.name || packed.parsed.meta.name || '').trim() || '新技能'
+    const requested = trySkillId(String(input.id ?? '')) || trySkillId(packed.parsed.meta.name || '')
+    const existing = requested ? this.get(requested) : null
+    if (existing) {
+      const next = this.put({
+        ...existing,
+        name,
+        description: description || existing.description,
+        source: String(input.source || packed.parsed.meta.source || existing.source).trim(),
+        tags: input.tags !== undefined ? asStringList(input.tags) : existing.tags,
+        emoji: input.emoji !== undefined ? String(input.emoji ?? '').trim() : existing.emoji,
+        enabled: input.enabled !== undefined ? input.enabled !== false : description ? true : existing.enabled,
+        notes: packed.notes,
+      })
+      if (packed.files.length) this.replaceFiles(existing.id, packed.files)
+      return { record: next, reused: true }
+    }
+    return {
+      record: this.create({
+        id: requested || undefined,
+        name,
+        description,
+        source: input.source || packed.parsed.meta.source,
+        tags: input.tags,
+        emoji: input.emoji,
+        enabled: input.enabled,
+        notes: packed.notes,
+        files: packed.files,
+        // frontmatter 里带了 description 就不算草稿，即使调用方没在记录字段里给。
+        draft: input.draft ?? !description,
+      }),
+      reused: false,
+    }
   }
 
   patch(id: string, patch: { name?: unknown; description?: unknown; source?: unknown; enabled?: unknown; notes?: unknown; tags?: unknown; emoji?: unknown }) {
