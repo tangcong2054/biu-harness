@@ -8151,6 +8151,27 @@ html.dark .composer-send:disabled {
   background: color-mix(in srgb, var(--biu-tag, #5b9fd6) 34%, transparent);
 }
 
+.composer-tool-chip.is-pick.pick-chip-clipboard {
+  --clipboard-ink: #0f766e;
+  gap: 5px;
+  background: color-mix(in srgb, var(--clipboard-ink) 12%, transparent);
+  color: var(--clipboard-ink);
+}
+
+html.dark .composer-tool-chip.is-pick.pick-chip-clipboard {
+  --clipboard-ink: #5eead4;
+  background: color-mix(in srgb, var(--clipboard-ink) 18%, transparent);
+}
+
+.composer-tool-chip.is-pick.pick-chip-clipboard:hover {
+  background: color-mix(in srgb, var(--clipboard-ink) 24%, transparent);
+}
+
+.composer-tool-chip.is-pick.pick-chip-clipboard .pick-kind-icon {
+  width: 15px;
+  height: 15px;
+}
+
 .pick-kind-icon-wrap {
   display: inline-flex;
   flex-shrink: 0;

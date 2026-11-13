@@ -484,6 +484,7 @@ export const ChatComposer = memo(function ChatComposer(props: SlotProps) {
         const ref = textPickFromPlain(live.current.route, raw)
         if (!ref) return false
         event.preventDefault()
+        ref.title = 'Clipboard'
         live.current.pick?.add(ref)
         return true
       },

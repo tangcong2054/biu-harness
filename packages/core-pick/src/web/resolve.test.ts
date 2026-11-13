@@ -116,12 +116,22 @@ test('formatPicks keeps ordinary plugin selection location for the agent', () =>
   assert.equal(parsed?.field, '任务 ID')
 })
 
-test('text pick without source lines shows character count', () => {
+test('text pick without clipboard marker still shows character count', () => {
   const ref = textPickFromPlain('/s/abc', 'hello world this is a pasted blob')
   assert.ok(ref)
   assert.equal(chipCaption(ref).span, String(ref.selection?.length))
   assert.match(chipLabel(ref), /\(\d+\)$/)
   assert.equal(textPickFromPlain('/s/abc', '   '), null)
+})
+
+test('long clipboard paste shows its line count without changing the original text', () => {
+  const ref = textPickFromPlain('/s/abc', 'first\r\nsecond\n\nlast')
+  assert.ok(ref)
+  const pasted = { ...ref, title: 'Clipboard' }
+  assert.equal(chipLabel(pasted), 'Clipboard (4 lines)')
+  assert.equal(chipLabel({ ...pasted, selection: 'one line' }), 'Clipboard (1 line)')
+  assert.equal(chipLabel({ ...pasted, path: '/pages/p1', start_line: 2, end_line: 3 }), 'Clipboard (2-3)')
+  assert.equal(pasted.selection, ref.selection)
 })
 
 test('chip caption keeps line span off the truncated preview', () => {

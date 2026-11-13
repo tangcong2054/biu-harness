@@ -239,13 +239,22 @@ export function pickFullText(ref: Pick<PickRef, 'kind' | 'selection' | 'text'>) 
   return ref.selection || ref.text || ''
 }
 
-/** 有源码行号用行号；纯文本选区/长粘贴用字数。 */
+export function isClipboardPick(ref: PickRef) {
+  return ref.kind === 'text' && ref.title === 'Clipboard' && !ref.path && ref.start_line == null
+}
+
+/** 有源码行号用行号；剪贴板粘贴显示行数，其他文本选区显示字数。 */
 export function chipSpanLabel(ref: PickRef) {
   const lines = lineSpanLabel(ref)
   if (lines) return lines
   if (ref.kind !== 'text') return ''
-  const n = (ref.selection || ref.text || '').length
-  return n > 0 ? String(n) : ''
+  const text = ref.selection || ref.text || ''
+  if (isClipboardPick(ref)) {
+    if (!text) return ''
+    const count = text.split(/\r\n|\r|\n/).length
+    return `${count} ${count === 1 ? 'line' : 'lines'}`
+  }
+  return text.length > 0 ? String(text.length) : ''
 }
 
 function pickChipName(ref: PickRef) {
@@ -260,6 +269,7 @@ function pickChipName(ref: PickRef) {
 }
 
 export function chipCaption(ref: PickRef) {
+  if (isClipboardPick(ref)) return { name: 'Clipboard', span: chipSpanLabel(ref) }
   if (ref.action === 'banner') return { name: ref.label || '背景', span: '' }
   if (ref.action === 'view') return { name: ref.label || '呈现方式', span: '' }
   if (ref.field) {

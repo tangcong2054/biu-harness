@@ -13,10 +13,11 @@ import {
   TagIcon,
   WrenchScrewdriverIcon,
 } from '@heroicons/react/16/solid'
+import { ClipboardDocumentListIcon } from '@heroicons/react/24/outline'
 import { useState, type ComponentType } from 'react'
 import { ensureTagChipStyle, HeadlessPopover, TagChipCloseMark, tagTone } from '@biu/public-ui'
 import type { PickRef } from './types.ts'
-import { chipCaption, chipLabel, pickFullText } from './types.ts'
+import { chipCaption, chipLabel, isClipboardPick, pickFullText } from './types.ts'
 
 /** 注入侧可能写 tasks / sessions-db，芯片按规范 kind 取色和图标。 */
 const PICK_KIND_ALIAS: Record<string, string> = {
@@ -81,7 +82,9 @@ export function PickChipLabel({ pick }: { pick: PickRef }) {
   const { name, span } = chipCaption(pick)
   return (
     <>
-      <PickKindGlyph kind={pick.kind} />
+      {isClipboardPick(pick)
+        ? <ClipboardDocumentListIcon className="pick-kind-icon" aria-hidden data-testid="pick-kind-icon" data-pick-kind="clipboard" />
+        : <PickKindGlyph kind={pick.kind} />}
       <span className="pick-chip-name">{name}</span>
       {span ? <span className="pick-chip-lines">({span})</span> : null}
     </>
@@ -194,7 +197,7 @@ export function PickChip({
   const [open, setOpen] = useState(false)
   const chip = (
     <span
-      className={`biu-tag composer-tool-chip is-pick${full ? ' pick-chip-previewable' : ''}`}
+      className={`biu-tag composer-tool-chip is-pick${isClipboardPick(pick) ? ' pick-chip-clipboard' : ''}${full ? ' pick-chip-previewable' : ''}`}
       data-testid="user-pick-chip"
       data-pick-kind={pick.kind}
       title={full ? '点击查看原文' : `${pick.kind} · ${label}`}

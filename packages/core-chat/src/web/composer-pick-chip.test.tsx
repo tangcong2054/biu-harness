@@ -3,7 +3,7 @@ import { afterEach, test } from 'vitest'
 import assert from 'node:assert/strict'
 import { Editor } from '@tiptap/core'
 import { cleanup, render, fireEvent, waitFor } from '@testing-library/react'
-import { PickChip, pickChipAttrs, pickFullText, textPickFromPlain, type PickRef } from '@biu/core-pick/web'
+import { PickChip, chipLabel, pickChipAttrs, pickFullText, textPickFromPlain, type PickRef } from '@biu/core-pick/web'
 import { composerDocExtensions } from './composer-kit.ts'
 import { insertPickChips, serializeComposer } from './composer-tiptap.ts'
 import { plainToInlineContent } from './composer-pick-node.tsx'
@@ -21,6 +21,27 @@ function pastedChip(): PickRef {
 test('pickFullText only returns original text for text picks', () => {
   assert.equal(pickFullText(pastedChip()), LONG.trim())
   assert.equal(pickFullText({ kind: 'page', selection: 'x' }), '')
+})
+
+test('pasted clipboard card keeps its source, line count and full original through editor serialization', async () => {
+  const ref = { ...pastedChip(), title: 'Clipboard', selection: 'first\nsecond\nthird' }
+  const editor = new Editor({ extensions: composerDocExtensions() as never })
+  try {
+    insertPickChips(editor, [ref])
+    const packed = serializeComposer(editor)
+    assert.equal(packed.refs.length, 1)
+    assert.equal(packed.refs[0]?.title, 'Clipboard')
+    assert.equal(chipLabel(packed.refs[0]!), 'Clipboard (3 lines)')
+    assert.equal(pickFullText(packed.refs[0]!), 'first\nsecond\nthird')
+  } finally {
+    editor.destroy()
+  }
+  const { getByTestId } = render(<PickChip pick={ref} />)
+  assert.equal(getByTestId('user-pick-chip').textContent, 'Clipboard(3 lines)')
+  assert.ok(getByTestId('user-pick-chip').classList.contains('pick-chip-clipboard'))
+  assert.equal(getByTestId('pick-kind-icon').getAttribute('data-pick-kind'), 'clipboard')
+  fireEvent.click(getByTestId('user-pick-chip'))
+  await waitFor(() => assert.ok(getByTestId('pick-text-preview').textContent?.includes(ref.selection)))
 })
 
 test('copying a long paste chip puts the full original text on the clipboard', () => {
