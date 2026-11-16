@@ -949,6 +949,62 @@ test('deriveMessages honors context_compact_submit tool/call as new prefix', () 
   assert.ok(!joined.includes('早期回答B'))
 })
 
+test('automatic compact retains the current turn, tool pairs and replay refs across re-derivation', () => {
+  const events: SessionEvent[] = [
+    ev({ type: 'system/prompt', text: 'SYS', seq: 0 }),
+    ev({ type: 'user/message', text: '旧慢 SQL 问题', kind: 'wake', seq: 1 }),
+    ev({ type: 'assistant/message', text: '旧结果', seq: 2 }),
+    ev({ type: 'turn/start', turn: 2, seq: 3 }),
+    ev({ type: 'user/message', text: 'websql插件的readme是什么', kind: 'wake', seq: 4 }),
+    ev({ type: 'user/message', text: '不要继续旧报告', kind: 'inject', seq: 5 }),
+    ev({ type: 'assistant/message', text: '读取说明', replayRef: 'private-ref',
+      tool_calls: [{ id: 'read', name: 'read_readme', arguments: '{}' }], seq: 6 }),
+    ev({ type: 'tool/call', name: 'read_readme', id: 'read', arguments: '{}', seq: 7 }),
+    ev({ type: 'tool/call', name: 'context_compact_submit', id: 'compact',
+      arguments: JSON.stringify({ auto: true, text: '慢 SQL 已完成', retainFromSeq: 3 }), seq: 8 }),
+    ev({ type: 'tool/result', id: 'read', name: 'read_readme', ok: true, detail: 'README 内容', seq: 9 }),
+  ]
+  const before = JSON.stringify(events)
+  const expected: LlmMessage[] = [
+    { role: 'system', content: 'SYS' },
+    { role: 'system', content: '[已压缩的历史摘要] 慢 SQL 已完成' },
+    { role: 'user', content: 'websql插件的readme是什么' },
+    { role: 'user', content: '不要继续旧报告' },
+    { role: 'assistant', content: '读取说明', replayRef: 'private-ref',
+      tool_calls: [{ id: 'read', type: 'function', function: { name: 'read_readme', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'read', content: 'README 内容' },
+  ]
+  assert.deepEqual(deriveMessages(events), expected)
+  assert.deepEqual(deriveMessages(JSON.parse(before)), expected)
+  assert.equal(JSON.stringify(events), before)
+  const composition = statInputComposition(events)
+  assert.equal(composition.histChars, 0)
+  assert.ok(composition.curChars >= 'websql插件的readme是什么'.length)
+
+  events.push(ev({ type: 'tool/call', id: 'compact-again', name: 'context_compact_submit',
+    arguments: JSON.stringify({ auto: true, text: '更新的历史摘要', retainFromSeq: 3 }), seq: 10 }))
+  const repeated = deriveMessages(events)
+  assert.deepEqual(repeated.slice(2), expected.slice(2))
+  assert.equal(repeated[1]?.content, '[已压缩的历史摘要] 更新的历史摘要')
+
+  events.push(ev({ type: 'turn/end', turn: 2, reason: 'complete', seq: 11 }))
+  events.push(ev({ type: 'turn/start', turn: 3, seq: 12 }))
+  events.push(ev({ type: 'user/message', text: '新的任务', kind: 'wake', seq: 13 }))
+  events.push(ev({ type: 'tool/call', id: 'compact-next', name: 'context_compact_submit',
+    arguments: JSON.stringify({ auto: true, text: '旧任务已结束', retainFromSeq: 12 }), seq: 14 }))
+  assert.deepEqual(deriveMessages(events).slice(2), [{ role: 'user', content: '新的任务' }])
+
+  events.push(ev({ type: 'tool/call', id: 'clear', name: 'context_clear', arguments: '{}', seq: 15 }))
+  assert.deepEqual(deriveMessages(events), [{ role: 'system', content: 'SYS' }])
+  events.push(ev({ type: 'user/message', text: '清空后新问题', kind: 'wake', seq: 16 }))
+  events.push(ev({ type: 'tool/call', id: 'stale', name: 'context_compact_submit',
+    arguments: JSON.stringify({ auto: true, text: '不应恢复的旧摘要', retainFromSeq: 12 }), seq: 17 }))
+  assert.deepEqual(deriveMessages(events), [
+    { role: 'system', content: 'SYS' },
+    { role: 'user', content: '清空后新问题' },
+  ])
+})
+
 test('deriveMessages context_clear wipes history with no summary prefix', () => {
   const events: SessionEvent[] = [
     { type: 'session/open', version: 1, seq: 0, ts: 0 },

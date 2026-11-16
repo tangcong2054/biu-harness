@@ -264,6 +264,65 @@ test('loop automatically compacts semantic history before the normal model reque
   assert.doesNotMatch(normalContext, /x{100}/)
 })
 
+test('automatic compact keeps the latest request and attachments even when the summary omits them', async () => {
+  const { ctx, sessionId } = await spine()
+  try {
+    await ctx.sessions.append(sessionId, { type: 'turn/start', turn: 1 })
+    await ctx.sessions.append(sessionId, { type: 'user/message', text: `分析慢 SQL：${'x'.repeat(12_000)}`, kind: 'wake' })
+    await ctx.sessions.append(sessionId, { type: 'assistant/message', text: '慢 SQL 分析已完成。' })
+    await ctx.sessions.append(sessionId, { type: 'turn/end', turn: 1, reason: 'complete' })
+    ctx.tools.register({
+      name: 'read_readme', description: 'read readme',
+      parameters: { type: 'object', properties: {} }, execute: () => 'websql README',
+    })
+    const calls: LlmMessage[][] = []
+    const replies: AssistantReply[] = [
+      { content: '慢 SQL 分析已完成，下一步输出旧报告。', toolCalls: [] },
+      { content: '先读取说明', toolCalls: [{ id: 'read', name: 'read_readme', arguments: '{}' }] },
+      { content: '这是 websql 插件的说明。', toolCalls: [] },
+    ]
+    const llm: LlmClient = { async chat(messages) {
+      calls.push(messages)
+      const reply = replies.shift()
+      assert.ok(reply, 'unexpected model request')
+      return reply
+    } }
+    const question = 'websql插件的readme是什么'
+    const image = { name: 'screenshot.png', mime: 'image/png', url: 'data:image/png;base64,AAAA' }
+    const id = '33333333-3333-4333-8333-333333333333.txt'
+    const file = { id, name: 'notes.txt', mime: 'text/plain', size: 3, url: `/api/sessions/${sessionId}/artifacts/${id}` }
+    const turn = await new AgentLoop(ctx, llm, sessionId, new AbortController().signal, {
+      provider: 'openai', apiKey: 'k', model: 'demo', contextWindowTokens: 5_000, outputReserveTokens: 500,
+    }).run([
+      { kind: 'wake', text: question, images: [image] },
+      { kind: 'inject', text: '请参考附件，不要继续旧报告', files: [file] },
+    ])
+    assert.equal(turn.text, '这是 websql 插件的说明。')
+    assert.equal(calls.length, 3)
+    assert.doesNotMatch(JSON.stringify(calls[0]), /websql|data:image|notes\.txt/)
+    for (const messages of calls.slice(1)) {
+      const users = messages.filter((message) => message.role === 'user')
+      assert.equal(users.length, 2)
+      assert.ok(JSON.stringify(users[0]).includes(question))
+      assert.ok(JSON.stringify(users[0]).includes(image.url))
+      assert.match(JSON.stringify(users[1]), /请参考附件，不要继续旧报告/)
+      assert.ok(JSON.stringify(users[1]).includes(id))
+      assert.doesNotMatch(JSON.stringify(messages), /x{100}/)
+    }
+    assert.equal(calls[2]?.find((message) => message.role === 'tool')?.content, 'websql README')
+    const record = await ctx.sessions.require(sessionId)
+    const compact = record.events.find((event) => event.type === 'tool/call' && event.name === 'context_compact_submit')
+    assert.ok(compact?.type === 'tool/call')
+    const boundary = record.events.findLast((event) => event.type === 'turn/start')!
+    assert.equal(JSON.parse(compact.arguments).retainFromSeq, boundary.seq)
+    const persisted = JSON.parse(JSON.stringify(record.events))
+    assert.deepEqual(sessions.deriveMessages(persisted, sessionId), ctx.sessions.deriveMessages(sessionId))
+    assert.equal(record.events.filter((event) => event.type === 'user/message' && event.text === question).length, 1)
+  } finally {
+    await ctx.fiber.dispose()
+  }
+})
+
 test('loop rejects locally when the current turn alone cannot fit the model hard budget', async () => {
   const { ctx, sessionId } = await spine()
   let called = false
@@ -289,6 +348,30 @@ test('loop rejects locally when the current turn alone cannot fit the model hard
   const turn = await loop.run([{ kind: 'wake', text: 'x'.repeat(8_000) }])
   assert.equal(called, false)
   assert.match(turn.text, /本地上下文超过模型硬预算/)
+})
+
+test('a long current turn stops at the hard budget without summarizing away the request', async () => {
+  const { ctx, sessionId } = await spine()
+  try {
+    ctx.tools.register({ name: 'large_result', description: 'large result',
+      parameters: { type: 'object', properties: {} }, execute: () => 'x'.repeat(16_000) })
+    let count = 0
+    const llm: LlmClient = { async chat() {
+      count++
+      return { content: '读取数据', toolCalls: [{ id: 'large', name: 'large_result', arguments: '{}' }] }
+    } }
+    const result = await new AgentLoop(ctx, llm, sessionId, new AbortController().signal, {
+      provider: 'openai', apiKey: 'k', model: 'demo', contextWindowTokens: 5_000, outputReserveTokens: 500,
+    }).run([{ kind: 'wake', text: '分析最新数据' }])
+    assert.equal(count, 1)
+    assert.match(result.text, /本地上下文超过模型硬预算/)
+    const messages = ctx.sessions.deriveMessages(sessionId)
+    assert.equal(messages.find((message) => message.role === 'user')?.content, '分析最新数据')
+    assert.equal(messages.find((message) => message.role === 'tool')?.content, 'x'.repeat(16_000))
+    assert.equal(ctx.sessions.peek(sessionId)!.events.some((event) => event.type === 'tool/call' && event.name === 'context_compact_submit'), false)
+  } finally {
+    await ctx.fiber.dispose()
+  }
 })
 
 test('loop invokes multiple tools concurrently', async () => {

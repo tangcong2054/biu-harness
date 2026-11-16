@@ -20,6 +20,7 @@ import {
   mergeSessionConfig,
   normalizeSessionConfig,
   isSessionCompactPoint,
+  reorderRetainedContextEvents,
   sessionCompactSummaryText,
   mergeContentEditFiles,
 } from '@biu/type-session'
@@ -125,6 +126,7 @@ export {
 } from './session-heal.ts'
 
 export function deriveMessages(events: SessionEvent[], sessionId?: string): LlmMessage[] {
+  events = reorderRetainedContextEvents(events)
   let system = ''
   const messages: LlmMessage[] = []
   /** 当前 assistant.tool_calls 的声明顺序（接口要求 role:tool 必须按此顺序紧跟） */
@@ -252,6 +254,7 @@ export interface InputComposition {
  * - 字数用字符长度。total 为 0 时各 pct 返回 0。
  */
 export function statInputComposition(events: SessionEvent[]): InputComposition {
+  events = reorderRetainedContextEvents(events)
   const len = (s: string | null | undefined) => (s ? s.length : 0)
   const isCompact = (e: SessionEvent) => isSessionCompactPoint(e)
 

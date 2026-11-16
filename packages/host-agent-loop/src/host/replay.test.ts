@@ -80,6 +80,47 @@ for (const mode of ['lean-replay', 'native-replay'] as const) {
   })
 }
 
+test('mid-turn automatic compact preserves and budgets native replay with the current conversation', async () => {
+  const { ctx, sessionId } = await spine()
+  try {
+    await ctx.sessions.append(sessionId, { type: 'turn/start', turn: 1 })
+    await ctx.sessions.append(sessionId, { type: 'user/message', text: 'x'.repeat(4_000), kind: 'wake' })
+    await ctx.sessions.append(sessionId, { type: 'assistant/message', text: '旧任务已完成' })
+    await ctx.sessions.append(sessionId, { type: 'turn/end', turn: 1, reason: 'complete' })
+    const largeReplay = { ...replay, reasoningContent: 'r'.repeat(1_800) }
+    const seen: LlmMessage[][] = []
+    const llm: LlmClient = { async chat(messages, _tools, _signal, options) {
+      seen.push(messages)
+      if (seen.length === 1) {
+        assert.equal(options?.replayMode, 'native-replay')
+        return { content: '读取 websql 说明', toolCalls: [{ id: 'read', name: 'replay_test', arguments: '{}' }], replay: largeReplay }
+      }
+      if (seen.length === 2) {
+        assert.equal(options?.replayMode, 'lean-replay')
+        assert.doesNotMatch(JSON.stringify(messages), /websql|r{100}/)
+        return { content: '旧任务已完成', toolCalls: [] }
+      }
+      assert.equal(seen.length, 3)
+      assert.equal(options?.replayMode, 'native-replay')
+      assert.equal(messages.find((message) => message.role === 'user')?.content, 'websql插件的readme是什么')
+      const assistant = messages.find((message) => message.role === 'assistant')!
+      assert.deepEqual(assistant.replay, largeReplay)
+      assert.equal(messages.find((message) => message.role === 'tool')?.content, 'tool-result')
+      const compact = ctx.sessions.peek(sessionId)!.events.find((event) => event.type === 'tool/call' && event.name === 'context_compact_submit')!
+      assert.ok(compact.type === 'tool/call')
+      assert.ok(JSON.parse(compact.arguments).afterTokens >= sessions.estimateMessageTokens(assistant))
+      return { content: '说明已读取', toolCalls: [], replay }
+    } }
+    const result = await new AgentLoop(ctx, llm, sessionId, new AbortController().signal, {
+      ...config('native-replay'), contextWindowTokens: 5_000, outputReserveTokens: 500,
+    }).run([{ kind: 'wake', text: 'websql插件的readme是什么' }])
+    assert.equal(result.text, '说明已读取')
+    assert.equal(seen.length, 3)
+  } finally {
+    await ctx.fiber.dispose()
+  }
+})
+
 test('captures in lean mode and restores in a later native turn without mutating a running turn', async () => {
   const { ctx, sessionId } = await spine()
   const settings = config('lean-replay')

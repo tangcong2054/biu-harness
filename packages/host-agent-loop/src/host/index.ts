@@ -2,8 +2,8 @@ import { Service, type Context } from 'cordis'
 import type { AssistantReply, ChatOptions, LlmClient, LlmConfig, LlmMessage, LlmUsage } from '@biu/host-llm'
 import { runWithSession } from '@biu/host-sessions/scope'
 import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime, runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
-import { estimateTokens, fitMessagesToTokenBudget, liftToolImages } from '@biu/host-sessions'
-import { parseSessionArtifactUrl, TODO_TOOL_NAME } from '@biu/type-session'
+import { deriveMessages, fitMessagesToTokenBudget, liftToolImages } from '@biu/host-sessions'
+import { isSessionCompactPoint, parseSessionArtifactUrl, TODO_TOOL_NAME } from '@biu/type-session'
 import { runWithToolPolicy, runWithToolProgress, type AgentToolMode } from '@biu/host-tools'
 import {
   buildAutoCompactMessages,
@@ -62,8 +62,8 @@ export class AgentLoop implements AgentRunner {
     this.config = { ...config }
   }
 
-  private async replayMessages(): Promise<LlmMessage[]> {
-    const messages = await liftToolImages(this.ctx.sessions.deriveMessages(this.sessionId), this.sessionId)
+  private async replayMessages(source = this.ctx.sessions.deriveMessages(this.sessionId)): Promise<LlmMessage[]> {
+    const messages = await liftToolImages(source, this.sessionId)
     return Promise.all(messages.map(async ({ replayRef, replayMissing, replay: _replay, ...message }) => {
       if (this.config.replayMode !== 'native-replay') return message
       if (replayMissing) throw new Error('此会话缺失原生回放状态，请新建会话或清除上下文后重试。')
@@ -74,7 +74,15 @@ export class AgentLoop implements AgentRunner {
   }
 
   private async autoCompact(messages: LlmMessage[], policy: ContextPolicy): Promise<boolean> {
-    const request = buildAutoCompactMessages(messages, policy.hardMessageTokens)
+    const events = this.ctx.sessions.peek(this.sessionId)?.events ?? []
+    const turnIndex = events.reduce((last, event, index) => event.type === 'turn/start' ? index : last, -1)
+    if (turnIndex < 0 || events.slice(turnIndex).some(isSessionCompactPoint)) return false
+    const retainFromSeq = events[turnIndex]!.seq
+    const eventCount = events.length
+    const history = deriveMessages(events.slice(0, turnIndex), this.sessionId)
+    if (!history.some((message) => message.role !== 'system')) return false
+    const retained = await this.replayMessages(deriveMessages(events.slice(turnIndex), this.sessionId))
+    const request = buildAutoCompactMessages(history, policy.hardMessageTokens)
     if (request.overBudget || request.droppedMessages > 0) {
       this.ctx.logger('host-agent-loop').warn(
         `auto compact skipped: complete history cannot fit compaction request session=${this.sessionId} dropped=${request.droppedMessages}`,
@@ -100,7 +108,16 @@ export class AgentLoop implements AgentRunner {
         return false
       }
       const beforeTokens = messageTokenTotal(messages)
-      const afterTokens = estimateTokens(summary)
+      const primarySystem = messages[0]?.role === 'system' ? [messages[0]] : []
+      const nextMessages: LlmMessage[] = [
+        ...primarySystem,
+        { role: 'system', content: `[已压缩的历史摘要] ${summary}` },
+        ...retained.filter((message) => message.role !== 'system'),
+      ]
+      const afterTokens = messageTokenTotal(nextMessages)
+      if (afterTokens >= beforeTokens || afterTokens > policy.hardMessageTokens) return false
+      this.throwIfAborted()
+      if (this.ctx.sessions.peek(this.sessionId)?.events.length !== eventCount) return false
       await this.ctx.sessions.append(this.sessionId, {
         type: 'tool/call',
         id: `auto-compact-${Date.now().toString(36)}`,
@@ -108,6 +125,7 @@ export class AgentLoop implements AgentRunner {
         arguments: JSON.stringify({
           text: summary,
           auto: true,
+          retainFromSeq,
           beforeTokens,
           afterTokens,
         }),
