@@ -60,6 +60,7 @@ export type SessionEventBody =
   | { type: 'step/end'; turn: number; step: number }
   | { type: 'system/prompt'; text: string }
   | { type: 'system/compact'; text: string }
+  | { type: 'context/handoff'; turn: number; step: number; kind: 'foreign' | 'legacy' | 'handoff'; messages: number }
   | { type: 'user/message'; text: string; kind: InboxKind; sender?: MessageSender; images?: UserMessageImage[]; files?: UserMessageFile[]; clientMessageId?: string }
   | {
       type: 'assistant/message'

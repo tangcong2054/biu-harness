@@ -76,6 +76,9 @@ export function projectTrajectoryRows(events: SessionEvent[]): TrajectoryRow[] {
       const add = event.files.reduce((n, file) => n + file.added, 0)
       const del = event.files.reduce((n, file) => n + file.removed, 0)
       summary = `db_content ${event.files.length} · +${add} −${del}`
+    } else if (event.type === 'context/handoff') {
+      const mode = event.kind === 'handoff' ? '上下文交接记录' : event.kind === 'foreign' ? '跨模型公共历史' : '旧版公共历史'
+      summary = `原生回放适配 · ${mode} · ${event.messages} 条（请求准备）`
     } else if (event.type === 'turn/end') {
       summary = `end · ${event.reason}`
     } else if (event.type === 'step/start' || event.type === 'step/end') {

@@ -7,6 +7,22 @@ function ev(partial: SessionEventBody & { seq: number; ts?: number }): SessionEv
   return { ...partial, ts: partial.ts ?? partial.seq }
 }
 
+test('handoff notices are observable without becoming model instructions or compact boundaries', () => {
+  const raw: SessionEvent[] = [
+    ev({ type: 'turn/start', turn: 1, seq: 0 }),
+    ev({ type: 'user/message', text: 'continue', kind: 'wake', seq: 1 }),
+    ev({ type: 'step/start', turn: 1, step: 0, seq: 2 }),
+    ev({ type: 'context/handoff', turn: 1, step: 0, kind: 'handoff', messages: 2, seq: 3 }),
+    ev({ type: 'assistant/message', text: 'done', seq: 4 }),
+  ]
+  const messages = buildRequestMessages(raw, 4)
+  assert.deepEqual(messages, buildRequestMessages(raw.filter((event) => event.type !== 'context/handoff'), 4))
+  const row = buildTrajectoryWindow(raw, 2).rows.find((item) => item.type === 'context/handoff')!
+  assert.equal(row.turn, 1)
+  assert.equal(row.step, 0)
+  assert.match(row.summary, /上下文交接记录.*2.*请求准备/)
+})
+
 test('trajectory window returns summary rows without full bodies', () => {
   const raw: SessionEvent[] = [ev({ type: 'session/open', version: 1, seq: 0 })]
   for (let i = 0; i < 3; i++) {

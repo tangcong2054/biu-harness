@@ -842,6 +842,23 @@ test('strict context fit refuses to send when system plus current turn cannot fi
   assert.equal(fitted.messages.some((message) => message.role === 'user'), false)
 })
 
+test('handoff data belongs to its original context group, not a new user turn', () => {
+  const current: LlmMessage[] = [
+    { role: 'user', content: 'current-request'.repeat(500) },
+    { role: 'assistant', content: 'progress' },
+    { role: 'user', content: 'historical tool record', replayHistory: { kind: 'handoff', targetRouteKey: 'route' } },
+    { role: 'assistant', content: 'continue' },
+  ]
+  const tooSmall = fitMessagesToTokenBudget(current, 100)
+  assert.equal(tooSmall.overBudget, true)
+  assert.equal(tooSmall.messages.length, 0)
+  assert.deepEqual(fitMessagesToTokenBudget(current, estimateRequestTokens(current)).messages, current)
+  const next: LlmMessage = { role: 'user', content: 'new request' }
+  const fitted = fitMessagesToTokenBudget([...current, next], estimateRequestTokens([next]))
+  assert.equal(fitted.overBudget, false)
+  assert.deepEqual(fitted.messages, [next])
+})
+
 test('deriveMessages projects pasted images as multimodal content', () => {
   const events: SessionEvent[] = [
     { type: 'session/open', version: 1, seq: 0, ts: 0 },

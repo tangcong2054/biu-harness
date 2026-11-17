@@ -1,5 +1,5 @@
 import { Service, type Context } from 'cordis'
-import type { AssistantReply, ChatOptions, LlmClient, LlmConfig, LlmMessage, LlmUsage } from '@biu/host-llm'
+import { ReplayHandoffRequiredError, type AssistantReply, type ChatOptions, type LlmClient, type LlmConfig, type LlmMessage, type LlmUsage } from '@biu/host-llm'
 import { runWithSession } from '@biu/host-sessions/scope'
 import { currentAccountId, currentRequestWorkspaceId, isOnlineRuntime, runWithAccount, runWithRequestWorkspace } from '@biu/host-plugin-loader/data-dir'
 import { deriveMessages, fitMessagesToTokenBudget, liftToolImages } from '@biu/host-sessions'
@@ -46,6 +46,9 @@ import type { AgentTurn, ClaimedInput, AgentRunner, PreStepReq } from '@biu/type
 export type AgentLoopFactory = (config: LlmConfig, sessionId: string, signal: AbortSignal) => AgentRunner
 
 export class AgentLoop implements AgentRunner {
+  private replayHandoff = false
+  private readonly recordedHandoffs = new Set<string>()
+
   constructor(
     private ctx: Context,
     private llm: LlmClient,
@@ -64,13 +67,51 @@ export class AgentLoop implements AgentRunner {
 
   private async replayMessages(source = this.ctx.sessions.deriveMessages(this.sessionId)): Promise<LlmMessage[]> {
     const messages = await liftToolImages(source, this.sessionId)
-    return Promise.all(messages.map(async ({ replayRef, replayMissing, replay: _replay, ...message }) => {
+    const loaded = await Promise.all(messages.map(async ({ replayRef, replayMissing, replay: _replay, ...message }) => {
       if (this.config.replayMode !== 'native-replay') return message
       if (replayMissing) throw new Error('此会话缺失原生回放状态，请新建会话或清除上下文后重试。')
       if (!replayRef) return message
       const replay = await this.ctx.sessions.loadReplay(this.sessionId, replayRef)
       return { ...message, replay }
     }))
+    return this.prepareMessages(loaded)
+  }
+
+  private prepareMessages(messages: LlmMessage[]): LlmMessage[] {
+    return this.llm.prepareMessages?.(messages, this.ctx.tools.schemas(), {
+      replayMode: this.config.replayMode ?? 'lean-replay',
+      replayHandoff: this.replayHandoff,
+    }) ?? messages
+  }
+
+  private fitReplayMessages(messages: LlmMessage[], budget: number) {
+    let current = messages
+    let droppedMessages = 0
+    for (let pass = 0; pass < 3; pass++) {
+      const fitted = fitMessagesToTokenBudget(this.prepareMessages(current), budget)
+      droppedMessages += fitted.droppedMessages
+      if (fitted.overBudget || fitted.droppedMessages === 0) return { ...fitted, droppedMessages }
+      current = fitted.messages
+    }
+    throw new Error('模型路由与上下文预算未能稳定，请缩短输入后重试。')
+  }
+
+  private async recordHandoffs(messages: LlmMessage[], turn: number, step: number): Promise<void> {
+    const groups = new Map<string, { kind: 'foreign' | 'legacy' | 'handoff'; messages: number }>()
+    for (const message of messages) {
+      const history = message.replayHistory
+      if (!history) continue
+      const key = `${turn}:${history.targetRouteKey}:${history.kind}`
+      const entry = groups.get(key) ?? { kind: history.kind, messages: 0 }
+      entry.messages++
+      groups.set(key, entry)
+    }
+    for (const [key, group] of groups) {
+      if (this.recordedHandoffs.has(key)) continue
+      this.throwIfAborted()
+      await this.ctx.sessions.append(this.sessionId, { type: 'context/handoff', turn, step, ...group })
+      this.recordedHandoffs.add(key)
+    }
   }
 
   private async autoCompact(messages: LlmMessage[], policy: ContextPolicy): Promise<boolean> {
@@ -403,7 +444,7 @@ export class AgentLoop implements AgentRunner {
           }
         }
 
-        const fitted = fitMessagesToTokenBudget(rawMessages, policy.hardMessageTokens)
+        const fitted = this.fitReplayMessages(rawMessages, policy.hardMessageTokens)
         if (fitted.overBudget) {
           throw new Error(
             `本地上下文超过模型硬预算：${fitted.estimatedTokens} > ${policy.hardMessageTokens} token；请缩短当前输入或提高模型上下文`,
@@ -422,25 +463,44 @@ export class AgentLoop implements AgentRunner {
             ? todoReminder(todoTurnState(session.peek(this.sessionId)?.events ?? []), step, todoNudged)
             : undefined)
         pendingReminder = undefined
-        const requestMessages = withReminder(fitted.messages, reminder)
-
-        reply = await this.llm.chat(requestMessages, tools, this.signal, {
-          replayMode: this.config.replayMode ?? 'lean-replay',
-          estimatedTotalTokens: projectedRequestTokens(
-            requestMessages,
-            tools,
-            policy.outputReserveTokens,
-          ),
-          onDelta: async (text) => {
-            queueChunk(text)
-          },
-          onReasoningDelta: (text) => {
-            queueChunk(text, 'reasoning')
-          },
-          onToolDelta: (call) => {
-            queueTool(call)
-          },
-        })
+        let streamed = false
+        const requestModel = async (messages: LlmMessage[]): Promise<AssistantReply> => {
+          this.throwIfAborted()
+          const prepared = this.prepareMessages(messages)
+          const requestMessages = withReminder(prepared, reminder)
+          const estimatedTokens = messageTokenTotal(requestMessages)
+          if (estimatedTokens > policy.hardMessageTokens) {
+            throw new Error(`上下文交接及提醒超过模型硬预算：${estimatedTokens} > ${policy.hardMessageTokens} token；请缩短输入或提高模型上下文。`)
+          }
+          await this.recordHandoffs(requestMessages, turn, step)
+          this.throwIfAborted()
+          return this.llm.chat(requestMessages, tools, this.signal, {
+            replayMode: this.config.replayMode ?? 'lean-replay',
+            replayHandoff: this.replayHandoff,
+            estimatedTotalTokens: projectedRequestTokens(requestMessages, tools, policy.outputReserveTokens),
+            onDelta: async (text) => {
+              streamed = true
+              queueChunk(text)
+            },
+            onReasoningDelta: (text) => {
+              streamed = true
+              queueChunk(text, 'reasoning')
+            },
+            onToolDelta: (call) => {
+              streamed = true
+              queueTool(call)
+            },
+          })
+        }
+        try {
+          reply = await requestModel(fitted.messages)
+        } catch (error) {
+          if (!(error instanceof ReplayHandoffRequiredError) || this.replayHandoff || streamed || this.signal.aborted) throw error
+          this.replayHandoff = true
+          const handedOff = this.fitReplayMessages(await this.replayMessages(), policy.hardMessageTokens)
+          if (handedOff.overBudget) throw new Error('上下文交接超过模型硬预算，请缩短输入或提高模型上下文。')
+          reply = await requestModel(handedOff.messages)
+        }
         await flushChunks()
         await flushTools()
         this.throwIfAborted()

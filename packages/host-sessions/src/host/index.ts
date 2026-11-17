@@ -452,8 +452,9 @@ function contextGroups(messages: LlmMessage[]): { prefix: LlmMessage[]; groups: 
     cursor += 1
     if (
       message.role === 'user' &&
+      message.replayHistory?.kind !== 'handoff' &&
       current.length &&
-      current.some((item) => item.role !== 'user')
+      current.some((item) => item.role !== 'user' || item.replayHistory?.kind === 'handoff')
     ) {
       flush()
     }
